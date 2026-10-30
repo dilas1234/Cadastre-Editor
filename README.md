@@ -9,9 +9,9 @@ come later). See `../../Documents/Lovetech/PLAGIS/SRS.pdf` for the full specific
 | Path | What it is | Status |
 |------|-----------|--------|
 | `crates/cadastre-core` | Shared survey geometry engine (COGO, closure, area, adjustment, topology, CRS). Compiles to native **and** wasm32. | ✅ built |
-| `crates/cadastre-server` | axum REST API + PostGIS + Keycloak auth. Beacons/parcels/tolerances, configurable workflow, jobs, edit sessions/locks, OpenAPI, embedded migrations. | ✅ Phases 2–3 |
+| `crates/cadastre-server` | axum REST API + PostGIS + Keycloak auth. Beacons/parcels/tolerances, configurable workflow, jobs, edit sessions/locks, live survey check, OpenAPI, embedded migrations. | ✅ Phases 2–3 |
 | `crates/cadastre-import` | Read-only Aumentum MSSQL import | planned |
-| `apps/editor` | Tauri 2 + Leptos desktop editor | planned |
+| `apps/editor` | Tauri 2 + Leptos + MapLibre desktop editor. Live-survey engine + server check done; GUI shell scaffolded (see `docs/phase-4-editor.md`). | 🚧 engine done, GUI scaffold (Phase 4) |
 | `apps/web` | Leptos web viewer + admin console | planned |
 
 ## Build & test
@@ -34,7 +34,7 @@ cargo run -p cadastre-server            # migrations run on startup; API on :808
 - OpenAPI/Swagger UI: `http://localhost:8080/swagger-ui`, spec at `/api-docs/openapi.json`.
 - Probes: `GET /health` (liveness), `GET /ready` (DB reachable).
 - Resources: tolerances, beacons, parcels, `workflow`, `jobs` (+ transitions/events),
-  `sessions` (+ locks). See `docs/server.md`.
+  `sessions` (+ locks), and `POST /api/v1/survey/check` (live closure/area). See `docs/server.md`.
 - `CADASTRE_AUTH=disabled` runs every request as a dev superuser. Set `enabled` to require a
   Keycloak bearer token whose RS256 signature is verified against the JWKS (fetched from the
   issuer, or supplied via `CADASTRE_KEYCLOAK_JWKS_JSON`/`_PATH`).

@@ -32,6 +32,10 @@ pub enum CoreError {
     #[error("observation references beacon index {0}, which is out of range")]
     BeaconIndexOutOfRange(usize),
 
+    /// A survey-session edit referenced a leg index outside the segment list.
+    #[error("segment index {index} is out of range (session has {len} leg(s))")]
+    SegmentIndexOutOfRange { index: usize, len: usize },
+
     /// A value was not finite where a finite value was required.
     #[error("expected a finite value for {0}")]
     NotFinite(&'static str),

@@ -24,18 +24,23 @@ fn row_to_dto(row: &sqlx::postgres::PgRow) -> TolerancesDto {
 const SELECT_COLS: &str = "closure_precision, area_fraction, join_distance, sliver_area, \
      duplicate_beacon, distance_residual, bearing_residual_sec";
 
+/// Load the active tolerance set, erroring if none is configured. Shared by the survey check.
+pub async fn load_active(pool: &sqlx::PgPool) -> ApiResult<TolerancesDto> {
+    let sql = format!("SELECT {SELECT_COLS} FROM cadastre.tolerance_config WHERE is_active");
+    let row = sqlx::query(&sql)
+        .fetch_optional(pool)
+        .await?
+        .ok_or_else(|| AppError::NotFound("active tolerance config".to_string()))?;
+    Ok(row_to_dto(&row))
+}
+
 /// Get the active tolerance set.
 #[utoipa::path(
     get, path = "/api/v1/tolerances", tag = "config",
     responses((status = 200, body = TolerancesDto))
 )]
 pub async fn get_tolerances(State(state): State<AppState>) -> ApiResult<Json<TolerancesDto>> {
-    let sql = format!("SELECT {SELECT_COLS} FROM cadastre.tolerance_config WHERE is_active");
-    let row = sqlx::query(&sql)
-        .fetch_optional(&state.pool)
-        .await?
-        .ok_or_else(|| AppError::NotFound("active tolerance config".to_string()))?;
-    Ok(Json(row_to_dto(&row)))
+    Ok(Json(load_active(&state.pool).await?))
 }
 
 /// Replace the active tolerance set (admin only). The previous set is retained for audit.

@@ -14,11 +14,13 @@ pub mod closure;
 pub mod cogo;
 pub mod crs;
 pub mod error;
+pub mod survey;
 pub mod tolerances;
 pub mod topology;
 pub mod types;
 pub mod units;
 
 pub use error::{CoreError, Result};
-pub use types::{Beacon, Course, Curve, Point, Traverse};
+pub use survey::{SurveyChecks, SurveySession, SurveySummary};
+pub use types::{Beacon, Course, Curve, Point, Segment, Traverse};
 pub use units::{Angle, Bearing};

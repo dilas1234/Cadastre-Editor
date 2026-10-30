@@ -289,3 +289,111 @@ pub struct NewLock {
     /// Resource identifier.
     pub resource_id: Uuid,
 }
+
+// ---------------------------------------------------------------------------
+// Phase 4: live survey check (FR-COG-02/03, FR-SUR-*).
+// ---------------------------------------------------------------------------
+
+/// A planar coordinate (easting/northing, metres, EPSG:26392).
+#[derive(Clone, Copy, Debug, Deserialize, Serialize, ToSchema)]
+pub struct PointDto {
+    /// Easting (metres).
+    pub x: f64,
+    /// Northing (metres).
+    pub y: f64,
+}
+
+/// One traverse leg. `bearing`/`chord_bearing` are whole-circle **decimal degrees**.
+#[derive(Clone, Copy, Debug, Deserialize, ToSchema)]
+#[serde(tag = "type", rename_all = "lowercase")]
+pub enum LegDto {
+    /// A straight course.
+    Line {
+        /// Whole-circle bearing (decimal degrees).
+        bearing: f64,
+        /// Distance (metres).
+        distance: f64,
+    },
+    /// A circular arc, reduced to its chord.
+    Curve {
+        /// Arc radius (metres).
+        radius: f64,
+        /// Arc length (metres).
+        arc_length: f64,
+        /// Chord whole-circle bearing (decimal degrees).
+        chord_bearing: f64,
+    },
+}
+
+/// Request to re-validate a traverse against the server's active tolerances.
+#[derive(Clone, Debug, Deserialize, ToSchema)]
+pub struct SurveyCheckRequest {
+    /// Start beacon coordinate.
+    pub start: PointDto,
+    /// Optional start beacon number.
+    pub start_beacon: Option<String>,
+    /// Ordered legs captured so far.
+    pub legs: Vec<LegDto>,
+    /// Optional stated area from the plan (m²).
+    pub stated_area: Option<f64>,
+}
+
+/// Closure summary with friendly units.
+#[derive(Clone, Copy, Debug, Serialize, ToSchema)]
+pub struct ClosureDto {
+    /// Easting component of the misclosure (m).
+    pub misclosure_east: f64,
+    /// Northing component of the misclosure (m).
+    pub misclosure_north: f64,
+    /// Linear misclosure (m).
+    pub linear_misclosure: f64,
+    /// Bearing of the misclosure vector (decimal degrees).
+    pub misclosure_bearing_deg: f64,
+    /// Perimeter used for the precision ratio (m).
+    pub perimeter: f64,
+    /// Precision-ratio denominator (1:N). `null` means an exact closure.
+    pub precision_ratio: Option<f64>,
+}
+
+/// Area comparison with friendly fields.
+#[derive(Clone, Copy, Debug, Serialize, ToSchema)]
+pub struct AreaCheckDto {
+    /// Computed area (m²).
+    pub computed: f64,
+    /// Stated area (m²).
+    pub stated: f64,
+    /// `computed - stated` (m²).
+    pub difference: f64,
+    /// Absolute fractional difference.
+    pub fraction: f64,
+}
+
+/// Tolerance pass/fail flags for the figure.
+#[derive(Clone, Copy, Debug, Serialize, ToSchema)]
+pub struct SurveyChecksDto {
+    /// The loop returns onto its start within the join distance.
+    pub closes_on_start: bool,
+    /// The precision ratio meets the configured minimum.
+    pub meets_precision: bool,
+    /// Area within tolerance of the stated area (`null` if not checkable).
+    pub area_within_tolerance: Option<bool>,
+}
+
+/// Authoritative live-check result (mirrors `cadastre_core::survey::SurveySummary`).
+#[derive(Clone, Copy, Debug, Serialize, ToSchema)]
+pub struct SurveyCheckResponse {
+    /// Number of legs.
+    pub leg_count: usize,
+    /// Number of vertices (legs + 1).
+    pub vertex_count: usize,
+    /// Perimeter (m).
+    pub perimeter: f64,
+    /// Closure, or `null` with no legs.
+    pub closure: Option<ClosureDto>,
+    /// Computed area (m²), or `null` with fewer than 3 vertices.
+    pub area: Option<f64>,
+    /// Area comparison, or `null` if not checkable.
+    pub area_check: Option<AreaCheckDto>,
+    /// Tolerance checks.
+    pub checks: SurveyChecksDto,
+}

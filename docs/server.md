@@ -24,7 +24,7 @@ crates/cadastre-server/
     error.rs       AppError → JSON { status, error, message }
     models.rs      request/response DTOs (decoupled from rows and cadastre-core types)
     openapi.rs     ApiDoc aggregating #[utoipa::path] handlers
-    routes/        health, tolerances, beacons, parcels, workflow, jobs, sessions
+    routes/        health, tolerances, beacons, parcels, workflow, jobs, sessions, survey
   tests/
     integration.rs DB-backed tests (skipped unless CADASTRE_TEST_DATABASE_URL is set)
 ```
@@ -52,6 +52,15 @@ Tables live in the `cadastre` schema:
   resources (parcel|beacon|job). A resource has at most one lock. Contention returns **409**,
   unless the holding session is non-active or stale (no heartbeat within the 5-minute TTL), in
   which case it is reclaimed. Staleness is `domain::session_is_stale` (pure, unit-tested).
+
+## Live survey check (Phase 4)
+
+`POST /api/v1/survey/check` runs `cadastre_core::survey::SurveySession` against the active
+tolerance config and returns closure, area, precision and pass/fail flags. The desktop editor
+runs the *same* engine locally (WASM) for its sub-100ms live check (NFR-03); this endpoint is the
+authoritative server-side re-validation, so submission can't drift from what the surveyor saw.
+Legs are posted as `{"type":"line","bearing":<deg>,"distance":<m>}` or
+`{"type":"curve","radius","arc_length","chord_bearing"}`. See `docs/phase-4-editor.md`.
 
 ### search_path pin (why `db.rs` sets it)
 

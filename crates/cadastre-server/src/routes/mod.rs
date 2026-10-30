@@ -5,6 +5,7 @@ pub mod health;
 pub mod jobs;
 pub mod parcels;
 pub mod sessions;
+pub mod survey;
 pub mod tolerances;
 pub mod workflow;
 
@@ -29,6 +30,8 @@ pub fn router(state: AppState) -> Router {
         )
         .route("/api/v1/beacons/{id}", get(beacons::get_beacon))
         .route("/api/v1/parcels", get(parcels::list_parcels))
+        // Live survey check (FR-COG-02/03)
+        .route("/api/v1/survey/check", post(survey::check_survey))
         // Workflow configuration (FR-WF-01, FR-ADM-02)
         .route("/api/v1/workflow", get(workflow::get_workflow))
         .route("/api/v1/workflow/stages", post(workflow::create_stage))

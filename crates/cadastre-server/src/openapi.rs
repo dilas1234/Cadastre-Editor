@@ -3,11 +3,12 @@
 use utoipa::OpenApi;
 
 use crate::models::{
-    BeaconDto, JobDto, JobEventDto, JobTransition, LockDto, NewBeacon, NewJob, NewLock, NewSession,
-    NewStage, NewTransition, ParcelDto, SessionDto, StageDto, TolerancesDto, TransitionDto,
-    WorkflowDto,
+    AreaCheckDto, BeaconDto, ClosureDto, JobDto, JobEventDto, JobTransition, LegDto, LockDto,
+    NewBeacon, NewJob, NewLock, NewSession, NewStage, NewTransition, ParcelDto, PointDto,
+    SessionDto, StageDto, SurveyCheckRequest, SurveyCheckResponse, SurveyChecksDto, TolerancesDto,
+    TransitionDto, WorkflowDto,
 };
-use crate::routes::{beacons, health, jobs, parcels, sessions, tolerances, workflow};
+use crate::routes::{beacons, health, jobs, parcels, sessions, survey, tolerances, workflow};
 
 /// The generated API description, served at `/api-docs/openapi.json`.
 #[derive(OpenApi)]
@@ -40,12 +41,15 @@ use crate::routes::{beacons, health, jobs, parcels, sessions, tolerances, workfl
         sessions::list_locks,
         sessions::acquire_lock,
         sessions::release_lock,
+        survey::check_survey,
     ),
     components(schemas(
         TolerancesDto, BeaconDto, NewBeacon, ParcelDto,
         WorkflowDto, StageDto, TransitionDto, NewStage, NewTransition,
         JobDto, NewJob, JobTransition, JobEventDto,
         SessionDto, NewSession, LockDto, NewLock,
+        PointDto, LegDto, SurveyCheckRequest, SurveyCheckResponse,
+        ClosureDto, AreaCheckDto, SurveyChecksDto,
     )),
     tags(
         (name = "ops", description = "Liveness and readiness"),
@@ -55,6 +59,7 @@ use crate::routes::{beacons, health, jobs, parcels, sessions, tolerances, workfl
         (name = "workflow", description = "Configurable workflow (FR-WF-01, FR-ADM-02)"),
         (name = "jobs", description = "Jobs and workflow transitions (FR-JOB-*, FR-WF-02/03)"),
         (name = "sessions", description = "Edit sessions and resource locks"),
+        (name = "survey", description = "Live survey closure/area check (FR-COG-02/03)"),
     )
 )]
 pub struct ApiDoc;

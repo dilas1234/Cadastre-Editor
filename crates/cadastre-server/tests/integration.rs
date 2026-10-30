@@ -307,6 +307,55 @@ async fn stale_session_lock_is_reclaimed() {
     assert_eq!(st, StatusCode::CONFLICT);
 }
 
+#[tokio::test]
+async fn survey_check_validates_against_active_tolerances() {
+    let Some(db_url) = test_db_url() else {
+        eprintln!("skipping: CADASTRE_TEST_DATABASE_URL not set");
+        return;
+    };
+    let state = state_with(AuthMode::Disabled, None, &db_url).await;
+    let app = routes::router(state);
+
+    // A closed 100 m square (one hectare) that lands back on its start.
+    let square = json!({
+        "start": {"x": 1000.0, "y": 1000.0},
+        "start_beacon": "B1",
+        "stated_area": 10000.0,
+        "legs": [
+            {"type": "line", "bearing": 0.0,   "distance": 100.0},
+            {"type": "line", "bearing": 90.0,  "distance": 100.0},
+            {"type": "line", "bearing": 180.0, "distance": 100.0},
+            {"type": "line", "bearing": 270.0, "distance": 100.0}
+        ]
+    });
+    let (st, body) = send(&app, "POST", "/api/v1/survey/check", None, Some(square)).await;
+    assert_eq!(st, StatusCode::OK, "{body}");
+    assert_eq!(body["leg_count"], 4);
+    assert_eq!(body["vertex_count"], 5);
+    assert!((body["area"].as_f64().unwrap() - 10_000.0).abs() < 0.01);
+    assert_eq!(body["checks"]["closes_on_start"], true);
+    assert_eq!(body["checks"]["meets_precision"], true);
+    assert_eq!(body["checks"]["area_within_tolerance"], true);
+    // Exact closure is reported as a null precision ratio.
+    assert!(body["closure"]["precision_ratio"].is_null());
+
+    // An open, two-leg figure does not close and overstates its area.
+    let open = json!({
+        "start": {"x": 0.0, "y": 0.0},
+        "stated_area": 10000.0,
+        "legs": [
+            {"type": "line", "bearing": 0.0,  "distance": 100.0},
+            {"type": "line", "bearing": 90.0, "distance": 100.0}
+        ]
+    });
+    let (st, body) = send(&app, "POST", "/api/v1/survey/check", None, Some(open)).await;
+    assert_eq!(st, StatusCode::OK);
+    assert_eq!(body["checks"]["closes_on_start"], false);
+    assert_eq!(body["checks"]["meets_precision"], false);
+    assert_eq!(body["checks"]["area_within_tolerance"], false);
+    assert!(body["closure"]["linear_misclosure"].as_f64().unwrap() > 100.0);
+}
+
 /// A throwaway RSA identity provider used to mint signed tokens for the auth test.
 struct TestIdp {
     kid: String,
