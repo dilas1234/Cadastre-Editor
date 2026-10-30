@@ -1,0 +1,11 @@
+/target
+**/*.rs.bk
+Cargo.lock.orig
+.DS_Store
+
+# insta review leftovers
+**/*.snap.new
+
+# editor/tooling
+.idea/
+.vscode/

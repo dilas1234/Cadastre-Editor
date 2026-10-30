@@ -1,0 +1,9 @@
+# Daily development uses stable. The Windows Server 2012 R2 build is a separate,
+# explicit invocation that overrides this with nightly + build-std against the
+# tier-3 target x86_64-win7-windows-msvc (see docs/windows-2012r2-build.md, Phase 9).
+# Note: rust-src (needed for build-std) is installed on the *nightly* toolchain only,
+# not here, to keep stable dev lean and avoid rustup component conflicts.
+[toolchain]
+channel = "stable"
+components = ["rustfmt", "clippy"]
+targets = ["wasm32-unknown-unknown"]

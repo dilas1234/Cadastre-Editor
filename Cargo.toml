@@ -1,0 +1,32 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/cadastre-core",
+    # Added in later phases:
+    # "crates/cadastre-server",
+    # "crates/cadastre-import",
+    # "apps/editor",
+    # "apps/web",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "Proprietary"
+authors = ["PLAGIS Cadastre Editor team"]
+rust-version = "1.77"
+
+[workspace.lints.rust]
+unsafe_code = "forbid"
+
+[workspace.lints.clippy]
+all = { level = "warn", priority = -1 }
+
+# Survey maths must be exact and fast. Optimise even in test/dev so the
+# 100ms live-check and 2s/500-beacon adjustment targets (NFR-03/04) are realistic.
+[profile.dev.package."*"]
+opt-level = 2
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
