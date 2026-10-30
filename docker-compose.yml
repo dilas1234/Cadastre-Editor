@@ -1,0 +1,40 @@
+# Phase 2 development stack: PostGIS + Keycloak.
+#
+# Dev only. Nothing here is installed on the host; `docker compose up -d` brings up
+# the database and identity provider the server talks to. Production deployment on
+# Windows Server 2012 R2 (Phase 9) does not use these containers.
+
+services:
+  db:
+    image: postgis/postgis:16-3.4
+    container_name: cadastre-db
+    environment:
+      POSTGRES_USER: cadastre
+      POSTGRES_PASSWORD: cadastre
+      POSTGRES_DB: cadastre
+    ports:
+      - "5432:5432"
+    volumes:
+      - cadastre-db-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U cadastre -d cadastre"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  keycloak:
+    image: quay.io/keycloak/keycloak:26.0
+    container_name: cadastre-keycloak
+    command: ["start-dev"]
+    environment:
+      KC_BOOTSTRAP_ADMIN_USERNAME: admin
+      KC_BOOTSTRAP_ADMIN_PASSWORD: admin
+      KC_HTTP_PORT: 8080
+    ports:
+      - "8081:8080"
+    depends_on:
+      db:
+        condition: service_healthy
+
+volumes:
+  cadastre-db-data:

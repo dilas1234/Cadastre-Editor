@@ -3,6 +3,9 @@
 Cargo.lock.orig
 .DS_Store
 
+# local environment
+.env
+
 # insta review leftovers
 **/*.snap.new
 

@@ -9,7 +9,7 @@ come later). See `../../Documents/Lovetech/PLAGIS/SRS.pdf` for the full specific
 | Path | What it is | Status |
 |------|-----------|--------|
 | `crates/cadastre-core` | Shared survey geometry engine (COGO, closure, area, adjustment, topology, CRS). Compiles to native **and** wasm32. | ✅ built |
-| `crates/cadastre-server` | axum REST API, jobs/workflow, posting, PostGIS | planned |
+| `crates/cadastre-server` | axum REST API + PostGIS persistence + Keycloak auth. Skeleton with beacons/parcels/tolerances, OpenAPI, embedded migrations. | ✅ skeleton (Phase 2) |
 | `crates/cadastre-import` | Read-only Aumentum MSSQL import | planned |
 | `apps/editor` | Tauri 2 + Leptos desktop editor | planned |
 | `apps/web` | Leptos web viewer + admin console | planned |
@@ -21,6 +21,21 @@ cargo test -p cadastre-core                              # unit + property + int
 cargo clippy --all-targets                               # lints
 cargo build -p cadastre-core --target wasm32-unknown-unknown   # proves the shared-engine WASM target
 ```
+
+## Running the server (Phase 2)
+
+```sh
+docker compose up -d db                 # PostGIS on :5432 (+ `keycloak` service on :8081)
+cp .env.example .env                    # dev config (CADASTRE_AUTH=disabled)
+set -a; . ./.env; set +a
+cargo run -p cadastre-server            # migrations run on startup; API on :8080
+```
+
+- OpenAPI/Swagger UI: `http://localhost:8080/swagger-ui`, spec at `/api-docs/openapi.json`.
+- Probes: `GET /health` (liveness), `GET /ready` (DB reachable).
+- `CADASTRE_AUTH=disabled` runs every request as a dev admin+editor user. Set `enabled` to
+  require a Keycloak bearer token. **Note:** token *signature* verification is a Phase 3 TODO —
+  the current auth layer only reads claims (see `docs/server.md`).
 
 ## Deployment target
 

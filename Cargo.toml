@@ -2,8 +2,8 @@
 resolver = "2"
 members = [
     "crates/cadastre-core",
+    "crates/cadastre-server",
     # Added in later phases:
-    # "crates/cadastre-server",
     # "crates/cadastre-import",
     # "apps/editor",
     # "apps/web",
