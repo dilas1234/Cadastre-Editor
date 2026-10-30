@@ -1,21 +1,15 @@
 //! PLAGIS Cadastre Editor server entry point.
 
-mod auth;
-mod config;
-mod db;
-mod error;
-mod models;
-mod openapi;
-mod routes;
-mod state;
+use std::sync::Arc;
 
 use tracing_subscriber::{fmt, layer::SubscriberExt, util::SubscriberInitExt, EnvFilter};
 use utoipa::OpenApi;
 use utoipa_swagger_ui::SwaggerUi;
 
-use crate::config::{AuthMode, Config};
-use crate::openapi::ApiDoc;
-use crate::state::AppState;
+use cadastre_server::config::{AuthMode, Config};
+use cadastre_server::openapi::ApiDoc;
+use cadastre_server::state::AppState;
+use cadastre_server::{db, idp, routes};
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -26,15 +20,23 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         e
     })?;
 
-    if config.auth_mode == AuthMode::Disabled {
-        tracing::warn!("CADASTRE_AUTH=disabled — all requests run as a dev admin user");
-    }
+    let jwks = if config.auth_mode == AuthMode::Enabled {
+        let keys = idp::load_jwks(&config).await.map_err(|e| {
+            tracing::error!("failed to load Keycloak JWKS: {e}");
+            e
+        })?;
+        tracing::info!("loaded {} Keycloak verification key(s)", keys.len());
+        Some(Arc::new(keys))
+    } else {
+        tracing::warn!("CADASTRE_AUTH=disabled — all requests run as a dev superuser");
+        None
+    };
 
     let pool = db::connect_and_migrate(&config.database_url).await?;
     tracing::info!("database connected and migrations applied");
 
     let bind_addr = config.bind_addr.clone();
-    let state = AppState { pool, config };
+    let state = AppState { pool, config, jwks };
 
     let app = routes::router(state).merge(
         SwaggerUi::new("/swagger-ui").url("/api-docs/openapi.json", ApiDoc::openapi()),

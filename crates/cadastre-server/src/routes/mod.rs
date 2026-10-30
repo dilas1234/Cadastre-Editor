@@ -2,10 +2,13 @@
 
 pub mod beacons;
 pub mod health;
+pub mod jobs;
 pub mod parcels;
+pub mod sessions;
 pub mod tolerances;
+pub mod workflow;
 
-use axum::routing::get;
+use axum::routing::{delete, get, post};
 use axum::Router;
 use tower_http::trace::TraceLayer;
 
@@ -26,6 +29,36 @@ pub fn router(state: AppState) -> Router {
         )
         .route("/api/v1/beacons/{id}", get(beacons::get_beacon))
         .route("/api/v1/parcels", get(parcels::list_parcels))
+        // Workflow configuration (FR-WF-01, FR-ADM-02)
+        .route("/api/v1/workflow", get(workflow::get_workflow))
+        .route("/api/v1/workflow/stages", post(workflow::create_stage))
+        .route(
+            "/api/v1/workflow/transitions",
+            post(workflow::create_transition),
+        )
+        // Jobs (FR-JOB-*, FR-WF-02/03)
+        .route("/api/v1/jobs", get(jobs::list_jobs).post(jobs::create_job))
+        .route("/api/v1/jobs/{id}", get(jobs::get_job))
+        .route("/api/v1/jobs/{id}/transition", post(jobs::transition_job))
+        .route("/api/v1/jobs/{id}/events", get(jobs::list_job_events))
+        // Edit sessions and locks
+        .route("/api/v1/sessions", post(sessions::open_session))
+        .route(
+            "/api/v1/sessions/{id}/heartbeat",
+            post(sessions::heartbeat_session),
+        )
+        .route(
+            "/api/v1/sessions/{id}/release",
+            post(sessions::release_session),
+        )
+        .route(
+            "/api/v1/sessions/{id}/locks",
+            get(sessions::list_locks).post(sessions::acquire_lock),
+        )
+        .route(
+            "/api/v1/sessions/{id}/locks/{lock_id}",
+            delete(sessions::release_lock),
+        )
         .layer(TraceLayer::new_for_http())
         .with_state(state)
 }

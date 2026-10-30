@@ -1,14 +1,11 @@
-//! Keycloak authentication — **stub** for Phase 2.
+//! Keycloak authentication: an `AuthUser` extractor backed by RS256/JWKS verification.
 //!
-//! When auth is enabled this reads the claims out of the bearer JWT but does **not**
-//! verify its signature yet. Real JWKS-based verification against the Keycloak realm
-//! arrives in Phase 3; the extractor API below will not change when it does.
+//! When `CADASTRE_AUTH=disabled` every request is a dev superuser. When enabled, the
+//! bearer token's signature is verified against the JWKS loaded at startup (see `jwks`),
+//! and its `iss`/`aud` are checked against the configured Keycloak realm.
 
 use axum::extract::FromRequestParts;
 use axum::http::request::Parts;
-use base64::engine::general_purpose::URL_SAFE_NO_PAD;
-use base64::Engine;
-use serde::Deserialize;
 
 use crate::config::AuthMode;
 use crate::error::AppError;
@@ -28,13 +25,16 @@ pub struct AuthUser {
 }
 
 impl AuthUser {
-    /// The synthetic user used when `CADASTRE_AUTH=disabled`. Holds every role so local
-    /// dev can exercise all endpoints without a token.
+    /// The synthetic user used when `CADASTRE_AUTH=disabled`. Holds every workflow role so
+    /// local dev can exercise all endpoints without a token.
     fn dev_user() -> Self {
         Self {
             subject: "dev".to_string(),
             username: Some("dev".to_string()),
-            roles: vec!["admin".to_string(), "editor".to_string()],
+            roles: ["admin", "editor", "reviewer", "approver"]
+                .iter()
+                .map(|s| s.to_string())
+                .collect(),
         }
     }
 
@@ -51,34 +51,6 @@ impl AuthUser {
             Err(AppError::Forbidden(format!("requires role '{role}'")))
         }
     }
-}
-
-/// The subset of Keycloak JWT claims we consume.
-#[derive(Debug, Deserialize)]
-struct Claims {
-    sub: String,
-    preferred_username: Option<String>,
-    #[serde(default)]
-    realm_access: RealmAccess,
-}
-
-#[derive(Debug, Default, Deserialize)]
-struct RealmAccess {
-    #[serde(default)]
-    roles: Vec<String>,
-}
-
-/// Decode a JWT payload **without verifying the signature** (stub; see module docs).
-fn decode_claims_unverified(token: &str) -> Result<Claims, AppError> {
-    let payload = token
-        .split('.')
-        .nth(1)
-        .ok_or_else(|| AppError::Unauthorized("malformed bearer token".to_string()))?;
-    let bytes = URL_SAFE_NO_PAD
-        .decode(payload)
-        .map_err(|_| AppError::Unauthorized("malformed bearer token".to_string()))?;
-    serde_json::from_slice(&bytes)
-        .map_err(|_| AppError::Unauthorized("token claims unreadable".to_string()))
 }
 
 impl FromRequestParts<AppState> for AuthUser {
@@ -102,11 +74,24 @@ impl FromRequestParts<AppState> for AuthUser {
             .strip_prefix("Bearer ")
             .ok_or_else(|| AppError::Unauthorized("expected a Bearer token".to_string()))?;
 
-        let claims = decode_claims_unverified(token)?;
+        // Auth is enabled, so the JWKS must have loaded at startup; its absence is a
+        // server misconfiguration rather than a client error.
+        let jwks = state.jwks.as_ref().ok_or_else(|| {
+            AppError::Unauthorized("auth enabled but no verification keys loaded".to_string())
+        })?;
+
+        let claims = jwks
+            .verify(
+                token,
+                state.config.keycloak_issuer.as_deref(),
+                state.config.keycloak_audience.as_deref(),
+            )
+            .map_err(|e| AppError::Unauthorized(e.to_string()))?;
+
         Ok(Self {
-            subject: claims.sub,
-            username: claims.preferred_username,
-            roles: claims.realm_access.roles,
+            subject: claims.subject,
+            username: claims.username,
+            roles: claims.roles,
         })
     }
 }

@@ -16,7 +16,7 @@ cadastre-core = { path = "../cadastre-core" }
 # Async runtime + web framework
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "signal"] }
 axum = "0.8"
-tower = "0.5"
+tower = { version = "0.5", features = ["util"] }
 tower-http = { version = "0.6", features = ["trace", "cors"] }
 
 # Persistence. runtime-tokio with NO TLS backend: dev connects to Postgres over
@@ -41,11 +41,18 @@ chrono = { version = "0.4", features = ["serde"] }
 utoipa = { version = "5", features = ["axum_extras", "chrono", "uuid"] }
 utoipa-swagger-ui = { version = "9", features = ["axum"] }
 
-# Keycloak JWT stub (decode claims; signature verification is Phase 3). base64 keeps
-# this pure-Rust with no crypto C deps.
+# Keycloak JWT verification. base64 + rsa + sha2 are all pure-Rust (rsa uses
+# num-bigint-dig, no C/ring), so RS256 signature verification does not compromise the
+# win7 server target (NFR-02).
 base64 = "0.22"
+rsa = "0.9"
+sha2 = { version = "0.10", features = ["oid"] }
 
 # Observability + errors
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 thiserror = "2"
+
+[dev-dependencies]
+# RSA keypair generation for JWT verification tests.
+rand = "0.8"

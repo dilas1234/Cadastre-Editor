@@ -24,6 +24,10 @@ pub enum AppError {
     #[error("{0}")]
     Forbidden(String),
 
+    /// The request conflicts with current state (e.g. a resource is already locked).
+    #[error("{0}")]
+    Conflict(String),
+
     /// A database error. The detail is logged, not returned to the client.
     #[error("database error")]
     Database(#[from] sqlx::Error),
@@ -36,6 +40,7 @@ impl AppError {
             AppError::BadRequest(_) => StatusCode::BAD_REQUEST,
             AppError::Unauthorized(_) => StatusCode::UNAUTHORIZED,
             AppError::Forbidden(_) => StatusCode::FORBIDDEN,
+            AppError::Conflict(_) => StatusCode::CONFLICT,
             AppError::Database(_) => StatusCode::INTERNAL_SERVER_ERROR,
         }
     }

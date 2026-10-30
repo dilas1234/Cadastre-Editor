@@ -110,3 +110,182 @@ pub struct ParcelDto {
     /// Last update time.
     pub updated_at: DateTime<Utc>,
 }
+
+// ---------------------------------------------------------------------------
+// Phase 3: workflow, jobs, edit sessions.
+// ---------------------------------------------------------------------------
+
+/// A workflow stage.
+#[derive(Clone, Debug, Serialize, ToSchema)]
+pub struct StageDto {
+    /// Stable code (e.g. `draft`).
+    pub code: String,
+    /// Display name.
+    pub name: String,
+    /// Ordering position.
+    pub seq: i32,
+    /// Whether a new job starts here.
+    pub is_initial: bool,
+    /// Whether the job is finished here.
+    pub is_terminal: bool,
+}
+
+/// A workflow transition, by stage code.
+#[derive(Clone, Debug, Serialize, ToSchema)]
+pub struct TransitionDto {
+    /// Action name (e.g. `submit`).
+    pub action: String,
+    /// Stage the job must be in.
+    pub from_stage: String,
+    /// Stage the job moves to.
+    pub to_stage: String,
+    /// Role required to perform it.
+    pub required_role: String,
+}
+
+/// The full workflow definition (FR-WF-01, FR-ADM-02).
+#[derive(Clone, Debug, Serialize, ToSchema)]
+pub struct WorkflowDto {
+    /// Stages ordered by `seq`.
+    pub stages: Vec<StageDto>,
+    /// All transitions.
+    pub transitions: Vec<TransitionDto>,
+}
+
+/// Payload to add a workflow stage (admin).
+#[derive(Clone, Debug, Deserialize, ToSchema)]
+pub struct NewStage {
+    /// Stable code (unique).
+    pub code: String,
+    /// Display name.
+    pub name: String,
+    /// Ordering position.
+    pub seq: i32,
+    /// Whether the job is finished here. Defaults to false.
+    pub is_terminal: Option<bool>,
+}
+
+/// Payload to add a workflow transition (admin).
+#[derive(Clone, Debug, Deserialize, ToSchema)]
+pub struct NewTransition {
+    /// Action name.
+    pub action: String,
+    /// Source stage code.
+    pub from_stage: String,
+    /// Target stage code.
+    pub to_stage: String,
+    /// Role required to perform it.
+    pub required_role: String,
+}
+
+/// A job (FR-JOB-*).
+#[derive(Clone, Debug, Serialize, ToSchema)]
+pub struct JobDto {
+    /// Server-assigned identifier.
+    pub id: Uuid,
+    /// Human reference (unique).
+    pub reference: String,
+    /// Job type (capture | maintenance | subdivision | ...).
+    pub job_type: String,
+    /// Optional title.
+    pub title: Option<String>,
+    /// Current workflow stage code.
+    pub status: String,
+    /// Assignee subject, if any.
+    pub assigned_to: Option<String>,
+    /// Who created the job.
+    pub created_by: String,
+    /// Creation time.
+    pub created_at: DateTime<Utc>,
+    /// Last update time.
+    pub updated_at: DateTime<Utc>,
+}
+
+/// Payload to create a job.
+#[derive(Clone, Debug, Deserialize, ToSchema)]
+pub struct NewJob {
+    /// Human reference (must be unique).
+    pub reference: String,
+    /// Job type.
+    pub job_type: String,
+    /// Optional title.
+    pub title: Option<String>,
+    /// Optional assignee subject.
+    pub assigned_to: Option<String>,
+}
+
+/// Payload to move a job along the workflow.
+#[derive(Clone, Debug, Deserialize, ToSchema)]
+pub struct JobTransition {
+    /// The action to apply (must be valid from the current stage).
+    pub action: String,
+    /// Optional note recorded in the job history.
+    pub note: Option<String>,
+}
+
+/// A job workflow history entry.
+#[derive(Clone, Debug, Serialize, ToSchema)]
+pub struct JobEventDto {
+    /// Monotonic event id.
+    pub id: i64,
+    /// Action applied.
+    pub action: String,
+    /// Stage moved from, if any.
+    pub from_stage: Option<String>,
+    /// Stage moved to.
+    pub to_stage: String,
+    /// Who performed it.
+    pub actor: String,
+    /// Optional note.
+    pub note: Option<String>,
+    /// When it happened.
+    pub created_at: DateTime<Utc>,
+}
+
+/// An edit session.
+#[derive(Clone, Debug, Serialize, ToSchema)]
+pub struct SessionDto {
+    /// Session identifier.
+    pub id: Uuid,
+    /// Job the session is working on, if any.
+    pub job_id: Option<Uuid>,
+    /// Owning user subject.
+    pub user_subject: String,
+    /// Lifecycle status (active | released | expired).
+    pub status: String,
+    /// When the session opened.
+    pub started_at: DateTime<Utc>,
+    /// Last heartbeat.
+    pub last_heartbeat_at: DateTime<Utc>,
+}
+
+/// Payload to open an edit session.
+#[derive(Clone, Debug, Deserialize, ToSchema)]
+pub struct NewSession {
+    /// Optional job to scope the session to.
+    pub job_id: Option<Uuid>,
+}
+
+/// An acquired resource lock.
+#[derive(Clone, Debug, Serialize, ToSchema)]
+pub struct LockDto {
+    /// Lock identifier.
+    pub id: Uuid,
+    /// Owning session.
+    pub session_id: Uuid,
+    /// Resource kind (parcel | beacon | job).
+    pub resource_type: String,
+    /// Resource identifier.
+    pub resource_id: Uuid,
+    /// When the lock was taken.
+    pub acquired_at: DateTime<Utc>,
+}
+
+/// Payload to acquire a lock.
+#[derive(Clone, Debug, Deserialize, ToSchema)]
+pub struct NewLock {
+    /// Resource kind (parcel | beacon | job).
+    pub resource_type: String,
+    /// Resource identifier.
+    pub resource_id: Uuid,
+}
