@@ -1,11 +1,18 @@
 //! Coordinate reference systems — pure Rust, no `proj` C dependency (protects the Windows
 //! Server 2012 R2 `win7` target; SRS §2.4, NFR-02).
 //!
-//! The working CRS is **EPSG:26392 — Minna / Nigeria Mid Belt** (Transverse Mercator on the
-//! Clarke 1880 (RGS) ellipsoid). A 3-parameter geocentric translation relates Minna to WGS 84.
+//! Two projected CRSs are supported:
 //!
-//! ⚠️ The datum-shift parameters below are provisional. The exact Minna→WGS 84 transformation
-//! PLAGIS uses must be confirmed (SRS §9) and is configurable via [`DatumShift`].
+//! - **EPSG:32632 — WGS 84 / UTM zone 32N** (Transverse Mercator on WGS 84). This is the CRS the
+//!   **live PLAGIS cadastre fabric is actually stored in** (confirmed from the production Aumentum
+//!   ArcSDE geodatabase: `SHAPE.STSrid = 32632`). Because it is already on WGS 84 its datum shift
+//!   is the identity, so grid⇄WGS 84 is a pure (un)projection.
+//! - **EPSG:26392 — Minna / Nigeria Mid Belt** (Transverse Mercator on the Clarke 1880 (RGS)
+//!   ellipsoid), related to WGS 84 by a 3-parameter geocentric translation. Legacy survey plans
+//!   are computed on Minna.
+//!
+//! ⚠️ The Minna datum-shift parameters below are provisional and must be confirmed with PLAGIS
+//! (SRS §9 / NFR-02); they are configurable via [`DatumShift`]. UTM 32N needs no such parameter.
 
 use crate::types::Point;
 
@@ -75,6 +82,19 @@ impl TransverseMercator {
             lon_origin: 8.5_f64.to_radians(),
             k0: 0.999_75,
             false_easting: 670_553.98,
+            false_northing: 0.0,
+        }
+    }
+
+    /// EPSG:32632 — WGS 84 / UTM zone 32N (central meridian 9°E). The CRS the live PLAGIS
+    /// cadastre fabric is stored in.
+    pub fn utm_zone_32n() -> Self {
+        Self {
+            ellipsoid: Ellipsoid::WGS84,
+            lat_origin: 0.0,
+            lon_origin: 9.0_f64.to_radians(),
+            k0: 0.9996,
+            false_easting: 500_000.0,
             false_northing: 0.0,
         }
     }
@@ -199,6 +219,13 @@ pub struct DatumShift {
 }
 
 impl DatumShift {
+    /// The identity (no datum change) — for CRSs already on WGS 84, such as UTM zone 32N.
+    pub const IDENTITY: DatumShift = DatumShift {
+        dx: 0.0,
+        dy: 0.0,
+        dz: 0.0,
+    };
+
     /// Provisional Minna → WGS 84 geocentric translation. **TO BE CONFIRMED with PLAGIS**
     /// (SRS §9 / NFR-02) before any production use.
     pub const MINNA_TO_WGS84_PROVISIONAL: DatumShift = DatumShift {
@@ -267,6 +294,15 @@ impl Default for WorkingCrs {
 }
 
 impl WorkingCrs {
+    /// EPSG:32632 — WGS 84 / UTM zone 32N, the CRS the live cadastre fabric uses. No datum
+    /// shift is needed because the projection is already on the WGS 84 ellipsoid.
+    pub fn utm_zone_32n() -> Self {
+        Self {
+            projection: TransverseMercator::utm_zone_32n(),
+            to_wgs84: DatumShift::IDENTITY,
+        }
+    }
+
     /// Project local-datum geographic coordinates (decimal degrees) to grid metres.
     pub fn project_deg(&self, lat_deg: f64, lon_deg: f64) -> Point {
         self.projection

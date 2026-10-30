@@ -62,3 +62,42 @@ fn datum_shift_is_nonzero_and_bounded() {
     assert!(dlat > 1e-5 && dlat < 1e-2, "dlat {dlat}");
     assert!(dlon < 1e-2, "dlon {dlon}");
 }
+
+// --- EPSG:32632 — WGS 84 / UTM zone 32N (the CRS the live cadastre fabric uses) ---
+
+/// On the 9°E central meridian, UTM 32N easting equals the 500 000 m false easting.
+#[test]
+fn utm32n_central_meridian_maps_to_500000() {
+    let tm = TransverseMercator::utm_zone_32n();
+    let p = tm.forward(0.0, 9.0_f64.to_radians());
+    assert!((p.x - 500_000.0).abs() < 1e-3, "easting {}", p.x);
+    assert!(p.y.abs() < 1e-3, "northing {}", p.y);
+}
+
+/// project → unproject round-trips across Plateau State to sub-micro-degree.
+#[test]
+fn utm32n_project_unproject_round_trip() {
+    let crs = WorkingCrs::utm_zone_32n();
+    for &(lat, lon) in &[(9.9, 8.9), (8.9, 8.5), (10.5, 9.3), (9.0, 9.0)] {
+        let grid = crs.project_deg(lat, lon);
+        let (lat2, lon2) = crs.unproject_deg(grid);
+        assert!((lat2 - lat).abs() < 1e-8, "lat {lat} -> {lat2}");
+        assert!((lon2 - lon).abs() < 1e-8, "lon {lon} -> {lon2}");
+    }
+}
+
+/// A real beacon from the production ArcSDE geodatabase (PLAGIS_COORDINATES, Alias "N1",
+/// easting/northing in EPSG:32632) inverts to a plausible Plateau-State WGS 84 position, and —
+/// because UTM 32N is already on WGS 84 — the datum-shifted path equals the plain unprojection.
+#[test]
+fn utm32n_matches_real_beacon_coordinate() {
+    let crs = WorkingCrs::utm_zone_32n();
+    let n1 = Point::new(488_249.908, 1_099_097.516);
+    let (lat, lon) = crs.unproject_deg(n1);
+    // Plateau State sits around 9–10°N, 8–9°E; N1 is just west of the 9°E meridian.
+    assert!((9.5..10.2).contains(&lat), "lat {lat}");
+    assert!((8.7..9.0).contains(&lon), "lon {lon}");
+
+    let (wlat, wlon) = crs.grid_to_wgs84_deg(n1);
+    assert!((wlat - lat).abs() < 1e-9 && (wlon - lon).abs() < 1e-9, "identity datum shift");
+}
