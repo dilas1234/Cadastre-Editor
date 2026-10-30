@@ -10,7 +10,7 @@ come later). See `../../Documents/Lovetech/PLAGIS/SRS.pdf` for the full specific
 |------|-----------|--------|
 | `crates/cadastre-core` | Shared survey geometry engine (COGO, closure, area, adjustment, topology, CRS). Compiles to native **and** wasm32. | ✅ built |
 | `crates/cadastre-server` | axum REST API + PostGIS + Keycloak auth. Beacons/parcels/tolerances, configurable workflow, jobs, edit sessions/locks, live survey check, OpenAPI, embedded migrations. | ✅ Phases 2–3 |
-| `crates/cadastre-import` | Read-only Aumentum MSSQL import | planned |
+| `crates/cadastre-import` | Read-only Aumentum ArcSDE import: DEFAULT-version reconstruction, WKT geometry, status/exception mapping. Pure logic tested; live tiberius reader behind `--features live`. | 🚧 Phase 8 (logic done) |
 | `apps/editor` | Tauri 2 + Leptos + MapLibre desktop editor. Live-survey engine + server check done; GUI shell scaffolded (see `docs/phase-4-editor.md`). | 🚧 engine done, GUI scaffold (Phase 4) |
 | `apps/web` | Leptos web viewer + admin console | planned |
 
