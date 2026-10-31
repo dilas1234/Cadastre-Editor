@@ -807,8 +807,22 @@ function finishMeasure() { drawMeasure(true); }
 function clearMeasure() { measurePts = []; map.getSource("measure")?.setData(empty()); $("measureWin")?.remove(); }
 
 // find / select by attributes
+// Search results carry their own geometry (EPSG:32632), so zooming never depends on the parcel
+// already being loaded in the map layer.
+function resultFeature(p) {
+  const toLLRing = (ring) => ring.map(([e, n]) => toLL(e, n));
+  const g = p.geometry || {};
+  const coordinates = g.type === "MultiPolygon" ? g.coordinates.map((poly) => poly.map(toLLRing)) : (g.coordinates || []).map(toLLRing);
+  return { type: "Feature", properties: { id: p.id, parcel_number: p.parcel_number, status: p.status }, geometry: { type: g.type || "Polygon", coordinates } };
+}
+function goToResult(p) {
+  const f = resultFeature(p);
+  zoomToFC({ type: "FeatureCollection", features: [f] });
+  focusParcel(f); selectFeatures([p.id]);
+  status(`${p.parcel_number || "(unposted)"} — ${p.status}`);
+}
 function findDialog() {
-  const input = h("input", { style: "flex:1", placeholder: "UPIN, e.g. PL0000000146", value: "" });
+  const input = h("input", { style: "flex:1", placeholder: "UPIN or plot number, e.g. 5621", value: "" });
   const results = h("div", { style: "margin-top:6px" });
   const run = async () => {
     const q = input.value.trim(); if (!q) return;
@@ -816,15 +830,20 @@ function findDialog() {
     try {
       const list = await api("/api/v1/parcels/search?number=" + encodeURIComponent(q));
       results.innerHTML = "";
-      if (!list.length) { results.textContent = "No matches."; return; }
+      if (!list.length) {
+        results.append(h("div", {}, `No parcel matches "${q}".`), h("div", { class: "muted" }, "Try the plot number alone (e.g. 5621) or part of the UPIN."));
+        return;
+      }
       const t = h("table", {}, h("tr", {}, h("th", {}, "Parcel"), h("th", {}, "Status"), h("th", {}, "Area (m²)")));
       for (const p of list.slice(0, 200)) {
-        const tr = h("tr", { style: "cursor:pointer" }, h("td", {}, p.parcel_number || "(unposted)"), h("td", {}, p.status), h("td", {}, p.computed_area != null ? Number(p.computed_area).toFixed(1) : "—"));
-        tr.onclick = () => { const f = state.parcels.features.find((x) => x.properties.id === p.id); if (f) { focusParcel(f); selectFeatures([p.id]); zoomToFC({ type: "FeatureCollection", features: [f] }); } };
+        const area = p.computed_area ?? p.stated_area;
+        const tr = h("tr", { style: "cursor:pointer", title: "Zoom to parcel" }, h("td", {}, p.parcel_number || "(unposted)"), h("td", {}, p.status), h("td", {}, area != null ? Number(area).toFixed(1) : "—"));
+        tr.onclick = () => goToResult(p);
         t.append(tr);
       }
-      results.append(h("div", { class: "muted" }, `${list.length} match(es) — click a row to zoom`), t);
-      selectFeatures(list.map((p) => p.id));
+      results.append(h("div", { class: "muted" }, `${list.length} match(es)${list.length > 200 ? " (first 200 shown)" : ""} — click a row to zoom`), t);
+      if (list.length === 1) goToResult(list[0]); // a single hit: go straight there, as Find does
+      else selectFeatures(list.map((p) => p.id));
     } catch (e) { results.textContent = "Search failed: " + e.message; }
   };
   input.addEventListener("keydown", (e) => e.key === "Enter" && run());

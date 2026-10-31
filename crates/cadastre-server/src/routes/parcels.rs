@@ -75,7 +75,8 @@ pub async fn create_job_parcel(
     Ok((StatusCode::CREATED, Json(row_to_dto(&row)?)))
 }
 
-/// Search parcels by number prefix, status, and/or bounding box (FR-VIEW).
+/// Search parcels by number (full UPIN, short plot number, or any part), status, and/or
+/// bounding box (FR-VIEW).
 #[utoipa::path(get, path = "/api/v1/parcels/search", tag = "parcels",
     params(ParcelSearch),
     responses((status = 200, body = [ParcelDto]), (status = 400, description = "Invalid bbox")))]
@@ -87,8 +88,14 @@ pub async fn search_parcels(
         QueryBuilder::new("SELECT ");
     qb.push(PARCEL_SELECT).push(" FROM cadastre.parcel WHERE 1=1");
 
-    if let Some(number) = q.number.as_deref().filter(|s| !s.is_empty()) {
-        qb.push(" AND parcel_number ILIKE ").push_bind(format!("{number}%"));
+    // Plot-number search: the full UPIN for short forms (5621 -> PL000000005621), else anywhere.
+    let number = q.number.as_deref().and_then(crate::numbering::parse_number_query);
+    if let Some(n) = &number {
+        qb.push(" AND (parcel_number ILIKE ").push_bind(n.contains.clone());
+        if let Some(exact) = &n.exact {
+            qb.push(" OR parcel_number = ").push_bind(exact.clone());
+        }
+        qb.push(")");
     }
     if let Some(status) = q.status.as_deref().filter(|s| !s.is_empty()) {
         qb.push(" AND status = ").push_bind(status.to_string());
@@ -99,7 +106,11 @@ pub async fn search_parcels(
             .push_bind(minx).push(", ").push_bind(miny).push(", ")
             .push_bind(maxx).push(", ").push_bind(maxy).push(", 32632)");
     }
-    qb.push(" ORDER BY parcel_number NULLS LAST LIMIT 500");
+    qb.push(" ORDER BY ");
+    if let Some(exact) = number.as_ref().and_then(|n| n.exact.clone()) {
+        qb.push("(parcel_number = ").push_bind(exact).push(") DESC, "); // exact UPIN first
+    }
+    qb.push("parcel_number NULLS LAST LIMIT 500");
 
     let rows = qb.build().fetch_all(&state.pool).await?;
     rows.iter().map(row_to_dto).collect::<ApiResult<Vec<_>>>().map(Json)

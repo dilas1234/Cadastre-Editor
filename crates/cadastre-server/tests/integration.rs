@@ -652,3 +652,32 @@ async fn empty_geojson_has_an_empty_features_array() {
     assert_eq!(fc["type"], "FeatureCollection");
     assert_eq!(fc["features"], json!([]), "{fc}");
 }
+
+/// Surveyors type plot numbers in short form; search must find the zero-padded UPIN, and rank
+/// the exact parcel first (regression: only an exact-prefix match worked).
+#[tokio::test]
+async fn search_finds_a_parcel_by_its_short_plot_number() {
+    let Some(db_url) = test_db_url() else {
+        eprintln!("skipping: CADASTRE_TEST_DATABASE_URL not set");
+        return;
+    };
+    let app = routes::router(state_with(AuthMode::Disabled, None, &db_url).await);
+    let (_, job) = send(&app, "POST", "/api/v1/jobs", None,
+        Some(json!({"reference": format!("JOB-{}", Uuid::new_v4()), "job_type": "capture"}))).await;
+    let job_id = job["id"].as_str().unwrap().to_string();
+    let (st, _) = send(&app, "POST", &format!("/api/v1/jobs/{job_id}/parcels"), None,
+        Some(json!({"geometry": square(5000.0, 5000.0, 20.0)}))).await;
+    assert_eq!(st, StatusCode::CREATED);
+    for action in ["submit", "start_review", "approve"] {
+        send(&app, "POST", &format!("/api/v1/jobs/{job_id}/transition"), None, Some(json!({ "action": action }))).await;
+    }
+    let (_, posted) = send(&app, "POST", &format!("/api/v1/jobs/{job_id}/post"), None, None).await;
+    let upin = posted["parcel_numbers"][0].as_str().unwrap().to_string();
+    let short = upin.trim_start_matches("PL").trim_start_matches('0').to_string(); // e.g. "57"
+
+    for typed in [short.clone(), format!("PL{short}"), format!(" pl {short} "), upin.to_lowercase()] {
+        let (st, found) = send(&app, "GET", &format!("/api/v1/parcels/search?number={}", typed.replace(' ', "%20")), None, None).await;
+        assert_eq!(st, StatusCode::OK);
+        assert_eq!(found[0]["parcel_number"], upin, "typed {typed:?}: exact UPIN must rank first: {found}");
+    }
+}

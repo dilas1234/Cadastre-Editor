@@ -230,7 +230,8 @@ pub struct NewParcel {
 #[derive(Clone, Debug, Default, Deserialize, IntoParams)]
 #[into_params(parameter_in = Query)]
 pub struct ParcelSearch {
-    /// Parcel-number prefix (case-insensitive), e.g. `PL0000`.
+    /// Parcel number to find (case- and space-insensitive): a full UPIN, a short plot number
+    /// (`5621` finds `PL000000005621` first), or any part of the number.
     pub number: Option<String>,
     /// Exact status (`draft` | `posted` | …).
     pub status: Option<String>,
