@@ -1,0 +1,3 @@
+# Server inventory output: contains usernames, hostnames and licence data. Never commit.
+aumentum-*.txt
+aumentum-docs/

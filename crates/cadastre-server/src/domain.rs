@@ -60,9 +60,26 @@ pub fn session_is_stale(last_heartbeat: DateTime<Utc>, now: DateTime<Utc>, ttl: 
     now.signed_duration_since(last_heartbeat) > ttl
 }
 
+/// The workflow stage a job must be in before it can be posted (FR-WF-04/05). Posting allocates
+/// official parcel numbers, so it must only ever follow approval.
+pub const POSTABLE_STAGE: &str = "approved";
+
+/// Whether a job in workflow stage `status` may be posted.
+pub fn can_post(status: &str) -> bool {
+    status == POSTABLE_STAGE
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn only_approved_jobs_can_be_posted() {
+        assert!(can_post("approved"));
+        for s in ["draft", "submitted", "under_review", "rejected", ""] {
+            assert!(!can_post(s), "{s} must not be postable");
+        }
+    }
 
     fn default_workflow() -> Vec<TransitionDef> {
         let t = |action: &str, from: &str, to: &str, role: &str| TransitionDef {

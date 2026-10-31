@@ -185,6 +185,7 @@ pub async fn transition_job(
         (status = 200, body = PostResult),
         (status = 403, description = "Requires approver role"),
         (status = 404, description = "Job not found"),
+        (status = 409, description = "Job is not approved"),
     ))]
 pub async fn post_job(
     State(state): State<AppState>,
@@ -192,7 +193,14 @@ pub async fn post_job(
     Path(id): Path<Uuid>,
 ) -> ApiResult<Json<PostResult>> {
     user.require_role("approver")?;
-    load_job(&state, id).await?;
+    let job = load_job(&state, id).await?;
+    if !crate::domain::can_post(&job.status) {
+        return Err(AppError::Conflict(format!(
+            "job is in stage '{}'; only '{}' jobs can be posted",
+            job.status,
+            crate::domain::POSTABLE_STAGE
+        )));
+    }
 
     let mut tx = state.pool.begin().await?;
     let rows = sqlx::query(

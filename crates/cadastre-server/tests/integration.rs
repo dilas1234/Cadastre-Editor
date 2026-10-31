@@ -391,3 +391,51 @@ impl TestIdp {
         format!("{h}.{p}.{s}")
     }
 }
+
+/// Posting allocates official parcel numbers, so it must be refused until the job is approved
+/// (regression: a draft job used to post and consume a UPIN).
+#[tokio::test]
+async fn posting_requires_an_approved_job() {
+    let Some(db_url) = test_db_url() else {
+        eprintln!("skipping: CADASTRE_TEST_DATABASE_URL not set");
+        return;
+    };
+    let app = routes::router(state_with(AuthMode::Disabled, None, &db_url).await);
+
+    let (st, job) = send(
+        &app,
+        "POST",
+        "/api/v1/jobs",
+        None,
+        Some(json!({"reference": format!("JOB-{}", Uuid::new_v4()), "job_type": "capture"})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::CREATED, "{job}");
+    let job_id = job["id"].as_str().unwrap().to_string();
+
+    let square = json!({"type": "Polygon", "coordinates": [[[0.0, 0.0], [50.0, 0.0], [50.0, 50.0], [0.0, 50.0], [0.0, 0.0]]]});
+    let (st, p) = send(&app, "POST", &format!("/api/v1/jobs/{job_id}/parcels"), None,
+        Some(json!({"geometry": square, "stated_area": 2500.0}))).await;
+    assert_eq!(st, StatusCode::CREATED, "{p}");
+
+    // Draft, submitted and under review: all refused with 409, and nothing is numbered.
+    for next in [None, Some("submit"), Some("start_review")] {
+        if let Some(action) = next {
+            let (st, j) = send(&app, "POST", &format!("/api/v1/jobs/{job_id}/transition"), None,
+                Some(json!({ "action": action }))).await;
+            assert_eq!(st, StatusCode::OK, "{action}: {j}");
+        }
+        let (st, body) = send(&app, "POST", &format!("/api/v1/jobs/{job_id}/post"), None, None).await;
+        assert_eq!(st, StatusCode::CONFLICT, "post before approval must be refused: {body}");
+    }
+
+    // Approve, then posting numbers the parcel exactly once.
+    let (st, _) = send(&app, "POST", &format!("/api/v1/jobs/{job_id}/transition"), None,
+        Some(json!({ "action": "approve" }))).await;
+    assert_eq!(st, StatusCode::OK);
+    let (st, posted) = send(&app, "POST", &format!("/api/v1/jobs/{job_id}/post"), None, None).await;
+    assert_eq!(st, StatusCode::OK, "{posted}");
+    assert_eq!(posted["posted"], 1);
+    let upin = posted["parcel_numbers"][0].as_str().unwrap();
+    assert!(upin.starts_with("PL") && upin.len() == 14, "UPIN format: {upin}");
+}

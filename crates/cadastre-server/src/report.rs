@@ -103,7 +103,8 @@ mod tests {
         let s = String::from_utf8_lossy(&pdf);
         assert!(s.contains("PL000000000001"));
         assert!(s.contains("JOB-7"));
-        assert!(s.contains("(unposted)"));
+        // Parentheses are PDF string delimiters, so the writer escapes them.
+        assert!(s.contains(r"\(unposted\)"));
     }
 
     #[test]
