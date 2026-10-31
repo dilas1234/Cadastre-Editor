@@ -1175,79 +1175,172 @@ async function runCheck() {
 }
 
 /* =====================================================================================
- * Phase 5 — Catalog
+ * Phase 5 — Catalog: live folder connections (e.g. \\PRODUCTIONMC\Image), browsed through the
+ * server's read-only /api/v1/catalog endpoints — nothing here is hard-coded.
  * ===================================================================================== */
-const host = location.hostname || "localhost";
-let catSelected = null; const catOpen = new Set(["root", "gdb", "jobs"]); const catHistory = [];
-function catalogModel() {
-  const fc = (id, name, ic, layer) => ({ id, name, icon: ic, layer });
-  return { id: "root", name: `\\\\${host.toUpperCase()}\\Cadastre`, icon: "server", children: [
-    { id: "gdb", name: `${REGION}.gdb`, icon: "gdb", children: [
-      fc("fc-parcels", `${REGION}_Parcels`, "polygonFc", "parcels"), fc("fc-jobs", `${REGION}_JobsArea`, "polygonFc", "jobsArea"),
-      fc("fc-lines", `${REGION}_Lines`, "lineFc", "lines"), fc("fc-points", `${REGION}_Points`, "pointFc", "points"),
-      fc("fc-ctrl", `${REGION}_CtrlPnts`, "pointFc", "ctrl")] },
-    { id: "jobs", name: "Jobs", icon: "folder", children: state.jobs.map((j) => ({ id: "job-" + j.id, name: `${j.reference} (${j.status})`, icon: "jobOpen", job: j.id })) },
-    { id: "imagery", name: "Imagery", icon: "folder", children: [fc("img-world", "World_Imagery", "raster", "imagery")] },
-    { id: "reports", name: "Reports", icon: "folder", children: state.job ? [
-      { id: "rep-plan", name: `${state.job.reference}_SitePlan.pdf`, icon: "sitePlan", pdf: "siteplan" },
-      { id: "rep-report", name: `${state.job.reference}_Report.pdf`, icon: "report", pdf: "report" }] : [] },
-    { id: "toolboxes", name: "Toolboxes", icon: "toolbox", children: [
-      { id: "tool-validate", name: "Validate Fabric", icon: "validate", run: validateFabric },
-      { id: "tool-survey", name: "Survey Closure Check", icon: "survey", run: () => openTask("survey") }] },
-  ] };
+const CAT_ICON = { folder: "folder", file_geodatabase: "gdb", toolbox: "toolbox", raster: "raster", raster_band: "band",
+  map_document: "mxd", layer_file: "lyr", kml: "kml", table: "table", workbook: "workbook", database_connection: "dbConn" };
+const CAT_TYPE = { folder: "Folder", file_geodatabase: "File Geodatabase", toolbox: "Toolbox", raster: "Raster Dataset", raster_band: "Raster Band",
+  map_document: "ArcMap Document", layer_file: "Layer", kml: "KML", table: "Table", workbook: "Excel Workbook", database_connection: "Database Connection" };
+const shpIcon = (g) => (g === "polyline" ? "lineFc" : g === "point" || g === "multipoint" ? "pointFc" : "polygonFc");
+const cat = {
+  nodes: new Map(),           // key -> node
+  open: new Set(["fc"]), selected: null, back: [], fwd: [], contentsVisible: true, view: "list",
+};
+// Node keys: "fc" (Folder Connections), "f:<folder>:<path>" (share items), "tb" / "tb:<tool>" (toolboxes).
+function catNode(key, props) { const n = cat.nodes.get(key) || { key, children: null, loading: false, error: null }; Object.assign(n, props); cat.nodes.set(key, n); return n; }
+function catItemKey(folder, path) { return `f:${folder}:${path}`; }
+function catUNC(n) { return n.folder == null ? n.name : (cat.roots[n.folder].name + (n.path ? "\\" + n.path.replace(/\//g, "\\") : "")); }
+cat.roots = [];
+catNode("fc", { name: "Folder Connections", icon: "folderConns", expandable: true, children: [] });
+catNode("tb", { name: "Toolboxes", icon: "toolbox", expandable: true, children: ["tb:validate", "tb:survey"] });
+catNode("tb:validate", { name: "Validate Fabric", icon: "validate", expandable: false, run: () => validateFabric(), type: "Tool" });
+catNode("tb:survey", { name: "Survey Closure Check", icon: "survey", expandable: false, run: () => openTask("survey"), type: "Tool" });
+
+async function loadCatalogRoots() {
+  try {
+    cat.roots = await api("/api/v1/catalog");
+    const keys = cat.roots.map((r) => {
+      const k = catItemKey(r.id, ""); catNode(k, { name: r.name, icon: "folderConn", expandable: true, folder: r.id, path: "", kind: "folder", type: "Folder Connection" }); return k;
+    });
+    catNode("fc", { children: keys });
+    if (keys.length) { cat.open.add(keys[0]); await catLoad(keys[0]); if (!cat.selected) cat.selected = keys[0]; }
+  } catch (e) { catNode("fc", { error: "Could not load folder connections: " + e.message }); }
+  buildCatalog();
 }
-function catFind(node, id) { if (node.id === id) return node; for (const c of node.children || []) { const r = catFind(c, id); if (r) return r; } return null; }
-function catPath(node, id, acc = []) { if (node.id === id) return [...acc, node]; for (const c of node.children || []) { const r = catPath(c, id, [...acc, node]); if (r) return r; } return null; }
-function catActivate(n) {
-  if (n.layer) { const l = findLayer(n.layer); if (l) { l.visible = true; buildTOC(); zoomToLayer(l); } }
-  else if (n.job) { $("jobBox").value = n.job; selectJob(n.job); }
-  else if (n.pdf) openPdf(n.pdf);
-  else if (n.run) n.run();
-  else if (n.children) { catOpen.add(n.id); catSelect(n.id); }
+async function catLoad(key) {
+  const n = cat.nodes.get(key);
+  if (!n || n.children || n.loading || n.folder == null) return;
+  n.loading = true; buildCatalog();
+  try {
+    const items = await api(`/api/v1/catalog/items?folder=${n.folder}&path=${encodeURIComponent(n.path)}`);
+    n.children = items.map((it) => {
+      const path = n.path ? `${n.path}/${it.name}` : it.name;
+      const k = catItemKey(n.folder, path);
+      catNode(k, { name: it.name, kind: it.kind, geometry: it.geometry, expandable: it.expandable, size: it.size, modified: it.modified,
+        folder: n.folder, path, icon: it.kind === "shapefile" ? shpIcon(it.geometry) : CAT_ICON[it.kind] || "folder",
+        type: it.kind === "shapefile" ? `Shapefile (${it.geometry || "?"})` : CAT_TYPE[it.kind] || it.kind });
+      return k;
+    });
+    n.error = null;
+  } catch (e) { n.error = e.message; n.children = []; }
+  n.loading = false; buildCatalog();
 }
-function catSelect(id) { if (catSelected && catSelected !== id) catHistory.push(catSelected); catSelected = id; buildCatalog(); }
-function buildCatalog() {
-  const model = catalogModel(); if (!catSelected) catSelected = "gdb";
-  const tree = $("catTree"); tree.innerHTML = "";
-  const nodeEl = (n) => {
-    const li = h("li"); const kids = n.children && n.children.length;
-    const open = catOpen.has(n.id);
-    const row = h("div", { class: "node" }, kids ? twisty(open, () => { open ? catOpen.delete(n.id) : catOpen.add(n.id); buildCatalog(); }) : h("span", { class: "tw none" }),
-      h("span", { html: icon(open && n.icon === "folder" ? "folderOpen" : n.icon) }), h("span", { class: `lbl${catSelected === n.id ? " sel" : ""}` }, n.name));
-    row.onclick = () => catSelect(n.id); row.ondblclick = () => catActivate(n);
-    li.append(row);
-    if (kids && open) { const ul = h("ul"); n.children.forEach((c) => ul.append(nodeEl(c))); li.append(ul); }
-    return li;
-  };
-  tree.append(h("ul", { class: "tree" }, nodeEl(model)));
-  // location box
-  const loc = $("catLocation"); loc.innerHTML = "";
-  const walk = (n, depth) => { if (n.children) { loc.append(h("option", { value: n.id, selected: n.id === catSelected }, " ".repeat(depth * 3) + n.name)); n.children.forEach((c) => walk(c, depth + 1)); } };
-  walk(model, 0);
-  const selNode = catFind(model, catSelected);
-  if (selNode && !selNode.children) { const p = catPath(model, catSelected); if (p && p.length > 1) loc.value = p[p.length - 2].id; }
-  // contents list
-  const contents = $("catContents"); contents.innerHTML = "";
-  const parent = selNode && selNode.children ? selNode : (catPath(model, catSelected) || []).slice(-2)[0];
-  const ul = h("ul", { class: "tree" });
-  for (const c of parent?.children || []) {
-    const row = h("div", { class: "node" }, h("span", { html: icon(c.icon) }), h("span", { class: `lbl${catSelected === c.id ? " sel" : ""}` }, c.name));
-    row.onclick = () => { catSelected = c.id; buildCatalog(); }; row.ondblclick = () => catActivate(c);
-    ul.append(h("li", {}, row));
+async function catToggle(key) {
+  if (cat.open.has(key)) cat.open.delete(key); else { cat.open.add(key); await catLoad(key); }
+  buildCatalog();
+}
+async function catSelect(key, { record = true } = {}) {
+  if (record && cat.selected && cat.selected !== key) { cat.back.push(cat.selected); cat.fwd = []; }
+  cat.selected = key;
+  const n = cat.nodes.get(key);
+  if (n && n.expandable) await catLoad(key);
+  buildCatalog();
+}
+function catParentKey(key) {
+  for (const [k, n] of cat.nodes) if ((n.children || []).includes(key)) return k;
+  return null;
+}
+function catAncestors(key) { const out = []; for (let k = key; k; k = catParentKey(k)) out.unshift(k); return out; }
+async function catActivate(key) {
+  const n = cat.nodes.get(key); if (!n) return;
+  if (n.run) return n.run();
+  if (n.expandable) { cat.open.add(key); for (const a of catAncestors(key)) cat.open.add(a); return catSelect(key); }
+  catProperties(key);
+}
+function catProperties(key) {
+  const n = cat.nodes.get(key); if (!n) return;
+  const rows = [["Name", n.name], ["Type", n.type || "—"], ["Location", n.folder != null ? catUNC(cat.nodes.get(catParentKey(key)) || n) : "—"]];
+  if (n.geometry) rows.push(["Geometry", n.geometry]);
+  if (n.size != null) rows.push(["Size", n.size >= 1 << 30 ? (n.size / (1 << 30)).toFixed(2) + " GB" : n.size >= 1 << 20 ? (n.size / (1 << 20)).toFixed(1) + " MB" : n.size.toLocaleString() + " bytes"]);
+  if (n.modified) rows.push(["Modified", new Date(n.modified).toLocaleString()]);
+  if (n.kind === "raster" && n.children) rows.push(["Bands", String(n.children.length)]);
+  floatWindow(`${n.name} Properties`, h("table", {}, ...rows.map(([k, v]) => h("tr", {}, h("th", {}, k), h("td", {}, v)))), { id: "catPropWin", width: 380 });
+}
+function catContextMenu(key, x, y) {
+  const n = cat.nodes.get(key);
+  contextMenu([
+    { label: n.expandable ? (cat.open.has(key) ? "Collapse" : "Expand") : "Open", action: () => (n.expandable ? catToggle(key) : catActivate(key)), disabled: !n.expandable && !n.run },
+    { label: "Copy Location", action: () => { const loc = n.folder != null ? catUNC(n) : n.name; navigator.clipboard?.writeText(loc); status("Copied " + loc); }, disabled: n.folder == null },
+    { label: "Refresh", icon: "refresh", action: () => catRefresh(key), disabled: n.folder == null },
+    "-",
+    { label: "Properties…", action: () => catProperties(key), disabled: n.folder == null && !n.run },
+  ], x, y);
+}
+async function catRefresh(key) {
+  const n = cat.nodes.get(key || cat.selected); if (!n) return;
+  if (n.folder == null) { await loadCatalogRoots(); return; }
+  const target = n.expandable ? n : cat.nodes.get(catParentKey(n.key));
+  if (target) { target.children = null; await catLoad(target.key); }
+}
+function catRow(key, depth, inContents) {
+  const n = cat.nodes.get(key);
+  const isOpen = cat.open.has(key);
+  const ic = n.icon === "folder" && isOpen && !inContents ? "folderOpen" : n.icon;
+  const row = h("div", { class: "node", title: n.folder != null ? catUNC(n) : n.name });
+  if (!inContents) row.append(n.expandable ? twisty(isOpen, () => catToggle(key)) : h("span", { class: "tw none" }));
+  row.append(h("span", { html: icon(ic) }), h("span", { class: `lbl${cat.selected === key ? " sel" : ""}` }, n.name));
+  if (inContents && cat.view === "details") {
+    row.append(h("span", { class: "catCol" }, n.type || ""), h("span", { class: "catCol num" }, n.size != null ? Math.round(n.size / 1024).toLocaleString() + " KB" : ""));
   }
-  if (!parent?.children?.length) ul.append(h("li", { class: "muted", style: "padding:4px" }, "(empty)"));
+  row.onclick = () => catSelect(key);
+  row.ondblclick = () => catActivate(key);
+  row.oncontextmenu = (ev) => { ev.preventDefault(); catSelect(key); catContextMenu(key, ev.clientX, ev.clientY); };
+  return row;
+}
+function catSubtree(key) {
+  const n = cat.nodes.get(key);
+  const li = h("li", {}, catRow(key));
+  if (cat.open.has(key) && (n.children || n.loading || n.error)) {
+    const ul = h("ul");
+    if (n.loading && !n.children) ul.append(h("li", {}, h("div", { class: "node muted" }, h("span", { class: "tw none" }), "Loading…")));
+    if (n.error) ul.append(h("li", {}, h("div", { class: "node", style: "color:#c62020" }, h("span", { class: "tw none" }), n.error)));
+    for (const c of n.children || []) ul.append(catSubtree(c));
+    li.append(ul);
+  }
+  return li;
+}
+function buildCatalog() {
+  if (!$("catTree")) return;
+  const tree = $("catTree"); const scroll = tree.scrollTop; tree.innerHTML = "";
+  tree.append(h("ul", { class: "tree ctree" }, catSubtree("fc"), catSubtree("tb")));
+  tree.scrollTop = scroll;
+  // Location: the selected location, with its ancestors to step back up.
+  const loc = $("catLocation"); loc.innerHTML = "";
+  const sel = cat.selected && cat.nodes.get(cat.selected);
+  const where = sel && !sel.expandable ? catParentKey(sel.key) : cat.selected;
+  for (const k of where ? catAncestors(where) : []) { const n = cat.nodes.get(k); loc.append(h("option", { value: k, selected: k === where }, n.name)); }
+  // Contents: the selected container's items (a selected dataset shows itself).
+  const contents = $("catContents"); contents.innerHTML = "";
+  contents.classList.toggle("hidden", !cat.contentsVisible);
+  if (!sel) return;
+  const list = sel.expandable ? (sel.children || []) : [sel.key];
+  const ul = h("ul", { class: `tree catList${cat.view === "details" ? " details" : ""}` });
+  if (sel.expandable && sel.loading) ul.append(h("li", { class: "muted", style: "padding:3px" }, "Loading…"));
+  for (const k of list) ul.append(h("li", {}, catRow(k, 0, true)));
+  if (sel.expandable && sel.children && !sel.children.length) ul.append(h("li", { class: "muted", style: "padding:3px" }, "(no GIS items)"));
   contents.append(ul);
 }
-$("catLocation").addEventListener("change", (e) => { catOpen.add(e.target.value); catSelect(e.target.value); });
+$("catLocation").addEventListener("change", (e) => catSelect(e.target.value));
 (function buildCatTools() {
   const t = $("catTools");
-  const add = (ic, tip, fn, dis) => t.append(h("span", { class: `tb${dis ? " disabled" : ""}`, title: tip, html: icon(ic), onclick: dis ? null : fn }));
-  add("back", "Back", () => { const p = catHistory.pop(); if (p) { catSelected = p; buildCatalog(); } });
-  add("up", "Up One Level", () => { const p = catPath(catalogModel(), catSelected); if (p && p.length > 1) { catSelected = p[p.length - 2].id; buildCatalog(); } });
-  add("home", "Default Home Folder", () => catSelect("root"));
-  add("connectFolder", "Connect To Folder", null, true);
-  add("views", "Views", null, true);
-  add("refresh", "Refresh", () => refreshAll());
+  const add = (ic, tip, fn, opts = {}) => { const b = h("span", { class: `tb${opts.drop ? " drop" : ""}${opts.disabled ? " disabled" : ""}`, title: tip, html: icon(ic), id: opts.id || null }); if (!opts.disabled) b.onclick = (ev) => fn(ev, b); t.append(b); return b; };
+  add("back", "Back", (ev) => {
+    if (ev.offsetX > 22) return contextMenu(cat.back.slice(-10).reverse().map((k) => ({ label: cat.nodes.get(k)?.name || k, action: () => { cat.fwd.push(cat.selected); cat.back.splice(cat.back.lastIndexOf(k)); catSelect(k, { record: false }); } })), ev.clientX, ev.clientY);
+    const k = cat.back.pop(); if (k) { cat.fwd.push(cat.selected); catSelect(k, { record: false }); }
+  }, { drop: true });
+  add("forward", "Forward", () => { const k = cat.fwd.pop(); if (k) { cat.back.push(cat.selected); catSelect(k, { record: false }); } });
+  t.append(h("span", { class: "tsep" }));
+  add("up", "Up One Level", () => { const p = catParentKey(cat.selected); if (p) catSelect(p); });
+  add("home", "Default Home Folder", () => { const k = cat.nodes.get("fc").children?.[0]; if (k) catActivate(k); });
+  add("connectFolder", "Connect To Folder (folder connections are configured on the server)", null, { disabled: true });
+  t.append(h("span", { class: "tsep" }));
+  add("views", "Views", (ev, b) => { const r = b.getBoundingClientRect(); contextMenu([
+    { label: "List", checked: () => cat.view === "list", action: () => { cat.view = "list"; buildCatalog(); } },
+    { label: "Details", checked: () => cat.view === "details", action: () => { cat.view = "details"; buildCatalog(); } }], r.left, r.bottom); }, { drop: true });
+  t.append(h("span", { class: "tsep" }));
+  add("refresh", "Refresh", () => catRefresh(cat.selected));
+  add("toggleContents", "Toggle Contents Panel", () => { cat.contentsVisible = !cat.contentsVisible; buildCatalog(); });
 })();
 
 /* =====================================================================================
@@ -1293,6 +1386,7 @@ function zoomToGraphics() {
 /* =====================================================================================
  * Boot
  * ===================================================================================== */
-async function refreshAll() { await Promise.all([loadParcels(false), loadBeacons(), loadJobs(), loadDrafts()]); buildTOC(); buildCatalog(); status("Refreshed"); }
+async function refreshAll() { await Promise.all([loadParcels(false), loadBeacons(), loadJobs(), loadDrafts()]); buildTOC(); await catRefresh(cat.selected); status("Refreshed"); }
 initialDeepLink = initialViewFromURL(); // apply /editor?center=E,N&scale=N before any data arrives
 buildMenus(); buildToolbars(); buildTocTools(); buildTOC(); renderTask(); buildCatalog(); updateNavButtons(); updateScaleBox();
+loadCatalogRoots();

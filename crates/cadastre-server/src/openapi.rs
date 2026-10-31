@@ -5,13 +5,13 @@ use utoipa::OpenApi;
 use crate::models::{
     AdjustRequest, AdjustResponse, AreaCheckDto, AuditEntryDto, AuditVerifyDto, BeaconDto,
     ClosureDto, FabricValidateRequest, JobDto, JobEventDto, JobTransition, LegDto, LineResidualDto,
-    LockDto, MeDto, NewBeacon, NewJob, NewLock, NewParcel, NewSession, NewStage, NewTransition,
+    CatalogFolderDto, LockDto, MeDto, NewBeacon, NewJob, NewLock, NewParcel, NewSession, NewStage, NewTransition,
     ObservationDto, OverlapDto, ParcelDto, PointDto, PostResult, PromoteResult, SessionDto,
     StageDto, SurveyCheckRequest, SurveyCheckResponse, SurveyChecksDto, TolerancesDto,
     TopologyReportDto, TransitionDto, WorkflowDto,
 };
 use crate::routes::{
-    audit, beacons, fabric, health, jobs, me, parcels, promote, reports, sessions, survey, tolerances,
+    audit, beacons, catalog, fabric, health, jobs, me, parcels, promote, reports, sessions, survey, tolerances,
     workflow,
 };
 
@@ -27,6 +27,8 @@ use crate::routes::{
         health::health,
         health::ready,
         me::me,
+        catalog::folders,
+        catalog::items,
         tolerances::get_tolerances,
         tolerances::put_tolerances,
         beacons::list_beacons,
@@ -60,7 +62,7 @@ use crate::routes::{
         promote::promote_run,
     ),
     components(schemas(
-        MeDto, TolerancesDto, BeaconDto, NewBeacon, ParcelDto,
+        MeDto, crate::catalog::CatalogItem, crate::catalog::ItemKind, CatalogFolderDto, TolerancesDto, BeaconDto, NewBeacon, ParcelDto,
         WorkflowDto, StageDto, TransitionDto, NewStage, NewTransition,
         JobDto, NewJob, JobTransition, JobEventDto,
         SessionDto, NewSession, LockDto, NewLock,

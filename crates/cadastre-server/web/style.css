@@ -190,3 +190,23 @@ table.legs button { border: 0; background: none; color: var(--bad); cursor: poin
   #statusMsg { display: none; }
   .float { left: 4px !important; right: 4px; width: auto !important; min-width: 0; }
 }
+
+/* ---- Catalog tree: Windows-style dotted connector lines ---- */
+.ctree, .ctree ul { list-style: none; margin: 0; }
+.ctree { padding: 2px 0 2px 2px; }
+.ctree ul { padding-left: 19px; }
+.ctree li { position: relative; }
+.ctree ul > li::before { content: ""; position: absolute; left: -12px; top: 0; bottom: 0; border-left: 1px dotted #a0a0a0; }
+.ctree ul > li:last-child::before { bottom: auto; height: 8px; }
+.ctree ul > li::after { content: ""; position: absolute; left: -12px; top: 8px; width: 10px; border-top: 1px dotted #a0a0a0; }
+.ctree .node .tw { position: relative; z-index: 1; margin-left: -16px; margin-right: 5px; }
+.ctree > li > .node .tw { margin-left: 0; }
+.ctree .node .tw.none { visibility: hidden; }
+.ctree .node { height: 16px; }
+#catTree .node .lbl, #catContents .node .lbl { padding: 0 2px; }
+.catList { padding: 1px 2px; }
+.catList .node { height: 16px; }
+.catList.details .node .lbl { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; }
+.catCol { color: #555; padding-left: 8px; white-space: nowrap; }
+.catCol.num { min-width: 70px; text-align: right; }
+#catContents.hidden + * {}

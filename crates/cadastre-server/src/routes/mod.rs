@@ -2,6 +2,7 @@
 
 pub mod audit;
 pub mod beacons;
+pub mod catalog;
 pub mod editor;
 pub mod fabric;
 pub mod health;
@@ -32,6 +33,8 @@ pub fn router(state: AppState) -> Router {
         .route("/editor", get(editor::index))
         .route("/editor/{*path}", get(editor::asset))
         .route("/api/v1/me", get(me::me))
+        .route("/api/v1/catalog", get(catalog::folders))
+        .route("/api/v1/catalog/items", get(catalog::items))
         .route("/api/v1/parcels.geojson", get(viewer::parcels_geojson))
         .route("/api/v1/beacons.geojson", get(viewer::beacons_geojson))
         .route(

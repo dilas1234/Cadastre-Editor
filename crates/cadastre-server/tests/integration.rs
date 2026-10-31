@@ -37,6 +37,7 @@ async fn state_with(auth_mode: AuthMode, jwks: Option<Jwks>, db_url: &str) -> Ap
         keycloak_audience: None,
         keycloak_jwks_json: None,
         keycloak_jwks_path: None,
+        catalog_folders: Vec::new(),
     };
     AppState {
         pool,

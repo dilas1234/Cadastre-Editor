@@ -581,3 +581,12 @@ pub struct MeDto {
     /// Realm roles.
     pub roles: Vec<String>,
 }
+
+/// A Catalog folder connection (`GET /api/v1/catalog`).
+#[derive(Clone, Debug, Serialize, ToSchema)]
+pub struct CatalogFolderDto {
+    /// Index to pass as `folder` when listing items.
+    pub id: usize,
+    /// Display name, e.g. the UNC name of the share.
+    pub name: String,
+}

@@ -158,3 +158,14 @@ list by source / visibility / selection, and the **Tasks** wizard), a docked **C
   (`localStorage`), not in the database.
 - Demo data for a dev server: `tools/seed-demo.sh` (control points, a posted block, an open job
   near Jos).
+
+### Catalog (`GET /api/v1/catalog`, `GET /api/v1/catalog/items?folder=&path=`)
+
+The editor's Catalog pane browses real folder connections such as `\\PRODUCTIONMC\Image`,
+configured with `CADASTRE_CATALOG_FOLDERS` (`name=path;…`; on PRODUCTIONMC:
+`\\PRODUCTIONMC\Image=D:\Image`). Read-only, listed the way ArcCatalog lists a folder: folders,
+file geodatabases, toolboxes, then datasets; sidecars (`.shx/.dbf/.prj/.ovr/.aux.xml/.tfw`…) and
+non-GIS files (PDF, Office, `Thumbs.db`) hidden; shapefiles carry their geometry type (read from the
+`.shp` header); TIFF/BigTIFF rasters expand into `Band_n` (band count read from the header only —
+rasters on the share exceed 100 GB). Paths are confined to the configured roots (`..`, absolute
+paths and drive letters are rejected). The server's service account needs read access to the share.

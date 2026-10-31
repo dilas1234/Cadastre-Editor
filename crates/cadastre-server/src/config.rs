@@ -29,6 +29,8 @@ pub struct Config {
     pub keycloak_jwks_json: Option<String>,
     /// Path to a JWKS JSON file (overrides fetching from the issuer).
     pub keycloak_jwks_path: Option<String>,
+    /// Catalog folder connections (`CADASTRE_CATALOG_FOLDERS`, `name=path;…`), read-only.
+    pub catalog_folders: Vec<crate::catalog::CatalogFolder>,
 }
 
 impl Config {
@@ -37,7 +39,8 @@ impl Config {
     /// Required: `CADASTRE_DATABASE_URL` (falls back to `DATABASE_URL`).
     /// Optional: `CADASTRE_BIND` (default `0.0.0.0:8080`), `CADASTRE_AUTH`
     /// (`enabled`/`disabled`, default `disabled`), `CADASTRE_KEYCLOAK_ISSUER`,
-    /// `CADASTRE_KEYCLOAK_AUDIENCE`, `CADASTRE_KEYCLOAK_JWKS_JSON`, `CADASTRE_KEYCLOAK_JWKS_PATH`.
+    /// `CADASTRE_KEYCLOAK_AUDIENCE`, `CADASTRE_KEYCLOAK_JWKS_JSON`, `CADASTRE_KEYCLOAK_JWKS_PATH`,
+    /// `CADASTRE_CATALOG_FOLDERS` (e.g. `\\PRODUCTIONMC\Image=D:\Image`).
     pub fn from_env() -> Result<Self, String> {
         let database_url = env::var("CADASTRE_DATABASE_URL")
             .or_else(|_| env::var("DATABASE_URL"))
@@ -61,6 +64,7 @@ impl Config {
             keycloak_audience: non_empty(env::var("CADASTRE_KEYCLOAK_AUDIENCE").ok()),
             keycloak_jwks_json: non_empty(env::var("CADASTRE_KEYCLOAK_JWKS_JSON").ok()),
             keycloak_jwks_path: non_empty(env::var("CADASTRE_KEYCLOAK_JWKS_PATH").ok()),
+            catalog_folders: crate::catalog::parse_folders(&env::var("CADASTRE_CATALOG_FOLDERS").unwrap_or_default()),
         })
     }
 }
