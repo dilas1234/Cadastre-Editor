@@ -107,6 +107,8 @@ are selected in the Phase 9 packaging work.
 - **Posting & numbering** (`POST /api/v1/jobs/{id}/parcels`, `.../post`): parcels are captured as
   drafts under a job (no number yet), then posting allocates official numbers from
   `parcel_number_seq` (UPIN `PL`+12 digits, FR-NUM-01), marks them active, and records the event.
+  Posting requires the `approver` role **and** the job to be in stage `approved`
+  (`domain::can_post`); any other stage returns **409**, so no UPIN is issued before review.
 - **Audit** (`GET /api/v1/audit`, `.../verify`): every job transition and posting appends a
   SHA-256 **hash-chained** entry (NFR-07/11); appends are serialised with a transaction advisory
   lock so the chain can't fork. `verify` recomputes the whole chain and reports the first break.

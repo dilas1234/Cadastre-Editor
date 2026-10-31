@@ -516,6 +516,13 @@ async fn posting_numbers_parcels_and_audit_chain_verifies() {
         assert_eq!(p["status"], "draft");
     }
 
+    // Posting requires approval: walk the job through the workflow first.
+    for action in ["submit", "start_review", "approve"] {
+        let (st, j) = send(&app, "POST", &format!("/api/v1/jobs/{job_id}/transition"), None,
+            Some(json!({ "action": action }))).await;
+        assert_eq!(st, StatusCode::OK, "{action}: {j}");
+    }
+
     // Post the job: both parcels get numbers and go active.
     let (st, result) = send(&app, "POST", &format!("/api/v1/jobs/{job_id}/post"), None, None).await;
     assert_eq!(st, StatusCode::OK, "{result}");

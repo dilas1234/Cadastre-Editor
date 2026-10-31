@@ -49,8 +49,9 @@ Raw evidence (git-ignored, contains usernames and licence data):
 6. **The replacement is feasible on the same server**, with constraints: Windows 2012 R2
    build target, a **daily scheduled shutdown**, many co-hosted roles, and ports already
    taken (§9). The repository already implements the survey engine, REST API, workflow,
-   jobs, locking, audit chain, PDF reports and the importer logic (§11); the **desktop
-   editor GUI, map tiles, live importer run, Windows packaging and ArcGIS hand-back** remain.
+   jobs, locking, audit chain, PDF reports, the importer (run end-to-end on real Aumentum data)
+   and a browser map viewer + editor v1 (§11); the **Tauri desktop shell, plan-layout parity,
+   Windows packaging, AD-backed identity and ArcGIS hand-back** remain.
 
 ---
 
@@ -331,7 +332,7 @@ Status: ✅ implemented & tested in repo · 🟡 partial · ⬜ not started.
 | COGO, traverse closure, area, precision (live) | `cadastre-core::survey`, `cogo`, `area`; `POST /survey/check` | ✅ |
 | Least-squares / fabric adjustment | `cadastre-core::adjust`; `POST /fabric/adjust` | ✅ |
 | Topology validation | `cadastre-core::topology`; `POST /fabric/validate` | ✅ |
-| CRS handling (UTM 32N live; Minna) | `cadastre-core::crs` incl. EPSG:32632 | ✅ (storage CRS decision open, §14) |
+| CRS handling (UTM 32N live; Minna) | `cadastre-core::crs` incl. EPSG:32632; live tables stored in **32632** (migration 0004) | ✅ |
 | Jobs, configurable workflow, role-gated transitions | `/jobs`, `/workflow` (stages/transitions), `job_event` | ✅ |
 | Job instances → tasks, per-user queues | jobs with `assigned_to` + stages | 🟡 (no task layer; confirm need from `job.xml`) |
 | Concurrent editing control (versions) | edit sessions + resource locks, stale reclaim | ✅ (lock-based, replaces versioning) |
@@ -342,12 +343,12 @@ Status: ✅ implemented & tested in repo · 🟡 partial · ⬜ not started.
 | Audit trail | hash-chained `audit_log`, `/audit`, `/audit/verify` | ✅ |
 | Users / roles / groups | Keycloak (OIDC) + role claims | 🟡 (AD federation, admin UI) |
 | Web administration | OpenAPI/Swagger; admin endpoints | 🟡 (no admin UI) |
-| Desktop editor (map + traverse grid) | `apps/editor` Tauri + Leptos + MapLibre | ⬜ (scaffold/spec only) |
-| Map display / vector tiles | Martin tiles (planned) | ⬜ |
+| Editor (map + layers + traverse entry + job strip) | browser editor v1 at `/editor` (MapLibre, served by the server); Tauri shell `apps/editor` | 🟡 (browser v1 done; Tauri desktop shell not started) |
+| Map display / vector tiles | browser viewer `/viewer` + `parcels.geojson`/`beacons.geojson` (WGS84); Martin service in compose | 🟡 (viewer done; Martin config only) |
 | Document attachments | — | ⬜ |
 | E-mail notifications | — | ⬜ |
 | Registry (LRS43) integration | — | ⬜ (needs LRS inspection) |
-| Import from Aumentum `sde` | `cadastre-import` (reconstruction SQL, WKT, status, exceptions) | 🟡 (logic tested; live run vs restored copy pending) |
+| Import from Aumentum `sde` | `cadastre-import` (reconstruction SQL, WKT, status, exceptions, file source, PostGIS staging sink) + `POST /import/promote/{run}` | ✅ (real import run: 18,887 parcels, 169 beacons) |
 | ArcGIS publishing of parcels | — | ⬜ (§10.5) |
 | Windows 2012 R2 packaging & services | build doc | ⬜ |
 
@@ -393,10 +394,9 @@ Status: ✅ implemented & tested in repo · 🟡 partial · ⬜ not started.
 | Crate / app | Contents | Status |
 |-------------|----------|--------|
 | `cadastre-core` | COGO, survey session, area, closure, adjustment, topology, CRS (EPSG:26392 + 32632), units/DMS; native + wasm32 | built, tested |
-| `cadastre-server` | axum + sqlx/PostGIS; tolerances, beacons, parcels (+search), fabric validate/adjust, workflow, jobs (+events, post, parcels), sessions/locks, survey check, audit chain + verify, job report & site plan PDF; RS256/JWKS auth; OpenAPI; migrations 0001–0003 | built, tested (see build/test record below) |
-| `cadastre-import` | ArcSDE DEFAULT reconstruction SQL builder, row mapping, WKT/WKB geometry, status mapping, exceptions; live tiberius reader behind `live` feature | logic tested; live run pending |
-| `apps/editor` | Tauri 2 + Leptos + MapLibre — architecture + scaffold | not buildable yet |
-| `apps/web` | viewer / admin console | planned |
+| `cadastre-server` | axum + sqlx/PostGIS; tolerances, beacons, parcels (+search, GeoJSON), fabric validate/adjust, workflow, jobs (+events, post, parcels), sessions/locks, survey check, audit chain + verify, job report & site plan PDF, import promotion; RS256/JWKS auth; OpenAPI; embedded browser **viewer** (`/viewer`) and **editor v1** (`/editor`); migrations 0001–0004 | built, tested (see build/test record below) |
+| `cadastre-import` | ArcSDE DEFAULT reconstruction SQL builder, row mapping, WKT/WKB geometry, status mapping, exceptions, file source + PostGIS staging sink; live tiberius reader behind `live` feature | tested; run end-to-end on real Aumentum data (18,887 parcels, 169 beacons) |
+| `apps/editor` | Tauri 2 + Leptos + MapLibre — architecture + scaffold | not buildable yet (browser editor v1 is the runnable path) |
 
 ### 11.1 Build & test record (2026-10-31)
 
@@ -406,10 +406,10 @@ Built and tested in a `rust:1-bookworm` container (Rust 1.99.1) against PostGIS 
 | Check | Result |
 |-------|--------|
 | `cargo build --workspace --all-targets` | ✅ |
-| `cargo test --workspace` (incl. DB integration tests) | ✅ 70 passed, 0 failed |
+| `cargo test --workspace` (incl. DB integration tests) | ✅ 77 passed, 0 failed (after merging origin/main) |
 | `cargo build -p cadastre-core --target wasm32-unknown-unknown` | ✅ |
 | `cargo build -p cadastre-import --features live` | ✅ |
-| `cargo clippy --workspace --all-targets` | ✅ 2 style warnings (`explicit_auto_deref` on `&mut *tx`) |
+| `cargo clippy --workspace --all-targets` | ✅ clean |
 | `tools/smoke-test.sh` against a running server | ✅ 24/24 — survey check, job → submit → review → approve → post (UPIN `PL…`), locks (409 on contention), search, PDFs, audit chain verify |
 
 **Defect found and fixed during testing:** `POST /jobs/{id}/post` posted jobs in **any** stage, so
@@ -419,12 +419,19 @@ regression test (`posting_requires_an_approved_job`). A pre-existing unit test
 (`job_report_is_valid_pdf_with_parcel_numbers`) asserted the unescaped `(unposted)` text and
 was corrected to expect the PDF-escaped form.
 
-Not yet verified: the Windows 2012 R2 (`x86_64-win7-windows-msvc`) build, auth-enabled mode
-against a real Keycloak, and the importer against a restored `sde` copy.
+After merging origin/main (browser viewer/editor, import sink/promotion, CRS 32632), the
+teammate's posting test and the browser editor were updated to the approval rule: the editor's
+**Post job** button now appears only for `approved` jobs.
 
-**Inconsistency to resolve:** `docs/server.md` says storage CRS is **EPSG:26392 (Minna)** but the
-live fabric is **EPSG:32632**. Recommendation: store in 32632 (source CRS, no re-projection
-error on import), derive Minna on output where a workflow requires it.
+Not yet verified: the Windows 2012 R2 (`x86_64-win7-windows-msvc`) build, auth-enabled mode
+against a real Keycloak, and browser-editor interactivity (not headlessly tested).
+
+**Storage CRS — resolved.** Migration 0004 moved live storage from EPSG:26392 to **EPSG:32632**,
+the CRS of the Aumentum fabric. Derive Minna on output only where a workflow requires it.
+
+**Count to reconcile:** the import promoted 18,887 parcels; the DEFAULT version holds 21,266
+(18,899 with `Status=2` active). Only active parcels are promoted, so the ~12-parcel difference
+from 18,899 should be explained in the import exceptions report before cut-over.
 
 ---
 
@@ -434,11 +441,11 @@ error on import), derive Minna on output where a workflow requires it.
 |-------|-------------|------------|--------|
 | 0 | WebView2 fixed-runtime spike on a real 2012 R2 VM (use staging 10.10.10.4) | — | ⬜ **gate** |
 | 1–3 | Core engine; server skeleton; jobs/workflow/sessions/auth | — | ✅ |
-| 4 | Editor: Tauri shell, traverse grid bound to `SurveySession`, MapLibre map | Phase 0 | 🟡 engine done |
+| 4 | Editor: browser v1 (map, layers, survey entry, save draft, job workflow) ✅; Tauri shell ⬜ | Phase 0 (Tauri only) | 🟡 |
 | 5 | Parcel mutation types, attribute schema config, **lineage** | `ParcelMutationConfig.xml`, `ParcelAttributeConfig.xml` (pass 3) | ⬜ |
 | 6 | Posting, UPIN numbering, audit chain, PDF reports | — | ✅ (plan layout parity ⬜) |
-| 7 | Vector tiles (Martin), web viewer | Phase 6 | ⬜ |
-| 8 | Import: live run on restored `sde` copy, exceptions report, reconciliation | restore on staging | 🟡 |
+| 7 | Web viewer ✅; vector tiles (Martin) config only | Phase 6 | 🟡 |
+| 8 | Import: real run + promotion ✅; reconciliation of counts, unposted job versions ⬜ | — | 🟡 |
 | 9 | Windows packaging: win7-target builds, services, TLS (rustls), PG14 install, Keycloak+AD | Phase 0 | ⬜ |
 | 10 | ArcGIS publish-back, LRS43 integration, documents, notifications | LRS inspection | ⬜ |
 | 11 | Parallel run on production, cut-over, Aumentum decommission | all | ⬜ |
@@ -472,5 +479,5 @@ error on import), derive Minna on output where a workflow requires it.
 | G8 | Why the daily `AutoShutdown` exists; maintenance window | Ask PLAGIS IT |
 | G9 | Are offline/disconnected sync and OCR used? | Ask editors; check `OffLineSync.mdf` size/date |
 | G10 | Status of unposted job versions | Query `sde.SDE_versions` (pass 3) |
-| G11 | Storage CRS decision (26392 vs 32632) | PLAGIS decision |
+| G11 | ~~Storage CRS decision~~ — resolved: 32632 (migration 0004) | — |
 | G12 | What is 10.10.10.3 (staging's configured DB host) — retired? | Ask PLAGIS IT |

@@ -134,7 +134,6 @@ $("jobSelect").onchange = (e) => {
   const stage = opt ? opt.dataset.status : null;
   renderJob(currentJobId, stage);
   loadDrafts(currentJobId);
-  $("postJob").classList.toggle("hidden", !currentJobId);
   updateSaveState();
 };
 
@@ -152,10 +151,16 @@ $("postJob").onclick = async () => {
     const res = await r.json();
     $("saveMsg").textContent = `posted ${res.posted} parcel(s)`;
     loadDrafts(currentJobId); loadParcels(false);
-  } else { $("saveMsg").textContent = "post failed: " + r.status; }
+  } else {
+    const err = await r.json().catch(() => ({}));
+    $("saveMsg").textContent = "post failed: " + (err.message || r.status);
+  }
 };
+// Posting allocates official parcel numbers, so the server only accepts it for approved jobs.
+const POSTABLE_STAGE = "approved";
 function renderJob(id, stage) {
   $("jobStage").textContent = stage || "—";
+  $("postJob").classList.toggle("hidden", !id || stage !== POSTABLE_STAGE);
   const acts = $("jobActions"); acts.innerHTML = "";
   if (!id) return;
   workflow.transitions.filter((t) => t.from_stage === stage).forEach((t) => {
@@ -170,7 +175,12 @@ async function transition(id, action) {
     method: "POST", headers: { "content-type": "application/json" },
     body: JSON.stringify({ action }),
   });
-  if (r.ok) { const j = await r.json(); $("jobStage").textContent = j.status; renderJob(id, j.status); }
+  if (r.ok) {
+    const j = await r.json();
+    const opt = $("jobSelect").selectedOptions[0];
+    if (opt && opt.value === id) { opt.dataset.status = j.status; opt.textContent = `${j.reference} (${j.status})`; }
+    renderJob(id, j.status);
+  }
   else { alert("transition failed: " + r.status); }
 }
 
