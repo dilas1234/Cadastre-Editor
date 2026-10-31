@@ -17,8 +17,6 @@ pub struct AuthUser {
     /// Subject identifier (`sub`).
     pub subject: String,
     /// Human-readable username (`preferred_username`), if present.
-    /// Consumed by audit-log entries in Phase 6; captured now so the extractor is stable.
-    #[allow(dead_code)]
     pub username: Option<String>,
     /// Realm roles granted to the user.
     pub roles: Vec<String>,

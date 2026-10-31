@@ -132,3 +132,29 @@ and tested.
   against a live PostGIS (e.g. the `docker compose` db): full job workflow, lock
   contention/reclaim, and auth role enforcement over HTTP. Without the variable those tests
   skip, so the default `cargo test` stays hermetic.
+
+## Editor UI (`/editor`)
+
+A browser editor laid out like the desktop GIS editor PLAGIS staff already use: title bar
+(`<Region> - PLAGIS CADASTRE Editor - Connected as <user>`, from `GET /api/v1/me`), menu bar,
+Tools / Standard / Drawing toolbars, the **Cadastre** toolbar (Region, Job Area, job workflow,
+site plan / report, validate), a docked **Table Of Contents** (drawing-order tree with legend,
+list by source / visibility / selection, and the **Tasks** wizard), a docked **Catalog**
+(Location, tree, contents) and a status bar with live UTM 32N coordinates in metres.
+
+- Assets: `web/` (`index.html`, `style.css`, `icons.js` — original SVG icons, `app.js`), embedded
+  with rust-embed. MapLibre and proj4 are **vendored** (`web/vendor/`), so the editor works on a LAN
+  without internet; only the imagery basemap (Esri World Imagery tiles) needs internet.
+- Layers and data are wired on `style.load`, not `load`, so an unreachable imagery server never
+  blocks jobs, parcels or tools.
+- Deep link: `/editor?center=<E>,<N>&scale=<n>` (UTM 32N metres) opens straight to a view.
+- Tools: zoom in/out (click or box), pan, full extent (= region extent), fixed zoom, previous/next
+  extent, select (click/box, Shift adds), identify, find (UPIN), measure, go to XY, scale box,
+  bookmarks; attribute table and layer properties from the TOC context menu.
+- Tasks: *New parcel from survey (COGO)* — job → start point (map click, control point or typed)
+  → traverse (bearings in decimal degrees or `d m s`) with the live server closure check → save as
+  a draft; *Job workflow* — stage, actions, post (approved jobs only), history.
+- Drawing: rectangles and text with font, size, B/I/U and colours; kept in the browser
+  (`localStorage`), not in the database.
+- Demo data for a dev server: `tools/seed-demo.sh` (control points, a posted block, an open job
+  near Jos).

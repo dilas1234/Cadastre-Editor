@@ -637,3 +637,18 @@ async fn posting_requires_an_approved_job() {
     let upin = posted["parcel_numbers"][0].as_str().unwrap();
     assert!(upin.starts_with("PL") && upin.len() == 14, "UPIN format: {upin}");
 }
+
+/// An empty result must still be valid GeoJSON (`"features": []`, not `null`) — the editor
+/// relies on it whenever a job has no draft parcels (regression).
+#[tokio::test]
+async fn empty_geojson_has_an_empty_features_array() {
+    let Some(db_url) = test_db_url() else {
+        eprintln!("skipping: CADASTRE_TEST_DATABASE_URL not set");
+        return;
+    };
+    let app = routes::router(state_with(AuthMode::Disabled, None, &db_url).await);
+    let (st, fc) = send(&app, "GET", &format!("/api/v1/parcels.geojson?status=draft&job={}", Uuid::new_v4()), None, None).await;
+    assert_eq!(st, StatusCode::OK, "{fc}");
+    assert_eq!(fc["type"], "FeatureCollection");
+    assert_eq!(fc["features"], json!([]), "{fc}");
+}

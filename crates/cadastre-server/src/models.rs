@@ -569,3 +569,14 @@ pub struct SurveyCheckResponse {
     /// Tolerance checks.
     pub checks: SurveyChecksDto,
 }
+
+/// The authenticated caller (`GET /api/v1/me`).
+#[derive(Clone, Debug, Serialize, ToSchema)]
+pub struct MeDto {
+    /// Display name (`preferred_username`, falling back to the subject).
+    pub username: String,
+    /// Subject identifier (`sub`).
+    pub subject: String,
+    /// Realm roles.
+    pub roles: Vec<String>,
+}

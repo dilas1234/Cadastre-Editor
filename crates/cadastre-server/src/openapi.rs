@@ -5,13 +5,13 @@ use utoipa::OpenApi;
 use crate::models::{
     AdjustRequest, AdjustResponse, AreaCheckDto, AuditEntryDto, AuditVerifyDto, BeaconDto,
     ClosureDto, FabricValidateRequest, JobDto, JobEventDto, JobTransition, LegDto, LineResidualDto,
-    LockDto, NewBeacon, NewJob, NewLock, NewParcel, NewSession, NewStage, NewTransition,
+    LockDto, MeDto, NewBeacon, NewJob, NewLock, NewParcel, NewSession, NewStage, NewTransition,
     ObservationDto, OverlapDto, ParcelDto, PointDto, PostResult, PromoteResult, SessionDto,
     StageDto, SurveyCheckRequest, SurveyCheckResponse, SurveyChecksDto, TolerancesDto,
     TopologyReportDto, TransitionDto, WorkflowDto,
 };
 use crate::routes::{
-    audit, beacons, fabric, health, jobs, parcels, promote, reports, sessions, survey, tolerances,
+    audit, beacons, fabric, health, jobs, me, parcels, promote, reports, sessions, survey, tolerances,
     workflow,
 };
 
@@ -26,6 +26,7 @@ use crate::routes::{
     paths(
         health::health,
         health::ready,
+        me::me,
         tolerances::get_tolerances,
         tolerances::put_tolerances,
         beacons::list_beacons,
@@ -59,7 +60,7 @@ use crate::routes::{
         promote::promote_run,
     ),
     components(schemas(
-        TolerancesDto, BeaconDto, NewBeacon, ParcelDto,
+        MeDto, TolerancesDto, BeaconDto, NewBeacon, ParcelDto,
         WorkflowDto, StageDto, TransitionDto, NewStage, NewTransition,
         JobDto, NewJob, JobTransition, JobEventDto,
         SessionDto, NewSession, LockDto, NewLock,

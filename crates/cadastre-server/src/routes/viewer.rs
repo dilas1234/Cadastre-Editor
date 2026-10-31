@@ -55,12 +55,13 @@ pub async fn parcels_geojson(
     };
 
     let sql = format!(
-        "SELECT COALESCE(json_build_object('type','FeatureCollection','features', json_agg(f))::text, \
+        "SELECT COALESCE(json_build_object('type','FeatureCollection','features', COALESCE(json_agg(f), '[]'::json))::text, \
                 '{{\"type\":\"FeatureCollection\",\"features\":[]}}') \
          FROM (SELECT json_build_object('type','Feature', \
                  'geometry', ST_AsGeoJSON(ST_Transform(geom,4326))::json, \
-                 'properties', json_build_object('parcel_number', parcel_number, \
-                     'status', status, 'area', round(computed_area::numeric,1))) AS f \
+                 'properties', json_build_object('id', id, 'parcel_number', parcel_number, \
+                     'status', status, 'job_id', job_id, \
+                     'area', round(COALESCE(computed_area, ST_Area(geom))::numeric,1))) AS f \
                FROM cadastre.parcel \
                WHERE geom IS NOT NULL{status_clause}{job_clause}{bbox_clause} \
                LIMIT {limit}) s"
@@ -76,11 +77,12 @@ pub async fn parcels_geojson(
 pub async fn beacons_geojson(
     State(state): State<AppState>,
 ) -> ApiResult<([(axum::http::HeaderName, &'static str); 1], String)> {
-    let sql = "SELECT COALESCE(json_build_object('type','FeatureCollection','features', json_agg(f))::text, \
+    let sql = "SELECT COALESCE(json_build_object('type','FeatureCollection','features', COALESCE(json_agg(f), '[]'::json))::text, \
                '{\"type\":\"FeatureCollection\",\"features\":[]}') \
          FROM (SELECT json_build_object('type','Feature', \
                  'geometry', ST_AsGeoJSON(ST_Transform(geom,4326))::json, \
-                 'properties', json_build_object('number', number, 'is_control', is_control)) AS f \
+                 'properties', json_build_object('id', id, 'number', number, 'is_control', is_control, \
+                     'easting', round(ST_X(geom)::numeric,3), 'northing', round(ST_Y(geom)::numeric,3))) AS f \
                FROM cadastre.beacon WHERE geom IS NOT NULL LIMIT 20000) s";
     let json: String = sqlx::query(sql).fetch_one(&state.pool).await?.get(0);
     Ok((
