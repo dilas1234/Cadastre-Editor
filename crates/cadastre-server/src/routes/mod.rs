@@ -2,14 +2,17 @@
 
 pub mod audit;
 pub mod beacons;
+pub mod editor;
 pub mod fabric;
 pub mod health;
 pub mod jobs;
 pub mod parcels;
+pub mod promote;
 pub mod reports;
 pub mod sessions;
 pub mod survey;
 pub mod tolerances;
+pub mod viewer;
 pub mod workflow;
 
 use axum::routing::{delete, get, post};
@@ -23,6 +26,12 @@ pub fn router(state: AppState) -> Router {
     Router::new()
         .route("/health", get(health::health))
         .route("/ready", get(health::ready))
+        // Browser viewer + editor (Phase 7/4, FR-VIEW/FR-SUR)
+        .route("/viewer", get(viewer::viewer))
+        .route("/editor", get(editor::index))
+        .route("/editor/{*path}", get(editor::asset))
+        .route("/api/v1/parcels.geojson", get(viewer::parcels_geojson))
+        .route("/api/v1/beacons.geojson", get(viewer::beacons_geojson))
         .route(
             "/api/v1/tolerances",
             get(tolerances::get_tolerances).put(tolerances::put_tolerances),
@@ -58,6 +67,8 @@ pub fn router(state: AppState) -> Router {
         // Audit log (NFR-07/11)
         .route("/api/v1/audit", get(audit::list_audit))
         .route("/api/v1/audit/verify", get(audit::verify_audit))
+        // Import promotion (Phase 8)
+        .route("/api/v1/import/promote/{run_id}", post(promote::promote_run))
         // Edit sessions and locks
         .route("/api/v1/sessions", post(sessions::open_session))
         .route(

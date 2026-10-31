@@ -55,7 +55,10 @@ pub struct StagedParcel {
     pub computed_area: f64,
     /// Stored SRID.
     pub srid: i32,
-    /// Boundary geometry.
+    /// Original source WKT (inserted verbatim into PostGIS via `ST_GeomFromText`, so geometry
+    /// is lossless end-to-end).
+    pub wkt: String,
+    /// Boundary geometry (parsed, used for validation/area).
     #[serde(skip)]
     pub geometry: ImportedGeometry,
 }
@@ -71,7 +74,7 @@ impl RawParcel {
             _ => return Err(ExceptionKind::MissingUpin),
         };
 
-        let wkt = self.wkt.as_deref().unwrap_or("");
+        let wkt = self.wkt.as_deref().unwrap_or("").trim();
         let geometry =
             ImportedGeometry::from_wkt(wkt).map_err(|_| ExceptionKind::InvalidGeometry)?;
         if geometry.is_empty() || geometry.exterior_ring().is_none() {
@@ -94,6 +97,7 @@ impl RawParcel {
             block_no: self.block_no.clone(),
             computed_area,
             srid: self.srid,
+            wkt: wkt.to_string(),
             geometry,
         })
     }

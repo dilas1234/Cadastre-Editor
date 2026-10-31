@@ -12,23 +12,35 @@ workspace = true
 
 [features]
 # Default build is the pure, DB-free logic (reconstruction SQL, mapping, WKT, exceptions):
-# always compiled and unit-tested, no network. The `live` feature adds the tiberius SQL
-# Server client used to read a (restored, non-production) `sde` database.
+# always compiled and unit-tested, no network.
+#   source — tiberius client reading a (restored, non-production) `sde` MSSQL database.
+#   sink   — sqlx/PostGIS staging-load writer (testable against a local PostGIS alone).
+#   live   — the full read→stage→load tool + binary.
 default = []
-live = ["dep:tiberius", "dep:tokio", "dep:tokio-util", "dep:futures-util"]
+source = ["dep:tiberius", "dep:tokio", "dep:tokio-util", "dep:futures-util"]
+sink = ["dep:sqlx", "dep:tokio"]
+live = ["source", "sink"]
 
 [dependencies]
 cadastre-core = { path = "../cadastre-core" }
 serde = { version = "1", features = ["derive"] }
 thiserror = "2"
 
-# Live SQL Server client (optional; MSSQL/ArcSDE read). tiberius is pure-Rust (no bundled C);
-# rustls is acceptable here because the importer runs on a modern host, not the win7 target.
+# SQL Server source (optional). tiberius is pure-Rust (no bundled C); rustls is acceptable here
+# because the importer runs on a modern host, not the win7 target.
 tiberius = { version = "0.12", optional = true, default-features = false, features = ["rustls", "tds73", "chrono"] }
-tokio = { version = "1", optional = true, features = ["net", "rt-multi-thread", "macros", "io-util"] }
 tokio-util = { version = "0.7", optional = true, features = ["compat"] }
 futures-util = { version = "0.3", optional = true }
+
+# PostGIS sink (optional). runtime-tokio, no TLS backend (localhost load), matching the server.
+sqlx = { version = "0.8", optional = true, default-features = false, features = ["runtime-tokio", "postgres"] }
+tokio = { version = "1", optional = true, features = ["net", "rt-multi-thread", "macros", "io-util"] }
 
 [[bin]]
 name = "cadastre-import"
 required-features = ["live"]
+
+# Loads a read-only sqlcmd dump (parcels.psv/beacons.psv) into the PostGIS import schema.
+[[bin]]
+name = "import-file"
+required-features = ["sink"]

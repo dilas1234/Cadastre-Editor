@@ -41,6 +41,9 @@ chrono = { version = "0.4", features = ["serde"] }
 utoipa = { version = "5", features = ["axum_extras", "chrono", "uuid"] }
 utoipa-swagger-ui = { version = "9", features = ["axum"] }
 
+# Editor web assets, embedded into the binary (self-contained deploy, no loose files at runtime).
+rust-embed = "8"
+
 # Keycloak JWT verification. base64 + rsa + sha2 are all pure-Rust (rsa uses
 # num-bigint-dig, no C/ring), so RS256 signature verification does not compromise the
 # win7 server target (NFR-02).

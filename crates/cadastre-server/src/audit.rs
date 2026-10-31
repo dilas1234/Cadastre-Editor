@@ -138,6 +138,9 @@ pub fn verify_entries(entries: &[AuditEntry]) -> VerifyResult {
     }
 }
 
+/// Advisory-lock key guarding audit appends (arbitrary constant).
+const AUDIT_LOCK_KEY: i64 = 0xCADA_5736;
+
 /// Append an entry to the chain within the caller's transaction/connection.
 pub async fn append(
     conn: &mut sqlx::PgConnection,
@@ -147,6 +150,13 @@ pub async fn append(
     entity_id: Option<&str>,
     payload: Value,
 ) -> Result<String, sqlx::Error> {
+    // Serialise appends so the hash chain cannot fork: two concurrent transactions must not read
+    // the same tail and both link off it. The lock is held until the caller's transaction ends.
+    sqlx::query("SELECT pg_advisory_xact_lock($1)")
+        .bind(AUDIT_LOCK_KEY)
+        .execute(&mut *conn)
+        .await?;
+
     let prev: Option<String> = sqlx::query("SELECT hash FROM cadastre.audit_log ORDER BY id DESC LIMIT 1")
         .fetch_optional(&mut *conn)
         .await?

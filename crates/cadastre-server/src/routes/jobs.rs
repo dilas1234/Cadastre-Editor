@@ -164,7 +164,7 @@ pub async fn transition_job(
     .await?;
 
     audit::append(
-        &mut *tx,
+        &mut tx,
         &user.subject,
         "transition",
         "job",
@@ -237,7 +237,7 @@ pub async fn post_job(
     }
 
     audit::append(
-        &mut *tx,
+        &mut tx,
         &user.subject,
         "post",
         "job",

@@ -1,17 +1,20 @@
-//! `cadastre-import` — read a restored Aumentum `sde` database and report what would import.
+//! `cadastre-import` — read a restored Aumentum `sde` database and stage it into PostGIS.
 //!
-//! Built only with `--features live`. This is a **read-only dry run**: it connects, reconstructs
-//! the DEFAULT-version parcels + control coordinates, validates/stages them, and prints the import
-//! report. It writes nothing — neither to Aumentum nor (yet) to PostGIS; the staging load is the
-//! next step. Configure via env:
+//! Built only with `--features live`. It reconstructs the DEFAULT-version parcels + control
+//! coordinates from MSSQL (read-only — never writes to Aumentum), validates/stages them, and
+//! prints the import report. If `CADASTRE_IMPORT_PG` is set it then loads the staged records and
+//! exceptions into the `import` schema of that PostGIS; otherwise it is a read-only dry run.
+//! Configure via env:
 //!
 //!   CADASTRE_IMPORT_HOST (default 127.0.0.1)   CADASTRE_IMPORT_PORT (default 1433)
 //!   CADASTRE_IMPORT_DB   (default sde)          CADASTRE_IMPORT_USER / CADASTRE_IMPORT_PASSWORD
+//!   CADASTRE_IMPORT_PG   (optional target, e.g. postgres://cadastre:cadastre@localhost:5432/cadastre)
 
 use std::env;
 
 use cadastre_import::client::{ConnectOptions, ImportSource};
 use cadastre_import::exceptions::stage_parcels;
+use cadastre_import::sink::Sink;
 use cadastre_import::Result;
 
 fn env_or(key: &str, default: &str) -> String {
@@ -51,6 +54,20 @@ async fn main() -> Result<()> {
     let coords = source.fetch_coordinates().await?;
     let beacons: Vec<_> = coords.iter().filter_map(|c| c.validate().ok()).collect();
     println!("Control beacons: {} of {} rows valid", beacons.len(), coords.len());
+
+    match env::var("CADASTRE_IMPORT_PG") {
+        Ok(pg) if !pg.is_empty() => {
+            eprintln!("loading into PostGIS import schema …");
+            let sink = Sink::connect(&pg).await?;
+            sink.ensure_schema().await?;
+            let summary = sink.load(&report, &beacons).await?;
+            println!(
+                "Loaded run {}: {} parcels, {} beacons, {} exceptions into schema 'import'.",
+                summary.run_id, summary.parcels, summary.beacons, summary.exceptions
+            );
+        }
+        _ => println!("CADASTRE_IMPORT_PG not set — dry run only, nothing written."),
+    }
 
     Ok(())
 }
