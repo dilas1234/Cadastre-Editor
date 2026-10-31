@@ -16,7 +16,7 @@
   --bad: #c62020;
 }
 * { box-sizing: border-box; }
-html, body { margin: 0; height: 100%; overflow: hidden; background: var(--title); }
+html, body { margin: 0; height: 100%; overflow: hidden; background: var(--chrome); }
 body, input, select, button, textarea {
   font-family: "Segoe UI", Tahoma, "DejaVu Sans", Arial, sans-serif; font-size: 12px; color: var(--text);
 }
@@ -24,20 +24,10 @@ body, input, select, button, textarea {
 .grow { flex: 1; }
 svg.ic { display: block; flex: none; }
 
-#window { display: flex; flex-direction: column; height: 100vh; border: 1px solid var(--title); }
-
-/* ---- title bar ---- */
-#titlebar { height: 24px; background: var(--title); display: flex; align-items: center; position: relative; flex: none; }
-#appIcon { width: 16px; height: 16px; margin: 0 6px; }
-#title { position: absolute; left: 0; right: 0; text-align: center; font-size: 14px; color: var(--title-text); pointer-events: none; }
-.winbtns { margin-left: auto; display: flex; height: 100%; z-index: 1; }
-.winbtns span { width: 30px; display: flex; align-items: center; justify-content: center; font-size: 12px; color: #222; }
-.winbtns span.x { width: 44px; }
-.winbtns span:hover { background: #8fd4f0; }
-.winbtns span.x:hover { background: #e04343; color: #fff; }
+#window { display: flex; flex-direction: column; height: 100vh; height: 100dvh; }
 
 /* ---- menu bar ---- */
-#menubar { height: 22px; background: #fff; display: flex; align-items: stretch; padding-left: 4px; flex: none; }
+#menubar { height: 22px; background: #fff; display: flex; align-items: stretch; padding-left: 4px; flex: none; position: relative; z-index: 20; }
 .menu { position: relative; padding: 0 7px; display: flex; align-items: center; cursor: default; border: 1px solid transparent; }
 .menu:hover, .menu.open { background: var(--hover); border-color: var(--hover-line); }
 .menuList { position: absolute; top: 100%; left: -1px; min-width: 210px; background: #f5f5f5; border: 1px solid #979797;
@@ -55,7 +45,7 @@ svg.ic { display: block; flex: none; }
 
 /* ---- toolbars ---- */
 #toolbars { background: var(--chrome); border-bottom: 1px solid var(--chrome-line); flex: none; }
-.tbrow { display: flex; align-items: center; min-height: 28px; padding: 1px 2px; gap: 2px; flex-wrap: nowrap; overflow: hidden; }
+.tbrow { display: flex; align-items: center; min-height: 28px; padding: 1px 2px; gap: 2px 2px; flex-wrap: wrap; }
 .toolbar { display: flex; align-items: center; height: 26px; padding: 0 3px 0 0; gap: 1px; }
 .toolbar .grip { width: 5px; height: 20px; margin: 0 3px 0 1px;
   background: radial-gradient(circle, #9b9b9b 0.8px, transparent 1.2px) 0 0 / 3px 3px; }
@@ -81,8 +71,8 @@ svg.ic { display: block; flex: none; }
 /* ---- workspace ---- */
 #workspace { flex: 1; display: flex; min-height: 0; background: var(--chrome); }
 .pane { width: 222px; display: flex; flex-direction: column; background: var(--chrome); flex: none; min-height: 0; }
-#tocPane { border-right: 4px solid var(--chrome); }
-#catalogPane { border-left: 4px solid var(--chrome); width: 222px; }
+#tocPane { }
+#catalogPane { width: 222px; }
 .paneHead { height: 21px; display: flex; align-items: center; justify-content: space-between; padding: 0 4px 0 6px;
   font-size: 13px; background: var(--pane-head); border: 1px solid #c5ccd6; border-bottom: 0; flex: none; }
 .paneBtns { display: flex; gap: 2px; }
@@ -173,3 +163,30 @@ table.legs button { border: 0; background: none; color: var(--bad); cursor: poin
   border-top: 1px solid var(--chrome-line); font-variant-numeric: tabular-nums; }
 #coordXY { min-width: 210px; text-align: left; margin-right: 18px; width: 220px; white-space: pre; }
 #statusMsg { color: #333; }
+
+/* ---- resizable panes ---- */
+.paneResize { width: 5px; flex: none; cursor: col-resize; background: var(--chrome); }
+.paneResize:hover, .paneResize.dragging { background: #bcd7f0; }
+.pane.hidden + .paneResize, .paneResize:has(+ .pane.hidden) { display: none; }
+
+/* ---- responsive ---- */
+/* Laptops: slimmer panes. */
+@media (max-width: 1366px) { .pane { width: 200px; } #catalogPane { width: 200px; } .fontBox { width: 104px; } }
+/* Tablets / small laptops: panes float over the map instead of squeezing it; Catalog starts closed. */
+@media (max-width: 1024px) {
+  #workspace { position: relative; }
+  .pane { position: absolute; top: 0; bottom: 0; z-index: 30; box-shadow: 0 0 12px rgba(0,0,0,.3); width: min(260px, 80vw) !important; }
+  #tocPane { left: 0; } #catalogPane { right: 0; }
+  .paneResize { display: none; }
+  #coordXY { width: auto; min-width: 0; margin-right: 4px; }
+}
+/* Phones: compact toolbars, scrollable menu bar. */
+@media (max-width: 640px) {
+  #menubar { overflow-x: auto; scrollbar-width: none; }
+  .menu { padding: 0 5px; }
+  .toolbar .grip, .toolbar .chev, .tlabel { display: none; }
+  .fontBox, .sizeBox, .scaleBox { display: none; }
+  .regionBox { width: 96px; } .jobBox { width: 96px; }
+  #statusMsg { display: none; }
+  .float { left: 4px !important; right: 4px; width: auto !important; min-width: 0; }
+}

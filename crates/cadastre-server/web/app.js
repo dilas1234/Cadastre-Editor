@@ -156,11 +156,10 @@ function zoomToFC(fc, opts = {}, regionOnly = false) {
 /* =====================================================================================
  * Phase 1 — window chrome: title, menus, toolbars, status bar
  * ===================================================================================== */
-$("appIcon").innerHTML = icon("app");
+// No in-page title bar: the browser window/tab title carries it, as the native window title did.
 function setTitle() {
   const who = state.me ? ` - Connected as ${state.me.username}` : "";
-  const t = `${REGION} - ${APP}${who}`;
-  $("title").textContent = t; document.title = t;
+  document.title = `${REGION} - ${APP}${who}`;
 }
 api("/api/v1/me").then((me) => { state.me = me; setTitle(); }).catch(() => setTitle());
 setTitle();
@@ -446,6 +445,22 @@ function toggleToolbar(id) {
   localStorage.setItem("cad.hiddenToolbars", JSON.stringify(hidden));
 }
 function togglePane(id) { $(id).classList.toggle("hidden"); map.resize(); }
+// Panes resize by dragging their inner edge (widths remembered per browser).
+document.querySelectorAll(".paneResize").forEach((bar) => {
+  const pane = $(bar.dataset.resize); const leftSide = bar.dataset.resize === "tocPane";
+  const saved = Number(localStorage.getItem("cad.w." + pane.id)); if (saved > 120) pane.style.width = saved + "px";
+  bar.addEventListener("mousedown", (e) => {
+    e.preventDefault(); bar.classList.add("dragging");
+    const x0 = e.clientX, w0 = pane.getBoundingClientRect().width;
+    const move = (ev) => { const w = Math.max(150, Math.min(560, w0 + (leftSide ? ev.clientX - x0 : x0 - ev.clientX))); pane.style.width = w + "px"; map.resize(); };
+    const up = () => { bar.classList.remove("dragging"); localStorage.setItem("cad.w." + pane.id, parseInt(pane.style.width)); window.removeEventListener("mousemove", move); window.removeEventListener("mouseup", up); };
+    window.addEventListener("mousemove", move); window.addEventListener("mouseup", up);
+  });
+});
+// Small screens: the Catalog starts closed (it floats over the map there); reopen from Windows ▸ Catalog.
+if (window.matchMedia("(max-width: 1024px)").matches) $("catalogPane").classList.add("hidden");
+if (window.matchMedia("(max-width: 640px)").matches) $("tocPane").classList.add("hidden");
+new ResizeObserver(() => map.resize()).observe($("mapFrame"));
 document.querySelectorAll("[data-pane-close]").forEach((b) => { b.innerHTML = icon("close"); b.onclick = () => togglePane(b.dataset.paneClose); });
 document.querySelectorAll("[data-pane-pin]").forEach((b) => { b.innerHTML = icon("pin"); });
 

@@ -12,13 +12,6 @@
 </head>
 <body>
 <div id="window">
-  <!-- Title bar -->
-  <div id="titlebar">
-    <span id="appIcon"></span>
-    <span id="title">PLAGIS CADASTRE Editor</span>
-    <span class="winbtns"><span title="Minimize">&#x2014;</span><span title="Maximize">&#x2750;</span><span class="x" title="Close">&#x2715;</span></span>
-  </div>
-
   <!-- Menu bar (built by app.js) -->
   <div id="menubar"></div>
 
@@ -38,6 +31,7 @@
       <div class="hscroll"><span class="arr">&#x25C2;</span><span class="track"><span class="thumb"></span></span><span class="arr">&#x25B8;</span></div>
     </aside>
 
+    <div class="paneResize" data-resize="tocPane" title="Drag to resize"></div>
     <div id="mapFrame">
       <div id="map"></div>
       <div id="mapStrip">
@@ -46,6 +40,7 @@
       </div>
     </div>
 
+    <div class="paneResize" data-resize="catalogPane" title="Drag to resize"></div>
     <aside id="catalogPane" class="pane">
       <div class="paneHead"><span>Catalog</span><span class="paneBtns"><span data-pane-pin title="Auto Hide"></span><span data-pane-close="catalogPane" title="Close"></span></span></div>
       <div class="paneTools" id="catTools"></div>
