@@ -11,6 +11,7 @@ pub mod reports;
 pub mod sessions;
 pub mod survey;
 pub mod tolerances;
+pub mod viewer;
 pub mod workflow;
 
 use axum::routing::{delete, get, post};
@@ -24,6 +25,9 @@ pub fn router(state: AppState) -> Router {
     Router::new()
         .route("/health", get(health::health))
         .route("/ready", get(health::ready))
+        // Browser viewer (Phase 7, FR-VIEW)
+        .route("/viewer", get(viewer::viewer))
+        .route("/api/v1/parcels.geojson", get(viewer::parcels_geojson))
         .route(
             "/api/v1/tolerances",
             get(tolerances::get_tolerances).put(tolerances::put_tolerances),
