@@ -99,6 +99,29 @@ Keeping ring/OpenSSL out of the tree protects the tier-3 `x86_64-win7-windows-ms
 target (NFR-02). A TLS backend (for Postgres and HTTPS JWKS fetch) and a vetted crypto provider
 are selected in the Phase 9 packaging work.
 
+## Fabric, posting, audit, output (Phases 5–7)
+
+- **Fabric** (`POST /api/v1/fabric/validate`, `.../adjust`): topology checks (invalid rings,
+  slivers, overlaps, duplicate beacons) and weighted least-squares network adjustment with
+  blunder flagging — both reuse `cadastre-core`, validated against the active tolerances.
+- **Posting & numbering** (`POST /api/v1/jobs/{id}/parcels`, `.../post`): parcels are captured as
+  drafts under a job (no number yet), then posting allocates official numbers from
+  `parcel_number_seq` (UPIN `PL`+12 digits, FR-NUM-01), marks them active, and records the event.
+- **Audit** (`GET /api/v1/audit`, `.../verify`): every job transition and posting appends a
+  SHA-256 **hash-chained** entry (NFR-07/11); appends are serialised with a transaction advisory
+  lock so the chain can't fork. `verify` recomputes the whole chain and reports the first break.
+- **Search** (`GET /api/v1/parcels/search`): by number prefix, status, and/or bbox.
+- **Output** (`GET /api/v1/jobs/{id}/report.pdf`, `.../siteplan.pdf`): a dependency-free PDF writer
+  (`pdf.rs`) renders a job report and a scaled site plan. The SRS names typst for richer output;
+  this keeps the server self-contained for now (revisit in Phase 9).
+- **Tiles**: the `tiles` (Martin) compose service publishes the PostGIS geometry tables as vector
+  tiles for the map. Config only — not exercised by the test suite.
+
+**Deferred GUIs (consistent with the Phase 4 editor):** the fabric-editing UI (Phase 5) and the
+Leptos viewer/admin console (Phase 7) are not built here — they need the browser/Tauri stack and
+on-target verification. The server endpoints and `cadastre-core` engine they bind to are complete
+and tested.
+
 ## Testing
 
 - `cargo test -p cadastre-server` runs unit tests (workflow/session logic in `domain.rs`, JWT

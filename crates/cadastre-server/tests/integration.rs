@@ -356,6 +356,134 @@ async fn survey_check_validates_against_active_tolerances() {
     assert!(body["closure"]["linear_misclosure"].as_f64().unwrap() > 100.0);
 }
 
+/// Send a request and return (status, content-type, raw body bytes) — for non-JSON responses.
+async fn send_bytes(router: &Router, method: &str, uri: &str) -> (StatusCode, String, Vec<u8>) {
+    let req = Request::builder().method(method).uri(uri).body(Body::empty()).unwrap();
+    let resp = router.clone().oneshot(req).await.unwrap();
+    let status = resp.status();
+    let ct = resp
+        .headers()
+        .get(header::CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("")
+        .to_string();
+    let bytes = to_bytes(resp.into_body(), usize::MAX).await.unwrap().to_vec();
+    (status, ct, bytes)
+}
+
+fn square(x: f64, y: f64, s: f64) -> Value {
+    json!({"type":"Polygon","coordinates":[[[x,y],[x+s,y],[x+s,y+s],[x,y+s],[x,y]]]})
+}
+
+#[tokio::test]
+async fn fabric_validate_flags_overlaps_and_passes_clean() {
+    let Some(db_url) = test_db_url() else {
+        eprintln!("skipping: CADASTRE_TEST_DATABASE_URL not set");
+        return;
+    };
+    let app = routes::router(state_with(AuthMode::Disabled, None, &db_url).await);
+
+    // Two separate 100 m squares: clean.
+    let clean = json!({"parcels": [
+        [[0.0,0.0],[100.0,0.0],[100.0,100.0],[0.0,100.0]],
+        [[500.0,0.0],[600.0,0.0],[600.0,100.0],[500.0,100.0]]
+    ], "beacons": []});
+    let (st, body) = send(&app, "POST", "/api/v1/fabric/validate", None, Some(clean)).await;
+    assert_eq!(st, StatusCode::OK, "{body}");
+    assert_eq!(body["is_clean"], true);
+
+    // Two overlapping squares + duplicate beacons.
+    let dirty = json!({"parcels": [
+        [[0.0,0.0],[100.0,0.0],[100.0,100.0],[0.0,100.0]],
+        [[50.0,0.0],[150.0,0.0],[150.0,100.0],[50.0,100.0]]
+    ], "beacons": [{"x":10.0,"y":10.0},{"x":10.001,"y":10.0}]});
+    let (st, body) = send(&app, "POST", "/api/v1/fabric/validate", None, Some(dirty)).await;
+    assert_eq!(st, StatusCode::OK, "{body}");
+    assert_eq!(body["is_clean"], false);
+    assert_eq!(body["overlaps"].as_array().unwrap().len(), 1);
+    assert_eq!(body["duplicate_beacons"].as_array().unwrap().len(), 1);
+}
+
+#[tokio::test]
+async fn fabric_adjust_converges_on_a_fixed_network() {
+    let Some(db_url) = test_db_url() else {
+        eprintln!("skipping: CADASTRE_TEST_DATABASE_URL not set");
+        return;
+    };
+    let app = routes::router(state_with(AuthMode::Disabled, None, &db_url).await);
+
+    // A free point C observed from two fixed anchors A, B; initial C is 2 m off.
+    let d = 2.0_f64.sqrt() * 50.0; // 70.7107
+    let req = json!({
+        "coords": [{"x":0.0,"y":0.0},{"x":100.0,"y":0.0},{"x":50.0,"y":48.0}],
+        "fixed": [true, true, false],
+        "observations": [
+            {"from":0,"to":2,"distance":d,"bearing":45.0,"sigma_distance_m":0.01,"sigma_bearing_sec":5.0},
+            {"from":1,"to":2,"distance":d,"bearing":315.0,"sigma_distance_m":0.01,"sigma_bearing_sec":5.0}
+        ]
+    });
+    let (st, body) = send(&app, "POST", "/api/v1/fabric/adjust", None, Some(req)).await;
+    assert_eq!(st, StatusCode::OK, "{body}");
+    assert!(body["iterations"].as_u64().unwrap() >= 1);
+    let c = &body["coords"][2];
+    assert!((c["x"].as_f64().unwrap() - 50.0).abs() < 0.1, "{c}");
+    assert!((c["y"].as_f64().unwrap() - 50.0).abs() < 0.1, "{c}");
+    assert_eq!(body["blunders"].as_array().unwrap().len(), 0);
+}
+
+#[tokio::test]
+async fn posting_numbers_parcels_and_audit_chain_verifies() {
+    let Some(db_url) = test_db_url() else {
+        eprintln!("skipping: CADASTRE_TEST_DATABASE_URL not set");
+        return;
+    };
+    let app = routes::router(state_with(AuthMode::Disabled, None, &db_url).await);
+
+    // Create a job and capture two draft parcels under it.
+    let reference = format!("JOB-{}", Uuid::new_v4());
+    let (_, job) = send(&app, "POST", "/api/v1/jobs", None,
+        Some(json!({"reference": reference, "job_type": "capture"}))).await;
+    let job_id = job["id"].as_str().unwrap().to_string();
+
+    for i in 0..2 {
+        let (st, p) = send(&app, "POST", &format!("/api/v1/jobs/{job_id}/parcels"), None,
+            Some(json!({"geometry": square(1000.0 + i as f64 * 200.0, 1000.0, 50.0)}))).await;
+        assert_eq!(st, StatusCode::CREATED, "{p}");
+        assert!(p["parcel_number"].is_null()); // unposted drafts have no number
+        assert_eq!(p["status"], "draft");
+    }
+
+    // Post the job: both parcels get numbers and go active.
+    let (st, result) = send(&app, "POST", &format!("/api/v1/jobs/{job_id}/post"), None, None).await;
+    assert_eq!(st, StatusCode::OK, "{result}");
+    assert_eq!(result["posted"], 2);
+    let numbers = result["parcel_numbers"].as_array().unwrap();
+    assert_eq!(numbers.len(), 2);
+    assert!(numbers[0].as_str().unwrap().starts_with("PL"));
+
+    // The audit chain (incl. this post) verifies intact.
+    let (st, v) = send(&app, "GET", "/api/v1/audit/verify", None, None).await;
+    assert_eq!(st, StatusCode::OK);
+    assert_eq!(v["ok"], true, "{v}");
+    assert!(v["checked"].as_u64().unwrap() >= 1);
+
+    // Search finds a posted parcel by number prefix.
+    let prefix = &numbers[0].as_str().unwrap()[..6];
+    let (st, found) = send(&app, "GET", &format!("/api/v1/parcels/search?number={prefix}"), None, None).await;
+    assert_eq!(st, StatusCode::OK);
+    assert!(found.as_array().unwrap().iter().any(|p| p["status"] == "posted"));
+
+    // PDF outputs are valid PDFs.
+    let (st, ct, bytes) = send_bytes(&app, "GET", &format!("/api/v1/jobs/{job_id}/report.pdf")).await;
+    assert_eq!(st, StatusCode::OK);
+    assert_eq!(ct, "application/pdf");
+    assert!(bytes.starts_with(b"%PDF-1.4") && bytes.ends_with(b"%%EOF"));
+
+    let (st, _, bytes) = send_bytes(&app, "GET", &format!("/api/v1/jobs/{job_id}/siteplan.pdf")).await;
+    assert_eq!(st, StatusCode::OK);
+    assert!(bytes.starts_with(b"%PDF-1.4"));
+}
+
 /// A throwaway RSA identity provider used to mint signed tokens for the auth test.
 struct TestIdp {
     kid: String,

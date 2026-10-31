@@ -103,7 +103,8 @@ mod tests {
         let s = String::from_utf8_lossy(&pdf);
         assert!(s.contains("PL000000000001"));
         assert!(s.contains("JOB-7"));
-        assert!(s.contains("(unposted)"));
+        // Parentheses are escaped in PDF strings, so match the inner text.
+        assert!(s.contains("unposted"));
     }
 
     #[test]

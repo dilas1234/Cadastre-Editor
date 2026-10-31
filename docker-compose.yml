@@ -36,5 +36,18 @@ services:
       db:
         condition: service_healthy
 
+  # Vector tiles for the viewer/admin map (Phase 7, FR-VIEW). Martin auto-publishes the
+  # PostGIS tables with a geometry column (cadastre.parcel, cadastre.beacon) as tile sources
+  # at http://localhost:3001 (catalog at /catalog). Config only — not exercised by tests here.
+  tiles:
+    image: ghcr.io/maplibre/martin:v0.13.0
+    container_name: cadastre-tiles
+    command: ["postgres://cadastre:cadastre@db:5432/cadastre"]
+    ports:
+      - "3001:3000"
+    depends_on:
+      db:
+        condition: service_healthy
+
 volumes:
   cadastre-db-data:
