@@ -1,0 +1,65 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<meta name="viewport" content="width=device-width, initial-scale=1"/>
+<title>PLAGIS Cadastre Editor</title>
+<link href="https://unpkg.com/maplibre-gl@4.7.1/dist/maplibre-gl.css" rel="stylesheet"/>
+<script src="https://unpkg.com/maplibre-gl@4.7.1/dist/maplibre-gl.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/proj4js/2.11.0/proj4.js"></script>
+<link href="/editor/style.css" rel="stylesheet"/>
+</head>
+<body>
+  <header id="topbar">
+    <span class="brand">PLAGIS Cadastre Editor</span>
+    <span class="sep"></span>
+    <label>Job</label>
+    <select id="jobSelect"><option value="">— select —</option></select>
+    <span id="jobStage" class="pill">—</span>
+    <span id="jobActions"></span>
+    <span class="grow"></span>
+    <a href="/swagger-ui" target="_blank" class="link">API</a>
+  </header>
+
+  <div id="body">
+    <aside id="sidebar">
+      <div class="tabs">
+        <button class="tab active" data-tab="layers">Layers</button>
+        <button class="tab" data-tab="survey">Survey entry</button>
+      </div>
+
+      <section class="panel" data-panel="layers">
+        <label class="chk"><input type="checkbox" id="lyr-imagery" checked/> Imagery</label>
+        <label class="chk"><input type="checkbox" id="lyr-parcels" checked/> Parcels</label>
+        <label class="chk"><input type="checkbox" id="lyr-beacons" checked/> Control beacons</label>
+        <hr/>
+        <input id="search" placeholder="Find parcel number (UPIN)…"/>
+        <div id="searchResults" class="muted"></div>
+      </section>
+
+      <section class="panel hidden" data-panel="survey">
+        <p class="muted">Click the map to set the start beacon, then add legs.</p>
+        <div class="row"><label>Start E</label><input id="startE" type="number" step="0.001"/></div>
+        <div class="row"><label>Start N</label><input id="startN" type="number" step="0.001"/></div>
+        <table id="legs"><thead><tr><th>#</th><th>Bearing°</th><th>Dist (m)</th><th></th></tr></thead>
+          <tbody></tbody></table>
+        <button id="addLeg">+ add leg</button>
+        <div class="row"><label>Stated area</label><input id="statedArea" type="number" step="0.01" placeholder="m²"/></div>
+        <div id="checkOut" class="checkout muted">enter legs to see closure / area</div>
+      </section>
+    </aside>
+
+    <div id="map"></div>
+  </div>
+
+  <footer id="statusbar">
+    <span id="coordLL">—</span>
+    <span class="sep"></span>
+    <span id="coordUTM">E —  N —  (EPSG:32632)</span>
+    <span class="grow"></span>
+    <span id="count" class="muted"></span>
+  </footer>
+
+  <script src="/editor/app.js"></script>
+</body>
+</html>

@@ -54,6 +54,23 @@ pub async fn parcels_geojson(
     ))
 }
 
+/// Beacons as a WGS84 GeoJSON FeatureCollection (reprojected from 32632).
+pub async fn beacons_geojson(
+    State(state): State<AppState>,
+) -> ApiResult<([(axum::http::HeaderName, &'static str); 1], String)> {
+    let sql = "SELECT COALESCE(json_build_object('type','FeatureCollection','features', json_agg(f))::text, \
+               '{\"type\":\"FeatureCollection\",\"features\":[]}') \
+         FROM (SELECT json_build_object('type','Feature', \
+                 'geometry', ST_AsGeoJSON(ST_Transform(geom,4326))::json, \
+                 'properties', json_build_object('number', number, 'is_control', is_control)) AS f \
+               FROM cadastre.beacon WHERE geom IS NOT NULL LIMIT 20000) s";
+    let json: String = sqlx::query(sql).fetch_one(&state.pool).await?.get(0);
+    Ok((
+        [(axum::http::header::CONTENT_TYPE, "application/json")],
+        json,
+    ))
+}
+
 fn parse_bbox(s: &str) -> Option<(f64, f64, f64, f64)> {
     let n: Vec<f64> = s.split(',').filter_map(|v| v.trim().parse().ok()).collect();
     match n.as_slice() {

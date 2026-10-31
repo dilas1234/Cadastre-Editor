@@ -2,6 +2,7 @@
 
 pub mod audit;
 pub mod beacons;
+pub mod editor;
 pub mod fabric;
 pub mod health;
 pub mod jobs;
@@ -25,9 +26,12 @@ pub fn router(state: AppState) -> Router {
     Router::new()
         .route("/health", get(health::health))
         .route("/ready", get(health::ready))
-        // Browser viewer (Phase 7, FR-VIEW)
+        // Browser viewer + editor (Phase 7/4, FR-VIEW/FR-SUR)
         .route("/viewer", get(viewer::viewer))
+        .route("/editor", get(editor::index))
+        .route("/editor/{*path}", get(editor::asset))
         .route("/api/v1/parcels.geojson", get(viewer::parcels_geojson))
+        .route("/api/v1/beacons.geojson", get(viewer::beacons_geojson))
         .route(
             "/api/v1/tolerances",
             get(tolerances::get_tolerances).put(tolerances::put_tolerances),
