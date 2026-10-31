@@ -6,12 +6,13 @@ use crate::models::{
     AdjustRequest, AdjustResponse, AreaCheckDto, AuditEntryDto, AuditVerifyDto, BeaconDto,
     ClosureDto, FabricValidateRequest, JobDto, JobEventDto, JobTransition, LegDto, LineResidualDto,
     LockDto, NewBeacon, NewJob, NewLock, NewParcel, NewSession, NewStage, NewTransition,
-    ObservationDto, OverlapDto, ParcelDto, PointDto, PostResult, SessionDto, StageDto,
-    SurveyCheckRequest, SurveyCheckResponse, SurveyChecksDto, TolerancesDto, TopologyReportDto,
-    TransitionDto, WorkflowDto,
+    ObservationDto, OverlapDto, ParcelDto, PointDto, PostResult, PromoteResult, SessionDto,
+    StageDto, SurveyCheckRequest, SurveyCheckResponse, SurveyChecksDto, TolerancesDto,
+    TopologyReportDto, TransitionDto, WorkflowDto,
 };
 use crate::routes::{
-    audit, beacons, fabric, health, jobs, parcels, reports, sessions, survey, tolerances, workflow,
+    audit, beacons, fabric, health, jobs, parcels, promote, reports, sessions, survey, tolerances,
+    workflow,
 };
 
 /// The generated API description, served at `/api-docs/openapi.json`.
@@ -55,6 +56,7 @@ use crate::routes::{
         audit::verify_audit,
         reports::job_report,
         reports::site_plan,
+        promote::promote_run,
     ),
     components(schemas(
         TolerancesDto, BeaconDto, NewBeacon, ParcelDto,
@@ -65,7 +67,7 @@ use crate::routes::{
         ClosureDto, AreaCheckDto, SurveyChecksDto,
         FabricValidateRequest, TopologyReportDto, OverlapDto,
         AdjustRequest, AdjustResponse, ObservationDto, LineResidualDto,
-        NewParcel, PostResult, AuditEntryDto, AuditVerifyDto,
+        NewParcel, PostResult, AuditEntryDto, AuditVerifyDto, PromoteResult,
     )),
     tags(
         (name = "ops", description = "Liveness and readiness"),
@@ -79,6 +81,7 @@ use crate::routes::{
         (name = "fabric", description = "Topology validation + least-squares adjustment (FR-ADJ-01..04)"),
         (name = "audit", description = "Hash-chained audit log (NFR-07/11)"),
         (name = "output", description = "PDF job reports and site plans (FR-OUT-*)"),
+        (name = "import", description = "Promote staged Aumentum imports into the live fabric"),
     )
 )]
 pub struct ApiDoc;

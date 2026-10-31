@@ -56,7 +56,7 @@ pub async fn create_job_parcel(
 
     let sql = format!(
         "INSERT INTO cadastre.parcel (job_id, geom, stated_area, status) \
-         VALUES ($1, ST_SetSRID(ST_GeomFromGeoJSON($2), 26392), $3, 'draft') \
+         VALUES ($1, ST_SetSRID(ST_GeomFromGeoJSON($2), 32632), $3, 'draft') \
          RETURNING {PARCEL_SELECT}"
     );
     let row = sqlx::query(&sql)
@@ -97,7 +97,7 @@ pub async fn search_parcels(
         let (minx, miny, maxx, maxy) = parse_bbox(bbox)?;
         qb.push(" AND geom && ST_MakeEnvelope(")
             .push_bind(minx).push(", ").push_bind(miny).push(", ")
-            .push_bind(maxx).push(", ").push_bind(maxy).push(", 26392)");
+            .push_bind(maxx).push(", ").push_bind(maxy).push(", 32632)");
     }
     qb.push(" ORDER BY parcel_number NULLS LAST LIMIT 500");
 

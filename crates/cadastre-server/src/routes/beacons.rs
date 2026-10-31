@@ -76,7 +76,7 @@ pub async fn create_beacon(
 
     let sql = format!(
         "INSERT INTO cadastre.beacon (number, geom, accuracy, is_control) \
-         VALUES ($1, ST_SetSRID(ST_MakePoint($2, $3), 26392), $4, $5) \
+         VALUES ($1, ST_SetSRID(ST_MakePoint($2, $3), 32632), $4, $5) \
          RETURNING {SELECT_COLS}"
     );
     let result = sqlx::query(&sql)

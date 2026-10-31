@@ -356,6 +356,69 @@ async fn survey_check_validates_against_active_tolerances() {
     assert!(body["closure"]["linear_misclosure"].as_f64().unwrap() > 100.0);
 }
 
+#[tokio::test]
+async fn promote_import_run_into_live_fabric() {
+    let Some(db_url) = test_db_url() else {
+        eprintln!("skipping: CADASTRE_TEST_DATABASE_URL not set");
+        return;
+    };
+    let app = routes::router(state_with(AuthMode::Disabled, None, &db_url).await);
+    let pool = sqlx::PgPool::connect(&db_url).await.unwrap();
+
+    // Seed a staged import run: one active parcel + one historic (not promoted) + one beacon.
+    let upin = format!("PL{:012}", rand_12());
+    let bnum = format!("IMP-{}", Uuid::new_v4());
+    let run_id: i64 = sqlx::query_scalar(
+        "INSERT INTO import.run (parcels, beacons, exceptions) VALUES (2, 1, 0) RETURNING id",
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    for (num, status) in [(&upin, "active"), (&format!("{upin}H"), "historic")] {
+        sqlx::query(
+            "INSERT INTO import.parcel (run_id, source_object_id, parcel_number, status, srid, computed_area, geom) \
+             VALUES ($1, 1, $2, $3, 32632, 10000, ST_GeomFromText('POLYGON((1000 1000,1100 1000,1100 1100,1000 1100,1000 1000))', 32632))",
+        )
+        .bind(run_id).bind(num).bind(status).execute(&pool).await.unwrap();
+    }
+    sqlx::query(
+        "INSERT INTO import.beacon (run_id, number, geom) \
+         VALUES ($1, $2, ST_SetSRID(ST_MakePoint(500000, 1100000), 32632))",
+    )
+    .bind(run_id).bind(&bnum).execute(&pool).await.unwrap();
+
+    // Promote: only the active parcel + the beacon go live.
+    let (st, res) = send(&app, "POST", &format!("/api/v1/import/promote/{run_id}"), None, None).await;
+    assert_eq!(st, StatusCode::OK, "{res}");
+    assert_eq!(res["parcels_promoted"], 1);
+    assert_eq!(res["beacons_promoted"], 1);
+
+    // The active parcel is now in the live fabric, posted; the historic one is not.
+    let (_, found) = send(&app, "GET", &format!("/api/v1/parcels/search?number={upin}"), None, None).await;
+    let arr = found.as_array().unwrap();
+    assert!(arr.iter().any(|p| p["parcel_number"] == upin && p["status"] == "posted"));
+    assert!(!arr.iter().any(|p| p["parcel_number"] == format!("{upin}H")));
+
+    // Promotion is idempotent.
+    let (st, res2) = send(&app, "POST", &format!("/api/v1/import/promote/{run_id}"), None, None).await;
+    assert_eq!(st, StatusCode::OK);
+    assert_eq!(res2["parcels_promoted"], 1);
+
+    // Audit chain still verifies after the promote entries.
+    let (_, v) = send(&app, "GET", "/api/v1/audit/verify", None, None).await;
+    assert_eq!(v["ok"], true, "{v}");
+
+    // Unknown run → 404.
+    let (st, _) = send(&app, "POST", "/api/v1/import/promote/999999999", None, None).await;
+    assert_eq!(st, StatusCode::NOT_FOUND);
+}
+
+/// A pseudo-random 12-digit number for a unique UPIN per test run.
+fn rand_12() -> u64 {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    (SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos() as u64) % 1_000_000_000_000
+}
+
 /// Send a request and return (status, content-type, raw body bytes) — for non-JSON responses.
 async fn send_bytes(router: &Router, method: &str, uri: &str) -> (StatusCode, String, Vec<u8>) {
     let req = Request::builder().method(method).uri(uri).body(Body::empty()).unwrap();

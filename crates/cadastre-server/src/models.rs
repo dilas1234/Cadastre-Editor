@@ -53,7 +53,7 @@ impl From<TolerancesDto> for cadastre_core::tolerances::Tolerances {
     }
 }
 
-/// A beacon as returned by the API. Coordinates are easting/northing in EPSG:26392.
+/// A beacon as returned by the API. Coordinates are easting/northing in EPSG:32632.
 #[derive(Clone, Debug, Serialize, ToSchema)]
 pub struct BeaconDto {
     /// Server-assigned identifier.
@@ -79,9 +79,9 @@ pub struct BeaconDto {
 pub struct NewBeacon {
     /// Beacon number (must be unique).
     pub number: String,
-    /// Easting (metres, EPSG:26392).
+    /// Easting (metres, EPSG:32632).
     pub easting: f64,
-    /// Northing (metres, EPSG:26392).
+    /// Northing (metres, EPSG:32632).
     pub northing: f64,
     /// A-priori 1σ accuracy (metres); defaults to 0.05 if omitted.
     pub accuracy: Option<f64>,
@@ -89,7 +89,7 @@ pub struct NewBeacon {
     pub is_control: Option<bool>,
 }
 
-/// A parcel as returned by the API. The boundary is GeoJSON in EPSG:26392.
+/// A parcel as returned by the API. The boundary is GeoJSON in EPSG:32632.
 #[derive(Clone, Debug, Serialize, ToSchema)]
 pub struct ParcelDto {
     /// Server-assigned identifier.
@@ -238,6 +238,17 @@ pub struct ParcelSearch {
     pub bbox: Option<String>,
 }
 
+/// Result of promoting an import run into the live fabric.
+#[derive(Clone, Copy, Debug, Serialize, ToSchema)]
+pub struct PromoteResult {
+    /// The import run promoted.
+    pub run_id: i64,
+    /// Active parcels inserted/updated into `cadastre.parcel`.
+    pub parcels_promoted: usize,
+    /// Beacons inserted/updated into `cadastre.beacon`.
+    pub beacons_promoted: usize,
+}
+
 /// Result of posting a job's parcels.
 #[derive(Clone, Debug, Serialize, ToSchema)]
 pub struct PostResult {
@@ -357,7 +368,7 @@ pub struct NewLock {
 // Phase 4: live survey check (FR-COG-02/03, FR-SUR-*).
 // ---------------------------------------------------------------------------
 
-/// A planar coordinate (easting/northing, metres, EPSG:26392).
+/// A planar coordinate (easting/northing, metres, EPSG:32632).
 #[derive(Clone, Copy, Debug, Deserialize, Serialize, ToSchema)]
 pub struct PointDto {
     /// Easting (metres).
