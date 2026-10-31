@@ -33,6 +33,12 @@ map.on("load", async () => {
   map.addLayer({ id: "beacons-pt", type: "circle", source: "beacons",
     paint: { "circle-radius": 3, "circle-color": "#ff4", "circle-stroke-color": "#333", "circle-stroke-width": 0.8 } });
 
+  map.addSource("drafts", { type: "geojson", data: empty() });
+  map.addLayer({ id: "drafts-fill", type: "fill", source: "drafts",
+    paint: { "fill-color": "#2e9e5b", "fill-opacity": 0.25 } });
+  map.addLayer({ id: "drafts-line", type: "line", source: "drafts",
+    paint: { "line-color": "#2e9e5b", "line-width": 1.5 } });
+
   map.addSource("survey", { type: "geojson", data: empty() });
   map.addLayer({ id: "survey-fill", type: "fill", source: "survey",
     filter: ["==", "$type", "Polygon"], paint: { "fill-color": "#f80", "fill-opacity": 0.2 } });
@@ -111,6 +117,7 @@ document.querySelectorAll(".tab").forEach((t) => t.onclick = () => {
 
 // --- jobs + workflow ---
 let workflow = { transitions: [] };
+let currentJobId = "";
 async function loadJobs() {
   workflow = await (await fetch("/api/v1/workflow")).json();
   const jobs = await (await fetch("/api/v1/jobs")).json();
@@ -122,9 +129,30 @@ async function loadJobs() {
   });
 }
 $("jobSelect").onchange = (e) => {
+  currentJobId = e.target.value;
   const opt = e.target.selectedOptions[0];
   const stage = opt ? opt.dataset.status : null;
-  renderJob(e.target.value, stage);
+  renderJob(currentJobId, stage);
+  loadDrafts(currentJobId);
+  $("postJob").classList.toggle("hidden", !currentJobId);
+  updateSaveState();
+};
+
+async function loadDrafts(jobId) {
+  if (!map.getSource("drafts")) return;
+  if (!jobId) { map.getSource("drafts").setData(empty()); return; }
+  const r = await fetch(`/api/v1/parcels.geojson?status=draft&limit=5000&job=${jobId}`);
+  map.getSource("drafts").setData(await r.json());
+}
+
+$("postJob").onclick = async () => {
+  if (!currentJobId) return;
+  const r = await fetch(`/api/v1/jobs/${currentJobId}/post`, { method: "POST" });
+  if (r.ok) {
+    const res = await r.json();
+    $("saveMsg").textContent = `posted ${res.posted} parcel(s)`;
+    loadDrafts(currentJobId); loadParcels(false);
+  } else { $("saveMsg").textContent = "post failed: " + r.status; }
 };
 function renderJob(id, stage) {
   $("jobStage").textContent = stage || "—";
@@ -177,6 +205,7 @@ function currentLegs() {
   })).filter((l) => isFinite(l.bearing) && isFinite(l.distance) && l.distance > 0);
 }
 
+let lastUTM = [];
 function drawSurvey(startE, startN, legs) {
   let E = startE, N = startN;
   const utm = [[E, N]];
@@ -185,6 +214,7 @@ function drawSurvey(startE, startN, legs) {
     E += l.distance * Math.sin(r); N += l.distance * Math.cos(r);
     utm.push([E, N]);
   }
+  lastUTM = utm;
   const ll = utm.map(([e, n]) => toLL(e, n));
   const feats = [{ type: "Feature", geometry: { type: "LineString", coordinates: ll } }];
   ll.forEach((c) => feats.push({ type: "Feature", geometry: { type: "Point", coordinates: c } }));
@@ -196,8 +226,9 @@ let checkTimer = null;
 function refreshSurvey() {
   const startE = parseFloat($("startE").value), startN = parseFloat($("startN").value);
   const legs = currentLegs();
-  if (!isFinite(startE) || !isFinite(startN)) { $("checkOut").textContent = "set a start point"; return; }
+  if (!isFinite(startE) || !isFinite(startN)) { $("checkOut").textContent = "set a start point"; updateSaveState(); return; }
   drawSurvey(startE, startN, legs);
+  updateSaveState();
   if (!legs.length) { $("checkOut").textContent = "add legs to check closure"; return; }
   clearTimeout(checkTimer);
   checkTimer = setTimeout(() => runCheck(startE, startN, legs), 150);
@@ -227,5 +258,40 @@ async function runCheck(startE, startN, legs) {
     `${flag(s.checks.meets_precision, "precision")}  ` +
     `${flag(s.checks.area_within_tolerance, "area")}`;
 }
+
+function updateSaveState() {
+  $("saveParcel").disabled = !(currentJobId && currentLegs().length >= 3);
+}
+
+function clearSurvey() {
+  legsBody.innerHTML = "";
+  $("startE").value = ""; $("startN").value = ""; $("statedArea").value = "";
+  map.getSource("survey") && map.getSource("survey").setData(empty());
+  $("checkOut").textContent = "enter legs to see closure / area";
+  lastUTM = [];
+  addLegRow();
+  updateSaveState();
+}
+
+$("saveParcel").onclick = async () => {
+  if (!currentJobId || lastUTM.length < 4) return;
+  // Close the ring back onto the start to form a valid polygon (coords are EPSG:32632).
+  const ring = [...lastUTM, lastUTM[0]];
+  const stated = parseFloat($("statedArea").value);
+  const body = {
+    geometry: { type: "Polygon", coordinates: [ring] },
+    stated_area: isFinite(stated) ? stated : null,
+  };
+  const r = await fetch(`/api/v1/jobs/${currentJobId}/parcels`, {
+    method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(body),
+  });
+  if (r.ok) {
+    $("saveMsg").textContent = "saved draft parcel ✓ (Post job to make it official)";
+    clearSurvey();
+    loadDrafts(currentJobId);
+  } else {
+    $("saveMsg").textContent = "save failed: " + r.status;
+  }
+};
 
 addLegRow(); // start with one empty leg

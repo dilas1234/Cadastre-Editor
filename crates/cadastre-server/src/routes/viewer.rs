@@ -19,16 +19,34 @@ pub struct GeoJsonQuery {
     pub bbox: Option<String>,
     /// Max features (default 3000).
     pub limit: Option<i64>,
+    /// Status filter: `posted` (default), `draft`, `submitted`, or `all`.
+    pub status: Option<String>,
+    /// Restrict to one job's parcels (uuid).
+    pub job: Option<String>,
 }
 
-/// Posted parcels as a WGS84 GeoJSON FeatureCollection (reprojected from 32632).
+/// Parcels as a WGS84 GeoJSON FeatureCollection (reprojected from 32632).
 pub async fn parcels_geojson(
     State(state): State<AppState>,
     Query(q): Query<GeoJsonQuery>,
 ) -> ApiResult<([(axum::http::HeaderName, &'static str); 1], String)> {
     let limit = q.limit.unwrap_or(3000).clamp(1, 20000);
 
-    // Optional bbox filter, transformed to 32632 to use the gist index.
+    // Status is validated against an allow-list before being inlined.
+    let status_clause = match q.status.as_deref() {
+        None | Some("posted") => " AND status = 'posted'".to_string(),
+        Some("all") => String::new(),
+        Some(s @ ("draft" | "submitted")) => format!(" AND status = '{s}'"),
+        Some(_) => return Err(crate::error::AppError::BadRequest("invalid status".into())),
+    };
+    // Job is parsed as a uuid (so the inlined value is safe).
+    let job_clause = match q.job.as_deref().filter(|s| !s.is_empty()) {
+        Some(j) => {
+            let id: uuid::Uuid = j.parse().map_err(|_| crate::error::AppError::BadRequest("invalid job id".into()))?;
+            format!(" AND job_id = '{id}'")
+        }
+        None => String::new(),
+    };
     let bbox_clause = match q.bbox.as_deref().and_then(parse_bbox) {
         Some((a, b, c, d)) => format!(
             " AND geom && ST_Transform(ST_MakeEnvelope({a},{b},{c},{d},4326),32632)"
@@ -44,7 +62,7 @@ pub async fn parcels_geojson(
                  'properties', json_build_object('parcel_number', parcel_number, \
                      'status', status, 'area', round(computed_area::numeric,1))) AS f \
                FROM cadastre.parcel \
-               WHERE geom IS NOT NULL AND status = 'posted'{bbox_clause} \
+               WHERE geom IS NOT NULL{status_clause}{job_clause}{bbox_clause} \
                LIMIT {limit}) s"
     );
     let json: String = sqlx::query(&sql).fetch_one(&state.pool).await?.get(0);
