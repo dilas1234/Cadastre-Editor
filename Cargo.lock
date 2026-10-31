@@ -276,6 +276,7 @@ dependencies = [
  "cadastre-core",
  "futures-util",
  "serde",
+ "sqlx",
  "thiserror 2.0.21",
  "tiberius",
  "tokio",

@@ -4,11 +4,13 @@
 //! feature class's current rows are *not* its business table — they must be reconstructed from
 //! the versioned delta tables for the DEFAULT version (see [`sde`]).
 //!
-//! This crate is split so the risky, DB-touching part is isolated:
+//! This crate is split so the risky, DB-touching parts are isolated behind features:
 //! - pure, DB-free, unit-tested logic — [`sde`] (SQL builder), [`geometry`] (WKT), [`status`],
 //!   [`model`], [`exceptions`] — is always compiled;
-//! - the live SQL Server reader ([`client`]) is behind the `live` feature and reads only a
-//!   **restored, non-production** copy of the `sde` database. It never writes to Aumentum.
+//! - the SQL Server reader ([`client`], feature `source`) reads only a **restored, non-production**
+//!   copy of the `sde` database and never writes to Aumentum;
+//! - the PostGIS staging-load writer ([`sink`], feature `sink`) writes validated records and the
+//!   exceptions report into an `import` schema, testable against a local PostGIS on its own.
 
 pub mod exceptions;
 pub mod geometry;
@@ -16,8 +18,11 @@ pub mod model;
 pub mod sde;
 pub mod status;
 
-#[cfg(feature = "live")]
+#[cfg(feature = "source")]
 pub mod client;
+
+#[cfg(feature = "sink")]
+pub mod sink;
 
 /// Everything the importer can fail with.
 #[derive(Debug, thiserror::Error, Clone, PartialEq)]
