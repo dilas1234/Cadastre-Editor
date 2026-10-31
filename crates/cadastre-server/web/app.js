@@ -649,10 +649,18 @@ function tocOptions() {
 /* =====================================================================================
  * Phase 3 — map tools
  * ===================================================================================== */
+// MapLibre paints the cursor on its own <canvas>, which overrides any cursor set via a CSS class
+// on the map container — so the active tool's cursor must be set on the canvas itself. "" lets
+// MapLibre show its native grab/grabbing for Pan.
+const TOOL_CURSOR = {
+  pan: "", zoomIn: "zoom-in", zoomOut: "zoom-out", select: "crosshair", selectEl: "default",
+  identify: "crosshair", measure: "crosshair", survey: "crosshair", rect: "crosshair", text: "text",
+};
 function setTool(tool) {
   state.tool = tool;
   for (const [t, btns] of toolButtons) btns.forEach((b) => b.classList.toggle("active", t === tool));
   const c = map.getContainer(); c.className = c.className.replace(/\btool-\S+/g, "").trim(); c.classList.add("tool-" + tool);
+  const cv = map.getCanvas(); if (cv) cv.style.cursor = tool in TOOL_CURSOR ? TOOL_CURSOR[tool] : "crosshair";
   // Pan is the only tool that drags the map; the others own the mouse.
   if (tool === "pan") map.dragPan.enable(); else map.dragPan.disable();
   if (tool !== "measure") clearMeasure();
