@@ -916,6 +916,7 @@ function floatWindow(title, body, { id, width = 300 } = {}) {
 function aboutDialog() {
   floatWindow(`About ${APP}`, h("div", {},
     h("p", {}, h("b", {}, APP)), h("p", {}, "Parcel capture, survey computation, job workflow and posting for PLAGIS."),
+    h("p", {}, "This software is developed by ", h("b", {}, "Che Dilas Yusuph"), " and ", h("b", {}, "Catherine Wuyep"), "."),
     h("p", { class: "muted" }, `Coordinate system: WGS 1984 UTM Zone 32N (EPSG:32632). Connected as ${state.me ? state.me.username : "—"}.`)), { width: 340 });
 }
 async function attributeTable(l) {
@@ -1027,39 +1028,84 @@ function openTask(kind) {
 }
 function renderTask() {
   const body = $("tasksBody"); body.innerHTML = "";
-  const t = TASKS[task.kind];
   const local = h("select", { onchange: (e) => openTask(e.target.value) }, ...Object.entries(TASKS).map(([k, v]) => h("option", { value: k, selected: k === task.kind }, v.name)));
   body.append(h("div", { class: "tasksHead" }, h("div", {}, "Tasks"), h("div", { class: "frow" }, h("label", {}, "Local:"), local)));
+  if (task.kind === "survey") { renderSurveyForm(body); return; }
+  // Workflow task keeps a short stepped page.
+  const t = TASKS.workflow;
   body.append(h("div", { class: "taskSteps" }, h("span", { html: icon("tasks") }),
     h("div", { class: "taskStepBar", title: `Step ${task.step + 1} of ${t.steps.length}` }, h("span", { style: `width:${((task.step + 1) / t.steps.length) * 100}%` }))));
   const page = h("div", { class: "taskPage" }, h("h4", {}, `${task.step + 1}. ${t.steps[task.step]}`));
-  (task.kind === "survey" ? surveyPage : workflowPage)(page);
-  body.append(page);
+  workflowPage(page); body.append(page);
   const last = task.step === t.steps.length - 1;
-  const nav = h("div", { class: "taskNav" },
+  body.append(h("div", { class: "taskNav" },
     h("button", { class: "btn", disabled: task.step === 0, onclick: () => { task.step--; renderTask(); } }, "Back"),
-    h("button", { class: "btn", disabled: last || !stepValid(), onclick: () => { task.step++; renderTask(); } }, "Next"),
-    h("button", { class: "btn", onclick: cancelTask }, "Cancel"),
-    h("button", { class: "btn", disabled: !last || !finishValid(), onclick: finishTask }, "Finish"));
-  body.append(nav);
+    h("button", { class: "btn", disabled: last, onclick: () => { task.step++; renderTask(); } }, "Next"),
+    h("button", { class: "btn", onclick: cancelTask }, "Close")));
 }
-function stepValid() {
-  if (task.kind === "workflow") return !!state.job;
-  return [() => !!state.job, () => !!task.start, () => surveyLegs().length >= 3, () => true][task.step]();
+
+// The survey task is one continuous form — no Back/Next. Pick a job (inline), drop a start, enter
+// legs with a live closure check, Save. After saving it stays armed for the next parcel.
+const subHead = (t) => h("div", { style: "font-weight:600;margin:9px 0 3px;color:#2a2a2a" }, t);
+function renderSurveyForm(body) {
+  const page = h("div", { class: "taskPage" });
+
+  const jobSel = h("select", { style: "flex:1;min-width:0", onchange: async (e) => { $("jobBox").value = e.target.value; await selectJob(e.target.value); } },
+    h("option", { value: "" }, "— choose a job —"),
+    ...state.jobs.map((j) => h("option", { value: j.id, selected: state.job?.id === j.id }, `${j.reference} (${j.status})`)));
+  page.append(subHead("Job"), h("div", { class: "frow" }, h("label", {}, "Job Area:"), jobSel, h("button", { class: "btn", style: "min-width:0", onclick: newJobDialog }, "New…")),
+    state.job ? null : h("p", { class: "muted" }, "Pick or create a job to save under (you can set the start and legs first)."));
+
+  const E = h("input", { type: "number", step: "0.001", value: task.start ? task.start[0].toFixed(3) : "" });
+  const N = h("input", { type: "number", step: "0.001", value: task.start ? task.start[1].toFixed(3) : "" });
+  const upd = () => { const e = parseFloat(E.value), n = parseFloat(N.value); task.start = isFinite(e) && isFinite(n) ? [e, n] : null; drawTraverse(); scheduleCheck(); };
+  E.oninput = upd; N.oninput = upd;
+  const beacon = h("select", { style: "flex:1;min-width:0", onchange: (ev) => { const f = state.beacons.features.find((x) => String(x.properties.id) === ev.target.value); if (f) { task.start = [Number(f.properties.easting), Number(f.properties.northing)]; drawTraverse(); renderTask(); } } },
+    h("option", { value: "" }, "— from control point —"), ...state.beacons.features.slice(0, 2000).map((f) => h("option", { value: f.properties.id }, f.properties.number)));
+  page.append(subHead("Start point"), h("p", { class: "muted" }, "Click the map (crosshair), pick a control point, or type UTM 32N coordinates."),
+    h("div", { class: "frow" }, h("label", {}, "Easting:"), E), h("div", { class: "frow" }, h("label", {}, "Northing:"), N),
+    h("div", { class: "frow" }, h("label", {}, "Beacon:"), beacon));
+
+  const tbl = h("table", { class: "legs" }, h("tr", {}, h("th", {}, "#"), h("th", {}, "Bearing"), h("th", {}, "Dist (m)"), h("th", {}, "")));
+  task.legs.forEach((l, i) => {
+    const b = h("input", { value: l.b, placeholder: "ddd mm ss", title: "Decimal degrees, or d m s" });
+    const d = h("input", { value: l.d, type: "number", step: "0.001" });
+    b.oninput = () => { l.b = b.value; drawTraverse(); scheduleCheck(); };
+    d.oninput = () => { l.d = d.value; drawTraverse(); scheduleCheck(); };
+    // Enter in the last distance box adds the next leg and jumps to its bearing — fast entry.
+    d.onkeydown = (ev) => { if (ev.key === "Enter" && i === task.legs.length - 1 && l.b !== "" && l.d !== "") { task.legs.push({ b: "", d: "" }); renderTask(); focusLastBearing(); } };
+    tbl.append(h("tr", {}, h("td", { class: "n" }, String(i + 1)), h("td", {}, b), h("td", {}, d),
+      h("td", {}, h("button", { title: "Remove leg", onclick: () => { task.legs.splice(i, 1); if (!task.legs.length) task.legs.push({ b: "", d: "" }); renderTask(); drawTraverse(); scheduleCheck(); } }, "✕"))));
+  });
+  page.append(subHead("Traverse (bearing + distance)"), tbl,
+    h("button", { class: "btn", onclick: () => { task.legs.push({ b: "", d: "" }); renderTask(); focusLastBearing(); } }, "Add leg"),
+    h("div", { class: "checkout", id: "checkOut" }, "Enter a start point and at least three legs to check closure."));
+
+  const stated = h("input", { type: "number", step: "0.01", value: task.stated, placeholder: "m² (optional)" });
+  stated.oninput = () => { task.stated = stated.value; scheduleCheck(); };
+  const save = h("button", { class: "btn", id: "surveySave", onclick: finishTask }, "Save draft parcel");
+  page.append(subHead("Save"), h("div", { class: "frow" }, h("label", {}, "Stated area:"), stated),
+    h("div", { class: "taskNav" }, save, h("button", { class: "btn", onclick: cancelTask }, "Clear")));
+
+  body.append(page);
+  scheduleCheck(true); updateTaskButtons();
 }
-function finishValid() { return task.kind === "workflow" ? true : !!state.job && !!task.start && surveyLegs().length >= 3; }
-function cancelTask() {
-  Object.assign(task, { step: 0, legs: [{ b: "", d: "" }], start: null, stated: "", check: null });
-  map.getSource("survey")?.setData(empty()); setTool("pan"); renderTask();
+function focusLastBearing() { const rows = $("tasksBody").querySelectorAll("table.legs tr"); rows[rows.length - 1]?.querySelectorAll("input")[0]?.focus(); }
+function updateTaskButtons() {
+  if (task.kind !== "survey") return;
+  const save = $("surveySave"); if (save) save.disabled = !(state.job && task.start && surveyLegs().length >= 3);
 }
+function resetTraverse() { task.step = 0; task.legs = [{ b: "", d: "" }]; task.start = null; task.stated = ""; task.check = null; map.getSource("survey")?.setData(empty()); }
+function cancelTask() { resetTraverse(); setTool("pan"); renderTask(); }
 async function finishTask() {
-  if (task.kind === "workflow") { cancelTask(); return; }
-  const utm = traverseUTM(); if (utm.length < 4) return;
+  if (task.kind !== "survey") return;
+  const utm = traverseUTM(); if (utm.length < 4 || !state.job) return;
   const stated = parseFloat(task.stated);
   try {
     await api(`/api/v1/jobs/${state.job.id}/parcels`, { method: "POST", body: { geometry: { type: "Polygon", coordinates: [[...utm, utm[0]]] }, stated_area: isFinite(stated) ? stated : null } });
-    status("Saved draft parcel to " + state.job.reference + " — post the job (once approved) to allocate a UPIN.");
-    await loadDrafts(); cancelTask(); buildCatalog();
+    status(`Saved draft parcel to ${state.job.reference} — ready for the next. Post the job (once approved) to allocate a UPIN.`);
+    await loadDrafts(); buildCatalog();
+    resetTraverse(); renderTask(); // stay in survey mode for the next parcel
   } catch (e) { alert("Save failed: " + e.message); }
 }
 function jobPicker() {
@@ -1068,45 +1114,6 @@ function jobPicker() {
   return h("div", {}, h("div", { class: "frow" }, h("label", {}, "Job Area:"), sel),
     h("div", { class: "frow" }, h("button", { class: "btn", onclick: newJobDialog }, "New job…")));
 }
-function surveyPage(page) {
-  if (task.step === 0) {
-    page.append(h("p", { class: "muted" }, "Choose the job this parcel is captured under."), jobPicker());
-  } else if (task.step === 1) {
-    const e = h("input", { type: "number", step: "0.001", value: task.start ? task.start[0].toFixed(3) : "" });
-    const n = h("input", { type: "number", step: "0.001", value: task.start ? task.start[1].toFixed(3) : "" });
-    const upd = () => { const E = parseFloat(e.value), N = parseFloat(n.value); task.start = isFinite(E) && isFinite(N) ? [E, N] : null; drawTraverse(); renderNavOnly(); };
-    e.oninput = upd; n.oninput = upd;
-    const beacon = h("select", { style: "flex:1;min-width:0", onchange: (ev) => {
-      const f = state.beacons.features.find((x) => String(x.properties.id) === ev.target.value);
-      if (f) { task.start = [Number(f.properties.easting), Number(f.properties.northing)]; renderTask(); drawTraverse(); }
-    } }, h("option", { value: "" }, "— from control point —"), ...state.beacons.features.slice(0, 2000).map((f) => h("option", { value: f.properties.id }, f.properties.number)));
-    page.append(h("p", { class: "muted" }, "Click the map, pick a control point, or type the start coordinates (UTM 32N)."),
-      h("div", { class: "frow" }, h("label", {}, "Easting:"), e), h("div", { class: "frow" }, h("label", {}, "Northing:"), n),
-      h("div", { class: "frow" }, h("label", {}, "Beacon:"), beacon));
-  } else if (task.step === 2) {
-    const tbl = h("table", { class: "legs" }, h("tr", {}, h("th", {}, "#"), h("th", {}, "Bearing"), h("th", {}, "Dist (m)"), h("th", {}, "")));
-    task.legs.forEach((l, i) => {
-      const b = h("input", { value: l.b, placeholder: "ddd mm ss", title: "Decimal degrees or d m s" });
-      const d = h("input", { value: l.d, type: "number", step: "0.001" });
-      b.oninput = () => { l.b = b.value; drawTraverse(); scheduleCheck(); };
-      d.oninput = () => { l.d = d.value; drawTraverse(); scheduleCheck(); };
-      tbl.append(h("tr", {}, h("td", { class: "n" }, String(i + 1)), h("td", {}, b), h("td", {}, d),
-        h("td", {}, h("button", { title: "Remove leg", onclick: () => { task.legs.splice(i, 1); if (!task.legs.length) task.legs.push({ b: "", d: "" }); renderTask(); drawTraverse(); scheduleCheck(); } }, "✕"))));
-    });
-    page.append(tbl, h("button", { class: "btn", onclick: () => { task.legs.push({ b: "", d: "" }); renderTask(); } }, "Add leg"),
-      h("div", { class: "checkout", id: "checkOut" }, "Enter at least three legs to check closure."));
-    scheduleCheck(true);
-  } else {
-    const stated = h("input", { type: "number", step: "0.01", value: task.stated, placeholder: "m²" });
-    stated.oninput = () => { task.stated = stated.value; scheduleCheck(); };
-    page.append(h("div", { class: "frow" }, h("label", {}, "Job:"), h("b", {}, state.job ? state.job.reference : "—")),
-      h("div", { class: "frow" }, h("label", {}, "Stated area:"), stated),
-      h("div", { class: "checkout", id: "checkOut" }, "Checking…"),
-      h("p", { class: "muted" }, "Finish saves the parcel as a draft under the job."));
-    scheduleCheck(true);
-  }
-}
-function renderNavOnly() { const nav = document.querySelector(".taskNav"); if (!nav) return; const [, next, , fin] = nav.children; next.disabled = !stepValid(); fin.disabled = !finishValid() || task.step !== TASKS[task.kind].steps.length - 1; }
 function workflowPage(page) {
   if (task.step === 0) {
     page.append(jobPicker());
@@ -1147,11 +1154,11 @@ function drawTraverse() {
   map.getSource("survey")?.setData(state.surveyFC);
 }
 function setSurveyStart(ll) {
-  task.start = toUTM(ll.lng, ll.lat); if (task.kind === "survey" && task.step < 1) task.step = state.job ? 1 : 0;
-  drawTraverse(); renderTask();
+  task.start = toUTM(ll.lng, ll.lat);
+  drawTraverse(); renderTask(); scheduleCheck();
 }
 let checkTimer = null;
-function scheduleCheck(now) { clearTimeout(checkTimer); checkTimer = setTimeout(runCheck, now ? 0 : 200); renderNavOnly(); }
+function scheduleCheck(now) { clearTimeout(checkTimer); checkTimer = setTimeout(runCheck, now ? 0 : 200); updateTaskButtons(); }
 async function runCheck() {
   const out = $("checkOut"); if (!out) return;
   const legs = surveyLegs();
