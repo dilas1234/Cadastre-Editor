@@ -13,6 +13,7 @@
 //!   exceptions report into an `import` schema, testable against a local PostGIS on its own.
 
 pub mod exceptions;
+pub mod file_source;
 pub mod geometry;
 pub mod model;
 pub mod sde;

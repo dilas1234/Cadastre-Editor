@@ -39,3 +39,8 @@ tokio = { version = "1", optional = true, features = ["net", "rt-multi-thread", 
 [[bin]]
 name = "cadastre-import"
 required-features = ["live"]
+
+# Loads a read-only sqlcmd dump (parcels.psv/beacons.psv) into the PostGIS import schema.
+[[bin]]
+name = "import-file"
+required-features = ["sink"]
