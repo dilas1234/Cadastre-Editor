@@ -3,7 +3,7 @@
 
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
-use utoipa::ToSchema;
+use utoipa::{IntoParams, ToSchema};
 use uuid::Uuid;
 
 /// Configurable tolerances (FR-ADM-03). Mirrors `cadastre_core::tolerances::Tolerances`.
@@ -94,8 +94,10 @@ pub struct NewBeacon {
 pub struct ParcelDto {
     /// Server-assigned identifier.
     pub id: Uuid,
-    /// Parcel number (unique).
-    pub parcel_number: String,
+    /// Official parcel number (UPIN). `null` for draft parcels not yet posted.
+    pub parcel_number: Option<String>,
+    /// Owning job, if captured under one.
+    pub job_id: Option<Uuid>,
     /// Boundary polygon as GeoJSON.
     #[schema(value_type = Object)]
     pub geometry: serde_json::Value,
@@ -212,6 +214,67 @@ pub struct NewJob {
     pub title: Option<String>,
     /// Optional assignee subject.
     pub assigned_to: Option<String>,
+}
+
+/// Payload to capture a draft parcel under a job (geometry as GeoJSON).
+#[derive(Clone, Debug, Deserialize, ToSchema)]
+pub struct NewParcel {
+    /// Boundary polygon as GeoJSON (in the server CRS).
+    #[schema(value_type = Object)]
+    pub geometry: serde_json::Value,
+    /// Area stated on the plan (m²), optional.
+    pub stated_area: Option<f64>,
+}
+
+/// Query parameters for parcel search (FR-VIEW).
+#[derive(Clone, Debug, Default, Deserialize, IntoParams)]
+#[into_params(parameter_in = Query)]
+pub struct ParcelSearch {
+    /// Parcel-number prefix (case-insensitive), e.g. `PL0000`.
+    pub number: Option<String>,
+    /// Exact status (`draft` | `posted` | …).
+    pub status: Option<String>,
+    /// Bounding box `minx,miny,maxx,maxy` in the server CRS.
+    pub bbox: Option<String>,
+}
+
+/// Result of posting a job's parcels.
+#[derive(Clone, Debug, Serialize, ToSchema)]
+pub struct PostResult {
+    /// Number of parcels posted.
+    pub posted: usize,
+    /// Parcel numbers assigned/confirmed, in order.
+    pub parcel_numbers: Vec<String>,
+}
+
+/// An audit-log entry (summary) for listing.
+#[derive(Clone, Debug, Serialize, ToSchema)]
+pub struct AuditEntryDto {
+    /// Monotonic id.
+    pub id: i64,
+    /// Who performed the action.
+    pub actor: String,
+    /// Action name.
+    pub action: String,
+    /// Entity kind.
+    pub entity: String,
+    /// Entity id, if any.
+    pub entity_id: Option<String>,
+    /// This entry's chain hash.
+    pub hash: String,
+    /// When it was recorded.
+    pub created_at: DateTime<Utc>,
+}
+
+/// Result of verifying the audit chain's integrity.
+#[derive(Clone, Copy, Debug, Serialize, ToSchema)]
+pub struct AuditVerifyDto {
+    /// Whether the whole chain is intact.
+    pub ok: bool,
+    /// Number of entries checked.
+    pub checked: usize,
+    /// Id of the first broken entry, if any.
+    pub first_bad: Option<i64>,
 }
 
 /// Payload to move a job along the workflow.
@@ -377,6 +440,104 @@ pub struct SurveyChecksDto {
     pub meets_precision: bool,
     /// Area within tolerance of the stated area (`null` if not checkable).
     pub area_within_tolerance: Option<bool>,
+}
+
+// ---------------------------------------------------------------------------
+// Phase 5: fabric topology validation + least-squares adjustment.
+// ---------------------------------------------------------------------------
+
+/// Request to validate a set of parcel rings + beacons against the active tolerances.
+#[derive(Clone, Debug, Deserialize, ToSchema)]
+pub struct FabricValidateRequest {
+    /// Parcel boundary rings (each a list of points, open or closed).
+    pub parcels: Vec<Vec<PointDto>>,
+    /// Beacon coordinates to check for duplicates.
+    #[serde(default)]
+    pub beacons: Vec<PointDto>,
+}
+
+/// An overlap between two parcels (by index).
+#[derive(Clone, Copy, Debug, Serialize, ToSchema)]
+pub struct OverlapDto {
+    /// First parcel index.
+    pub a: usize,
+    /// Second parcel index.
+    pub b: usize,
+    /// Overlapping area (m²).
+    pub area: f64,
+}
+
+/// Topology findings (FR-ADJ-04).
+#[derive(Clone, Debug, Serialize, ToSchema)]
+pub struct TopologyReportDto {
+    /// Parcels with fewer than three distinct vertices.
+    pub invalid_rings: Vec<usize>,
+    /// Parcels below the sliver-area tolerance.
+    pub slivers: Vec<usize>,
+    /// Overlapping parcel pairs.
+    pub overlaps: Vec<OverlapDto>,
+    /// Beacon index pairs closer than the duplicate tolerance.
+    pub duplicate_beacons: Vec<[usize; 2]>,
+    /// Whether the fabric is free of all of the above.
+    pub is_clean: bool,
+}
+
+/// One observed line for the adjustment (bearing in decimal degrees).
+#[derive(Clone, Copy, Debug, Deserialize, ToSchema)]
+pub struct ObservationDto {
+    /// "From" beacon index.
+    pub from: usize,
+    /// "To" beacon index.
+    pub to: usize,
+    /// Measured distance (m).
+    pub distance: f64,
+    /// Measured whole-circle bearing (decimal degrees).
+    pub bearing: f64,
+    /// Distance std-dev (m) for weighting.
+    pub sigma_distance_m: f64,
+    /// Bearing std-dev (arcseconds) for weighting.
+    pub sigma_bearing_sec: f64,
+}
+
+/// Request for a least-squares network adjustment (FR-ADJ-01..03).
+#[derive(Clone, Debug, Deserialize, ToSchema)]
+pub struct AdjustRequest {
+    /// Initial coordinates per beacon.
+    pub coords: Vec<PointDto>,
+    /// Control mask: `true` beacons are held fixed.
+    pub fixed: Vec<bool>,
+    /// Observed lines.
+    pub observations: Vec<ObservationDto>,
+    /// Max iterations (default 50).
+    pub max_iter: Option<usize>,
+    /// Convergence threshold on the largest shift, metres (default 1e-4).
+    pub tol: Option<f64>,
+}
+
+/// One line residual after adjustment.
+#[derive(Clone, Copy, Debug, Serialize, ToSchema)]
+pub struct LineResidualDto {
+    /// Observation index.
+    pub observation: usize,
+    /// Distance residual (m).
+    pub distance_residual: f64,
+    /// Bearing residual (arcseconds).
+    pub bearing_residual_sec: f64,
+}
+
+/// Adjustment result.
+#[derive(Clone, Debug, Serialize, ToSchema)]
+pub struct AdjustResponse {
+    /// Adjusted coordinates (fixed beacons unchanged).
+    pub coords: Vec<PointDto>,
+    /// Per-line residuals.
+    pub residuals: Vec<LineResidualDto>,
+    /// Iterations taken.
+    pub iterations: usize,
+    /// Largest shift in the final iteration (m).
+    pub final_shift: f64,
+    /// Observation indices flagged as likely blunders against the active tolerances.
+    pub blunders: Vec<usize>,
 }
 
 /// Authoritative live-check result (mirrors `cadastre_core::survey::SurveySummary`).

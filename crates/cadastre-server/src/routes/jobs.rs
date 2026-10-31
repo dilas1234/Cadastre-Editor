@@ -6,12 +6,15 @@ use axum::Json;
 use sqlx::Row;
 use uuid::Uuid;
 
+use serde_json::json;
+
 use crate::auth::AuthUser;
 use crate::domain::{resolve_transition, TransitionError};
 use crate::error::{ApiResult, AppError};
-use crate::models::{JobDto, JobEventDto, JobTransition, NewJob};
+use crate::models::{JobDto, JobEventDto, JobTransition, NewJob, PostResult};
 use crate::routes::workflow::{is_unique_violation, load_transition_defs};
 use crate::state::AppState;
+use crate::{audit, numbering};
 
 const JOB_COLS: &str = "id, reference, job_type, title, status, assigned_to, created_by, \
      created_at, updated_at";
@@ -160,8 +163,86 @@ pub async fn transition_job(
     .execute(&mut *tx)
     .await?;
 
+    audit::append(
+        &mut *tx,
+        &user.subject,
+        "transition",
+        "job",
+        Some(&id.to_string()),
+        json!({ "action": req.action, "to": to_stage }),
+    )
+    .await?;
+
     tx.commit().await?;
     Ok(Json(row_to_job(&row)))
+}
+
+/// Post a job: assign official numbers to its draft parcels and mark them active (FR-WF-04/05,
+/// FR-NUM-01). Requires `approver`. Recorded in the hash-chained audit log.
+#[utoipa::path(post, path = "/api/v1/jobs/{id}/post", tag = "jobs",
+    params(("id" = Uuid, Path, description = "Job id")),
+    responses(
+        (status = 200, body = PostResult),
+        (status = 403, description = "Requires approver role"),
+        (status = 404, description = "Job not found"),
+    ))]
+pub async fn post_job(
+    State(state): State<AppState>,
+    user: AuthUser,
+    Path(id): Path<Uuid>,
+) -> ApiResult<Json<PostResult>> {
+    user.require_role("approver")?;
+    load_job(&state, id).await?;
+
+    let mut tx = state.pool.begin().await?;
+    let rows = sqlx::query(
+        "SELECT id, parcel_number FROM cadastre.parcel \
+         WHERE job_id = $1 AND status = 'draft' ORDER BY created_at",
+    )
+    .bind(id)
+    .fetch_all(&mut *tx)
+    .await?;
+
+    let mut parcel_numbers = Vec::with_capacity(rows.len());
+    for row in &rows {
+        let parcel_id: Uuid = row.get("id");
+        let number = match row.get::<Option<String>, _>("parcel_number") {
+            Some(existing) => existing,
+            None => {
+                let seq: i64 = sqlx::query_scalar("SELECT nextval('cadastre.parcel_number_seq')")
+                    .fetch_one(&mut *tx)
+                    .await?;
+                numbering::format_upin(seq)
+            }
+        };
+        sqlx::query(
+            "UPDATE cadastre.parcel \
+             SET parcel_number = $2, status = 'posted', posted_at = now(), \
+                 computed_area = ST_Area(geom), updated_at = now() \
+             WHERE id = $1",
+        )
+        .bind(parcel_id)
+        .bind(&number)
+        .execute(&mut *tx)
+        .await?;
+        parcel_numbers.push(number);
+    }
+
+    audit::append(
+        &mut *tx,
+        &user.subject,
+        "post",
+        "job",
+        Some(&id.to_string()),
+        json!({ "parcels_posted": parcel_numbers.len() as i64 }),
+    )
+    .await?;
+
+    tx.commit().await?;
+    Ok(Json(PostResult {
+        posted: parcel_numbers.len(),
+        parcel_numbers,
+    }))
 }
 
 /// The workflow history of a job, oldest first.

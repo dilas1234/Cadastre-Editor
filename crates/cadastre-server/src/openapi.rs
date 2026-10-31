@@ -3,12 +3,16 @@
 use utoipa::OpenApi;
 
 use crate::models::{
-    AreaCheckDto, BeaconDto, ClosureDto, JobDto, JobEventDto, JobTransition, LegDto, LockDto,
-    NewBeacon, NewJob, NewLock, NewSession, NewStage, NewTransition, ParcelDto, PointDto,
-    SessionDto, StageDto, SurveyCheckRequest, SurveyCheckResponse, SurveyChecksDto, TolerancesDto,
+    AdjustRequest, AdjustResponse, AreaCheckDto, AuditEntryDto, AuditVerifyDto, BeaconDto,
+    ClosureDto, FabricValidateRequest, JobDto, JobEventDto, JobTransition, LegDto, LineResidualDto,
+    LockDto, NewBeacon, NewJob, NewLock, NewParcel, NewSession, NewStage, NewTransition,
+    ObservationDto, OverlapDto, ParcelDto, PointDto, PostResult, SessionDto, StageDto,
+    SurveyCheckRequest, SurveyCheckResponse, SurveyChecksDto, TolerancesDto, TopologyReportDto,
     TransitionDto, WorkflowDto,
 };
-use crate::routes::{beacons, health, jobs, parcels, sessions, survey, tolerances, workflow};
+use crate::routes::{
+    audit, beacons, fabric, health, jobs, parcels, reports, sessions, survey, tolerances, workflow,
+};
 
 /// The generated API description, served at `/api-docs/openapi.json`.
 #[derive(OpenApi)]
@@ -42,6 +46,15 @@ use crate::routes::{beacons, health, jobs, parcels, sessions, survey, tolerances
         sessions::acquire_lock,
         sessions::release_lock,
         survey::check_survey,
+        fabric::validate,
+        fabric::adjust,
+        parcels::create_job_parcel,
+        parcels::search_parcels,
+        jobs::post_job,
+        audit::list_audit,
+        audit::verify_audit,
+        reports::job_report,
+        reports::site_plan,
     ),
     components(schemas(
         TolerancesDto, BeaconDto, NewBeacon, ParcelDto,
@@ -50,6 +63,9 @@ use crate::routes::{beacons, health, jobs, parcels, sessions, survey, tolerances
         SessionDto, NewSession, LockDto, NewLock,
         PointDto, LegDto, SurveyCheckRequest, SurveyCheckResponse,
         ClosureDto, AreaCheckDto, SurveyChecksDto,
+        FabricValidateRequest, TopologyReportDto, OverlapDto,
+        AdjustRequest, AdjustResponse, ObservationDto, LineResidualDto,
+        NewParcel, PostResult, AuditEntryDto, AuditVerifyDto,
     )),
     tags(
         (name = "ops", description = "Liveness and readiness"),
@@ -60,6 +76,9 @@ use crate::routes::{beacons, health, jobs, parcels, sessions, survey, tolerances
         (name = "jobs", description = "Jobs and workflow transitions (FR-JOB-*, FR-WF-02/03)"),
         (name = "sessions", description = "Edit sessions and resource locks"),
         (name = "survey", description = "Live survey closure/area check (FR-COG-02/03)"),
+        (name = "fabric", description = "Topology validation + least-squares adjustment (FR-ADJ-01..04)"),
+        (name = "audit", description = "Hash-chained audit log (NFR-07/11)"),
+        (name = "output", description = "PDF job reports and site plans (FR-OUT-*)"),
     )
 )]
 pub struct ApiDoc;

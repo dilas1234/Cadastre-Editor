@@ -1,9 +1,12 @@
 //! HTTP routing.
 
+pub mod audit;
 pub mod beacons;
+pub mod fabric;
 pub mod health;
 pub mod jobs;
 pub mod parcels;
+pub mod reports;
 pub mod sessions;
 pub mod survey;
 pub mod tolerances;
@@ -30,8 +33,12 @@ pub fn router(state: AppState) -> Router {
         )
         .route("/api/v1/beacons/{id}", get(beacons::get_beacon))
         .route("/api/v1/parcels", get(parcels::list_parcels))
+        .route("/api/v1/parcels/search", get(parcels::search_parcels))
         // Live survey check (FR-COG-02/03)
         .route("/api/v1/survey/check", post(survey::check_survey))
+        // Fabric topology validation + least-squares adjustment (FR-ADJ-01..04)
+        .route("/api/v1/fabric/validate", post(fabric::validate))
+        .route("/api/v1/fabric/adjust", post(fabric::adjust))
         // Workflow configuration (FR-WF-01, FR-ADM-02)
         .route("/api/v1/workflow", get(workflow::get_workflow))
         .route("/api/v1/workflow/stages", post(workflow::create_stage))
@@ -44,6 +51,13 @@ pub fn router(state: AppState) -> Router {
         .route("/api/v1/jobs/{id}", get(jobs::get_job))
         .route("/api/v1/jobs/{id}/transition", post(jobs::transition_job))
         .route("/api/v1/jobs/{id}/events", get(jobs::list_job_events))
+        .route("/api/v1/jobs/{id}/post", post(jobs::post_job))
+        .route("/api/v1/jobs/{id}/parcels", post(parcels::create_job_parcel))
+        .route("/api/v1/jobs/{id}/report.pdf", get(reports::job_report))
+        .route("/api/v1/jobs/{id}/siteplan.pdf", get(reports::site_plan))
+        // Audit log (NFR-07/11)
+        .route("/api/v1/audit", get(audit::list_audit))
+        .route("/api/v1/audit/verify", get(audit::verify_audit))
         // Edit sessions and locks
         .route("/api/v1/sessions", post(sessions::open_session))
         .route(
