@@ -1827,7 +1827,7 @@ function editorMenu() {
     { label: "Save Edits", action: saveEdits, disabled: () => !edit.active },
     "-",
     { label: "Create Features Window", icon: "createFeatures", action: openCreateFeatures },
-    { label: "Edit Sketch Properties…", icon: "sketchProps", action: openSketchProps, disabled: () => !edit.verts.length },
+    { label: "Edit Sketch Properties…", icon: "sketchProps", action: openSketchProps },
     "-",
     { label: "Snapping", checked: () => edit.snapping, action: toggleSnapping },
     "-",
@@ -1943,7 +1943,7 @@ function toggleSnapping() { edit.snapping = !edit.snapping; $("edSnap")?.classLi
 function updateEditorButtons() {
   const set = (id, on) => $(id)?.classList.toggle("disabled", !on);
   const has = edit.verts.length > 0;
-  set("edFinish", canFinishSketch()); set("edDelete", has); set("edProps", has || edit.active);
+  set("edFinish", canFinishSketch()); set("edDelete", has); set("edProps", true);
   $("edSnap")?.classList.toggle("active", edit.snapping);
 }
 
@@ -2006,14 +2006,37 @@ function openSketchProps() {
     tr.addEventListener("click", (ev) => { if (!/INPUT|BUTTON/.test(ev.target.tagName)) { edit.sel = i; drawSketch(); openSketchProps(); } });
     tbl.append(tr);
   });
-  if (!edit.verts.length) tbl.append(h("tr", {}, h("td", { colspan: 4, class: "muted" }, "No sketch. Pick the Sketch tool and click the map.")));
+  if (!edit.verts.length) tbl.append(h("tr", {}, h("td", { colspan: 4, class: "muted" }, "No vertices yet — type a coordinate below, or pick the Sketch tool and click the map.")));
+
+  // Key in a vertex by coordinate (UTM 32N metres). Starting an edit session if needed, this lets
+  // you build a parcel entirely by typing E/N — or seed the first point, then click the rest.
+  const addE = h("input", { type: "number", step: "0.001", placeholder: "Easting", style: "width:92px" });
+  const addN = h("input", { type: "number", step: "0.001", placeholder: "Northing", style: "width:92px" });
+  const last = edit.verts[edit.verts.length - 1];
+  if (last) { addE.value = last[0].toFixed(3); addN.value = last[1].toFixed(3); }
+  else { const c = map.getCenter(); const [cE, cN] = toUTM(c.lng, c.lat); addE.value = cE.toFixed(3); addN.value = cN.toFixed(3); }
+  const addVertex = () => {
+    const e = parseFloat(addE.value), n = parseFloat(addN.value);
+    if (!isFinite(e) || !isFinite(n)) { status("Enter a valid Easting and Northing."); return; }
+    if (!edit.active) startEditing("sketch");
+    if (edit.geomType === "point") { edit.verts = [[e, n]]; } else { edit.verts.push([e, n]); }
+    edit.sel = edit.verts.length - 1;
+    drawSketch(); openSketchProps(); updateEditorButtons();
+    setTimeout(() => $("sketchPropsWin")?.querySelector("input[placeholder='Easting']")?.focus(), 0);
+  };
+  addE.onkeydown = (ev) => { if (ev.key === "Enter") addN.focus(); };
+  addN.onkeydown = (ev) => { if (ev.key === "Enter") addVertex(); };
+
   const body = h("div", {},
     h("div", { class: "muted" }, `${edit.geomType} sketch — ${edit.verts.length} vertex(es), WGS 84 / UTM 32N metres`),
+    subHead("Add vertex by coordinate"),
+    h("div", { class: "frow" }, h("label", {}, "E / N:"), addE, addN, h("button", { class: "btn", style: "min-width:0", onclick: addVertex }, "Add")),
+    subHead("Vertices"),
     tbl,
     h("div", { class: "taskNav" },
       h("button", { class: "btn", disabled: !canFinishSketch(), onclick: finishSketch }, "Finish Sketch"),
       h("button", { class: "btn", disabled: !edit.verts.length, onclick: deleteSketch }, "Delete Sketch")));
-  floatWindow("Edit Sketch Properties", body, { id: "sketchPropsWin", width: 320 });
+  floatWindow("Edit Sketch Properties", body, { id: "sketchPropsWin", width: 340 });
 }
 function refreshSketchProps() { if ($("sketchPropsWin")) openSketchProps(); }
 
