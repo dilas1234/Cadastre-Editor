@@ -31,7 +31,12 @@ fn parse_parcel_line(line: &str) -> Option<RawParcel> {
     Some(RawParcel {
         object_id: f[0].trim().parse().ok()?,
         upin: opt(f[1]),
-        status_code: f[2].trim().parse().ok()?,
+        // A NULL Status (seen on production) becomes code 0, so the row is staged as an
+        // UnknownStatus exception and reported, never silently dropped.
+        status_code: match f[2].trim() {
+            "" => 0,
+            code => code.parse().ok()?,
+        },
         job_id: opt(f[3]),
         plan_no: opt(f[4]),
         cad_zone: opt(f[5]),
@@ -100,5 +105,13 @@ mod tests {
         assert_eq!(bs[0].alias.as_deref(), Some("ABUZ"));
         assert!((bs[0].x - 352440.677).abs() < 1e-3);
         assert!((bs[1].y - 1032578.939).abs() < 1e-3);
+    }
+
+    #[test]
+    fn blank_status_is_kept_as_code_zero_not_dropped() {
+        let ps = parse_parcels("126381|PL000000007201|||||||32632|POLYGON ((0 0, 1 0, 1 1, 0 0))\n");
+        assert_eq!(ps.len(), 1, "a NULL Status row must not be dropped");
+        assert_eq!(ps[0].status_code, 0);
+        assert_eq!(ps[0].upin.as_deref(), Some("PL000000007201"));
     }
 }

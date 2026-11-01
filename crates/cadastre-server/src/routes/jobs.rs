@@ -211,16 +211,44 @@ pub async fn post_job(
     .fetch_all(&mut *tx)
     .await?;
 
+    // Keep the allocator above every UPIN ever issued (imports included) before allocating.
+    sqlx::query("SELECT cadastre.sync_upin_sequence()").execute(&mut *tx).await?;
+
     let mut parcel_numbers = Vec::with_capacity(rows.len());
     for row in &rows {
         let parcel_id: Uuid = row.get("id");
         let number = match row.get::<Option<String>, _>("parcel_number") {
-            Some(existing) => existing,
+            Some(existing) => {
+                sqlx::query(
+                    "INSERT INTO cadastre.issued_upin (upin, source) VALUES ($1, 'posted') \
+                     ON CONFLICT (upin) DO NOTHING",
+                )
+                .bind(&existing)
+                .execute(&mut *tx)
+                .await?;
+                existing
+            }
             None => {
                 let seq: i64 = sqlx::query_scalar("SELECT nextval('cadastre.parcel_number_seq')")
                     .fetch_one(&mut *tx)
                     .await?;
-                numbering::format_upin(seq)
+                let upin = numbering::format_upin(seq);
+                // A newly allocated UPIN must never have been issued before (registry links
+                // to a completed transaction would otherwise move to this parcel).
+                let recorded = sqlx::query(
+                    "INSERT INTO cadastre.issued_upin (upin, source) VALUES ($1, 'posted') \
+                     ON CONFLICT (upin) DO NOTHING",
+                )
+                .bind(&upin)
+                .execute(&mut *tx)
+                .await?
+                .rows_affected();
+                if recorded == 0 {
+                    return Err(AppError::Conflict(format!(
+                        "UPIN {upin} has already been issued; posting stopped so it is not reused"
+                    )));
+                }
+                upin
             }
         };
         sqlx::query(
