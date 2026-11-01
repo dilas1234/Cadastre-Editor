@@ -9,14 +9,18 @@
 //! - Bearings are stored as decimal seconds of arc internally; distances to the millimetre.
 
 pub mod adjust;
+pub mod alignment;
 pub mod area;
 pub mod closure;
 pub mod cogo;
 pub mod crs;
+pub mod curves;
 pub mod error;
 pub mod survey;
 pub mod tolerances;
+pub mod tools;
 pub mod topology;
+pub mod transform;
 pub mod types;
 pub mod units;
 

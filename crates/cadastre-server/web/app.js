@@ -344,6 +344,8 @@ const MENUS = () => ({
     { label: "Site Plan (PDF)", icon: "sitePlan", action: () => openPdf("siteplan"), disabled: () => !state.job },
     { label: "Job Report (PDF)", icon: "report", action: () => openPdf("report"), disabled: () => !state.job },
     "-",
+    { label: "Import Survey / CAD / Attributes…", icon: "addData", action: openImportDialog },
+    "-",
     { label: "Print…", kbd: "Ctrl+P", action: () => window.print() },
     "-",
     { label: "Sign Out", action: () => authLogout(), disabled: () => !auth.cfg?.enabled },
@@ -397,6 +399,7 @@ const MENUS = () => ({
   Geoprocessing: [
     { label: "Validate Fabric (selected / job)…", icon: "validate", action: validateFabric },
     { label: "Survey Closure Check…", icon: "survey", action: () => openTask("survey") },
+    { label: "Computation Tools (35)…", icon: "arcToolbox", action: openComputeTools },
     "-",
     { label: "ArcToolbox", icon: "arcToolbox", disabled: true },
     { label: "Python", icon: "python", disabled: true },
@@ -1266,6 +1269,296 @@ function aboutDialog() {
     h("p", {}, "This software is developed by ", h("b", {}, "Che Dilas Yusuph"), " and ", h("b", {}, "Catherine Wuyep"), "."),
     h("p", { class: "muted" }, `Coordinate system: WGS 1984 UTM Zone 32N (EPSG:32632). Connected as ${state.me ? state.me.username : "—"}.`)), { width: 340 });
 }
+/* =====================================================================================
+ * Survey computation tools (the 35-tool catalogue) and survey/CAD/attribute import.
+ * Both talk to the same `cadastre-core` engine the desktop editor and the server use, so a
+ * bearing, closure or area computed here matches a headless report exactly.
+ * ===================================================================================== */
+const TOOL_CATEGORY_LABELS = {
+  basic: "Basic COGO", intersections: "Intersections", curves: "Curves",
+  area: "Area & adjustment", transformations: "Transformations",
+  geodetic: "Geodetic", "line-utilities": "Line utilities",
+};
+const FIELD_HINTS = {
+  legs: 'JSON legs, e.g. [{"type":"line","bearing_deg":90,"distance":100},{"type":"curve","radius":50,"arc_length":78.54,"chord_bearing_deg":135,"turn":"right"}]',
+  ring: "One point per line: easting,northing (or a JSON array of points).",
+};
+let toolCatalogue = null;
+async function loadToolCatalogue() {
+  if (!toolCatalogue) toolCatalogue = await api("/api/v1/survey/tools");
+  return toolCatalogue;
+}
+function parsePointValue(text) {
+  const t = String(text).trim();
+  if (!t) return undefined;
+  if (t.startsWith("[") || t.startsWith("{")) {
+    const v = JSON.parse(t);
+    const p = Array.isArray(v) ? { x: Number(v[0]), y: Number(v[1]) } : { x: Number(v.x), y: Number(v.y) };
+    if (!isFinite(p.x) || !isFinite(p.y)) throw new Error("point is not numeric");
+    return p;
+  }
+  throw new Error("enter a point as easting,northing or {\"x\":…,\"y\":…}");
+}
+function parsePointsValue(text) {
+  const t = String(text).trim();
+  if (!t) return [];
+  if (t.startsWith("[")) {
+    const rows = JSON.parse(t);
+    if (!Array.isArray(rows)) throw new Error("expected a JSON array of points");
+    return rows.map((row) => {
+      const p = Array.isArray(row) ? { x: Number(row[0]), y: Number(row[1]) } : { x: Number(row.x), y: Number(row.y) };
+      if (!isFinite(p.x) || !isFinite(p.y)) throw new Error("a point in the array is not numeric");
+      return p;
+    });
+  }
+  return t.split(/\n|;/).map((s) => s.trim()).filter(Boolean).map((line) => {
+    const [x, y] = line.split(/[,\s]+/).filter(Boolean).map(Number);
+    if (!isFinite(x) || !isFinite(y)) throw new Error(`bad point line: ${line}`);
+    return { x, y };
+  });
+}
+function toolField(field) {
+  const label = h("label", { title: field.description }, field.name);
+  if (field.kind === "number") {
+    const input = h("input", { type: "number", step: "any", style: "flex:1;min-width:0" });
+    return {
+      name: field.name,
+      el: h("div", { class: "frow" }, label, input),
+      value: () => (input.value.trim() === "" ? undefined : Number(input.value)),
+    };
+  }
+  if (field.kind === "string") {
+    const input = h("input", { type: "text", placeholder: field.description, style: "flex:1;min-width:0" });
+    return {
+      name: field.name,
+      el: h("div", { class: "frow" }, label, input),
+      value: () => (input.value.trim() === "" ? undefined : input.value.trim()),
+    };
+  }
+  if (field.kind === "point") {
+    const x = h("input", { type: "number", step: "any", placeholder: "E", style: "width:110px" });
+    const y = h("input", { type: "number", step: "any", placeholder: "N", style: "width:110px" });
+    const pick = h("button", {
+      class: "btn", style: "min-width:0", title: "Use the current map centre",
+      onclick: () => { const [E, N] = toUTM(map.getCenter().lng, map.getCenter().lat); x.value = E.toFixed(3); y.value = N.toFixed(3); },
+    }, "Map centre");
+    return {
+      name: field.name,
+      el: h("div", { class: "frow", style: "flex-wrap:wrap" }, label, h("span", { class: "muted" }, "E"), x, h("span", { class: "muted" }, "N"), y, pick),
+      value: () => {
+        if (x.value.trim() === "" && y.value.trim() === "") return undefined;
+        const p = { x: Number(x.value), y: Number(y.value) };
+        if (!isFinite(p.x) || !isFinite(p.y)) throw new Error(`${field.name}: enter both easting and northing`);
+        return p;
+      },
+    };
+  }
+  // `points` and `array` both take JSON. Points also accept a simple "easting,northing" line list.
+  const area = h("textarea", {
+    rows: field.kind === "points" ? 4 : 5,
+    placeholder: FIELD_HINTS[field.name] || (field.kind === "points" ? "easting,northing per line" : "JSON array"),
+    style: "width:100%;box-sizing:border-box;font-family:ui-monospace,monospace;font-size:11px",
+  });
+  return {
+    name: field.name,
+    el: h("div", { style: "margin:6px 0" }, h("div", { style: "font-weight:600;margin-bottom:2px" }, field.name),
+      h("div", { class: "muted", style: "font-size:11px;margin-bottom:2px" }, field.description), area),
+    value: () => {
+      const t = area.value.trim();
+      if (!t) return undefined;
+      if (field.kind === "points") return parsePointsValue(t);
+      const v = JSON.parse(t);
+      if (!Array.isArray(v)) throw new Error(`${field.name}: expected a JSON array`);
+      return v;
+    },
+  };
+}
+async function openComputeTools() {
+  const body = h("div", {}, h("p", { class: "muted" }, "Loading tool catalogue…"));
+  floatWindow("Survey Computation Tools", body, { id: "computeWin", width: 660 });
+  let catalogue;
+  try { catalogue = await loadToolCatalogue(); }
+  catch (e) { body.textContent = "Could not load the tool catalogue: " + e.message; return; }
+  body.innerHTML = "";
+
+  const list = h("div", { style: "width:190px;flex:0 0 190px;max-height:64vh;overflow:auto;border-right:1px solid #ddd;padding-right:6px" });
+  const right = h("div", { style: "flex:1;min-width:0" });
+  body.append(h("div", { class: "muted", style: "margin-bottom:5px" },
+    `${catalogue.count} tools. Inputs use EPSG:32632 metres; output is JSON from the shared survey engine.`),
+    h("div", { style: "display:flex;gap:8px;align-items:flex-start" }, list, right));
+
+  const buttons = [];
+  const groups = new Map();
+  for (const tool of catalogue.tools) {
+    if (!groups.has(tool.category)) groups.set(tool.category, []);
+    groups.get(tool.category).push(tool);
+  }
+  for (const [category, tools] of groups) {
+    list.append(h("div", { style: "font-weight:600;margin:7px 0 3px;color:#444" }, TOOL_CATEGORY_LABELS[category] || category));
+    for (const tool of tools) {
+      const b = h("button", { class: "btn", style: "display:block;width:100%;text-align:left;margin:1px 0;min-width:0", title: tool.description, onclick: () => select(tool) }, tool.name);
+      buttons.push([b, tool.id]);
+      list.append(b);
+    }
+  }
+
+  function select(tool) {
+    for (const [b, id] of buttons) b.classList.toggle("active", id === tool.id);
+    const fields = tool.inputs.map(toolField);
+    const result = h("pre", { style: "white-space:pre-wrap;max-height:300px;overflow:auto;margin:8px 0 0;background:#fafafa;border:1px solid #ddd;padding:5px" }, "Run the tool to see its result.");
+    const run = h("button", {
+      class: "btn",
+      onclick: async () => {
+        const input = {};
+        try {
+          for (const f of fields) { const v = f.value(); if (v !== undefined) input[f.name] = v; }
+        } catch (e) { result.textContent = "Input error: " + e.message; return; }
+        run.disabled = true; result.textContent = "Computing…";
+        try {
+          const r = await api(`/api/v1/survey/tools/${tool.id}`, { method: "POST", body: input });
+          result.textContent = JSON.stringify(r.result ?? r, null, 2);
+          status(`${tool.name} computed.`);
+        } catch (e) { result.textContent = "Error: " + e.message; }
+        finally { run.disabled = false; }
+      },
+    }, "Run");
+    right.innerHTML = "";
+    right.append(h("h4", { style: "margin:0 0 2px" }, tool.name),
+      h("div", { class: "muted", style: "margin-bottom:6px" }, tool.description),
+      ...fields.map((f) => f.el),
+      h("div", { class: "muted", style: "font-size:11px;margin-top:6px" }, `Returns: ${tool.output}`),
+      h("div", { class: "frow", style: "margin-top:6px" }, run), result);
+  }
+  select(catalogue.tools[0]);
+}
+
+const readTextFile = (input) => new Promise((resolve, reject) => {
+  const file = input.files && input.files[0];
+  if (!file) { resolve(null); return; }
+  const reader = new FileReader();
+  reader.onload = () => resolve({ name: file.name, text: String(reader.result) });
+  reader.onerror = () => reject(reader.error || new Error(`could not read ${file.name}`));
+  reader.readAsText(file);
+});
+
+function importSummary(result, filename) {
+  if (result.kind === "raster") {
+    const w = result.world, size = w ? `${w.a} × ${w.e}` : "—";
+    return h("div", {},
+      h("p", {}, h("b", {}, `${filename}: raster georeference`)),
+      h("table", {},
+        h("tr", {}, h("th", {}, "CRS"), h("td", {}, result.epsg ? `EPSG:${result.epsg}` : "unknown (no .prj)")),
+        h("tr", {}, h("th", {}, "Pixel size"), h("td", {}, size)),
+        h("tr", {}, h("th", {}, "Top-left centre"), h("td", {}, w ? `${fmt3(w.c)}  ${fmt3(w.f)}` : "—")),
+        h("tr", {}, h("th", {}, "Rotation"), h("td", {}, w && (w.b || w.d) ? "rotated/sheared" : "north-up"))),
+      h("p", { class: "muted" }, "Raster files are referenced through the Catalog; a world file only supplies the pixel-to-map transform."));
+  }
+  const box = h("div", {},
+    h("p", {}, h("b", {}, `${filename}: ${result.format || "survey"}`)),
+    h("p", {}, `${result.points.length} point(s), ${result.boundaries.length} boundary(ies), `
+      + `CRS ${result.crs || (result.epsg ? "EPSG:" + result.epsg : "not stated")}.`));
+  if (result.points.length) {
+    const t = h("table", {}, h("tr", {}, h("th", {}, "Point"), h("th", {}, "Easting"), h("th", {}, "Northing"), h("th", {}, "Code")));
+    for (const p of result.points.slice(0, 25)) t.append(h("tr", {},
+      h("td", {}, p.id), h("td", {}, fmt3(p.point.x)), h("td", {}, fmt3(p.point.y)), h("td", {}, p.code || "")));
+    box.append(t);
+    if (result.points.length > 25) box.append(h("div", { class: "muted" }, `… ${result.points.length - 25} more`));
+  }
+  if (result.boundaries.length) {
+    box.append(h("div", { style: "margin-top:6px;font-weight:600" }, "Boundaries"),
+      h("ul", { style: "margin:2px 0 0 16px;padding:0" }, ...result.boundaries.slice(0, 25).map((b) =>
+        h("li", {}, `${b.id} (${b.kind}) — ${b.ring.length} vertices, ${b.closed ? "closed" : "open"}`))));
+  }
+  for (const [label, list] of [["Warning", result.warnings || []], ["Row issue", result.issues || []]]) {
+    if (list.length) box.append(h("div", { style: "margin-top:6px" }, h("b", {}, `${label}s`),
+      h("ul", { style: "margin:2px 0 0 16px;padding:0" }, ...list.slice(0, 30).map((w) =>
+        h("li", {}, typeof w === "string" ? w : (w.line ? `line ${w.line}: ${w.message}` : JSON.stringify(w)))))));
+  }
+  return box;
+}
+
+function openImportDialog() {
+  const body = h("div");
+  floatWindow("Import Survey / CAD / Attributes", body, { id: "importWin", width: 580 });
+
+  const file = h("input", { type: "file", accept: ".csv,.tsv,.txt,.psv,.dxf,.xml,.landxml,.tfw,.tifw,.jgw,.jpgw,.jpegw,.pgw,.gfw,.bpw,.j2w,.wld" });
+  const crs = h("input", { type: "text", value: "EPSG:32632", style: "width:120px" });
+  const prj = h("input", { type: "file", accept: ".prj" });
+  const join = h("input", { type: "checkbox" });
+  const attrFile = h("input", { type: "file", accept: ".csv,.tsv,.txt,.psv", disabled: true });
+  const keyColumn = h("input", { type: "text", placeholder: "auto (e.g. Point)", style: "width:130px", disabled: true });
+  const out = h("div", { class: "muted" }, "Choose a file to preview. DXF must be saved as ASCII; drawing units and CRS are not reprojected.");
+  const apply = h("button", { class: "btn", disabled: true }, "Import into job");
+  let current = null;
+
+  join.onchange = () => {
+    attrFile.disabled = !join.checked; keyColumn.disabled = !join.checked;
+  };
+
+  const preview = h("button", {
+    class: "btn",
+    onclick: async () => {
+      out.className = ""; out.textContent = "Reading…"; apply.disabled = true; current = null;
+      try {
+        const f = await readTextFile(file);
+        if (!f) { out.className = "muted"; out.textContent = "Choose a file first."; return; }
+        const prjFile = await readTextFile(prj);
+        if (join.checked) {
+          const a = await readTextFile(attrFile);
+          if (!a) { out.textContent = "Choose the attribute table, or clear the join box."; return; }
+          const result = await api("/api/v1/import/attributes", { method: "POST", body: {
+            coordinates: f.text, attributes: a.text,
+            key_column: keyColumn.value.trim() || null, crs: crs.value.trim() || null,
+          } });
+          current = { name: f.name, contents: f.text, crs: crs.value.trim() || null, attributes: a.text, key_column: keyColumn.value.trim() || null };
+          out.innerHTML = ""; out.append(importSummary({ kind: "survey", ...result }, f.name));
+        } else {
+          const result = await api("/api/v1/import/preview", { method: "POST", body: {
+            filename: f.name, contents: f.text, crs: crs.value.trim() || null, prj: prjFile ? prjFile.text : null,
+          } });
+          current = { name: f.name, contents: f.text, crs: crs.value.trim() || null, attributes: null, key_column: null };
+          out.innerHTML = ""; out.append(importSummary(result, f.name));
+          if (result.kind === "raster") current = null;
+        }
+        apply.disabled = !(current && state.job);
+        if (current && !state.job) out.append(h("p", { class: "muted" }, "Pick a Job Area to import these features as drafts."));
+      } catch (e) { out.textContent = "Import preview failed: " + e.message; }
+    },
+  }, "Preview");
+
+  apply.onclick = async () => {
+    if (!current || !state.job) return;
+    apply.disabled = true; out.textContent = "Importing into " + state.job.reference + "…";
+    try {
+      const r = await api(`/api/v1/jobs/${state.job.id}/import`, { method: "POST", body: {
+        filename: current.name, contents: current.contents, crs: current.crs,
+        attributes: current.attributes, key_column: current.key_column,
+      } });
+      await loadDrafts(); buildCatalog();
+      if (state.drafts.features.length) zoomToFC(state.drafts);
+      out.className = "";
+      out.innerHTML = "";
+      out.append(h("p", {}, h("b", {}, `Imported into ${state.job.reference}`)),
+        h("p", {}, `${r.created_parcels} draft parcel(s), ${r.created_beacons} beacon(s).`));
+      if (r.skipped_boundaries?.length) out.append(h("div", { class: "muted" }, `${r.skipped_boundaries.length} boundary(ies) skipped`));
+      if (r.skipped_beacons?.length) out.append(h("div", { class: "muted" }, `${r.skipped_beacons.length} beacon(s) skipped (already present or unnamed)`));
+      for (const w of r.warnings || []) out.append(h("div", { class: "muted" }, w));
+      status(`Imported ${r.created_parcels} parcel(s) and ${r.created_beacons} beacon(s) into ${state.job.reference}.`);
+    } catch (e) { out.textContent = "Import failed: " + e.message; }
+    finally { apply.disabled = !(current && state.job); }
+  };
+
+  body.append(
+    h("p", { class: "muted", style: "margin-top:0" }, "Coordinate lists (CSV/TSV), ASCII DXF, LandXML and raster world files are detected from the file name and contents."),
+    h("div", { class: "frow" }, h("label", {}, "File:"), file),
+    h("div", { class: "frow" }, h("label", {}, "CRS:"), crs, h("span", { class: "muted" }, "assumed only if the file does not state one")),
+    h("div", { class: "frow" }, h("label", {}, "World .prj:"), prj, h("span", { class: "muted" }, "optional, for rasters")),
+    h("div", { class: "frow" }, h("label", {}, "Join table:"), join, attrFile),
+    h("div", { class: "frow" }, h("label", {}, "Key column:"), keyColumn),
+    h("div", { class: "frow", style: "margin-top:8px" }, preview, apply),
+    h("div", { style: "margin-top:8px;background:#fafafa;border:1px solid #ddd;padding:5px;max-height:48vh;overflow:auto" }, out));
+}
+
 async function attributeTable(l) {
   const fc = { parcels: state.parcels, jobsArea: state.drafts, ctrl: state.beacons }[l.id] || empty();
   const fs = fc.features.slice(0, 500);

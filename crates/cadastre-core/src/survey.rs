@@ -123,11 +123,12 @@ impl SurveySession {
     pub fn summary(&self, tolerances: &Tolerances) -> SurveySummary {
         let traverse = self.traverse();
         let vertices = cogo::traverse_points(&traverse);
-        let perimeter = cogo::traverse_length(&traverse);
+        let perimeter = area::traverse_perimeter(&traverse);
 
-        // `closure` needs >= 1 leg; `polygon_area` needs >= 3 distinct vertices.
+        // `closure` needs >= 1 leg; `traverse_area` needs >= 3 distinct vertices and adds the
+        // circular-segment area of curved legs.
         let closure = closure::closure(&traverse).ok();
-        let area = area::polygon_area(&vertices).ok();
+        let area = area::traverse_area(&traverse).ok();
         let area_check = match (area, self.stated_area) {
             (Some(computed), Some(stated)) => Some(area::area_check(computed, stated)),
             _ => None,

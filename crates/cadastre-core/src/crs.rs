@@ -111,6 +111,28 @@ impl TransverseMercator {
             - (35.0 * e6 / 3072.0) * (6.0 * phi).sin())
     }
 
+    /// Grid point scale factor at a geographic position (unitless).
+    ///
+    /// This is the factor by which a ground distance must be multiplied to obtain the grid
+    /// distance at that latitude/longitude (before any elevation/geoid correction). Uses the
+    /// standard Transverse Mercator series to sixth order in longitude from the central meridian.
+    pub fn point_scale_factor(&self, lat: f64, lon: f64) -> f64 {
+        let ep2 = self.ellipsoid.ep2();
+        let (sin_phi, cos_phi) = lat.sin_cos();
+        let tan_phi = sin_phi / cos_phi;
+        let t = tan_phi * tan_phi;
+        let c = ep2 * cos_phi * cos_phi;
+        let a = (lon - self.lon_origin) * cos_phi;
+        let a2 = a * a;
+        let a4 = a2 * a2;
+        let a6 = a4 * a2;
+        self.k0
+            * (1.0
+                + (1.0 + c) * a2 / 2.0
+                + (5.0 - 4.0 * t + 42.0 * c + 13.0 * c * c - 28.0 * ep2) * a4 / 24.0
+                + (61.0 - 148.0 * t + 16.0 * t * t) * a6 / 720.0)
+    }
+
     /// Project geographic coordinates (radians) to grid easting/northing (metres).
     pub fn forward(&self, lat: f64, lon: f64) -> Point {
         let a = self.ellipsoid.a;
@@ -313,6 +335,12 @@ impl WorkingCrs {
     pub fn unproject_deg(&self, grid: Point) -> (f64, f64) {
         let (lat, lon) = self.projection.inverse(grid);
         (lat.to_degrees(), lon.to_degrees())
+    }
+
+    /// Grid point scale factor at a local-datum geographic position (decimal degrees).
+    pub fn point_scale_factor_deg(&self, lat_deg: f64, lon_deg: f64) -> f64 {
+        self.projection
+            .point_scale_factor(lat_deg.to_radians(), lon_deg.to_radians())
     }
 
     /// Convert a grid point (Minna) to WGS 84 latitude/longitude (decimal degrees).

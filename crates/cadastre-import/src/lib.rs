@@ -12,12 +12,18 @@
 //! - the PostGIS staging-load writer ([`sink`], feature `sink`) writes validated records and the
 //!   exceptions report into an `import` schema, testable against a local PostGIS on its own.
 
+pub mod conversion;
+pub mod dxf;
 pub mod exceptions;
 pub mod file_source;
 pub mod geometry;
+pub mod landxml;
 pub mod model;
 pub mod sde;
 pub mod status;
+pub mod tabular;
+pub mod worldfile;
+pub mod xml;
 
 #[cfg(feature = "source")]
 pub mod client;

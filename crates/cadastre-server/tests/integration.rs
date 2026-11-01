@@ -791,6 +791,284 @@ async fn search_finds_a_parcel_by_its_short_plot_number() {
     }
 }
 
+// ---- Survey computation tools and survey/CAD/attribute import ----
+//
+// The editor, the headless reports and these endpoints must all run the same engine. These
+// tests drive the HTTP surface and check it returns exactly what `cadastre-core` computes.
+
+#[tokio::test]
+async fn survey_tool_catalogue_and_execution() {
+    let Some(db_url) = test_db_url() else {
+        eprintln!("skipping: CADASTRE_TEST_DATABASE_URL not set");
+        return;
+    };
+    let app = routes::router(state_with(AuthMode::Disabled, None, &db_url).await);
+
+    let (st, catalogue) = send(&app, "GET", "/api/v1/survey/tools", None, None).await;
+    assert_eq!(st, StatusCode::OK, "{catalogue}");
+    assert_eq!(catalogue["count"], 35);
+    let tools = catalogue["tools"].as_array().unwrap();
+    assert_eq!(tools.len(), 35);
+    assert!(tools.iter().any(|t| t["id"] == "inverse"));
+
+    let (st, spec) = send(&app, "GET", "/api/v1/survey/tools/inverse", None, None).await;
+    assert_eq!(st, StatusCode::OK, "{spec}");
+    assert_eq!(spec["category"], "basic");
+
+    let (st, run) = send(
+        &app,
+        "POST",
+        "/api/v1/survey/tools/inverse",
+        None,
+        Some(json!({"from": {"x": 0.0, "y": 0.0}, "to": {"x": 100.0, "y": 100.0}})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{run}");
+    assert_eq!(run["tool"], "inverse");
+    let distance = run["result"]["distance"].as_f64().unwrap();
+    assert!((distance - 20_000.0f64.sqrt()).abs() < 1e-9, "{distance}");
+    let bearing = run["result"]["bearing_deg"].as_f64().unwrap();
+    assert!((bearing - 45.0).abs() < 1e-9, "{bearing}");
+
+    let (st, _) = send(&app, "GET", "/api/v1/survey/tools/no-such-tool", None, None).await;
+    assert_eq!(st, StatusCode::NOT_FOUND);
+    let (st, _) = send(
+        &app,
+        "POST",
+        "/api/v1/survey/tools/inverse",
+        None,
+        Some(json!({"from": {"x": 0.0, "y": 0.0}})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::BAD_REQUEST, "incomplete input must be rejected");
+}
+
+#[tokio::test]
+async fn import_preview_agrees_across_coordinate_cad_and_landxml() {
+    let Some(db_url) = test_db_url() else {
+        eprintln!("skipping: CADASTRE_TEST_DATABASE_URL not set");
+        return;
+    };
+    let app = routes::router(state_with(AuthMode::Disabled, None, &db_url).await);
+
+    let csv = "Point,Easting,Northing,Code\n\
+               1,352440.677,1233094.048,BC\n\
+               2,352440.677,1233144.048,BC\n\
+               3,352540.677,1233144.048,BC\n\
+               4,352540.677,1233094.048,BC\n";
+    let (st, preview) = send(
+        &app,
+        "POST",
+        "/api/v1/import/preview",
+        None,
+        Some(json!({"filename": "parcel.csv", "contents": csv, "crs": "EPSG:32632"})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{preview}");
+    assert_eq!(preview["kind"], "survey");
+    assert_eq!(preview["format"], "coordinates");
+    assert_eq!(preview["points"].as_array().unwrap().len(), 4);
+    assert_eq!(preview["points"][0]["point"]["x"], 352440.677);
+
+    let landxml = r#"<?xml version="1.0"?>
+<LandXML xmlns="http://www.landxml.org/schema/LandXML-1.2" version="1.2">
+  <CoordinateSystem name="WGS 84 / UTM zone 32N" epsgCode="32632"/>
+  <CgPoints>
+    <CgPoint name="1" code="BC">1233094.048 352440.677</CgPoint>
+    <CgPoint name="2" code="BC">1233144.048 352440.677</CgPoint>
+  </CgPoints>
+  <Parcels>
+    <Parcel name="PL-1" area="5000">
+      <CoordGeom>
+        <Line><Start>1233094.048 352440.677</Start><End>1233144.048 352440.677</End></Line>
+        <Line><Start>1233144.048 352440.677</Start><End>1233144.048 352540.677</End></Line>
+        <Line><Start>1233144.048 352540.677</Start><End>1233094.048 352540.677</End></Line>
+        <Line><Start>1233094.048 352540.677</Start><End>1233094.048 352440.677</End></Line>
+      </CoordGeom>
+    </Parcel>
+  </Parcels>
+</LandXML>"#;
+    let (st, preview) = send(
+        &app,
+        "POST",
+        "/api/v1/import/preview",
+        None,
+        Some(json!({"filename": "parcel.xml", "contents": landxml})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{preview}");
+    assert_eq!(preview["epsg"], 32632);
+    assert_eq!(preview["boundaries"][0]["closed"], true);
+    let ring = preview["boundaries"][0]["ring"].as_array().unwrap();
+    assert_eq!(ring.len(), 4);
+    // Northing/easting in the file, easting/northing on the wire.
+    assert_eq!(ring[0]["x"], 352440.677);
+    assert_eq!(ring[0]["y"], 1233094.048);
+
+    let (st, raster) = send(
+        &app,
+        "POST",
+        "/api/v1/import/preview",
+        None,
+        Some(json!({
+            "filename": "ortho.tfw",
+            "contents": "0.5\n0\n0\n-0.5\n352440.25\n1233094.75\n",
+            "prj": "PROJCS[\"WGS 84 / UTM zone 32N\",AUTHORITY[\"EPSG\",\"32632\"]]"
+        })),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{raster}");
+    assert_eq!(raster["kind"], "raster");
+    assert_eq!(raster["epsg"], 32632);
+    assert_eq!(raster["world"]["e"], -0.5);
+
+    let (st, _) = send(
+        &app,
+        "POST",
+        "/api/v1/import/preview",
+        None,
+        Some(json!({"filename": "mystery.xyz", "contents": "not a survey"})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::BAD_REQUEST);
+}
+
+#[tokio::test]
+async fn attribute_join_and_job_import_create_drafts() {
+    let Some(db_url) = test_db_url() else {
+        eprintln!("skipping: CADASTRE_TEST_DATABASE_URL not set");
+        return;
+    };
+    let app = routes::router(state_with(AuthMode::Disabled, None, &db_url).await);
+
+    // Unique beacon numbers and coordinates so repeated runs never collide with earlier data.
+    let tag = Uuid::new_v4().simple().to_string();
+    let ids: Vec<String> = (0..4).map(|i| format!("T{tag}{i}")).collect();
+    let mut easting = 600_000.0 + (Uuid::new_v4().as_u128() % 1000) as f64;
+    let northing = 4_000_000.0;
+    easting = easting.round();
+    let corners = [
+        (easting, northing),
+        (easting, northing + 50.0),
+        (easting + 100.0, northing + 50.0),
+        (easting + 100.0, northing),
+    ];
+    let mut csv = String::from("Point,Easting,Northing,Code\n");
+    for (id, (x, y)) in ids.iter().zip(corners.iter()) {
+        csv.push_str(&format!("{id},{x},{y},BC\n"));
+    }
+    let mut attrs = String::from("Point,Owner\n");
+    for id in &ids {
+        attrs.push_str(&format!("{id},Owner {id}\n"));
+    }
+
+    let (st, joined) = send(
+        &app,
+        "POST",
+        "/api/v1/import/attributes",
+        None,
+        Some(json!({
+            "coordinates": csv,
+            "attributes": attrs,
+            "key_column": "Point",
+            "crs": "EPSG:32632"
+        })),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{joined}");
+    assert_eq!(joined["points"].as_array().unwrap().len(), 4);
+    assert_eq!(joined["points"][0]["attributes"]["Owner"], format!("Owner {}", ids[0]));
+    assert_eq!(joined["points"][0]["attributes"]["Code"], "BC");
+    assert!(joined["warnings"].as_array().unwrap().is_empty(), "{joined}");
+
+    let reference = format!("IMPORT-{}", Uuid::new_v4());
+    let (st, job) = send(
+        &app,
+        "POST",
+        "/api/v1/jobs",
+        None,
+        Some(json!({"reference": reference, "job_type": "capture"})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::CREATED, "{job}");
+    let job_id = job["id"].as_str().unwrap().to_string();
+
+    // A DXF boundary becomes one draft parcel.
+    let dxf = format!(
+        "0\nSECTION\n2\nENTITIES\n0\nLWPOLYLINE\n8\nPARCEL\n90\n4\n70\n1\n\
+         10\n{easting}\n20\n{northing}\n\
+         10\n{easting}\n20\n{}\n\
+         10\n{}\n20\n{}\n\
+         10\n{}\n20\n{northing}\n\
+         0\nENDSEC\n0\nEOF\n",
+        northing + 50.0,
+        easting + 100.0,
+        northing + 50.0,
+        easting + 100.0
+    );
+    let (st, imported) = send(
+        &app,
+        "POST",
+        &format!("/api/v1/jobs/{job_id}/import"),
+        None,
+        Some(json!({"filename": "parcel.dxf", "contents": dxf})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::CREATED, "{imported}");
+    assert_eq!(imported["created_parcels"], 1);
+
+    // The coordinate list (with attribute join) becomes four beacons.
+    let (st, imported) = send(
+        &app,
+        "POST",
+        &format!("/api/v1/jobs/{job_id}/import"),
+        None,
+        Some(json!({
+            "filename": "beacons.csv",
+            "contents": csv,
+            "attributes": attrs,
+            "key_column": "Point",
+            "crs": "EPSG:32632"
+        })),
+    )
+    .await;
+    assert_eq!(st, StatusCode::CREATED, "{imported}");
+    assert_eq!(imported["created_beacons"], 4);
+    assert_eq!(imported["created_parcels"], 0);
+    assert!(imported["skipped_beacons"].as_array().unwrap().is_empty(), "{imported}");
+
+    // The draft parcel is visible in the job's draft fabric with its computed area.
+    let (st, drafts) = send(
+        &app,
+        "GET",
+        &format!("/api/v1/parcels.geojson?status=draft&limit=50&job={job_id}"),
+        None,
+        None,
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{drafts}");
+    let features = drafts["features"].as_array().unwrap();
+    assert_eq!(features.len(), 1);
+    let computed = features[0]["properties"]["computed_area"]
+        .as_f64()
+        .or_else(|| features[0]["properties"]["area"].as_f64());
+    assert!(
+        computed.map(|a| (a - 5000.0).abs() < 0.01).unwrap_or(false),
+        "draft parcel area: {computed:?} in {drafts}"
+    );
+
+    // A raster world file cannot become job geometry.
+    let (st, _) = send(
+        &app,
+        "POST",
+        &format!("/api/v1/jobs/{job_id}/import"),
+        None,
+        Some(json!({"filename": "ortho.tfw", "contents": "0.5\n0\n0\n-0.5\n0\n0\n"})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::BAD_REQUEST);
+}
+
 /// The Aumentum workflow engine over HTTP: a job type shaped like Aumentum's "Deed Plan
 /// Creationv2" (branch at the start, a review that can send work back, an end task).
 #[tokio::test]

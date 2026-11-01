@@ -11,8 +11,8 @@ use crate::models::{
     TopologyReportDto, TransitionDto, WorkflowDto,
 };
 use crate::routes::{
-    audit, beacons, catalog, fabric, health, jobs, me, parcels, promote, reports, sessions, survey, tolerances,
-    workflow,
+    audit, beacons, catalog, fabric, health, import, jobs, me, parcels, promote, reports, sessions, survey,
+    survey_tools, tolerances, workflow,
 };
 
 /// The generated API description, served at `/api-docs/openapi.json`.
@@ -63,6 +63,12 @@ use crate::routes::{
         sessions::acquire_lock,
         sessions::release_lock,
         survey::check_survey,
+        survey_tools::list_tools,
+        survey_tools::get_tool,
+        survey_tools::execute_tool,
+        import::preview,
+        import::attributes,
+        import::import_into_job,
         fabric::validate,
         fabric::adjust,
         parcels::create_job_parcel,
@@ -93,6 +99,8 @@ use crate::routes::{
         FabricValidateRequest, TopologyReportDto, OverlapDto,
         AdjustRequest, AdjustResponse, ObservationDto, LineResidualDto,
         NewParcel, PostResult, AuditEntryDto, AuditVerifyDto, PromoteResult,
+        crate::routes::import::PreviewRequest, crate::routes::import::AttributeImportRequest,
+        crate::routes::import::JobImportRequest,
     )),
     tags(
         (name = "ops", description = "Liveness and readiness"),

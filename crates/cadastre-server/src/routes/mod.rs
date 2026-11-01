@@ -6,6 +6,7 @@ pub mod catalog;
 pub mod editor;
 pub mod fabric;
 pub mod health;
+pub mod import;
 pub mod jobs;
 pub mod me;
 pub mod parcels;
@@ -13,6 +14,7 @@ pub mod promote;
 pub mod reports;
 pub mod sessions;
 pub mod survey;
+pub mod survey_tools;
 pub mod tolerances;
 pub mod viewer;
 pub mod wf;
@@ -80,6 +82,12 @@ pub fn router(state: AppState) -> Router {
         .route("/api/v1/parcels/search", get(parcels::search_parcels))
         // Live survey check (FR-COG-02/03)
         .route("/api/v1/survey/check", post(survey::check_survey))
+        // The 35 computation tools (COGO, curves, area, transformations, geodetic)
+        .route("/api/v1/survey/tools", get(survey_tools::list_tools))
+        .route(
+            "/api/v1/survey/tools/{id}",
+            get(survey_tools::get_tool).post(survey_tools::execute_tool),
+        )
         // Fabric topology validation + least-squares adjustment (FR-ADJ-01..04)
         .route("/api/v1/fabric/validate", post(fabric::validate))
         .route("/api/v1/fabric/adjust", post(fabric::adjust))
@@ -104,6 +112,10 @@ pub fn router(state: AppState) -> Router {
         .route("/api/v1/audit/verify", get(audit::verify_audit))
         // Import promotion (Phase 8)
         .route("/api/v1/import/promote/{run_id}", post(promote::promote_run))
+        // Survey/CAD/attribute/world-file import (preview then apply to a job)
+        .route("/api/v1/import/preview", post(import::preview))
+        .route("/api/v1/import/attributes", post(import::attributes))
+        .route("/api/v1/jobs/{id}/import", post(import::import_into_job))
         // Edit sessions and locks
         .route("/api/v1/sessions", post(sessions::open_session))
         .route(
