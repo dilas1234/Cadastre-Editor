@@ -254,3 +254,10 @@ table.legs tr.selrow td { background: #fff6cf; }
 .wfStepBtn { min-width: 0; padding: 0 8px; }
 .wfStepNote { font-size: 11px; white-space: nowrap; }
 .wfEditing { border-top: 1px solid #e3e3e3; margin-top: 6px; }
+
+/* notify(): a message over the map that cannot be missed */
+.toast { position: fixed; left: 50%; bottom: 46px; transform: translateX(-50%); z-index: 9999; max-width: min(640px, calc(100vw - 32px));
+  padding: 9px 16px; border-radius: 4px; font-size: 13px; color: #fff; background: #1f6f2b; box-shadow: 0 3px 12px rgba(0,0,0,.35); transition: opacity 1s; }
+.toast.warn { background: #9a5a00; }
+.toast.err { background: #a01818; }
+.toast.fade { opacity: 0; }

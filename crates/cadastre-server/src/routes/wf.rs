@@ -749,6 +749,8 @@ pub struct WfAreaBody {
 pub struct WfCommitDto {
     /// UPINs given to the committed parcels.
     pub parcel_numbers: Vec<String>,
+    /// Beacon numbers added to the fabric (as typed by the officer).
+    pub beacons_added: Vec<String>,
     pub editing: WfEditingDto,
 }
 
@@ -975,8 +977,14 @@ pub async fn discard(State(state): State<AppState>, user: AuthUser, Path(id): Pa
 /// parcel fabric). Only from a commit task. Each parcel receives its UPIN; with
 /// `editor.allow_overlap` = 0 (Aumentum's setting) a parcel overlapping the fabric is refused.
 #[utoipa::path(post, path = "/api/v1/wf/jobs/{id}/commit", tag = "wf", params(("id" = i32, Path, description = "Job instance id")),
-    responses((status = 200, body = WfCommitDto), (status = 409, description = "Not a commit task, nothing to commit, or overlaps")))]
-pub async fn commit(State(state): State<AppState>, user: AuthUser, Path(id): Path<i32>) -> ApiResult<Json<WfCommitDto>> {
+    request_body(content = crate::routes::wfbeacons::WfCommitRequest, description = "Beacon numbers typed for the new corners (optional body)"),
+    responses((status = 200, body = WfCommitDto), (status = 409, description = "Not a commit task, nothing to commit, overlaps, or beacon numbers missing / already used")))]
+pub async fn commit(State(state): State<AppState>, user: AuthUser, Path(id): Path<i32>, body: axum::body::Bytes) -> ApiResult<Json<WfCommitDto>> {
+    let req: crate::routes::wfbeacons::WfCommitRequest = if body.iter().all(u8::is_ascii_whitespace) {
+        Default::default()
+    } else {
+        serde_json::from_slice(&body).map_err(|e| AppError::BadRequest(format!("invalid commit request: {e}")))?
+    };
     let actor = resolve_actor(&state, &user).await?;
     let mut tx = state.pool.begin().await?;
     let cur = lock_open_job(&mut tx, id, &actor).await?;
@@ -1003,11 +1011,12 @@ pub async fn commit(State(state): State<AppState>, user: AuthUser, Path(id): Pat
             return Err(AppError::Conflict(format!("parcels may not overlap the fabric (Editor.AllowOverlap = 0); overlaps: {}", clashes.join(", "))));
         }
     }
+    let beacons = crate::routes::wfbeacons::apply(&mut tx, job_id, &req).await?;
     let numbers = crate::routes::jobs::post_drafts(&mut tx, job_id).await?;
     sqlx::query("UPDATE cadastre.wf_job_instance SET updated = now()::timestamp WHERE id = $1").bind(id).execute(&mut *tx).await?;
-    audit::append(&mut tx, &actor.label, "wf_commit", "wf_job_instance", Some(&id.to_string()), json!({ "parcel_numbers": numbers })).await?;
+    audit::append(&mut tx, &actor.label, "wf_commit", "wf_job_instance", Some(&id.to_string()), json!({ "parcel_numbers": numbers, "beacons_added": beacons })).await?;
     tx.commit().await?;
-    Ok(Json(WfCommitDto { parcel_numbers: numbers, editing: editing_info(&state, id).await? }))
+    Ok(Json(WfCommitDto { parcel_numbers: numbers, beacons_added: beacons, editing: editing_info(&state, id).await? }))
 }
 
 #[derive(Deserialize, ToSchema)]

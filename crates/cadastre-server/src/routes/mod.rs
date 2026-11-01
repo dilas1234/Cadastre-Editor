@@ -4,6 +4,7 @@ pub mod audit;
 pub mod beacons;
 pub mod catalog;
 pub mod editor;
+pub mod fci;
 pub mod fabric;
 pub mod health;
 pub mod import;
@@ -19,6 +20,7 @@ pub mod tolerances;
 pub mod viewer;
 pub mod wf;
 pub mod wfadmin;
+pub mod wfbeacons;
 pub mod workflow;
 
 use axum::routing::{delete, get, post, put};
@@ -47,6 +49,7 @@ pub fn router(state: AppState) -> Router {
         .route("/api/v1/wf/jobs/{id}/assign", post(wf::assign))
         .route("/api/v1/wf/jobs/{id}/hold", post(wf::hold))
         .route("/api/v1/wf/jobs/{id}/editing", get(wf::get_editing).post(wf::start_editing))
+        .route("/api/v1/wf/jobs/{id}/editing/corners", get(wfbeacons::corners))
         .route("/api/v1/wf/jobs/{id}/area", put(wf::put_area).delete(wf::delete_area))
         .route("/api/v1/wf/jobs/{id}/area/{action}", post(wf::area_action))
         .route("/api/v1/wf/jobs/{id}/discard", post(wf::discard))
@@ -77,6 +80,7 @@ pub fn router(state: AppState) -> Router {
             "/api/v1/beacons",
             get(beacons::list_beacons).post(beacons::create_beacon),
         )
+        .route("/api/v1/beacons/search", get(beacons::search_beacons))
         .route("/api/v1/beacons/{id}", get(beacons::get_beacon))
         .route("/api/v1/parcels", get(parcels::list_parcels))
         .route("/api/v1/parcels/search", get(parcels::search_parcels))
@@ -105,6 +109,8 @@ pub fn router(state: AppState) -> Router {
         .route("/api/v1/jobs/{id}/events", get(jobs::list_job_events))
         .route("/api/v1/jobs/{id}/post", post(jobs::post_job))
         .route("/api/v1/jobs/{id}/parcels", post(parcels::create_job_parcel))
+        .route("/api/v1/jobs/{id}/parcels/{parcel_id}", put(parcels::update_job_parcel).delete(parcels::delete_job_parcel))
+        .route("/api/v1/jobs/{id}/parcels/{parcel_id}/separate", post(parcels::separate_job_parcel))
         .route("/api/v1/jobs/{id}/report.pdf", get(reports::job_report))
         .route("/api/v1/jobs/{id}/siteplan.pdf", get(reports::site_plan))
         // Audit log (NFR-07/11)
@@ -116,6 +122,7 @@ pub fn router(state: AppState) -> Router {
         .route("/api/v1/import/preview", post(import::preview))
         .route("/api/v1/import/attributes", post(import::attributes))
         .route("/api/v1/jobs/{id}/import", post(import::import_into_job))
+        .route("/api/v1/jobs/{id}/import/feature-class", post(fci::import_feature_class))
         // Edit sessions and locks
         .route("/api/v1/sessions", post(sessions::open_session))
         .route(

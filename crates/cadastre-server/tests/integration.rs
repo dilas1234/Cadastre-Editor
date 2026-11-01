@@ -9,7 +9,7 @@ use std::sync::Arc;
 use axum::body::{Body, to_bytes};
 use axum::http::{header, Request, StatusCode};
 use axum::Router;
-use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+use base64::engine::general_purpose::{STANDARD, URL_SAFE_NO_PAD};
 use base64::Engine;
 use serde_json::{json, Value};
 use tower::ServiceExt;
@@ -789,6 +789,17 @@ async fn search_finds_a_parcel_by_its_short_plot_number() {
         assert_eq!(st, StatusCode::OK);
         assert_eq!(found[0]["parcel_number"], upin, "typed {typed:?}: exact UPIN must rank first: {found}");
     }
+
+    // The Registry property number on the map label finds the parcel too, spaces and case aside.
+    let pool = sqlx::PgPool::connect(&db_url).await.unwrap();
+    let prop = format!("PL{}", rand_12() % 1_000_000 + 9_000_000);
+    sqlx::query("INSERT INTO cadastre.parcel_attribute (object_id, upin, property_number, status) VALUES ($1, $2, $3, '0')")
+        .bind(-((rand_12() % 1_000_000_000) as i32) - 1).bind(&upin).bind(&prop).execute(&pool).await.unwrap();
+    for typed in [prop.clone(), prop.to_lowercase(), format!("PL {}", &prop[2..])] {
+        let (st, found) = send(&app, "GET", &format!("/api/v1/parcels/search?number={}", typed.replace(' ', "%20")), None, None).await;
+        assert_eq!(st, StatusCode::OK);
+        assert_eq!(found[0]["parcel_number"], upin, "typed property number {typed:?}: {found}");
+    }
 }
 
 // ---- Survey computation tools and survey/CAD/attribute import ----
@@ -1198,6 +1209,21 @@ async fn job_editing_follows_job_area_and_commit_rules() {
     let (st, _) = draft(x0 + 50.0, 20.0).await;
     assert_eq!(st, StatusCode::CREATED);
 
+    // Edit Vertices on a saved draft: moved inside the area is saved, outside is refused with
+    // Aumentum's message; a draft can be deleted; posted parcels are not drafts.
+    let (st, extra) = draft(x0 + 100.0, 20.0).await;
+    assert_eq!(st, StatusCode::CREATED);
+    let extra_url = format!("{draft_url}/{}", extra["id"].as_str().unwrap());
+    let (st, moved) = send(&app, "PUT", &extra_url, None, Some(json!({"geometry": square(x0 + 120.0, y0 + 30.0, 25.0)}))).await;
+    assert_eq!(st, StatusCode::OK, "{moved}");
+    let (st, r) = send(&app, "PUT", &extra_url, None, Some(json!({"geometry": square(x0 + 190.0, y0 + 30.0, 25.0)}))).await;
+    assert_eq!(st, StatusCode::CONFLICT, "{r}");
+    assert_eq!(r["message"], cadastre_server::routes::wf::OUTSIDE_JOB_AREA);
+    let (st, _) = send(&app, "DELETE", &extra_url, None, None).await;
+    assert_eq!(st, StatusCode::NO_CONTENT);
+    let (st, _) = send(&app, "DELETE", &extra_url, None, None).await;
+    assert_eq!(st, StatusCode::NOT_FOUND);
+
     let (st, _) = send(&app, "POST", &format!("/api/v1/wf/jobs/{id}/commit"), None, None).await;
     assert_eq!(st, StatusCode::CONFLICT, "commit only at the commit task");
     let (_, _) = send(&app, "POST", &format!("/api/v1/wf/jobs/{id}/advance"), None, Some(json!({}))).await;
@@ -1215,10 +1241,44 @@ async fn job_editing_follows_job_area_and_commit_rules() {
     assert!(r["message"].as_str().unwrap().contains(&blocker));
     sqlx::query("DELETE FROM cadastre.parcel WHERE parcel_number = $1").bind(&blocker).execute(&pool).await.unwrap();
 
-    let (st, c) = send(&app, "POST", &format!("/api/v1/wf/jobs/{id}/commit"), None, None).await;
+    // Beacon numbers are typed by the officer at commit, never generated. One corner lies on a
+    // fabric beacon already (a shared pillar): it keeps that beacon's number.
+    let tag = format!("B{}", rand_12() % 100_000_000);
+    let (st, _) = send(&app, "POST", "/api/v1/beacons", None,
+        Some(json!({"number": format!("{tag}X"), "easting": x0 + 10.0, "northing": y0 + 10.0}))).await;
+    assert_eq!(st, StatusCode::CREATED);
+    let (st, pts) = send(&app, "GET", &format!("/api/v1/wf/jobs/{id}/editing/corners"), None, None).await;
+    assert_eq!(st, StatusCode::OK, "{pts}");
+    let pts = pts.as_array().unwrap().clone();
+    assert_eq!(pts.len(), 8, "two separate squares: 8 corner points");
+    assert_eq!(pts.iter().filter(|p| p["beacon_number"] == format!("{tag}X")).count(), 1, "the shared pillar keeps its number");
+    let new_pts: Vec<&Value> = pts.iter().filter(|p| p["beacon_id"].is_null()).collect();
+    let typed = |numbers: Vec<String>| json!({"beacons": new_pts.iter().zip(numbers).map(|(p, n)| json!({"easting": p["easting"], "northing": p["northing"], "number": n})).collect::<Vec<_>>()});
+
+    let (st, r) = send(&app, "POST", &format!("/api/v1/wf/jobs/{id}/commit"), None, None).await;
+    assert_eq!(st, StatusCode::CONFLICT, "no beacon numbers typed: {r}");
+    assert!(r["message"].as_str().unwrap().contains("beacon number of every corner"), "{r}");
+    let mut numbers: Vec<String> = (1..=7).map(|i| format!("{tag}-{i}")).collect();
+    numbers[6] = numbers[5].clone();
+    let (st, r) = send(&app, "POST", &format!("/api/v1/wf/jobs/{id}/commit"), None, Some(typed(numbers.clone()))).await;
+    assert_eq!(st, StatusCode::BAD_REQUEST, "one number for two corners: {r}");
+    numbers[6] = format!("{tag}x").to_lowercase().to_uppercase(); // the pillar's number, used elsewhere
+    let (st, r) = send(&app, "POST", &format!("/api/v1/wf/jobs/{id}/commit"), None, Some(typed(numbers.clone()))).await;
+    assert_eq!(st, StatusCode::CONFLICT, "a number already in the fabric elsewhere: {r}");
+    assert!(r["message"].as_str().unwrap().contains("already exists"), "{r}");
+    numbers[6] = format!("{tag}-7");
+
+    let (st, c) = send(&app, "POST", &format!("/api/v1/wf/jobs/{id}/commit"), None, Some(typed(numbers.clone()))).await;
     assert_eq!(st, StatusCode::OK, "{c}");
     assert_eq!(c["parcel_numbers"].as_array().unwrap().len(), 2);
+    assert_eq!(c["beacons_added"].as_array().unwrap().len(), 7, "{c}");
     assert_eq!(c["editing"]["drafts"], 0);
+    let linked: i64 = sqlx::query_scalar("SELECT count(*) FROM cadastre.parcel_corner pc JOIN cadastre.parcel p ON p.id = pc.parcel_id WHERE p.parcel_number = ANY($1)")
+        .bind(c["parcel_numbers"].as_array().unwrap().iter().map(|v| v.as_str().unwrap().to_string()).collect::<Vec<_>>())
+        .fetch_one(&pool).await.unwrap();
+    assert_eq!(linked, 8, "every corner of both parcels is linked to its beacon");
+    let (_, found) = send(&app, "GET", &format!("/api/v1/beacons/search?q={tag}-3"), None, None).await;
+    assert_eq!(found[0]["number"], format!("{tag}-3"), "a committed beacon is found by its number");
 
     // A closed area takes no edits; discard; delete the area once it is empty.
     let (_, e) = send(&app, "POST", &format!("/api/v1/wf/jobs/{id}/area/close"), None, None).await;
@@ -1228,6 +1288,66 @@ async fn job_editing_follows_job_area_and_commit_rules() {
     let (_, _) = send(&app, "POST", &format!("/api/v1/wf/jobs/{id}/area/reopen"), None, None).await;
     let (st, _) = draft(x0 + 100.0, 20.0).await;
     assert_eq!(st, StatusCode::CREATED);
+    // Phase 3 under a workflow job. Create Parcel by FCI: an uploaded polygon shapefile becomes
+    // drafts (no .prj: taken as UTM 32N); one polygon outside the job area refuses the whole file.
+    let drafts_now = |app: Router| { let u = format!("/api/v1/parcels.geojson?status=draft&job={cjob}"); async move { send(&app, "GET", &u, None, None).await.1["features"].as_array().unwrap().clone() } };
+    let before = drafts_now(app.clone()).await.len();
+    let fci = format!("/api/v1/jobs/{cjob}/import/feature-class");
+    let sq = |x: f64, y: f64, s: f64| vec![(x, y), (x, y + s), (x + s, y + s), (x + s, y), (x, y)];
+    let shp = shapefile_polygons(&[sq(x0 + 20.0, y0 + 120.0, 20.0), sq(x0 + 60.0, y0 + 120.0, 20.0)]);
+    let (st, r) = send(&app, "POST", &fci, None, Some(json!({"shp_base64": STANDARD.encode(&shp), "name": "plots.shp"}))).await;
+    assert_eq!(st, StatusCode::CREATED, "{r}");
+    assert_eq!(r["created_parcels"], 2);
+    assert!(r["warnings"][0].as_str().unwrap().contains("32632"), "{r}");
+    let outside = shapefile_polygons(&[sq(x0 + 100.0, y0 + 160.0, 20.0), sq(x0 + 190.0, y0 + 160.0, 30.0)]);
+    let (st, r) = send(&app, "POST", &fci, None, Some(json!({"shp_base64": STANDARD.encode(&outside)}))).await;
+    assert_eq!(st, StatusCode::CONFLICT, "{r}");
+    assert!(r["message"].as_str().unwrap().contains("FID 1"), "{r}");
+    assert_eq!(drafts_now(app.clone()).await.len(), before + 2, "nothing imported from a refused file");
+    // The same polygon in WGS 84 (with its .prj) is converted to UTM 32N.
+    let ll: String = sqlx::query_scalar("SELECT ST_AsText(ST_Transform(ST_SetSRID(ST_MakePoint($1, $2), 32632), 4326))").bind(x0 + 130.0).bind(y0 + 60.0).fetch_one(&pool).await.unwrap();
+    let nums: Vec<f64> = ll.trim_start_matches("POINT(").trim_end_matches(')').split(' ').map(|v| v.parse().unwrap()).collect();
+    let d = 0.00015; // ~16 m
+    let wgs = shapefile_polygons(&[vec![(nums[0], nums[1]), (nums[0], nums[1] + d), (nums[0] + d, nums[1] + d), (nums[0] + d, nums[1]), (nums[0], nums[1])]]);
+    let prj = r#"GEOGCS["GCS_WGS_1984",DATUM["D_WGS_1984",SPHEROID["WGS_1984",6378137.0,298.257223563]],PRIMEM["Greenwich",0.0],UNIT["Degree",0.0174532925199433]]"#;
+    let (st, r) = send(&app, "POST", &fci, None, Some(json!({"shp_base64": STANDARD.encode(&wgs), "prj": prj}))).await;
+    assert_eq!(st, StatusCode::CREATED, "{r}");
+    assert_eq!(r["source_epsg"], 4326);
+
+    // Parcel Separation: a line across the first FCI parcel makes two drafts of 200 m² each; a
+    // line that does not cross is refused.
+    let draft_at = |x: f64, y: f64| {
+        let pool = pool.clone(); let cjob = cjob.clone();
+        async move {
+            sqlx::query_scalar::<_, Uuid>("SELECT id FROM cadastre.parcel WHERE job_id = $1::uuid AND status = 'draft' AND ST_Contains(geom, ST_SetSRID(ST_MakePoint($2, $3), 32632))")
+                .bind(cjob).bind(x).bind(y).fetch_one(&pool).await.unwrap()
+        }
+    };
+    let sep = format!("{draft_url}/{}/separate", draft_at(x0 + 30.0, y0 + 130.0).await);
+    let (st, r) = send(&app, "POST", &sep, None, Some(json!({"line": {"type": "LineString", "coordinates": [[x0 + 5.0, y0 + 5.0], [x0 + 6.0, y0 + 6.0]]}}))).await;
+    assert_eq!(st, StatusCode::BAD_REQUEST, "{r}");
+    let (st, parts) = send(&app, "POST", &sep, None, Some(json!({"line": {"type": "LineString", "coordinates": [[x0 + 30.0, y0 + 110.0], [x0 + 30.0, y0 + 150.0]]}}))).await;
+    assert_eq!(st, StatusCode::CREATED, "{parts}");
+    let areas: Vec<f64> = parts.as_array().unwrap().iter().map(|p| p["computed_area"].as_f64().unwrap().round()).collect();
+    assert_eq!(areas, vec![200.0, 200.0], "{parts}");
+    // Donut Parcel: a hole inside is accepted; a "hole" outside the parcel is not a valid shape.
+    let put = format!("{draft_url}/{}", draft_at(x0 + 70.0, y0 + 130.0).await);
+    let outer = json!([[x0 + 60.0, y0 + 120.0], [x0 + 80.0, y0 + 120.0], [x0 + 80.0, y0 + 140.0], [x0 + 60.0, y0 + 140.0], [x0 + 60.0, y0 + 120.0]]);
+    let hole = json!([[x0 + 65.0, y0 + 125.0], [x0 + 65.0, y0 + 130.0], [x0 + 70.0, y0 + 130.0], [x0 + 70.0, y0 + 125.0], [x0 + 65.0, y0 + 125.0]]);
+    let (st, r) = send(&app, "PUT", &put, None, Some(json!({"geometry": {"type": "Polygon", "coordinates": [outer, hole]}}))).await;
+    assert_eq!(st, StatusCode::OK, "{r}");
+    let bad = json!([[x0 + 90.0, y0 + 125.0], [x0 + 90.0, y0 + 130.0], [x0 + 95.0, y0 + 130.0], [x0 + 95.0, y0 + 125.0], [x0 + 90.0, y0 + 125.0]]);
+    let (st, r) = send(&app, "PUT", &put, None, Some(json!({"geometry": {"type": "Polygon", "coordinates": [outer, bad]}}))).await;
+    assert_eq!(st, StatusCode::BAD_REQUEST, "{r}");
+
+    // Survey import under a workflow job: point IDs come back for the commit, no beacons are made.
+    let csv = format!("id,easting,northing\nZQ{b}A,{},{}\nZQ{b}B,{},{}\n", x0 + 150.0, y0 + 20.0, x0 + 160.0, y0 + 20.0);
+    let (st, r) = send(&app, "POST", &format!("/api/v1/jobs/{cjob}/import"), None, Some(json!({"filename": "points.csv", "contents": csv}))).await;
+    assert_eq!(st, StatusCode::CREATED, "{r}");
+    assert_eq!(r["workflow_job"], true);
+    assert_eq!(r["created_beacons"], 0, "beacons are entered at commit, not at import");
+    assert_eq!(r["points_for_commit"].as_array().unwrap().len(), 2, "{r}");
+
     let (st, _) = send(&app, "DELETE", &format!("/api/v1/wf/jobs/{id}/area"), None, None).await;
     assert_eq!(st, StatusCode::CONFLICT, "drafts block deleting the area");
     let (_, e) = send(&app, "POST", &format!("/api/v1/wf/jobs/{id}/discard"), None, None).await;
@@ -1238,4 +1358,72 @@ async fn job_editing_follows_job_area_and_commit_rules() {
     let (st, d) = send(&app, "POST", &format!("/api/v1/wf/jobs/{id}/advance"), None, Some(json!({}))).await;
     assert_eq!(st, StatusCode::OK, "{d}");
     assert_eq!(d["job"]["current_task_id"], plan);
+}
+
+/// The Beacon box searches every beacon on the server: exact number first, then numbers starting
+/// with the text, nearest first; and the map loads survey beacons only for the area in view.
+#[tokio::test]
+async fn beacon_search_ranks_exact_then_prefix_then_nearest() {
+    let Some(db_url) = test_db_url() else {
+        eprintln!("skipping: CADASTRE_TEST_DATABASE_URL not set");
+        return;
+    };
+    let app = routes::router(state_with(AuthMode::Disabled, None, &db_url).await);
+    let tag = format!("T{}", rand_12() % 1_000_000);
+    let (x0, y0) = (300_000.0 + (rand_12() % 100_000) as f64, 1_000_000.0 + (rand_12() % 100_000) as f64);
+    for (name, dx, control) in [(tag.clone(), 900.0, true), (format!("{tag}1"), 500.0, false), (format!("{tag}2"), 10.0, false), (format!("X{tag}"), 1.0, false)] {
+        let (st, b) = send(&app, "POST", "/api/v1/beacons", None,
+            Some(json!({"number": name, "easting": x0 + dx, "northing": y0, "is_control": control}))).await;
+        assert_eq!(st, StatusCode::CREATED, "{b}");
+    }
+    let (st, found) = send(&app, "GET", &format!("/api/v1/beacons/search?q={}&e={x0}&n={y0}", tag.to_lowercase()), None, None).await;
+    assert_eq!(st, StatusCode::OK, "{found}");
+    let names: Vec<&str> = found.as_array().unwrap().iter().map(|b| b["number"].as_str().unwrap()).collect();
+    assert_eq!(names, [tag.clone(), format!("{tag}2"), format!("{tag}1"), format!("X{tag}")], "exact, then prefix by distance, then contains");
+
+    // A wildcard typed by the user is taken literally.
+    let (_, none) = send(&app, "GET", &format!("/api/v1/beacons/search?q={tag}_"), None, None).await;
+    assert_eq!(none, json!([]), "{none}");
+
+    // GeoJSON: survey beacons only, in a bbox around the test points (in WGS84).
+    let (_, all) = send(&app, "GET", "/api/v1/beacons.geojson?control=false&limit=20000", None, None).await;
+    let pick = all["features"].as_array().unwrap().iter().find(|f| f["properties"]["number"] == format!("{tag}2")).expect("survey beacon listed").clone();
+    let (lon, lat) = (pick["geometry"]["coordinates"][0].as_f64().unwrap(), pick["geometry"]["coordinates"][1].as_f64().unwrap());
+    let bbox = format!("{},{},{},{}", lon - 0.0003, lat - 0.0003, lon + 0.0003, lat + 0.0003);
+    let (_, near) = send(&app, "GET", &format!("/api/v1/beacons.geojson?control=false&bbox={bbox}"), None, None).await;
+    let near: Vec<String> = near["features"].as_array().unwrap().iter().map(|f| f["properties"]["number"].as_str().unwrap().to_string()).collect();
+    assert!(near.contains(&format!("{tag}2")) && near.contains(&format!("X{tag}")) && !near.contains(&format!("{tag}1")), "{near:?}");
+    let (_, ctrl) = send(&app, "GET", &format!("/api/v1/beacons.geojson?control=true&bbox={},{},{},{}", lon - 0.01, lat - 0.01, lon + 0.01, lat + 0.01), None, None).await;
+    assert!(ctrl["features"].as_array().unwrap().iter().all(|f| f["properties"]["is_control"] == true), "{ctrl}");
+}
+
+/// A minimal polygon shapefile (.shp) holding one ring per polygon, for the FCI import tests.
+fn shapefile_polygons(polys: &[Vec<(f64, f64)>]) -> Vec<u8> {
+    let all: Vec<(f64, f64)> = polys.iter().flatten().copied().collect();
+    let bbox = |pts: &[(f64, f64)]| {
+        let (mut a, mut b, mut c, mut d) = (f64::MAX, f64::MAX, f64::MIN, f64::MIN);
+        for &(x, y) in pts { a = a.min(x); b = b.min(y); c = c.max(x); d = d.max(y); }
+        [a, b, c, d]
+    };
+    let mut recs = Vec::new();
+    for (i, ring) in polys.iter().enumerate() {
+        let mut c = Vec::new();
+        c.extend(5i32.to_le_bytes());
+        for v in bbox(ring) { c.extend(v.to_le_bytes()); }
+        c.extend(1i32.to_le_bytes());
+        c.extend((ring.len() as i32).to_le_bytes());
+        c.extend(0i32.to_le_bytes());
+        for &(x, y) in ring { c.extend(x.to_le_bytes()); c.extend(y.to_le_bytes()); }
+        recs.extend(((i + 1) as i32).to_be_bytes());
+        recs.extend(((c.len() / 2) as i32).to_be_bytes());
+        recs.extend(c);
+    }
+    let mut out = vec![0u8; 100];
+    out[0..4].copy_from_slice(&9994i32.to_be_bytes());
+    out[24..28].copy_from_slice(&(((100 + recs.len()) / 2) as i32).to_be_bytes());
+    out[28..32].copy_from_slice(&1000i32.to_le_bytes());
+    out[32..36].copy_from_slice(&5i32.to_le_bytes());
+    for (k, v) in bbox(&all).iter().enumerate() { out[36 + k * 8..44 + k * 8].copy_from_slice(&v.to_le_bytes()); }
+    out.extend(recs);
+    out
 }

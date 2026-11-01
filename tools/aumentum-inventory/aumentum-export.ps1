@@ -6,7 +6,9 @@
   Files (UTF-8, '|'-separated, empty field = NULL):
     parcels.psv            OBJECTID|UPIN|Status|JobID|PlanNo|CadZone|PlotNo|BlockNo|SRID|WKT
                            (no header; the format cadastre-import's import-file already reads)
-    beacons.psv            Alias|X|Y   (no header)
+    beacons.psv            Alias|X|Y   (no header): the PLAGIS_Coordinates control points
+    points.psv             header line, then every survey point (beacon) of Plateau_State_Points in the
+                           DEFAULT version: name, category, type, X/Y/Z, control-point and job links
     parcel-attributes.psv  header line, then every ParcelAttributeTable column, incl. the registry
                            link fields LRSID, LinkageStatus, LinkageDate
     upins-issued.psv       header line, then every UPIN found in ANY version or history state
@@ -19,7 +21,8 @@
   UNCOMMITTED (never blocks editors); the only write on the server is the session's own #temp
   table. PowerShell 4 compatible.
 #>
-param([string]$OutDir = (Join-Path $env:USERPROFILE 'Desktop'), [string]$SqlInstance = '', [string]$SqlUser = '', [string]$SqlPassword = '')
+param([string]$OutDir = (Join-Path $env:USERPROFILE 'Desktop'), [string]$SqlInstance = '', [string]$SqlUser = '', [string]$SqlPassword = '',
+      [ValidateSet('all', 'points')][string]$Only = 'all')
 $ErrorActionPreference = 'Stop'
 if (-not $SqlInstance) {
   $svc = Get-Service 'MSSQL*' | Where { $_.Name -notmatch 'WID|SQLEXPRESS|FDLauncher|OLAP' -and $_.Status -eq 'Running' } | Select -First 1
@@ -93,22 +96,40 @@ SELECT $columns FROM $a a WHERE a.SDE_STATE_ID IN (SELECT lineage_id FROM #L) $n
 
 $t0 = Get-Date
 Write-Host "Exporting from $SqlInstance (read-only) to $dir" -ForegroundColor Yellow
-$reg = Query "SELECT registration_id, owner, table_name FROM sde.SDE_table_registry WHERE table_name IN ('PLATEAU_STATE_PARCELS','PARCELATTRIBUTETABLE','PLAGIS_COORDINATES')"
+$reg = Query "SELECT registration_id, owner, table_name FROM sde.SDE_table_registry WHERE table_name IN ('PLATEAU_STATE_PARCELS','PARCELATTRIBUTETABLE','PLAGIS_COORDINATES','PLATEAU_STATE_POINTS')"
 function RegOf([string]$t) { $r = $reg | Where { $_.table_name -eq $t } | Select -First 1; if (-not $r) { throw "$t is not registered in sde" }; $r }
-$P = RegOf 'PLATEAU_STATE_PARCELS'; $A = RegOf 'PARCELATTRIBUTETABLE'; $C = RegOf 'PLAGIS_COORDINATES'
+$P = RegOf 'PLATEAU_STATE_PARCELS'; $A = RegOf 'PARCELATTRIBUTETABLE'; $C = RegOf 'PLAGIS_COORDINATES'; $T = RegOf 'PLATEAU_STATE_POINTS'
 
-Write-Host "[1/4] parcels (DEFAULT version) ..." -ForegroundColor Cyan
+# Survey points (the beacons of the parcel fabric), DEFAULT version. X/Y are the stored attribute
+# coordinates; SHAPE is exported too, for points whose attributes are blank.
+function ExportPoints {
+  $tc = "OBJECTID, CONVERT(varchar(36), PointID) AS PointID, PointName, Category, Type, Units, CONVERT(float, Weight) AS Weight, CONVERT(varchar(36), ControlPointID) AS ControlPointID, CONVERT(varchar(36), JobID) AS JobID, TempID, CONVERT(float, X) AS X, CONVERT(float, Y) AS Y, CONVERT(float, Z) AS Z, SHAPE.STX AS ShapeX, SHAPE.STY AS ShapeY"
+  Export (CurrentRows $T.owner $T.table_name $T.registration_id $tc) 'points.psv' -Header
+}
+if ($Only -eq 'points') {
+  Write-Host "[1/1] survey points / beacons (DEFAULT version) ..." -ForegroundColor Cyan
+  $nt = ExportPoints
+  $line = "points.psv rows: $nt (exported $(Get-Date -Format s), took $([int]((Get-Date) - $t0).TotalSeconds)s)"
+  [IO.File]::WriteAllLines((Join-Path $dir 'points-summary.txt'), [string[]]@($line), $utf8)
+  Write-Host "  $line"; Write-Host "`nDone. Files are in $dir" -ForegroundColor Green
+  return
+}
+
+Write-Host "[1/5] parcels (DEFAULT version) ..." -ForegroundColor Cyan
 $pc = "OBJECTID, UPIN, Status, CONVERT(varchar(36), JobID) AS JobID, PlanNo, CadZone, PlotNo, BlockNo, SHAPE.STSrid AS srid, SHAPE.STAsText() AS wkt"
 $np = Export (CurrentRows $P.owner $P.table_name $P.registration_id $pc) 'parcels.psv'
 
-Write-Host "[2/4] parcel attributes incl. registry links (DEFAULT version) ..." -ForegroundColor Cyan
+Write-Host "[2/5] parcel attributes incl. registry links (DEFAULT version) ..." -ForegroundColor Cyan
 $ac = "OBJECTID, DatasetName, RegionName, CONVERT(varchar(36), ParcelID) AS ParcelID, UPIN, ParcelName, Parent, PropertyNumber, PropertyType, Plot, Block, Location, ParcelArea, AreaUnit, PlanNumber, LGA, Status, CanRollback, IsStrata, MutationType, CreationDate, LastEditDate, ConsolidationDate, ArchiveReason, ArchiveDate, LRSID, LinkageStatus, LinkageDate, SurveyorGeneral"
 $na = Export (CurrentRows $A.owner $A.table_name $A.registration_id $ac) 'parcel-attributes.psv' -Header
 
-Write-Host "[3/4] control coordinates ..." -ForegroundColor Cyan
+Write-Host "[3/5] control coordinates ..." -ForegroundColor Cyan
 $nb = Export "SELECT Alias, CONVERT(float, X) AS X, CONVERT(float, Y) AS Y FROM $($C.owner).$($C.table_name);" 'beacons.psv'
 
-Write-Host "[4/4] every UPIN ever issued (all versions and history states) ..." -ForegroundColor Cyan
+Write-Host "[4/5] survey points / beacons (DEFAULT version) ..." -ForegroundColor Cyan
+$nt = ExportPoints
+
+Write-Host "[5/5] every UPIN ever issued (all versions and history states) ..." -ForegroundColor Cyan
 $pa = "$($P.owner).a$($P.registration_id)"; $aa = "$($A.owner).a$($A.registration_id)"
 $nu = Export @"
 SELECT UPIN, MIN(src) AS first_source, COUNT(*) AS occurrences FROM (
@@ -122,7 +143,7 @@ SELECT UPIN, MIN(src) AS first_source, COUNT(*) AS occurrences FROM (
 Write-Host "Summary ..." -ForegroundColor Cyan
 $sum = @()
 $sum += "Aumentum export of $env:COMPUTERNAME ($SqlInstance) at $(Get-Date -Format s), took $([int]((Get-Date) - $t0).TotalSeconds)s"
-$sum += "parcels.psv rows: $np"; $sum += "parcel-attributes.psv rows: $na"; $sum += "beacons.psv rows: $nb"; $sum += "upins-issued.psv rows: $nu"
+$sum += "parcels.psv rows: $np"; $sum += "parcel-attributes.psv rows: $na"; $sum += "beacons.psv rows: $nb"; $sum += "points.psv rows: $nt"; $sum += "upins-issued.psv rows: $nu"
 $sum += "DEFAULT state: " + (Query "SELECT state_id FROM sde.SDE_versions WHERE name='DEFAULT'").Rows[0].state_id
 $sum += "versions: " + (Query "SELECT COUNT(*) AS n FROM sde.SDE_versions").Rows[0].n
 $sum += ""; $sum += "parcels by Status (DEFAULT), counted from parcels.psv:"

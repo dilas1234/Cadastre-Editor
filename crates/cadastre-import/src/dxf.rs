@@ -193,10 +193,7 @@ fn parse_pairs(contents: &str) -> Result<Vec<Pair>, DxfError> {
     }
     let mut lines = contents.lines().enumerate();
     let mut pairs = Vec::new();
-    loop {
-        let Some((line_no, code_line)) = lines.next() else {
-            break;
-        };
+    while let Some((line_no, code_line)) = lines.next() {
         if code_line.trim().is_empty() {
             continue;
         }

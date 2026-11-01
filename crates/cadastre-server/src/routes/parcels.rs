@@ -54,33 +54,7 @@ pub async fn create_job_parcel(
 ) -> ApiResult<(StatusCode, Json<ParcelDto>)> {
     user.require_role("editor")?;
 
-    // Under an Aumentum job, edits follow its job area: the job must be open and have an open job
-    // area, and the parcel must lie inside it (Aumentum's rule and message).
-    let guard = sqlx::query(
-        "SELECT s.is_open, a.status AS area_status, \
-                ST_CoveredBy(ST_SetSRID(ST_GeomFromGeoJSON($2), 32632), ST_Buffer(a.geom, 0.01)) AS inside \
-         FROM cadastre.wf_job_instance w JOIN cadastre.wf_job_status s ON s.code = w.status \
-         LEFT JOIN cadastre.job_area a ON a.wf_job_instance_id = w.id WHERE w.cadastre_job_id = $1",
-    )
-    .bind(job_id)
-    .bind(new.geometry.to_string())
-    .fetch_optional(&state.pool)
-    .await
-    .map_err(|_| AppError::BadRequest("invalid GeoJSON geometry".to_string()))?;
-    if let Some(g) = guard {
-        let (open, area_status, inside): (bool, Option<String>, Option<bool>) = (g.get("is_open"), g.get("area_status"), g.get("inside"));
-        if !open {
-            return Err(AppError::Conflict("the job is not open".into()));
-        }
-        match area_status.as_deref() {
-            None => return Err(AppError::Conflict("create the job area before drawing parcels".into())),
-            Some("closed") => return Err(AppError::Conflict("the job area is closed; reopen it to edit".into())),
-            _ => {}
-        }
-        if inside != Some(true) {
-            return Err(AppError::Conflict(crate::routes::wf::OUTSIDE_JOB_AREA.into()));
-        }
-    }
+    job_area_guard(&state, job_id, Some(&new.geometry)).await?;
 
     let sql = format!(
         "INSERT INTO cadastre.parcel (job_id, geom, stated_area, status) \
@@ -103,6 +77,162 @@ pub async fn create_job_parcel(
     Ok((StatusCode::CREATED, Json(row_to_dto(&row)?)))
 }
 
+/// Under an Aumentum job, edits follow its job area: the job must be open and have an open job
+/// area, and a parcel geometry (when given) must lie inside it (Aumentum's rule and message).
+pub(crate) async fn job_area_guard(state: &AppState, job_id: Uuid, geometry: Option<&serde_json::Value>) -> ApiResult<()> {
+    let guard = sqlx::query(
+        "SELECT s.is_open, a.status AS area_status, \
+                CASE WHEN $2::text IS NULL THEN true ELSE ST_CoveredBy(ST_SetSRID(ST_GeomFromGeoJSON($2), 32632), ST_Buffer(a.geom, 0.01)) END AS inside \
+         FROM cadastre.wf_job_instance w JOIN cadastre.wf_job_status s ON s.code = w.status \
+         LEFT JOIN cadastre.job_area a ON a.wf_job_instance_id = w.id WHERE w.cadastre_job_id = $1",
+    )
+    .bind(job_id)
+    .bind(geometry.map(|g| g.to_string()))
+    .fetch_optional(&state.pool)
+    .await
+    .map_err(|_| AppError::BadRequest("invalid GeoJSON geometry".to_string()))?;
+    if let Some(g) = guard {
+        let (open, area_status, inside): (bool, Option<String>, Option<bool>) = (g.get("is_open"), g.get("area_status"), g.get("inside"));
+        if !open {
+            return Err(AppError::Conflict("the job is not open".into()));
+        }
+        match area_status.as_deref() {
+            None => return Err(AppError::Conflict("create the job area before drawing parcels".into())),
+            Some("closed") => return Err(AppError::Conflict("the job area is closed; reopen it to edit".into())),
+            _ => {}
+        }
+        if inside != Some(true) {
+            return Err(AppError::Conflict(crate::routes::wf::OUTSIDE_JOB_AREA.into()));
+        }
+    }
+    Ok(())
+}
+
+/// Change a draft parcel's boundary (Edit Vertices). Only drafts; the job-area rules apply.
+#[utoipa::path(put, path = "/api/v1/jobs/{id}/parcels/{parcel_id}", tag = "parcels",
+    params(("id" = Uuid, Path, description = "Job id"), ("parcel_id" = Uuid, Path, description = "Draft parcel id")),
+    request_body = NewParcel,
+    responses((status = 200, body = ParcelDto), (status = 400, description = "Invalid geometry"), (status = 404, description = "No such draft in this job"), (status = 409, description = "Job closed, job area closed, or outside the job area")))]
+pub async fn update_job_parcel(
+    State(state): State<AppState>,
+    user: AuthUser,
+    Path((job_id, parcel_id)): Path<(Uuid, Uuid)>,
+    Json(new): Json<NewParcel>,
+) -> ApiResult<Json<ParcelDto>> {
+    user.require_role("editor")?;
+    job_area_guard(&state, job_id, Some(&new.geometry)).await?;
+    let reason: Option<String> = sqlx::query_scalar("SELECT CASE WHEN ST_IsValid(g) THEN NULL ELSE ST_IsValidReason(g) END FROM (SELECT ST_GeomFromGeoJSON($1) AS g) s")
+        .bind(new.geometry.to_string())
+        .fetch_one(&state.pool)
+        .await
+        .map_err(|_| AppError::BadRequest("invalid GeoJSON geometry".to_string()))?;
+    if let Some(r) = reason {
+        return Err(AppError::BadRequest(format!("not a valid parcel shape: {r}")));
+    }
+    let sql = format!(
+        "UPDATE cadastre.parcel SET geom = ST_SetSRID(ST_GeomFromGeoJSON($3), 32632), \
+             stated_area = COALESCE($4, stated_area), updated_at = now() \
+         WHERE id = $2 AND job_id = $1 AND status = 'draft' RETURNING {PARCEL_SELECT}"
+    );
+    let row = sqlx::query(&sql)
+        .bind(job_id)
+        .bind(parcel_id)
+        .bind(new.geometry.to_string())
+        .bind(new.stated_area)
+        .fetch_optional(&state.pool)
+        .await
+        .map_err(|e| match e.as_database_error().and_then(|d| d.code()) {
+            Some(code) if code == "XX000" || code.starts_with("22") => AppError::BadRequest("invalid GeoJSON geometry".to_string()),
+            _ => AppError::from(e),
+        })?
+        .ok_or_else(|| AppError::NotFound(format!("draft parcel {parcel_id} in job {job_id}")))?;
+    Ok(Json(row_to_dto(&row)?))
+}
+
+/// A line that separates a draft parcel into parts (Aumentum: Parcel Separation).
+#[derive(Debug, serde::Deserialize, utoipa::ToSchema)]
+pub struct SeparateRequest {
+    /// GeoJSON LineString (EPSG:32632) crossing the parcel from edge to edge.
+    pub line: serde_json::Value,
+}
+
+/// Separate a draft parcel along a line: the draft is replaced by its parts, each a new draft.
+#[utoipa::path(post, path = "/api/v1/jobs/{id}/parcels/{parcel_id}/separate", tag = "parcels",
+    params(("id" = Uuid, Path, description = "Job id"), ("parcel_id" = Uuid, Path, description = "Draft parcel id")),
+    request_body = SeparateRequest,
+    responses((status = 201, body = [ParcelDto]), (status = 400, description = "The line does not cross the parcel"), (status = 404, description = "No such draft in this job"), (status = 409, description = "Job or job area closed")))]
+pub async fn separate_job_parcel(
+    State(state): State<AppState>,
+    user: AuthUser,
+    Path((job_id, parcel_id)): Path<(Uuid, Uuid)>,
+    Json(req): Json<SeparateRequest>,
+) -> ApiResult<(StatusCode, Json<Vec<ParcelDto>>)> {
+    user.require_role("editor")?;
+    job_area_guard(&state, job_id, None).await?;
+    let mut tx = state.pool.begin().await?;
+    let found: Option<Uuid> = sqlx::query_scalar("SELECT id FROM cadastre.parcel WHERE id = $2 AND job_id = $1 AND status = 'draft' FOR UPDATE")
+        .bind(job_id)
+        .bind(parcel_id)
+        .fetch_optional(&mut *tx)
+        .await?;
+    if found.is_none() {
+        return Err(AppError::NotFound(format!("draft parcel {parcel_id} in job {job_id}")));
+    }
+    let parts: Vec<String> = sqlx::query_scalar(
+        "SELECT ST_AsGeoJSON((ST_Dump(ST_CollectionExtract(ST_Split(p.geom, ST_SetSRID(ST_GeomFromGeoJSON($2), 32632)), 3))).geom, 3) \
+         FROM cadastre.parcel p WHERE p.id = $1",
+    )
+    .bind(parcel_id)
+    .bind(req.line.to_string())
+    .fetch_all(&mut *tx)
+    .await
+    .map_err(|e| match e.as_database_error().and_then(|d| d.code()) {
+        Some(code) if code == "XX000" || code.starts_with("22") => AppError::BadRequest("the separation line is not a valid line".to_string()),
+        _ => AppError::from(e),
+    })?;
+    if parts.is_empty() {
+        return Err(AppError::NotFound(format!("draft parcel {parcel_id} in job {job_id}")));
+    }
+    if parts.len() < 2 {
+        return Err(AppError::BadRequest("the line must cross the parcel from one edge to another".into()));
+    }
+    sqlx::query("DELETE FROM cadastre.parcel WHERE id = $1").bind(parcel_id).execute(&mut *tx).await?;
+    let mut out = Vec::new();
+    let sql = format!(
+        "INSERT INTO cadastre.parcel (job_id, geom, computed_area, status) \
+         VALUES ($1, ST_SetSRID(ST_GeomFromGeoJSON($2), 32632), ST_Area(ST_SetSRID(ST_GeomFromGeoJSON($2), 32632)), 'draft') RETURNING {PARCEL_SELECT}"
+    );
+    for g in &parts {
+        let row = sqlx::query(&sql).bind(job_id).bind(g).fetch_one(&mut *tx).await?;
+        out.push(row_to_dto(&row)?);
+    }
+    tx.commit().await?;
+    Ok((StatusCode::CREATED, Json(out)))
+}
+
+/// Delete one draft parcel (posted parcels are never deleted here).
+#[utoipa::path(delete, path = "/api/v1/jobs/{id}/parcels/{parcel_id}", tag = "parcels",
+    params(("id" = Uuid, Path, description = "Job id"), ("parcel_id" = Uuid, Path, description = "Draft parcel id")),
+    responses((status = 204), (status = 404, description = "No such draft in this job"), (status = 409, description = "Job or job area closed")))]
+pub async fn delete_job_parcel(
+    State(state): State<AppState>,
+    user: AuthUser,
+    Path((job_id, parcel_id)): Path<(Uuid, Uuid)>,
+) -> ApiResult<StatusCode> {
+    user.require_role("editor")?;
+    job_area_guard(&state, job_id, None).await?;
+    let n = sqlx::query("DELETE FROM cadastre.parcel WHERE id = $2 AND job_id = $1 AND status = 'draft'")
+        .bind(job_id)
+        .bind(parcel_id)
+        .execute(&state.pool)
+        .await?
+        .rows_affected();
+    if n == 0 {
+        return Err(AppError::NotFound(format!("draft parcel {parcel_id} in job {job_id}")));
+    }
+    Ok(StatusCode::NO_CONTENT)
+}
+
 /// Search parcels by number (full UPIN, short plot number, or any part), status, and/or
 /// bounding box (FR-VIEW).
 #[utoipa::path(get, path = "/api/v1/parcels/search", tag = "parcels",
@@ -118,10 +248,17 @@ pub async fn search_parcels(
 
     // Plot-number search: the full UPIN for short forms (5621 -> PL000000005621), else anywhere.
     let number = q.number.as_deref().and_then(crate::numbering::parse_number_query);
+    // The Registry property number the map labels show (e.g. PL58813), typed with or without spaces.
+    let property = q.number.as_deref().map(|s| s.split_whitespace().collect::<String>().to_uppercase()).filter(|s| !s.is_empty());
+    const BY_PROPERTY: &str = "parcel_number IN (SELECT pa.upin FROM cadastre.parcel_attribute pa \
+         WHERE upper(replace(btrim(pa.property_number), ' ', '')) = ";
     if let Some(n) = &number {
         qb.push(" AND (parcel_number ILIKE ").push_bind(n.contains.clone());
         if let Some(exact) = &n.exact {
             qb.push(" OR parcel_number = ").push_bind(exact.clone());
+        }
+        if let Some(p) = &property {
+            qb.push(" OR ").push(BY_PROPERTY).push_bind(p.clone()).push(")");
         }
         qb.push(")");
     }
@@ -135,6 +272,9 @@ pub async fn search_parcels(
             .push_bind(maxx).push(", ").push_bind(maxy).push(", 32632)");
     }
     qb.push(" ORDER BY ");
+    if let (Some(p), Some(_)) = (&property, &number) {
+        qb.push("(").push(BY_PROPERTY).push_bind(p.clone()).push(")) DESC, "); // the labelled parcel first
+    }
     if let Some(exact) = number.as_ref().and_then(|n| n.exact.clone()) {
         qb.push("(parcel_number = ").push_bind(exact).push(") DESC, "); // exact UPIN first
     }
