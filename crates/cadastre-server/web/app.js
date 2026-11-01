@@ -57,14 +57,31 @@ const state = {
   dynLayers: [], // rasters/datasets dragged from the Catalog onto the TOC
 };
 let dynSeq = 1;
-// Ensure proj4 knows a projected CRS by EPSG; our data is UTM 32N, so that is pre-defined and any
-// unknown code falls back to it (the Catalog rasters are all 32632).
-function ensureProj(epsg) {
+// Coordinate systems Catalog data in Plateau can arrive in. The fabric is UTM 32N; older survey data
+// is on the Minna datum (UTM 31N/32N or the Nigeria West/Mid/East Belt transverse Mercators). The
+// Minna -> WGS84 shift is EPSG's (-92, -93, 122). The server reads these codes from .prj files.
+const MINNA = "+ellps=clrk80 +towgs84=-92,-93,122,0,0,0,0 +units=m +no_defs";
+const EXTRA_CRS = {
+  4263: "+proj=longlat +ellps=clrk80 +towgs84=-92,-93,122,0,0,0,0 +no_defs",
+  26331: `+proj=utm +zone=31 ${MINNA}`,
+  26332: `+proj=utm +zone=32 ${MINNA}`,
+  26391: `+proj=tmerc +lat_0=4 +lon_0=4.5 +k=0.99975 +x_0=230738.26 +y_0=0 ${MINNA}`,
+  26392: `+proj=tmerc +lat_0=4 +lon_0=8.5 +k=0.99975 +x_0=670553.98 +y_0=0 ${MINNA}`,
+  26393: `+proj=tmerc +lat_0=4 +lon_0=12.5 +k=0.99975 +x_0=1110369.7 +y_0=0 ${MINNA}`,
+  32631: "+proj=utm +zone=31 +datum=WGS84 +units=m +no_defs",
+  32633: "+proj=utm +zone=33 +datum=WGS84 +units=m +no_defs",
+};
+// Resolve an EPSG code to a proj4 name. `known` is false when the code is missing or unsupported
+// and UTM 32N (the fabric's CRS) is assumed, so callers can tell the user instead of silently
+// drawing data in the wrong place.
+function resolveCrs(epsg) {
+  if (epsg === 4326) return { code: "EPSG:4326", known: true };
   const code = "EPSG:" + epsg;
-  if (epsg === 4326 || proj4.defs(code)) return code;
-  if (epsg === 32632) return "EPSG:32632";
-  return "EPSG:32632";
+  if (epsg && !proj4.defs(code) && EXTRA_CRS[epsg]) proj4.defs(code, EXTRA_CRS[epsg]);
+  if (epsg && proj4.defs(code)) return { code, known: true };
+  return { code: "EPSG:32632", known: false };
 }
+function ensureProj(epsg) { return resolveCrs(epsg).code; }
 
 // Digitizing / edit session (ArcMap Editor). Vertices are kept in EPSG:32632 metres.
 const edit = { active: false, template: "parcel", geomType: "polygon", construction: "polygon", verts: [], sel: -1, snapping: true };
@@ -650,37 +667,58 @@ function buildTOC() {
   applyVisibility();
 }
 function zoomToLayer(l) {
-  const fc = { parcels: state.parcels, jobsArea: state.drafts, ctrl: state.beacons, cadastral: state.parcels,
+  const regionExtent = () => map.fitBounds([REGION_BBOX.slice(0, 2), REGION_BBOX.slice(2)], { padding: 20 });
+  if (l.kind === "raster") { regionExtent(); return; } // the basemap: its working extent is the region
+  const both = { type: "FeatureCollection", features: [...state.parcels.features, ...state.beacons.features] };
+  const fc = { parcels: state.parcels, jobsArea: state.drafts, ctrl: state.beacons, cadastral: both,
     lines: state.surveyFC, points: state.surveyFC }[l.id];
-  if (!fc || !zoomToFC(fc)) status(`${l.name}: nothing to zoom to`);
+  // The layer's data inside the region first (a stray outlier must not zoom out to half the
+  // country); if it has none there, all of it.
+  if (!fc || !(zoomToFC(fc, { padding: 40 }, true) || zoomToFC(fc, { padding: 40 }))) status(`${l.name}: nothing to zoom to`);
 }
 // --- dropped Catalog layers (rasters) ---
 function dynBounds(l) {
   const xs = l.bbox.map((c) => c[0]), ys = l.bbox.map((c) => c[1]);
   return [[Math.min(...xs), Math.min(...ys)], [Math.max(...xs), Math.max(...ys)]];
 }
+// Zoom to a layer added from the Catalog; capped at street level so a single small feature
+// does not zoom in past readable detail.
+function zoomToDynLayer(l) { map.fitBounds(dynBounds(l), { padding: 40, maxZoom: 18 }); }
 function dynLayerNode(l) {
   const li = h("li");
   const cb = h("input", { type: "checkbox", checked: l.visible, title: "Visible" });
   cb.addEventListener("click", (ev) => { ev.stopPropagation(); l.visible = cb.checked; applyDynVisibility(); });
-  const icName = l.kind === "raster" ? "raster" : "lineFc";
+  const icName = l.icon || (l.kind === "raster" ? "raster" : "lineFc");
   const row = h("div", { class: "node", title: l.unc || l.name }, h("span", { class: "tw none" }), cb, h("span", { html: icon(icName) }),
     h("span", { class: `lbl${tocSelected === l.id ? " sel" : ""}` }, l.name));
   row.addEventListener("click", () => { tocSelected = l.id; buildTOC(); });
-  row.addEventListener("dblclick", () => map.fitBounds(dynBounds(l), { padding: 40 }));
+  row.addEventListener("dblclick", () => zoomToDynLayer(l));
   row.addEventListener("contextmenu", (ev) => {
     ev.preventDefault(); tocSelected = l.id; buildTOC();
     contextMenu([
-      { label: "Zoom To Layer", icon: "fullExtent", action: () => map.fitBounds(dynBounds(l), { padding: 40 }) },
+      { label: "Zoom To Layer", icon: "fullExtent", action: () => zoomToDynLayer(l) },
       { label: l.visible ? "Hide Layer" : "Show Layer", action: () => { l.visible = !l.visible; applyDynVisibility(); buildTOC(); } },
       { label: "Transparency 50%", action: () => { l.map.forEach((id) => map.getLayer(id) && map.setPaintProperty(id, "raster-opacity", 0.5)); }, disabled: l.kind !== "raster" },
       { label: "Full opacity", action: () => { l.map.forEach((id) => map.getLayer(id) && map.setPaintProperty(id, "raster-opacity", 1)); }, disabled: l.kind !== "raster" },
+      // ArcMap's "Display Background Value": show an ortho's black (0,0,0) or white (255,255,255)
+      // collar as transparent.
+      { label: "Display Background As Transparent", disabled: l.kind !== "raster", sub: [
+        { label: (l.background === 0 ? "\u2713 " : "") + "Black (0, 0, 0)", action: () => setRasterBackground(l, 0) },
+        { label: (l.background === 255 ? "\u2713 " : "") + "White (255, 255, 255)", action: () => setRasterBackground(l, 255) },
+        { label: (l.background == null ? "\u2713 " : "") + "None (show background)", action: () => setRasterBackground(l, null) },
+      ] },
       "-",
       { label: "Remove", action: () => removeDynLayer(l) },
     ], ev.clientX, ev.clientY);
   });
   li.append(row);
   return li;
+}
+function setRasterBackground(l, value) {
+  l.background = value;
+  const src = map.getSource(l.src); if (!src) return;
+  src.updateImage({ url: l.ovUrl + (value == null ? "" : `&background=${value}`), coordinates: l.bbox });
+  status(value == null ? `${l.name}: background shown.` : `${l.name}: ${value === 0 ? "black" : "white"} background shown as transparent.`);
 }
 function removeDynLayer(l) {
   for (const id of l.map) if (map.getLayer(id)) map.removeLayer(id);
@@ -697,7 +735,8 @@ async function addRasterLayer(node) {
   let info;
   try { info = await api(`/api/v1/catalog/raster/info?folder=${folder}&path=${encodeURIComponent(path)}`); }
   catch (e) { status(`Could not read ${name}: ${e.message}`); alert(`Could not read ${name}:\n${e.message}`); return; }
-  const code = ensureProj(info.epsg || 32632);
+  const crs = resolveCrs(info.epsg);
+  const code = crs.code;
   const toLLc = (x, y) => (code === "EPSG:4326" ? [x, y] : proj4(code, "EPSG:4326", [x, y]));
   const [minx, miny, maxx, maxy] = info.bbox;
   const tl = toLLc(minx, maxy), tr = toLLc(maxx, maxy), br = toLLc(maxx, miny), bl = toLLc(minx, miny);
@@ -707,8 +746,8 @@ async function addRasterLayer(node) {
     const url = `/api/v1/catalog/raster/overview?folder=${folder}&path=${encodeURIComponent(path)}&max=2048`;
     map.addSource(srcId, { type: "image", url, coordinates: [tl, tr, br, bl] });
     map.addLayer({ id: lyrId, type: "raster", source: srcId, paint: { "raster-opacity": 1 } }, firstVectorLayer());
-    state.dynLayers.unshift({ id, name, kind: "raster", map: [lyrId], src: srcId, bbox: [tl, tr, br, bl], visible: true, unc: catUNC(node) });
-    status(`${name} added to the map.`);
+    state.dynLayers.unshift({ id, name, kind: "raster", map: [lyrId], src: srcId, bbox: [tl, tr, br, bl], visible: true, unc: catUNC(node), icon: "raster", ovUrl: url, background: null });
+    status(crs.known ? `${name} added to the map.` : `${name} added. Its coordinate system is not stated in the file, so WGS 1984 UTM Zone 32N (the fabric's) is assumed.`);
   } else {
     const gfxId = addGraphic({ type: "line", pts: [tl, tr, br, bl, tl] });
     state.dynLayers.unshift({ id, name: name + " (extent)", kind: "rasterExtent", map: [], bbox: [tl, tr, br, bl], visible: true, unc: catUNC(node), gfxId });
@@ -718,9 +757,58 @@ async function addRasterLayer(node) {
   map.fitBounds(dynBounds(state.dynLayers[0]), { padding: 40 });
 }
 
+// Distinct outline colours for successive shapefile layers (readable on imagery).
+const SHP_COLORS = ["#ff7f00", "#00e5ff", "#ff3df5", "#7cff3d", "#ffd400", "#ff4040", "#9a7dff"];
+// Reproject every position in a GeoJSON geometry (any type) with `fwd`.
+function reprojectCoords(c, fwd) {
+  return typeof c[0] === "number" ? fwd(c) : c.map((x) => reprojectCoords(x, fwd));
+}
+async function addShapefileLayer(node) {
+  const { folder, path, name } = node;
+  status(`Adding ${name}…`);
+  let d;
+  try { d = await api(`/api/v1/catalog/shapefile?folder=${folder}&path=${encodeURIComponent(path)}`); }
+  catch (e) { status(`Could not read ${name}: ${e.message}`); alert(`Could not read ${name}:\n${e.message}`); return; }
+  const feats = (d.geojson && d.geojson.features) || [];
+  if (!feats.length) { status(`${name} has no features to draw.`); return; }
+  const crs = resolveCrs(d.epsg);
+  const fwd = crs.code === "EPSG:4326" ? (p) => [p[0], p[1]] : ((t) => (p) => t.forward([p[0], p[1]]))(proj4(crs.code, "EPSG:4326"));
+  const fc = { type: "FeatureCollection", features: feats.filter((f) => f.geometry).map((f) => ({ ...f, geometry: { ...f.geometry, coordinates: reprojectCoords(f.geometry.coordinates, fwd) } })) };
+  const [minx, miny, maxx, maxy] = d.bbox;
+  const corners = [fwd([minx, maxy]), fwd([maxx, maxy]), fwd([maxx, miny]), fwd([minx, miny])];
+  const id = "s" + dynSeq++, srcId = "ssrc-" + id;
+  const color = SHP_COLORS[(dynSeq - 2) % SHP_COLORS.length];
+  map.addSource(srcId, { type: "geojson", data: fc });
+  // New vector layers go on top of the map, as ArcMap adds them.
+  const ids = [];
+  if (/polygon/.test(d.geometry_type)) {
+    map.addLayer({ id: id + "-fill", type: "fill", source: srcId, paint: { "fill-color": color, "fill-opacity": 0.12 } }); ids.push(id + "-fill");
+    map.addLayer({ id: id + "-line", type: "line", source: srcId, paint: { "line-color": color, "line-width": 1.6 } }); ids.push(id + "-line");
+  } else if (/line/.test(d.geometry_type)) {
+    map.addLayer({ id: id + "-line", type: "line", source: srcId, paint: { "line-color": color, "line-width": 1.8 } }); ids.push(id + "-line");
+  } else {
+    map.addLayer({ id: id + "-pt", type: "circle", source: srcId, paint: { "circle-radius": 4, "circle-color": color, "circle-stroke-color": "#000", "circle-stroke-width": 1 } }); ids.push(id + "-pt");
+  }
+  state.dynLayers.unshift({ id, name, kind: "shapefile", map: ids, src: srcId, bbox: corners, visible: true, unc: catUNC(node),
+    icon: node.icon || "polygonFc", features: fc.features.length, epsg: crs.known ? d.epsg : null });
+  buildTOC();
+  map.fitBounds(dynBounds(state.dynLayers[0]), { padding: 40, maxZoom: 18 });
+  const notes = [];
+  if (!crs.known) notes.push("its coordinate system was not recognised, so WGS 1984 UTM Zone 32N is assumed");
+  if (d.truncated) notes.push("it is very large, so only part of its geometry is shown");
+  status(`${name} added: ${fc.features.length.toLocaleString()} feature(s)` + (notes.length ? `; ${notes.join("; ")}.` : "."));
+}
+// Add a Catalog item to the map, by its type (drag-and-drop, or "Add To Map").
+function addCatalogLayer(n) {
+  if (!n) return;
+  if (n.kind === "raster") return addRasterLayer(n);
+  if (n.kind === "shapefile") return addShapefileLayer(n);
+  status(`${n.name} cannot be added to the map.`);
+}
+
 function layerContextMenu(l, x, y) {
   contextMenu([
-    { label: "Zoom To Layer", icon: "fullExtent", action: () => zoomToLayer(l), disabled: l.kind === "raster" || l.kind === "graphics" },
+    { label: "Zoom To Layer", icon: "fullExtent", action: () => zoomToLayer(l), disabled: l.kind === "graphics" },
     { label: l.visible ? "Hide Layer" : "Show Layer", action: () => { l.visible = !l.visible; buildTOC(); } },
     "-",
     { label: "Selection", sub: [
@@ -1608,6 +1696,8 @@ function catContextMenu(key, x, y) {
   const n = cat.nodes.get(key);
   contextMenu([
     { label: n.expandable ? (cat.open.has(key) ? "Collapse" : "Expand") : "Open", action: () => (n.expandable ? catToggle(key) : catActivate(key)), disabled: !n.expandable && !n.run },
+    // Same as dragging the item onto the Table Of Contents.
+    ...(n.kind === "raster" || n.kind === "shapefile" ? [{ label: "Add To Map", icon: "addData", action: () => addCatalogLayer(n) }] : []),
     { label: "Copy Location", action: () => { const loc = n.folder != null ? catUNC(n) : n.name; navigator.clipboard?.writeText(loc); status("Copied " + loc); }, disabled: n.folder == null },
     { label: "Refresh", icon: "refresh", action: () => catRefresh(key), disabled: n.folder == null },
     "-",
@@ -1743,20 +1833,22 @@ function zoomToGraphics() {
  * Boot
  * ===================================================================================== */
 async function refreshAll() { await Promise.all([loadParcels(false), loadBeacons(), loadJobs(), loadDrafts()]); buildTOC(); await catRefresh(cat.selected); status("Refreshed"); }
-// Drag a raster from the Catalog onto the map or the Table Of Contents to add it as a layer.
+// Drag a raster (.tif) or a shapefile (.shp) from the Catalog onto the map or the Table Of Contents
+// to add it as a layer. The Catalog row puts its node key on the drag as "text/cad-item".
+const CAT_DRAG_TYPE = "text/cad-item";
 ["tocPane", "mapFrame"].forEach((pid) => {
   const el = $(pid); if (!el) return;
   el.addEventListener("dragover", (ev) => {
-    if (!ev.dataTransfer.types.includes("text/cad-raster")) return;
+    if (!ev.dataTransfer.types.includes(CAT_DRAG_TYPE)) return;
     ev.preventDefault(); ev.dataTransfer.dropEffect = "copy"; el.classList.add("dropok");
   });
-  el.addEventListener("dragleave", (ev) => { if (ev.target === el) el.classList.remove("dropok"); });
+  el.addEventListener("dragleave", (ev) => { if (!el.contains(ev.relatedTarget)) el.classList.remove("dropok"); });
   el.addEventListener("drop", (ev) => {
-    const key = ev.dataTransfer.getData("text/cad-raster"); el.classList.remove("dropok");
+    el.classList.remove("dropok");
+    const key = ev.dataTransfer.getData(CAT_DRAG_TYPE);
     if (!key) return;
     ev.preventDefault();
-    const n = cat.nodes.get(key);
-    if (n && n.kind === "raster") addRasterLayer(n);
+    addCatalogLayer(cat.nodes.get(key));
   });
 });
 
