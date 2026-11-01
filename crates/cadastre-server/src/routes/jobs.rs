@@ -203,16 +203,39 @@ pub async fn post_job(
     }
 
     let mut tx = state.pool.begin().await?;
+    let parcel_numbers = post_drafts(&mut tx, id).await?;
+
+    audit::append(
+        &mut tx,
+        &user.subject,
+        "post",
+        "job",
+        Some(&id.to_string()),
+        json!({ "parcels_posted": parcel_numbers.len() as i64 }),
+    )
+    .await?;
+
+    tx.commit().await?;
+    Ok(Json(PostResult {
+        posted: parcel_numbers.len(),
+        parcel_numbers,
+    }))
+}
+
+/// Post a job's draft parcels: give each its official UPIN (above every UPIN ever issued, via the
+/// ledger) and make it part of the live fabric. Shared by `POST /jobs/{id}/post` and the
+/// Aumentum workflow's commit. Returns the UPINs, in draft order.
+pub async fn post_drafts(conn: &mut sqlx::PgConnection, job_id: Uuid) -> ApiResult<Vec<String>> {
     let rows = sqlx::query(
         "SELECT id, parcel_number FROM cadastre.parcel \
          WHERE job_id = $1 AND status = 'draft' ORDER BY created_at",
     )
-    .bind(id)
-    .fetch_all(&mut *tx)
+    .bind(job_id)
+    .fetch_all(&mut *conn)
     .await?;
 
     // Keep the allocator above every UPIN ever issued (imports included) before allocating.
-    sqlx::query("SELECT cadastre.sync_upin_sequence()").execute(&mut *tx).await?;
+    sqlx::query("SELECT cadastre.sync_upin_sequence()").execute(&mut *conn).await?;
 
     let mut parcel_numbers = Vec::with_capacity(rows.len());
     for row in &rows {
@@ -224,13 +247,13 @@ pub async fn post_job(
                      ON CONFLICT (upin) DO NOTHING",
                 )
                 .bind(&existing)
-                .execute(&mut *tx)
+                .execute(&mut *conn)
                 .await?;
                 existing
             }
             None => {
                 let seq: i64 = sqlx::query_scalar("SELECT nextval('cadastre.parcel_number_seq')")
-                    .fetch_one(&mut *tx)
+                    .fetch_one(&mut *conn)
                     .await?;
                 let upin = numbering::format_upin(seq);
                 // A newly allocated UPIN must never have been issued before (registry links
@@ -240,7 +263,7 @@ pub async fn post_job(
                      ON CONFLICT (upin) DO NOTHING",
                 )
                 .bind(&upin)
-                .execute(&mut *tx)
+                .execute(&mut *conn)
                 .await?
                 .rows_affected();
                 if recorded == 0 {
@@ -259,26 +282,12 @@ pub async fn post_job(
         )
         .bind(parcel_id)
         .bind(&number)
-        .execute(&mut *tx)
+        .execute(&mut *conn)
         .await?;
         parcel_numbers.push(number);
     }
 
-    audit::append(
-        &mut tx,
-        &user.subject,
-        "post",
-        "job",
-        Some(&id.to_string()),
-        json!({ "parcels_posted": parcel_numbers.len() as i64 }),
-    )
-    .await?;
-
-    tx.commit().await?;
-    Ok(Json(PostResult {
-        posted: parcel_numbers.len(),
-        parcel_numbers,
-    }))
+    Ok(parcel_numbers)
 }
 
 /// The workflow history of a job, oldest first.

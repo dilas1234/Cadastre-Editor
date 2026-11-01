@@ -30,6 +30,12 @@ services:
       KC_BOOTSTRAP_ADMIN_USERNAME: admin
       KC_BOOTSTRAP_ADMIN_PASSWORD: admin
       KC_HTTP_PORT: 8080
+      # The address browsers use; tokens carry it as their issuer, so it must be the same for
+      # everyone (set CADASTRE_KC_HOSTNAME=http://<server-ip>:8081 on the server).
+      KC_HOSTNAME: ${CADASTRE_KC_HOSTNAME:-http://localhost:8081}
+      KC_HOSTNAME_BACKCHANNEL_DYNAMIC: "true"
+    volumes:
+      - keycloak-data:/opt/keycloak/data
     ports:
       - "8081:8080"
     depends_on:
@@ -50,4 +56,5 @@ services:
         condition: service_healthy
 
 volumes:
+  keycloak-data:
   cadastre-db-data:

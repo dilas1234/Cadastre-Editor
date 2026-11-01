@@ -1,0 +1,25 @@
+{
+  "_comment": "Sign in with Plagis.com Windows accounts: Keycloak user federation to Active Directory (DC 10.10.10.2). Fill bindDn/bindCredential with a READ-ONLY service account from PLAGIS IT, then: tools/keycloak/setup.sh --ldap tools/keycloak/ldap-federation.json",
+  "name": "plagis-ad",
+  "providerId": "ldap",
+  "providerType": "org.keycloak.storage.UserStorageProvider",
+  "config": {
+    "vendor": ["ad"],
+    "connectionUrl": ["ldap://10.10.10.2:389"],
+    "bindDn": ["CN=<service account>,CN=Users,DC=Plagis,DC=com"],
+    "bindCredential": ["<password>"],
+    "usersDn": ["DC=Plagis,DC=com"],
+    "usernameLDAPAttribute": ["sAMAccountName"],
+    "rdnLDAPAttribute": ["cn"],
+    "uuidLDAPAttribute": ["objectGUID"],
+    "userObjectClasses": ["person, organizationalPerson, user"],
+    "searchScope": ["2"],
+    "editMode": ["READ_ONLY"],
+    "importEnabled": ["true"],
+    "syncRegistrations": ["false"],
+    "authType": ["simple"],
+    "useTruststoreSpi": ["always"],
+    "pagination": ["true"],
+    "enabled": ["true"]
+  }
+}

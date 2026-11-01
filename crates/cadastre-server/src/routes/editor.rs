@@ -40,6 +40,7 @@ fn content_type(path: &str) -> &'static str {
         Some("css") => "text/css",
         Some("json") => "application/json",
         Some("svg") => "image/svg+xml",
+        Some("pbf") => "application/x-protobuf",
         _ => "application/octet-stream",
     }
 }

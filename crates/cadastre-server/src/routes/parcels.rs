@@ -54,6 +54,34 @@ pub async fn create_job_parcel(
 ) -> ApiResult<(StatusCode, Json<ParcelDto>)> {
     user.require_role("editor")?;
 
+    // Under an Aumentum job, edits follow its job area: the job must be open and have an open job
+    // area, and the parcel must lie inside it (Aumentum's rule and message).
+    let guard = sqlx::query(
+        "SELECT s.is_open, a.status AS area_status, \
+                ST_CoveredBy(ST_SetSRID(ST_GeomFromGeoJSON($2), 32632), ST_Buffer(a.geom, 0.01)) AS inside \
+         FROM cadastre.wf_job_instance w JOIN cadastre.wf_job_status s ON s.code = w.status \
+         LEFT JOIN cadastre.job_area a ON a.wf_job_instance_id = w.id WHERE w.cadastre_job_id = $1",
+    )
+    .bind(job_id)
+    .bind(new.geometry.to_string())
+    .fetch_optional(&state.pool)
+    .await
+    .map_err(|_| AppError::BadRequest("invalid GeoJSON geometry".to_string()))?;
+    if let Some(g) = guard {
+        let (open, area_status, inside): (bool, Option<String>, Option<bool>) = (g.get("is_open"), g.get("area_status"), g.get("inside"));
+        if !open {
+            return Err(AppError::Conflict("the job is not open".into()));
+        }
+        match area_status.as_deref() {
+            None => return Err(AppError::Conflict("create the job area before drawing parcels".into())),
+            Some("closed") => return Err(AppError::Conflict("the job area is closed; reopen it to edit".into())),
+            _ => {}
+        }
+        if inside != Some(true) {
+            return Err(AppError::Conflict(crate::routes::wf::OUTSIDE_JOB_AREA.into()));
+        }
+    }
+
     let sql = format!(
         "INSERT INTO cadastre.parcel (job_id, geom, stated_area, status) \
          VALUES ($1, ST_SetSRID(ST_GeomFromGeoJSON($2), 32632), $3, 'draft') \

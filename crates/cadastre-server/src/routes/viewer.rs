@@ -34,22 +34,22 @@ pub async fn parcels_geojson(
 
     // Status is validated against an allow-list before being inlined.
     let status_clause = match q.status.as_deref() {
-        None | Some("posted") => " AND status = 'posted'".to_string(),
+        None | Some("posted") => " AND p.status = 'posted'".to_string(),
         Some("all") => String::new(),
-        Some(s @ ("draft" | "submitted")) => format!(" AND status = '{s}'"),
+        Some(s @ ("draft" | "submitted")) => format!(" AND p.status = '{s}'"),
         Some(_) => return Err(crate::error::AppError::BadRequest("invalid status".into())),
     };
     // Job is parsed as a uuid (so the inlined value is safe).
     let job_clause = match q.job.as_deref().filter(|s| !s.is_empty()) {
         Some(j) => {
             let id: uuid::Uuid = j.parse().map_err(|_| crate::error::AppError::BadRequest("invalid job id".into()))?;
-            format!(" AND job_id = '{id}'")
+            format!(" AND p.job_id = '{id}'")
         }
         None => String::new(),
     };
     let bbox_clause = match q.bbox.as_deref().and_then(parse_bbox) {
         Some((a, b, c, d)) => format!(
-            " AND geom && ST_Transform(ST_MakeEnvelope({a},{b},{c},{d},4326),32632)"
+            " AND p.geom && ST_Transform(ST_MakeEnvelope({a},{b},{c},{d},4326),32632)"
         ),
         None => String::new(),
     };
@@ -58,12 +58,16 @@ pub async fn parcels_geojson(
         "SELECT COALESCE(json_build_object('type','FeatureCollection','features', COALESCE(json_agg(f), '[]'::json))::text, \
                 '{{\"type\":\"FeatureCollection\",\"features\":[]}}') \
          FROM (SELECT json_build_object('type','Feature', \
-                 'geometry', ST_AsGeoJSON(ST_Transform(geom,4326))::json, \
-                 'properties', json_build_object('id', id, 'parcel_number', parcel_number, \
-                     'status', status, 'job_id', job_id, \
-                     'area', round(COALESCE(computed_area, ST_Area(geom))::numeric,1))) AS f \
-               FROM cadastre.parcel \
-               WHERE geom IS NOT NULL{status_clause}{job_clause}{bbox_clause} \
+                 'geometry', ST_AsGeoJSON(ST_Transform(p.geom,4326))::json, \
+                 'properties', json_build_object('id', p.id, 'parcel_number', p.parcel_number, \
+                     'status', p.status, 'job_id', p.job_id, \
+                     'area', round(COALESCE(p.computed_area, ST_Area(p.geom))::numeric,1), \
+                     'property_number', a.property_number, 'parcel_area', a.parcel_area)) AS f \
+               FROM cadastre.parcel p \
+               LEFT JOIN LATERAL (SELECT NULLIF(btrim(pa.property_number), '') AS property_number, pa.parcel_area \
+                    FROM cadastre.parcel_attribute pa WHERE pa.upin = p.parcel_number \
+                    ORDER BY (pa.status = '0') DESC NULLS LAST, pa.last_edit_date DESC NULLS LAST, pa.object_id DESC LIMIT 1) a ON true \
+               WHERE p.geom IS NOT NULL{status_clause}{job_clause}{bbox_clause} \
                LIMIT {limit}) s"
     );
     let json: String = sqlx::query(&sql).fetch_one(&state.pool).await?.get(0);

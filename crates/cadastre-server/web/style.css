@@ -223,3 +223,34 @@ table.legs tr.selrow td { background: #fff6cf; }
 .catCol { color: #555; padding-left: 8px; white-space: nowrap; }
 .catCol.num { min-width: 70px; text-align: right; }
 #catContents.hidden + * {}
+
+/* Workflow tab (Aumentum job instances) */
+#wfBody { display: flex; flex-direction: column; }
+#wfBody.hidden { display: none; }
+.wfList { flex: 0 1 38%; min-height: 90px; overflow: auto; border-top: 1px solid #d4d4d4; border-bottom: 1px solid #d4d4d4; }
+.wfRow { padding: 4px 6px; border-bottom: 1px solid #eee; cursor: pointer; }
+.wfRow:hover { background: #e5f3ff; }
+.wfRow.sel { background: #cce8ff; }
+.wfRowTop { display: flex; justify-content: space-between; align-items: center; gap: 6px; }
+.wfPill { font-size: 11px; padding: 0 6px; border-radius: 8px; border: 1px solid; white-space: nowrap; }
+.wfPill.open { color: #0a5aa8; border-color: #7eb4ea; background: #eaf4fd; }
+.wfPill.hold { color: #8a5a00; border-color: #e0b04a; background: #fff6df; }
+.wfPill.done { color: #1a6b2a; border-color: #8cc79a; background: #ecf8ef; }
+.wfPill.ended { color: #555; border-color: #bbb; background: #f2f2f2; }
+.wfDetail { flex: 1 1 auto; overflow: auto; padding: 6px; }
+.wfSub { font-weight: 600; margin: 9px 0 3px; color: #2a2a2a; }
+.wfKv { margin: 4px 0; }
+.wfKvRow { display: flex; flex-wrap: wrap; gap: 0 8px; padding: 1px 0; }
+.wfKvK { color: var(--muted); min-width: 118px; }
+.wfKvV { flex: 1 1 140px; min-width: 0; overflow-wrap: anywhere; }
+.wfDetail .btn, .tasksHead .btn { height: auto; min-height: 23px; white-space: normal; text-align: center; }
+.wfSteps { margin: 0; padding-left: 20px; }
+.wfSteps li { margin-bottom: 4px; }
+.wfChoice { display: block; margin: 2px 0; }
+.wfHist { width: 100%; border-collapse: collapse; font-size: 11px; }
+.wfHist th, .wfHist td { border-bottom: 1px solid #eee; text-align: left; padding: 2px 3px; vertical-align: top; }
+.wfHist tr.cur td { background: #fff6df; }
+.wfStepHead { display: flex; justify-content: space-between; align-items: center; gap: 6px; }
+.wfStepBtn { min-width: 0; padding: 0 8px; }
+.wfStepNote { font-size: 11px; white-space: nowrap; }
+.wfEditing { border-top: 1px solid #e3e3e3; margin-top: 6px; }
