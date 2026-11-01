@@ -1,0 +1,1071 @@
+//! Aumentum workflow API (Phase 2): job types, task graph, steps, job instances and their task
+//! history, assignment and hold. Rules live in [`crate::wfengine`]; this module loads state,
+//! applies a decision in one transaction, and records it in the audit chain.
+
+use axum::extract::{Path, Query, State};
+use axum::http::StatusCode;
+use axum::Json;
+use chrono::NaiveDateTime;
+use serde::{Deserialize, Serialize};
+use serde_json::json;
+use sqlx::{QueryBuilder, Row};
+use utoipa::{IntoParams, ToSchema};
+
+use crate::audit;
+use crate::auth::AuthUser;
+use crate::error::{ApiResult, AppError};
+use crate::state::AppState;
+use crate::wfengine::{self, Advance, AdvanceError, Edge};
+
+// ---------------------------------------------------------------------------------------------
+// DTOs
+// ---------------------------------------------------------------------------------------------
+
+#[derive(Serialize, ToSchema)]
+pub struct WfStepDto {
+    pub id: i32,
+    pub name: String,
+    pub icon: Option<String>,
+    /// The tools the step enables, in Aumentum's order (COM GUIDs or class names).
+    pub commands: Vec<String>,
+}
+#[derive(Serialize, ToSchema)]
+pub struct WfTaskDto {
+    pub id: i32,
+    pub name: String,
+    pub description: Option<String>,
+    pub steps: Vec<WfStepDto>,
+    /// Principals granted the task (sids); empty means unrestricted.
+    pub permitted_sids: Vec<i32>,
+}
+#[derive(Serialize, ToSchema)]
+pub struct WfEdgeDto {
+    pub task_id: i32,
+    pub next_task_id: Option<i32>,
+    pub task_order: Option<i32>,
+}
+#[derive(Serialize, ToSchema)]
+pub struct WfJobTypeDto {
+    pub id: i32,
+    pub name: String,
+    pub description: Option<String>,
+    pub start_task_id: Option<i32>,
+    pub end_task_id: Option<i32>,
+    pub active: bool,
+    pub flow: Vec<WfEdgeDto>,
+}
+#[derive(Serialize, ToSchema)]
+pub struct WfStatusDto {
+    pub code: i16,
+    pub label: String,
+    pub is_open: bool,
+    /// Whether PLAGIS has confirmed the meaning of this Aumentum code.
+    pub confirmed: bool,
+}
+#[derive(Serialize, ToSchema)]
+pub struct WfDefinitionsDto {
+    pub job_types: Vec<WfJobTypeDto>,
+    pub tasks: Vec<WfTaskDto>,
+    pub statuses: Vec<WfStatusDto>,
+}
+
+#[derive(Serialize, ToSchema)]
+pub struct WfJobDto {
+    pub id: i32,
+    pub job_type_id: i32,
+    pub job_type: String,
+    pub current_task_id: Option<i32>,
+    pub current_task: Option<String>,
+    pub assigned_sid: Option<i32>,
+    pub assigned_to: Option<String>,
+    pub status: i16,
+    pub status_label: String,
+    pub is_open: bool,
+    pub priority: Option<String>,
+    pub name: Option<String>,
+    pub comment: Option<String>,
+    pub lrs_transaction_number: Option<String>,
+    pub created: Option<NaiveDateTime>,
+    pub started: Option<NaiveDateTime>,
+    pub updated: Option<NaiveDateTime>,
+    pub ended: Option<NaiveDateTime>,
+    pub source: String,
+}
+#[derive(Serialize, ToSchema)]
+pub struct WfTaskInstanceDto {
+    pub id: i32,
+    pub task_id: i32,
+    pub task: String,
+    pub sid: Option<i32>,
+    pub assigned_to: Option<String>,
+    pub assigned: Option<NaiveDateTime>,
+    pub started: Option<NaiveDateTime>,
+    pub ended: Option<NaiveDateTime>,
+    pub comment: Option<String>,
+}
+#[derive(Serialize, ToSchema)]
+pub struct WfTaskRefDto {
+    pub id: i32,
+    pub name: String,
+}
+#[derive(Serialize, ToSchema)]
+pub struct WfJobDetailDto {
+    pub job: WfJobDto,
+    /// Tasks the job may move to next (a branch offers several; one may be a rework loop).
+    pub next_tasks: Vec<WfTaskRefDto>,
+    /// Whether the job may be completed from its current task.
+    pub can_complete: bool,
+    /// The current task's steps and the tools each enables.
+    pub steps: Vec<WfStepDto>,
+    /// Task history, oldest first.
+    pub history: Vec<WfTaskInstanceDto>,
+    /// Registry properties and parcel links, as Aumentum stored them (XML).
+    pub lrs_properties: Option<String>,
+    pub link_parcels_properties: Option<String>,
+}
+#[derive(Serialize, ToSchema)]
+pub struct WfJobListDto {
+    pub total: i64,
+    pub jobs: Vec<WfJobDto>,
+}
+#[derive(Serialize, ToSchema)]
+pub struct WfPrincipalDto {
+    pub sid: i32,
+    pub code: String,
+    pub name: Option<String>,
+    pub is_user: bool,
+    pub is_locked: bool,
+    pub os_account: Option<String>,
+}
+
+#[derive(Deserialize, IntoParams)]
+pub struct WfJobQuery {
+    /// `true` (default): open jobs only; `false`: all.
+    pub open: Option<bool>,
+    /// A status code.
+    pub status: Option<i16>,
+    /// Assignee (principal sid).
+    pub assigned: Option<i32>,
+    /// Job type id.
+    pub job_type: Option<i32>,
+    /// Text search: job id, name, comment or Registry transaction number.
+    pub q: Option<String>,
+    pub limit: Option<i64>,
+    pub offset: Option<i64>,
+}
+#[derive(Deserialize, ToSchema)]
+pub struct NewWfJob {
+    pub job_type_id: i32,
+    pub name: Option<String>,
+    pub comment: Option<String>,
+    pub priority: Option<String>,
+    /// The Registry transaction the job serves.
+    pub lrs_transaction_number: Option<String>,
+    /// Who the first task is assigned to (sid); default: the task's default assignee.
+    pub assigned_sid: Option<i32>,
+}
+#[derive(Deserialize, ToSchema)]
+pub struct WfAdvance {
+    /// The task to move to; omit to complete the job (at its end task) or to take the only path.
+    pub to_task_id: Option<i32>,
+    /// Comment recorded on the finished task.
+    pub comment: Option<String>,
+    /// Assignee of the next task (sid); default: the next task's default assignee.
+    pub assign_sid: Option<i32>,
+}
+#[derive(Deserialize, ToSchema)]
+pub struct WfAssign {
+    pub sid: i32,
+    pub comment: Option<String>,
+}
+#[derive(Deserialize, ToSchema)]
+pub struct WfHold {
+    /// `true`: put the job on hold; `false`: resume it.
+    pub hold: bool,
+    pub comment: Option<String>,
+}
+
+// ---------------------------------------------------------------------------------------------
+// Who is acting
+// ---------------------------------------------------------------------------------------------
+
+/// The caller as an Aumentum principal: matched by login (`code`) or Windows account
+/// (`os_account`, e.g. PLAGIS\jdoe). Administrators (the `admin` role, Aumentum's `admins`
+/// group or `ds_gral_admin`) may act on any task.
+struct Actor {
+    sid: Option<i32>,
+    sids: Vec<i32>,
+    admin: bool,
+    label: String,
+}
+
+async fn resolve_actor(state: &AppState, user: &AuthUser) -> ApiResult<Actor> {
+    let login = user.username.clone().unwrap_or_else(|| user.subject.clone());
+    let short = login.rsplit('\\').next().unwrap_or(&login).to_lowercase();
+    let sid: Option<i32> = sqlx::query_scalar(
+        "SELECT sid FROM cadastre.principal WHERE is_user AND (lower(code) = $1 OR lower(os_account) = $2 \
+         OR lower(os_account) LIKE '%\\' || $1) ORDER BY sid LIMIT 1",
+    )
+    .bind(&short)
+    .bind(login.to_lowercase())
+    .fetch_optional(&state.pool)
+    .await?;
+    let membership: Vec<(i32, i32)> = sqlx::query_as("SELECT group_sid, member_sid FROM cadastre.principal_member")
+        .fetch_all(&state.pool)
+        .await?;
+    let sids = sid.map(|s| wfengine::effective_sids(s, &membership)).unwrap_or_default();
+    let aumentum_admin: bool = if sids.is_empty() {
+        false
+    } else {
+        sqlx::query_scalar(
+            "SELECT EXISTS (SELECT 1 FROM cadastre.principal p WHERE p.sid = ANY($1) AND lower(p.code) = 'admins') \
+             OR EXISTS (SELECT 1 FROM cadastre.principal_role r WHERE r.sid = ANY($1) AND r.role = 'ds_gral_admin' AND r.allow)",
+        )
+        .bind(&sids)
+        .fetch_one(&state.pool)
+        .await?
+    };
+    Ok(Actor { sid, sids, admin: user.has_role("admin") || aumentum_admin, label: login })
+}
+
+async fn task_permitted(conn: &mut sqlx::PgConnection, task_id: i32) -> ApiResult<Vec<i32>> {
+    Ok(sqlx::query_scalar("SELECT sid FROM cadastre.wf_task_permission WHERE task_id = $1")
+        .bind(task_id)
+        .fetch_all(conn)
+        .await?)
+}
+
+async fn default_assignee(conn: &mut sqlx::PgConnection, task_id: i32) -> ApiResult<Option<i32>> {
+    Ok(sqlx::query_scalar("SELECT sid FROM cadastre.wf_task_permission WHERE task_id = $1 AND is_default ORDER BY sid LIMIT 1")
+        .bind(task_id)
+        .fetch_optional(conn)
+        .await?)
+}
+
+/// Record the Aumentum "UserTask" notification for an assignment. It is sent by the mail outbox
+/// when an SMTP server is configured; otherwise it is kept as 'skipped' with the reason (Aumentum's
+/// production has no SMTP server, so it sends nothing either).
+async fn notify_assignment(conn: &mut sqlx::PgConnection, job_id: i32, task_id: i32, sid: Option<i32>) -> ApiResult<()> {
+    let Some(sid) = sid else { return Ok(()) };
+    let row = sqlx::query(
+        "SELECT p.is_user, COALESCE(p.name, p.code) AS who, p.email, COALESCE(j.name, 'Job ' || j.id) AS job, t.name AS task,                 m.subject, m.body,                 COALESCE((SELECT value FROM cadastre.app_setting WHERE key = 'mail.smtp_server'), '') <> ''                 AND COALESCE((SELECT value FROM cadastre.app_setting WHERE key = 'mail.from'), '') <> '' AS smtp          FROM cadastre.principal p, cadastre.wf_job_instance j, cadastre.wf_task t, cadastre.mail_template m          WHERE p.sid = $1 AND j.id = $2 AND t.id = $3 AND m.feature = 'UserTask'",
+    )
+    .bind(sid)
+    .bind(job_id)
+    .bind(task_id)
+    .fetch_optional(&mut *conn)
+    .await?;
+    let Some(r) = row else { return Ok(()) };
+    if !r.get::<bool, _>("is_user") {
+        return Ok(()); // assigned to a group: Aumentum's pool, no personal e-mail
+    }
+    let (who, job, task): (String, String, String) = (r.get("who"), r.get("job"), r.get("task"));
+    let fields = [("FinalUser", who.as_str()), ("JobInstance", job.as_str()), ("Task", task.as_str())];
+    let email: Option<String> = r.get("email");
+    let (status, detail) = if !r.get::<bool, _>("smtp") {
+        ("skipped", Some("no SMTP server configured (mail.smtp_server / mail.from)"))
+    } else if email.as_deref().map(|e| e.contains('@')) != Some(true) {
+        ("skipped", Some("the assignee has no e-mail address"))
+    } else {
+        ("pending", None)
+    };
+    sqlx::query(
+        "INSERT INTO cadastre.wf_notification (feature, job_instance_id, task_id, to_sid, to_email, subject, body, status, detail)          VALUES ('UserTask', $1, $2, $3, $4, $5, $6, $7, $8)",
+    )
+    .bind(job_id)
+    .bind(task_id)
+    .bind(sid)
+    .bind(&email)
+    .bind(crate::mail::render(r.get("subject"), &fields))
+    .bind(crate::mail::render(r.get("body"), &fields))
+    .bind(status)
+    .bind(detail)
+    .execute(&mut *conn)
+    .await?;
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------------------------
+// Reads
+// ---------------------------------------------------------------------------------------------
+
+async fn steps_of(pool: &sqlx::PgPool, task_id: Option<i32>) -> ApiResult<Vec<WfStepDto>> {
+    let Some(task_id) = task_id else { return Ok(vec![]) };
+    let rows = sqlx::query(
+        "SELECT s.id, s.name, s.icon, s.commands FROM cadastre.wf_task_step ts JOIN cadastre.wf_step s ON s.id = ts.step_id \
+         WHERE ts.task_id = $1 ORDER BY ts.ord, s.id",
+    )
+    .bind(task_id)
+    .fetch_all(pool)
+    .await?;
+    Ok(rows.iter().map(|r| WfStepDto { id: r.get("id"), name: r.get("name"), icon: r.get("icon"), commands: r.get("commands") }).collect())
+}
+
+/// Every job type with its task graph, every task with its steps and permissions, and the
+/// status codes.
+#[utoipa::path(get, path = "/api/v1/wf/definitions", tag = "wf", responses((status = 200, body = WfDefinitionsDto)))]
+pub async fn definitions(State(state): State<AppState>) -> ApiResult<Json<WfDefinitionsDto>> {
+    let flows = sqlx::query("SELECT job_type_id, task_id, next_task_id, task_order FROM cadastre.wf_task_flow ORDER BY job_type_id, task_order, task_id")
+        .fetch_all(&state.pool)
+        .await?;
+    let job_types = sqlx::query("SELECT id, name, description, start_task_id, end_task_id, active FROM cadastre.wf_job_type ORDER BY id")
+        .fetch_all(&state.pool)
+        .await?
+        .iter()
+        .map(|r| {
+            let id: i32 = r.get("id");
+            WfJobTypeDto {
+                id,
+                name: r.get("name"),
+                description: r.get("description"),
+                start_task_id: r.get("start_task_id"),
+                end_task_id: r.get("end_task_id"),
+                active: r.get("active"),
+                flow: flows
+                    .iter()
+                    .filter(|f| f.get::<i32, _>("job_type_id") == id)
+                    .map(|f| WfEdgeDto { task_id: f.get("task_id"), next_task_id: f.get("next_task_id"), task_order: f.get("task_order") })
+                    .collect(),
+            }
+        })
+        .collect();
+    let perms: Vec<(i32, i32)> = sqlx::query_as("SELECT task_id, sid FROM cadastre.wf_task_permission").fetch_all(&state.pool).await?;
+    let mut tasks = Vec::new();
+    for r in sqlx::query("SELECT id, name, description FROM cadastre.wf_task ORDER BY id").fetch_all(&state.pool).await? {
+        let id: i32 = r.get("id");
+        tasks.push(WfTaskDto {
+            id,
+            name: r.get("name"),
+            description: r.get("description"),
+            steps: steps_of(&state.pool, Some(id)).await?,
+            permitted_sids: perms.iter().filter(|(t, _)| *t == id).map(|(_, s)| *s).collect(),
+        });
+    }
+    let statuses = sqlx::query("SELECT code, label, is_open, confirmed FROM cadastre.wf_job_status ORDER BY code")
+        .fetch_all(&state.pool)
+        .await?
+        .iter()
+        .map(|r| WfStatusDto { code: r.get("code"), label: r.get("label"), is_open: r.get("is_open"), confirmed: r.get("confirmed") })
+        .collect();
+    Ok(Json(WfDefinitionsDto { job_types, tasks, statuses }))
+}
+
+const JOB_SELECT: &str = "SELECT j.id, j.job_type_id, jt.name AS job_type, j.current_task_id, t.name AS current_task, \
+    j.assigned_sid, COALESCE(p.name, p.code) AS assigned_to, j.status, s.label AS status_label, s.is_open, j.priority, \
+    j.name, j.comment, j.lrs_transaction_number, j.created, j.started, j.updated, j.ended, j.source, \
+    j.lrs_properties, j.link_parcels_properties \
+    FROM cadastre.wf_job_instance j JOIN cadastre.wf_job_type jt ON jt.id = j.job_type_id \
+    JOIN cadastre.wf_job_status s ON s.code = j.status \
+    LEFT JOIN cadastre.wf_task t ON t.id = j.current_task_id LEFT JOIN cadastre.principal p ON p.sid = j.assigned_sid";
+
+fn row_to_job(r: &sqlx::postgres::PgRow) -> WfJobDto {
+    WfJobDto {
+        id: r.get("id"),
+        job_type_id: r.get("job_type_id"),
+        job_type: r.get("job_type"),
+        current_task_id: r.get("current_task_id"),
+        current_task: r.get("current_task"),
+        assigned_sid: r.get("assigned_sid"),
+        assigned_to: r.get("assigned_to"),
+        status: r.get("status"),
+        status_label: r.get("status_label"),
+        is_open: r.get("is_open"),
+        priority: r.get("priority"),
+        name: r.get("name"),
+        comment: r.get("comment"),
+        lrs_transaction_number: r.get("lrs_transaction_number"),
+        created: r.get("created"),
+        started: r.get("started"),
+        updated: r.get("updated"),
+        ended: r.get("ended"),
+        source: r.get("source"),
+    }
+}
+
+fn push_filters<'a>(qb: &mut QueryBuilder<'a, sqlx::Postgres>, q: &'a WfJobQuery) {
+    qb.push(" WHERE true");
+    if q.open.unwrap_or(true) && q.status.is_none() {
+        qb.push(" AND s.is_open");
+    }
+    if let Some(st) = q.status {
+        qb.push(" AND j.status = ").push_bind(st);
+    }
+    if let Some(a) = q.assigned {
+        qb.push(" AND j.assigned_sid = ").push_bind(a);
+    }
+    if let Some(t) = q.job_type {
+        qb.push(" AND j.job_type_id = ").push_bind(t);
+    }
+    if let Some(text) = q.q.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
+        let like = format!("%{}%", text.replace('%', "\\%").replace('_', "\\_"));
+        qb.push(" AND (j.id::text = ").push_bind(text.to_string())
+            .push(" OR j.name ILIKE ").push_bind(like.clone())
+            .push(" OR j.comment ILIKE ").push_bind(like.clone())
+            .push(" OR j.lrs_transaction_number ILIKE ").push_bind(like)
+            .push(")");
+    }
+}
+
+/// Job instances (open ones by default), most recently updated first.
+#[utoipa::path(get, path = "/api/v1/wf/jobs", tag = "wf", params(WfJobQuery), responses((status = 200, body = WfJobListDto)))]
+pub async fn list_jobs(State(state): State<AppState>, Query(q): Query<WfJobQuery>) -> ApiResult<Json<WfJobListDto>> {
+    let limit = q.limit.unwrap_or(100).clamp(1, 1000);
+    let offset = q.offset.unwrap_or(0).max(0);
+    let mut count = QueryBuilder::new("SELECT count(*) FROM cadastre.wf_job_instance j JOIN cadastre.wf_job_status s ON s.code = j.status");
+    push_filters(&mut count, &q);
+    let total: i64 = count.build_query_scalar().fetch_one(&state.pool).await?;
+    let mut qb = QueryBuilder::new(JOB_SELECT);
+    push_filters(&mut qb, &q);
+    qb.push(" ORDER BY COALESCE(j.updated, j.created) DESC NULLS LAST, j.id DESC LIMIT ").push_bind(limit).push(" OFFSET ").push_bind(offset);
+    let jobs = qb.build().fetch_all(&state.pool).await?.iter().map(row_to_job).collect();
+    Ok(Json(WfJobListDto { total, jobs }))
+}
+
+async fn load_detail(state: &AppState, id: i32) -> ApiResult<WfJobDetailDto> {
+    let row = sqlx::query(&format!("{JOB_SELECT} WHERE j.id = $1"))
+        .bind(id)
+        .fetch_optional(&state.pool)
+        .await?
+        .ok_or_else(|| AppError::NotFound(format!("job instance {id}")))?;
+    let job = row_to_job(&row);
+    let (edges, end_task) = graph(&state.pool, job.job_type_id).await?;
+    let (next_tasks, can_complete) = match (job.is_open, job.current_task_id) {
+        (true, Some(cur)) => (wfengine::next_tasks(&edges, cur), wfengine::can_complete(&edges, end_task, cur)),
+        _ => (vec![], false),
+    };
+    let next_tasks = task_refs(&state.pool, &next_tasks).await?;
+    let history = sqlx::query(
+        "SELECT ti.id, ti.task_id, t.name AS task, ti.sid, COALESCE(p.name, p.code) AS assigned_to, ti.assigned, ti.started, ti.ended, ti.comment \
+         FROM cadastre.wf_task_instance ti JOIN cadastre.wf_task t ON t.id = ti.task_id LEFT JOIN cadastre.principal p ON p.sid = ti.sid \
+         WHERE ti.job_instance_id = $1 ORDER BY COALESCE(ti.assigned, ti.started), ti.id",
+    )
+    .bind(id)
+    .fetch_all(&state.pool)
+    .await?
+    .iter()
+    .map(|r| WfTaskInstanceDto {
+        id: r.get("id"),
+        task_id: r.get("task_id"),
+        task: r.get("task"),
+        sid: r.get("sid"),
+        assigned_to: r.get("assigned_to"),
+        assigned: r.get("assigned"),
+        started: r.get("started"),
+        ended: r.get("ended"),
+        comment: r.get("comment"),
+    })
+    .collect();
+    let steps = if job.is_open { steps_of(&state.pool, job.current_task_id).await? } else { vec![] };
+    Ok(WfJobDetailDto {
+        lrs_properties: row.get("lrs_properties"),
+        link_parcels_properties: row.get("link_parcels_properties"),
+        job,
+        next_tasks,
+        can_complete,
+        steps,
+        history,
+    })
+}
+
+async fn graph(pool: &sqlx::PgPool, job_type_id: i32) -> ApiResult<(Vec<Edge>, Option<i32>)> {
+    let edges = sqlx::query_as::<_, (i32, Option<i32>)>("SELECT task_id, next_task_id FROM cadastre.wf_task_flow WHERE job_type_id = $1")
+        .bind(job_type_id)
+        .fetch_all(pool)
+        .await?
+        .into_iter()
+        .map(|(task_id, next_task_id)| Edge { task_id, next_task_id })
+        .collect();
+    let end: Option<i32> = sqlx::query_scalar("SELECT end_task_id FROM cadastre.wf_job_type WHERE id = $1").bind(job_type_id).fetch_one(pool).await?;
+    Ok((edges, end))
+}
+
+async fn task_refs(pool: &sqlx::PgPool, ids: &[i32]) -> ApiResult<Vec<WfTaskRefDto>> {
+    Ok(sqlx::query("SELECT id, name FROM cadastre.wf_task WHERE id = ANY($1) ORDER BY id")
+        .bind(ids)
+        .fetch_all(pool)
+        .await?
+        .iter()
+        .map(|r| WfTaskRefDto { id: r.get("id"), name: r.get("name") })
+        .collect())
+}
+
+/// One job instance: its current task and steps, where it may go next, and its task history.
+#[utoipa::path(get, path = "/api/v1/wf/jobs/{id}", tag = "wf", params(("id" = i32, Path, description = "Job instance id")),
+    responses((status = 200, body = WfJobDetailDto), (status = 404, description = "Not found")))]
+pub async fn get_job(State(state): State<AppState>, Path(id): Path<i32>) -> ApiResult<Json<WfJobDetailDto>> {
+    Ok(Json(load_detail(&state, id).await?))
+}
+
+/// Users and groups (Aumentum principals).
+#[utoipa::path(get, path = "/api/v1/wf/principals", tag = "wf", responses((status = 200, body = [WfPrincipalDto])))]
+pub async fn principals(State(state): State<AppState>) -> ApiResult<Json<Vec<WfPrincipalDto>>> {
+    let rows = sqlx::query("SELECT sid, code, name, is_user, is_locked, os_account FROM cadastre.principal ORDER BY is_user, lower(COALESCE(name, code))")
+        .fetch_all(&state.pool)
+        .await?;
+    Ok(Json(rows.iter().map(|r| WfPrincipalDto { sid: r.get("sid"), code: r.get("code"), name: r.get("name"), is_user: r.get("is_user"), is_locked: r.get("is_locked"), os_account: r.get("os_account") }).collect()))
+}
+
+// ---------------------------------------------------------------------------------------------
+// Actions
+// ---------------------------------------------------------------------------------------------
+
+/// Start a job of a job type: it opens on the type's start task, assigned to the given principal
+/// or the task's default assignee.
+#[utoipa::path(post, path = "/api/v1/wf/jobs", tag = "wf", request_body = NewWfJob,
+    responses((status = 201, body = WfJobDetailDto), (status = 403, description = "Not permitted"), (status = 404, description = "Unknown job type")))]
+pub async fn create_job(State(state): State<AppState>, user: AuthUser, Json(req): Json<NewWfJob>) -> ApiResult<(StatusCode, Json<WfJobDetailDto>)> {
+    let actor = resolve_actor(&state, &user).await?;
+    let start: Option<Option<i32>> = sqlx::query_scalar("SELECT start_task_id FROM cadastre.wf_job_type WHERE id = $1 AND active")
+        .bind(req.job_type_id)
+        .fetch_optional(&state.pool)
+        .await?;
+    let start = start
+        .ok_or_else(|| AppError::NotFound(format!("job type {}", req.job_type_id)))?
+        .ok_or_else(|| AppError::BadRequest(format!("job type {} has no start task", req.job_type_id)))?;
+    let mut tx = state.pool.begin().await?;
+    if !wfengine::may_act(&task_permitted(&mut tx, start).await?, &actor.sids, actor.admin) {
+        return Err(AppError::Forbidden(format!("{} may not start this job type's first task", actor.label)));
+    }
+    let assignee = match req.assigned_sid {
+        Some(s) => Some(s),
+        None => default_assignee(&mut tx, start).await?.or(actor.sid),
+    };
+    let id: i32 = sqlx::query_scalar(
+        "INSERT INTO cadastre.wf_job_instance (job_type_id, current_task_id, assigned_sid, priority, status, name, comment, lrs_transaction_number, created, started, updated, source) \
+         VALUES ($1, $2, $3, $4, 2, $5, $6, $7, now()::timestamp, now()::timestamp, now()::timestamp, 'cadastre') RETURNING id",
+    )
+    .bind(req.job_type_id)
+    .bind(start)
+    .bind(assignee)
+    .bind(req.priority.as_deref().unwrap_or("N"))
+    .bind(&req.name)
+    .bind(&req.comment)
+    .bind(&req.lrs_transaction_number)
+    .fetch_one(&mut *tx)
+    .await?;
+    sqlx::query(
+        "INSERT INTO cadastre.wf_task_instance (job_instance_id, job_type_id, task_id, sid, assigned, started) \
+         VALUES ($1, $2, $3, $4, now()::timestamp, now()::timestamp)",
+    )
+    .bind(id)
+    .bind(req.job_type_id)
+    .bind(start)
+    .bind(assignee)
+    .execute(&mut *tx)
+    .await?;
+    notify_assignment(&mut tx, id, start, assignee).await?;
+    audit::append(&mut tx, &actor.label, "wf_create", "wf_job_instance", Some(&id.to_string()),
+        json!({ "job_type_id": req.job_type_id, "task_id": start, "assigned_sid": assignee, "lrs_transaction_number": req.lrs_transaction_number })).await?;
+    tx.commit().await?;
+    Ok((StatusCode::CREATED, Json(load_detail(&state, id).await?)))
+}
+
+/// Finish the current task and move the job along its task graph (or complete it at the end).
+#[utoipa::path(post, path = "/api/v1/wf/jobs/{id}/advance", tag = "wf", request_body = WfAdvance, params(("id" = i32, Path, description = "Job instance id")),
+    responses((status = 200, body = WfJobDetailDto), (status = 403, description = "Not permitted"), (status = 409, description = "Not a next task, or the job is not open")))]
+pub async fn advance(State(state): State<AppState>, user: AuthUser, Path(id): Path<i32>, Json(req): Json<WfAdvance>) -> ApiResult<Json<WfJobDetailDto>> {
+    let actor = resolve_actor(&state, &user).await?;
+    let mut tx = state.pool.begin().await?;
+    // Lock the job so two officers cannot advance it at once.
+    let row = sqlx::query(
+        "SELECT j.job_type_id, j.current_task_id, s.is_open FROM cadastre.wf_job_instance j JOIN cadastre.wf_job_status s ON s.code = j.status \
+         WHERE j.id = $1 FOR UPDATE OF j",
+    )
+    .bind(id)
+    .fetch_optional(&mut *tx)
+    .await?
+    .ok_or_else(|| AppError::NotFound(format!("job instance {id}")))?;
+    let (job_type_id, current, is_open): (i32, Option<i32>, bool) = (row.get(0), row.get(1), row.get(2));
+    let current = current.ok_or_else(|| AppError::Conflict("job has no current task".into()))?;
+    if !wfengine::may_act(&task_permitted(&mut tx, current).await?, &actor.sids, actor.admin) {
+        return Err(AppError::Forbidden(format!("{} may not act on this task", actor.label)));
+    }
+    if is_commit_task(&mut tx, Some(current)).await? {
+        let drafts: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM cadastre.parcel p JOIN cadastre.wf_job_instance w ON w.cadastre_job_id = p.job_id WHERE w.id = $1 AND p.status = 'draft'",
+        )
+        .bind(id)
+        .fetch_one(&mut *tx)
+        .await?;
+        if drafts > 0 {
+            return Err(AppError::Conflict(format!("commit (or discard) the job's {drafts} parcel(s) before finishing this task")));
+        }
+    }
+    let (edges, end_task) = graph(&state.pool, job_type_id).await?;
+    let decision = wfengine::resolve_advance(&edges, end_task, current, is_open, req.to_task_id).map_err(|e| match e {
+        AdvanceError::NotOpen => AppError::Conflict("the job is not open".into()),
+        AdvanceError::NotANextTask { requested, allowed } => AppError::Conflict(format!("task {requested} does not follow the current task; next tasks: {allowed:?}")),
+        AdvanceError::ChooseNextTask { allowed } => AppError::Conflict(format!("choose the next task: {allowed:?}")),
+    })?;
+    // Close the open task instance of the current task.
+    sqlx::query(
+        "UPDATE cadastre.wf_task_instance SET ended = now()::timestamp, started = COALESCE(started, now()::timestamp), \
+         comment = COALESCE($3, comment) WHERE job_instance_id = $1 AND task_id = $2 AND ended IS NULL",
+    )
+    .bind(id)
+    .bind(current)
+    .bind(&req.comment)
+    .execute(&mut *tx)
+    .await?;
+    let payload = match decision {
+        Advance::Complete => {
+            sqlx::query("UPDATE cadastre.wf_job_instance SET status = 3, ended = now()::timestamp, updated = now()::timestamp WHERE id = $1")
+                .bind(id)
+                .execute(&mut *tx)
+                .await?;
+            json!({ "from_task": current, "completed": true, "comment": req.comment })
+        }
+        Advance::To(next) => {
+            let assignee = match req.assign_sid {
+                Some(s) => Some(s),
+                None => default_assignee(&mut tx, next).await?,
+            };
+            sqlx::query("UPDATE cadastre.wf_job_instance SET current_task_id = $2, assigned_sid = $3, status = 2, updated = now()::timestamp WHERE id = $1")
+                .bind(id)
+                .bind(next)
+                .bind(assignee)
+                .execute(&mut *tx)
+                .await?;
+            sqlx::query("INSERT INTO cadastre.wf_task_instance (job_instance_id, job_type_id, task_id, sid, assigned) VALUES ($1, $2, $3, $4, now()::timestamp)")
+                .bind(id)
+                .bind(job_type_id)
+                .bind(next)
+                .bind(assignee)
+                .execute(&mut *tx)
+                .await?;
+            notify_assignment(&mut tx, id, next, assignee).await?;
+            json!({ "from_task": current, "to_task": next, "assigned_sid": assignee, "comment": req.comment })
+        }
+    };
+    audit::append(&mut tx, &actor.label, "wf_advance", "wf_job_instance", Some(&id.to_string()), payload).await?;
+    tx.commit().await?;
+    Ok(Json(load_detail(&state, id).await?))
+}
+
+/// Reassign the job's current task (Aumentum role `ds_reasignTask`, or an administrator).
+#[utoipa::path(post, path = "/api/v1/wf/jobs/{id}/assign", tag = "wf", request_body = WfAssign, params(("id" = i32, Path, description = "Job instance id")),
+    responses((status = 200, body = WfJobDetailDto), (status = 403, description = "Not permitted")))]
+pub async fn assign(State(state): State<AppState>, user: AuthUser, Path(id): Path<i32>, Json(req): Json<WfAssign>) -> ApiResult<Json<WfJobDetailDto>> {
+    let actor = resolve_actor(&state, &user).await?;
+    let may_reassign: bool = actor.admin
+        || sqlx::query_scalar("SELECT EXISTS (SELECT 1 FROM cadastre.principal_role WHERE sid = ANY($1) AND role = 'ds_reasignTask' AND allow)")
+            .bind(&actor.sids)
+            .fetch_one(&state.pool)
+            .await?;
+    if !may_reassign {
+        return Err(AppError::Forbidden(format!("{} may not reassign tasks", actor.label)));
+    }
+    let mut tx = state.pool.begin().await?;
+    let cur: Option<Option<i32>> = sqlx::query_scalar("SELECT current_task_id FROM cadastre.wf_job_instance WHERE id = $1 FOR UPDATE")
+        .bind(id)
+        .fetch_optional(&mut *tx)
+        .await?;
+    let cur = cur.ok_or_else(|| AppError::NotFound(format!("job instance {id}")))?;
+    let exists: bool = sqlx::query_scalar("SELECT EXISTS (SELECT 1 FROM cadastre.principal WHERE sid = $1)").bind(req.sid).fetch_one(&mut *tx).await?;
+    if !exists {
+        return Err(AppError::NotFound(format!("principal {}", req.sid)));
+    }
+    sqlx::query("UPDATE cadastre.wf_job_instance SET assigned_sid = $2, updated = now()::timestamp WHERE id = $1")
+        .bind(id)
+        .bind(req.sid)
+        .execute(&mut *tx)
+        .await?;
+    sqlx::query("UPDATE cadastre.wf_task_instance SET sid = $3, assigned = now()::timestamp WHERE job_instance_id = $1 AND task_id = $2 AND ended IS NULL")
+        .bind(id)
+        .bind(cur)
+        .bind(req.sid)
+        .execute(&mut *tx)
+        .await?;
+    if let Some(cur) = cur {
+        notify_assignment(&mut tx, id, cur, Some(req.sid)).await?;
+    }
+    audit::append(&mut tx, &actor.label, "wf_assign", "wf_job_instance", Some(&id.to_string()), json!({ "sid": req.sid, "task_id": cur, "comment": req.comment })).await?;
+    tx.commit().await?;
+    Ok(Json(load_detail(&state, id).await?))
+}
+
+/// Put an open job on hold (status 8) or resume it (status 2).
+#[utoipa::path(post, path = "/api/v1/wf/jobs/{id}/hold", tag = "wf", request_body = WfHold, params(("id" = i32, Path, description = "Job instance id")),
+    responses((status = 200, body = WfJobDetailDto), (status = 409, description = "The job is closed")))]
+pub async fn hold(State(state): State<AppState>, user: AuthUser, Path(id): Path<i32>, Json(req): Json<WfHold>) -> ApiResult<Json<WfJobDetailDto>> {
+    let actor = resolve_actor(&state, &user).await?;
+    let mut tx = state.pool.begin().await?;
+    let row = sqlx::query("SELECT j.current_task_id, s.is_open FROM cadastre.wf_job_instance j JOIN cadastre.wf_job_status s ON s.code = j.status WHERE j.id = $1 FOR UPDATE OF j")
+        .bind(id)
+        .fetch_optional(&mut *tx)
+        .await?
+        .ok_or_else(|| AppError::NotFound(format!("job instance {id}")))?;
+    let (cur, is_open): (Option<i32>, bool) = (row.get(0), row.get(1));
+    if !is_open {
+        return Err(AppError::Conflict("the job is closed".into()));
+    }
+    if let Some(cur) = cur {
+        if !wfengine::may_act(&task_permitted(&mut tx, cur).await?, &actor.sids, actor.admin) {
+            return Err(AppError::Forbidden(format!("{} may not act on this task", actor.label)));
+        }
+    }
+    sqlx::query("UPDATE cadastre.wf_job_instance SET status = $2, updated = now()::timestamp WHERE id = $1")
+        .bind(id)
+        .bind(if req.hold { 8i16 } else { 2i16 })
+        .execute(&mut *tx)
+        .await?;
+    audit::append(&mut tx, &actor.label, if req.hold { "wf_hold" } else { "wf_resume" }, "wf_job_instance", Some(&id.to_string()), json!({ "comment": req.comment })).await?;
+    tx.commit().await?;
+    Ok(Json(load_detail(&state, id).await?))
+}
+
+// ---------------------------------------------------------------------------------------------
+// Editing under a job: the job's editing job (drafts), its job area, discard and commit
+// ---------------------------------------------------------------------------------------------
+
+/// Aumentum's "save job area to parcel fabric" tool. A task whose steps use it is a commit task:
+/// the job's parcels are committed there, and the job may not leave it with work uncommitted.
+pub const COMMIT_TOOL: &str = "{E9CFA8EC-BCBF-420d-8BA8-1ACE00F05C83}";
+/// Aumentum's message when a parcel is drawn outside the job area (from the editor's own log).
+pub const OUTSIDE_JOB_AREA: &str = "You have a point outside the Job Area. All edits must be inside Job Area.";
+
+#[derive(Serialize, ToSchema)]
+pub struct WfEditingDto {
+    pub job_instance_id: i32,
+    /// The editing job that holds this job's draft parcels (created on first use).
+    pub cadastre_job_id: Option<uuid::Uuid>,
+    pub reference: Option<String>,
+    /// The job area in WGS84 (for the map) and in UTM 32N (for drawing), if one exists.
+    pub area: Option<serde_json::Value>,
+    pub area_utm: Option<serde_json::Value>,
+    pub area_status: Option<String>,
+    pub area_m2: Option<f64>,
+    /// Uncommitted draft parcels.
+    pub drafts: i64,
+    /// Whether the job's current task is where its parcels are committed.
+    pub is_commit_task: bool,
+}
+#[derive(Deserialize, ToSchema)]
+pub struct WfAreaBody {
+    /// A GeoJSON Polygon in UTM zone 32N (EPSG:32632) metres.
+    pub geometry: serde_json::Value,
+}
+#[derive(Serialize, ToSchema)]
+pub struct WfCommitDto {
+    /// UPINs given to the committed parcels.
+    pub parcel_numbers: Vec<String>,
+    pub editing: WfEditingDto,
+}
+
+async fn is_commit_task(conn: &mut sqlx::PgConnection, task_id: Option<i32>) -> ApiResult<bool> {
+    let Some(task_id) = task_id else { return Ok(false) };
+    Ok(sqlx::query_scalar(
+        "SELECT EXISTS (SELECT 1 FROM cadastre.wf_task_step ts JOIN cadastre.wf_step s ON s.id = ts.step_id \
+         WHERE ts.task_id = $1 AND EXISTS (SELECT 1 FROM unnest(s.commands) c WHERE upper(c) = upper($2)))",
+    )
+    .bind(task_id)
+    .bind(COMMIT_TOOL)
+    .fetch_one(conn)
+    .await?)
+}
+
+async fn editing_info(state: &AppState, id: i32) -> ApiResult<WfEditingDto> {
+    let row = sqlx::query(
+        "SELECT w.current_task_id, w.cadastre_job_id, j.reference, \
+                ST_AsGeoJSON(ST_Transform(a.geom, 4326))::json AS area, ST_AsGeoJSON(a.geom)::json AS area_utm, a.status AS area_status, ST_Area(a.geom) AS area_m2, \
+                (SELECT count(*) FROM cadastre.parcel p WHERE p.job_id = w.cadastre_job_id AND p.status = 'draft') AS drafts \
+         FROM cadastre.wf_job_instance w LEFT JOIN cadastre.job j ON j.id = w.cadastre_job_id \
+         LEFT JOIN cadastre.job_area a ON a.wf_job_instance_id = w.id WHERE w.id = $1",
+    )
+    .bind(id)
+    .fetch_optional(&state.pool)
+    .await?
+    .ok_or_else(|| AppError::NotFound(format!("job instance {id}")))?;
+    let mut conn = state.pool.acquire().await?;
+    Ok(WfEditingDto {
+        job_instance_id: id,
+        cadastre_job_id: row.get("cadastre_job_id"),
+        reference: row.get("reference"),
+        area: row.get("area"),
+        area_utm: row.get("area_utm"),
+        area_status: row.get("area_status"),
+        area_m2: row.get("area_m2"),
+        drafts: row.get("drafts"),
+        is_commit_task: is_commit_task(&mut conn, row.get("current_task_id")).await?,
+    })
+}
+
+/// Lock an open job for a change by `actor` on its current task; returns its current task.
+async fn lock_open_job(tx: &mut sqlx::PgConnection, id: i32, actor: &Actor) -> ApiResult<Option<i32>> {
+    let row = sqlx::query(
+        "SELECT j.current_task_id, s.is_open FROM cadastre.wf_job_instance j JOIN cadastre.wf_job_status s ON s.code = j.status \
+         WHERE j.id = $1 FOR UPDATE OF j",
+    )
+    .bind(id)
+    .fetch_optional(&mut *tx)
+    .await?
+    .ok_or_else(|| AppError::NotFound(format!("job instance {id}")))?;
+    let (cur, open): (Option<i32>, bool) = (row.get(0), row.get(1));
+    if !open {
+        return Err(AppError::Conflict("the job is not open".into()));
+    }
+    if let Some(cur) = cur {
+        if !wfengine::may_act(&task_permitted(tx, cur).await?, &actor.sids, actor.admin) {
+            return Err(AppError::Forbidden(format!("{} may not act on this job's current task", actor.label)));
+        }
+    }
+    Ok(cur)
+}
+
+/// The job's editing state (does not create anything).
+#[utoipa::path(get, path = "/api/v1/wf/jobs/{id}/editing", tag = "wf", params(("id" = i32, Path, description = "Job instance id")),
+    responses((status = 200, body = WfEditingDto)))]
+pub async fn get_editing(State(state): State<AppState>, Path(id): Path<i32>) -> ApiResult<Json<WfEditingDto>> {
+    Ok(Json(editing_info(&state, id).await?))
+}
+
+/// Start editing under the job: creates its editing job (which holds its draft parcels) if needed.
+#[utoipa::path(post, path = "/api/v1/wf/jobs/{id}/editing", tag = "wf", params(("id" = i32, Path, description = "Job instance id")),
+    responses((status = 200, body = WfEditingDto), (status = 409, description = "The job is not open")))]
+pub async fn start_editing(State(state): State<AppState>, user: AuthUser, Path(id): Path<i32>) -> ApiResult<Json<WfEditingDto>> {
+    let actor = resolve_actor(&state, &user).await?;
+    let mut tx = state.pool.begin().await?;
+    lock_open_job(&mut tx, id, &actor).await?;
+    let existing: Option<uuid::Uuid> = sqlx::query_scalar("SELECT cadastre_job_id FROM cadastre.wf_job_instance WHERE id = $1").bind(id).fetch_one(&mut *tx).await?;
+    if existing.is_none() {
+        let job_id: uuid::Uuid = sqlx::query_scalar(
+            "INSERT INTO cadastre.job (reference, job_type, title, created_by, updated_by, current_stage_id, status) \
+             SELECT 'WF-' || w.id, 'aumentum:' || jt.name, w.name, $2, $2, s.id, s.code \
+             FROM cadastre.wf_job_instance w JOIN cadastre.wf_job_type jt ON jt.id = w.job_type_id, cadastre.workflow_stage s \
+             WHERE w.id = $1 AND s.is_initial RETURNING id",
+        )
+        .bind(id)
+        .bind(&actor.label)
+        .fetch_one(&mut *tx)
+        .await?;
+        sqlx::query("UPDATE cadastre.wf_job_instance SET cadastre_job_id = $2, updated = now()::timestamp WHERE id = $1").bind(id).bind(job_id).execute(&mut *tx).await?;
+        audit::append(&mut tx, &actor.label, "wf_start_editing", "wf_job_instance", Some(&id.to_string()), json!({ "cadastre_job_id": job_id })).await?;
+    }
+    tx.commit().await?;
+    Ok(Json(editing_info(&state, id).await?))
+}
+
+/// Create or redraw the job area (Aumentum: Create / Edit Job Area). Reopens a closed area.
+#[utoipa::path(put, path = "/api/v1/wf/jobs/{id}/area", tag = "wf", request_body = WfAreaBody, params(("id" = i32, Path, description = "Job instance id")),
+    responses((status = 200, body = WfEditingDto), (status = 400, description = "Not a valid polygon"), (status = 409, description = "Drafts would fall outside the new area")))]
+pub async fn put_area(State(state): State<AppState>, user: AuthUser, Path(id): Path<i32>, Json(body): Json<WfAreaBody>) -> ApiResult<Json<WfEditingDto>> {
+    let actor = resolve_actor(&state, &user).await?;
+    let mut tx = state.pool.begin().await?;
+    lock_open_job(&mut tx, id, &actor).await?;
+    let ok: Option<bool> = sqlx::query_scalar(
+        "SELECT ST_GeometryType(g) = 'ST_Polygon' AND ST_IsValid(g) AND ST_Area(g) > 0 FROM (SELECT ST_SetSRID(ST_GeomFromGeoJSON($1), 32632) AS g) x",
+    )
+    .bind(body.geometry.to_string())
+    .fetch_one(&mut *tx)
+    .await
+    .map_err(|_| AppError::BadRequest("the job area must be a GeoJSON Polygon in UTM zone 32N".into()))?;
+    if ok != Some(true) {
+        return Err(AppError::BadRequest("the job area must be a single valid polygon with an area".into()));
+    }
+    // UTM zone 32N coordinates: eastings 100 km..900 km, northings within the northern hemisphere
+    // band. Outside that the geometry cannot be shown on the map (it projects to infinity).
+    let in_zone: bool = sqlx::query_scalar(
+        "SELECT ST_XMin(g) >= 100000 AND ST_XMax(g) <= 900000 AND ST_YMin(g) >= 0 AND ST_YMax(g) <= 9400000          FROM (SELECT ST_SetSRID(ST_GeomFromGeoJSON($1), 32632) AS g) x",
+    )
+    .bind(body.geometry.to_string())
+    .fetch_one(&mut *tx)
+    .await?;
+    if !in_zone {
+        return Err(AppError::BadRequest("the job area is outside UTM zone 32N (EPSG:32632); coordinates must be eastings/northings in metres".into()));
+    }
+    // Redrawing must keep the job's existing drafts inside the area.
+    let outside: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM cadastre.parcel p JOIN cadastre.wf_job_instance w ON w.cadastre_job_id = p.job_id \
+         WHERE w.id = $1 AND p.status = 'draft' AND NOT ST_CoveredBy(p.geom, ST_Buffer(ST_SetSRID(ST_GeomFromGeoJSON($2), 32632), 0.01))",
+    )
+    .bind(id)
+    .bind(body.geometry.to_string())
+    .fetch_one(&mut *tx)
+    .await?;
+    if outside > 0 {
+        return Err(AppError::Conflict(format!("{outside} draft parcel(s) of this job would fall outside the new job area")));
+    }
+    sqlx::query(
+        "INSERT INTO cadastre.job_area (wf_job_instance_id, geom, status, created_by, updated_by) \
+         VALUES ($1, ST_SetSRID(ST_GeomFromGeoJSON($2), 32632), 'open', $3, $3) \
+         ON CONFLICT (wf_job_instance_id) DO UPDATE SET geom = EXCLUDED.geom, status = 'open', closed_at = NULL, updated_by = $3, updated_at = now()",
+    )
+    .bind(id)
+    .bind(body.geometry.to_string())
+    .bind(&actor.label)
+    .execute(&mut *tx)
+    .await?;
+    audit::append(&mut tx, &actor.label, "wf_job_area_save", "wf_job_instance", Some(&id.to_string()), json!({ "geometry": body.geometry })).await?;
+    tx.commit().await?;
+    Ok(Json(editing_info(&state, id).await?))
+}
+
+/// Close (no more edits) or reopen the job area.
+#[utoipa::path(post, path = "/api/v1/wf/jobs/{id}/area/{action}", tag = "wf",
+    params(("id" = i32, Path, description = "Job instance id"), ("action" = String, Path, description = "close | reopen")),
+    responses((status = 200, body = WfEditingDto), (status = 404, description = "No job area")))]
+pub async fn area_action(State(state): State<AppState>, user: AuthUser, Path((id, action)): Path<(i32, String)>) -> ApiResult<Json<WfEditingDto>> {
+    let actor = resolve_actor(&state, &user).await?;
+    let status = match action.as_str() {
+        "close" => "closed",
+        "reopen" => "open",
+        _ => return Err(AppError::BadRequest("action must be close or reopen".into())),
+    };
+    let mut tx = state.pool.begin().await?;
+    lock_open_job(&mut tx, id, &actor).await?;
+    let n = sqlx::query(
+        "UPDATE cadastre.job_area SET status = $2, closed_at = CASE WHEN $2 = 'closed' THEN now() END, updated_by = $3, updated_at = now() WHERE wf_job_instance_id = $1",
+    )
+    .bind(id)
+    .bind(status)
+    .bind(&actor.label)
+    .execute(&mut *tx)
+    .await?
+    .rows_affected();
+    if n == 0 {
+        return Err(AppError::NotFound("this job has no job area".into()));
+    }
+    audit::append(&mut tx, &actor.label, &format!("wf_job_area_{action}"), "wf_job_instance", Some(&id.to_string()), json!({})).await?;
+    tx.commit().await?;
+    Ok(Json(editing_info(&state, id).await?))
+}
+
+/// Delete the job area (Aumentum: Delete Job Area). Refused while the job has uncommitted drafts.
+#[utoipa::path(delete, path = "/api/v1/wf/jobs/{id}/area", tag = "wf", params(("id" = i32, Path, description = "Job instance id")),
+    responses((status = 200, body = WfEditingDto), (status = 409, description = "Discard or commit the drafts first")))]
+pub async fn delete_area(State(state): State<AppState>, user: AuthUser, Path(id): Path<i32>) -> ApiResult<Json<WfEditingDto>> {
+    let actor = resolve_actor(&state, &user).await?;
+    let mut tx = state.pool.begin().await?;
+    lock_open_job(&mut tx, id, &actor).await?;
+    let drafts: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM cadastre.parcel p JOIN cadastre.wf_job_instance w ON w.cadastre_job_id = p.job_id WHERE w.id = $1 AND p.status = 'draft'",
+    )
+    .bind(id)
+    .fetch_one(&mut *tx)
+    .await?;
+    if drafts > 0 {
+        return Err(AppError::Conflict(format!("the job has {drafts} uncommitted parcel(s): discard or commit them first")));
+    }
+    sqlx::query("DELETE FROM cadastre.job_area WHERE wf_job_instance_id = $1").bind(id).execute(&mut *tx).await?;
+    audit::append(&mut tx, &actor.label, "wf_job_area_delete", "wf_job_instance", Some(&id.to_string()), json!({})).await?;
+    tx.commit().await?;
+    Ok(Json(editing_info(&state, id).await?))
+}
+
+/// Discard the job's uncommitted draft parcels (Aumentum: Discard Changes).
+#[utoipa::path(post, path = "/api/v1/wf/jobs/{id}/discard", tag = "wf", params(("id" = i32, Path, description = "Job instance id")),
+    responses((status = 200, body = WfEditingDto)))]
+pub async fn discard(State(state): State<AppState>, user: AuthUser, Path(id): Path<i32>) -> ApiResult<Json<WfEditingDto>> {
+    let actor = resolve_actor(&state, &user).await?;
+    let mut tx = state.pool.begin().await?;
+    lock_open_job(&mut tx, id, &actor).await?;
+    let n = sqlx::query(
+        "DELETE FROM cadastre.parcel p USING cadastre.wf_job_instance w WHERE w.id = $1 AND p.job_id = w.cadastre_job_id AND p.status = 'draft'",
+    )
+    .bind(id)
+    .execute(&mut *tx)
+    .await?
+    .rows_affected();
+    audit::append(&mut tx, &actor.label, "wf_discard", "wf_job_instance", Some(&id.to_string()), json!({ "drafts_discarded": n as i64 })).await?;
+    tx.commit().await?;
+    Ok(Json(editing_info(&state, id).await?))
+}
+
+/// Commit the job's draft parcels to the fabric (Aumentum: Commit Parcel / save job area to the
+/// parcel fabric). Only from a commit task. Each parcel receives its UPIN; with
+/// `editor.allow_overlap` = 0 (Aumentum's setting) a parcel overlapping the fabric is refused.
+#[utoipa::path(post, path = "/api/v1/wf/jobs/{id}/commit", tag = "wf", params(("id" = i32, Path, description = "Job instance id")),
+    responses((status = 200, body = WfCommitDto), (status = 409, description = "Not a commit task, nothing to commit, or overlaps")))]
+pub async fn commit(State(state): State<AppState>, user: AuthUser, Path(id): Path<i32>) -> ApiResult<Json<WfCommitDto>> {
+    let actor = resolve_actor(&state, &user).await?;
+    let mut tx = state.pool.begin().await?;
+    let cur = lock_open_job(&mut tx, id, &actor).await?;
+    if !is_commit_task(&mut tx, cur).await? {
+        return Err(AppError::Conflict("parcels are committed at the job's commit task (e.g. Commit Parcel)".into()));
+    }
+    let job_id: Option<uuid::Uuid> = sqlx::query_scalar("SELECT cadastre_job_id FROM cadastre.wf_job_instance WHERE id = $1").bind(id).fetch_one(&mut *tx).await?;
+    let job_id = job_id.ok_or_else(|| AppError::Conflict("the job has no parcels to commit".into()))?;
+    let drafts: i64 = sqlx::query_scalar("SELECT count(*) FROM cadastre.parcel WHERE job_id = $1 AND status = 'draft'").bind(job_id).fetch_one(&mut *tx).await?;
+    if drafts == 0 {
+        return Err(AppError::Conflict("the job has no parcels to commit".into()));
+    }
+    let allow_overlap: Option<String> = sqlx::query_scalar("SELECT value FROM cadastre.app_setting WHERE key = 'editor.allow_overlap'").fetch_optional(&mut *tx).await?;
+    if allow_overlap.as_deref() != Some("1") {
+        let clashes: Vec<String> = sqlx::query_scalar(
+            "SELECT DISTINCT p.parcel_number FROM cadastre.parcel d JOIN cadastre.parcel p \
+               ON p.status = 'posted' AND p.geom && d.geom AND ST_Area(ST_Intersection(p.geom, d.geom)) > 0.01 \
+             WHERE d.job_id = $1 AND d.status = 'draft' ORDER BY 1 LIMIT 20",
+        )
+        .bind(job_id)
+        .fetch_all(&mut *tx)
+        .await?;
+        if !clashes.is_empty() {
+            return Err(AppError::Conflict(format!("parcels may not overlap the fabric (Editor.AllowOverlap = 0); overlaps: {}", clashes.join(", "))));
+        }
+    }
+    let numbers = crate::routes::jobs::post_drafts(&mut tx, job_id).await?;
+    sqlx::query("UPDATE cadastre.wf_job_instance SET updated = now()::timestamp WHERE id = $1").bind(id).execute(&mut *tx).await?;
+    audit::append(&mut tx, &actor.label, "wf_commit", "wf_job_instance", Some(&id.to_string()), json!({ "parcel_numbers": numbers })).await?;
+    tx.commit().await?;
+    Ok(Json(WfCommitDto { parcel_numbers: numbers, editing: editing_info(&state, id).await? }))
+}
+
+#[derive(Deserialize, ToSchema)]
+pub struct WfEnd {
+    /// `completed` (status 3) or `cancelled` (status 9).
+    pub outcome: String,
+    pub comment: Option<String>,
+}
+
+/// End a job from any task (Aumentum: end / delete job instance). Administrators, or holders of
+/// Aumentum's `ds_delete_jobinstance` role. Refused while the job has uncommitted parcels.
+#[utoipa::path(post, path = "/api/v1/wf/jobs/{id}/end", tag = "wf", request_body = WfEnd, params(("id" = i32, Path, description = "Job instance id")),
+    responses((status = 200, body = WfJobDetailDto), (status = 403, description = "Not allowed to end jobs"), (status = 409, description = "Closed already, or uncommitted parcels")))]
+pub async fn end_job(State(state): State<AppState>, user: AuthUser, Path(id): Path<i32>, Json(req): Json<WfEnd>) -> ApiResult<Json<WfJobDetailDto>> {
+    let actor = resolve_actor(&state, &user).await?;
+    let status: i16 = match req.outcome.as_str() {
+        "completed" => 3,
+        "cancelled" => 9,
+        _ => return Err(AppError::BadRequest("outcome must be completed or cancelled".into())),
+    };
+    let allowed = actor.admin
+        || sqlx::query_scalar("SELECT EXISTS (SELECT 1 FROM cadastre.principal_role WHERE sid = ANY($1) AND role = 'ds_delete_jobinstance' AND allow)")
+            .bind(&actor.sids)
+            .fetch_one(&state.pool)
+            .await?;
+    if !allowed {
+        return Err(AppError::Forbidden(format!("{} may not end jobs", actor.label)));
+    }
+    let mut tx = state.pool.begin().await?;
+    let row = sqlx::query("SELECT j.current_task_id, s.is_open FROM cadastre.wf_job_instance j JOIN cadastre.wf_job_status s ON s.code = j.status WHERE j.id = $1 FOR UPDATE OF j")
+        .bind(id)
+        .fetch_optional(&mut *tx)
+        .await?
+        .ok_or_else(|| AppError::NotFound(format!("job instance {id}")))?;
+    let (cur, open): (Option<i32>, bool) = (row.get(0), row.get(1));
+    if !open {
+        return Err(AppError::Conflict("the job is already closed".into()));
+    }
+    let drafts: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM cadastre.parcel p JOIN cadastre.wf_job_instance w ON w.cadastre_job_id = p.job_id WHERE w.id = $1 AND p.status = 'draft'",
+    )
+    .bind(id)
+    .fetch_one(&mut *tx)
+    .await?;
+    if drafts > 0 {
+        return Err(AppError::Conflict(format!("commit or discard the job's {drafts} parcel(s) before ending it")));
+    }
+    sqlx::query("UPDATE cadastre.wf_task_instance SET ended = now()::timestamp, comment = COALESCE($2, comment) WHERE job_instance_id = $1 AND ended IS NULL")
+        .bind(id)
+        .bind(&req.comment)
+        .execute(&mut *tx)
+        .await?;
+    sqlx::query("UPDATE cadastre.wf_job_instance SET status = $2, ended = now()::timestamp, updated = now()::timestamp WHERE id = $1")
+        .bind(id)
+        .bind(status)
+        .execute(&mut *tx)
+        .await?;
+    audit::append(&mut tx, &actor.label, "wf_end", "wf_job_instance", Some(&id.to_string()), json!({ "outcome": req.outcome, "at_task": cur, "comment": req.comment })).await?;
+    tx.commit().await?;
+    Ok(Json(load_detail(&state, id).await?))
+}

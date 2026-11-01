@@ -17,9 +17,11 @@ pub mod survey;
 pub mod survey_tools;
 pub mod tolerances;
 pub mod viewer;
+pub mod wf;
+pub mod wfadmin;
 pub mod workflow;
 
-use axum::routing::{delete, get, post};
+use axum::routing::{delete, get, post, put};
 use axum::Router;
 use tower_http::trace::TraceLayer;
 
@@ -35,6 +37,29 @@ pub fn router(state: AppState) -> Router {
         .route("/editor", get(editor::index))
         .route("/editor/{*path}", get(editor::asset))
         .route("/api/v1/me", get(me::me))
+        .route("/api/v1/auth/config", get(me::auth_config))
+        // Aumentum workflow engine (Phase 2)
+        .route("/api/v1/wf/definitions", get(wf::definitions))
+        .route("/api/v1/wf/principals", get(wf::principals))
+        .route("/api/v1/wf/jobs", get(wf::list_jobs).post(wf::create_job))
+        .route("/api/v1/wf/jobs/{id}", get(wf::get_job))
+        .route("/api/v1/wf/jobs/{id}/advance", post(wf::advance))
+        .route("/api/v1/wf/jobs/{id}/assign", post(wf::assign))
+        .route("/api/v1/wf/jobs/{id}/hold", post(wf::hold))
+        .route("/api/v1/wf/jobs/{id}/editing", get(wf::get_editing).post(wf::start_editing))
+        .route("/api/v1/wf/jobs/{id}/area", put(wf::put_area).delete(wf::delete_area))
+        .route("/api/v1/wf/jobs/{id}/area/{action}", post(wf::area_action))
+        .route("/api/v1/wf/jobs/{id}/discard", post(wf::discard))
+        .route("/api/v1/wf/jobs/{id}/commit", post(wf::commit))
+        .route("/api/v1/wf/jobs/{id}/end", post(wf::end_job))
+        .route("/api/v1/wf/jobs/{id}/files", get(wfadmin::list_files)
+            .post(wfadmin::upload_file).layer(axum::extract::DefaultBodyLimit::max(50 * 1024 * 1024)))
+        .route("/api/v1/wf/files/{file_id}", get(wfadmin::get_file))
+        .route("/api/v1/wf/productivity", get(wfadmin::productivity))
+        .route("/api/v1/wf/notifications", get(wfadmin::notifications))
+        .route("/api/v1/admin/security", get(wfadmin::security))
+        .route("/api/v1/admin/change", post(wfadmin::change))
+        .route("/api/v1/admin/settings", get(wfadmin::settings).put(wfadmin::put_setting))
         .route("/api/v1/catalog", get(catalog::folders))
         .route("/api/v1/catalog/items", get(catalog::items))
         .route("/api/v1/catalog/databases", get(catalog::databases))

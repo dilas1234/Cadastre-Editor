@@ -1068,3 +1068,174 @@ async fn attribute_join_and_job_import_create_drafts() {
     .await;
     assert_eq!(st, StatusCode::BAD_REQUEST);
 }
+
+/// The Aumentum workflow engine over HTTP: a job type shaped like Aumentum's "Deed Plan
+/// Creationv2" (branch at the start, a review that can send work back, an end task).
+#[tokio::test]
+async fn aumentum_workflow_follows_the_task_graph() {
+    let Some(db_url) = test_db_url() else {
+        eprintln!("skipping: CADASTRE_TEST_DATABASE_URL not set");
+        return;
+    };
+    let app = routes::router(state_with(AuthMode::Disabled, None, &db_url).await);
+    let pool = sqlx::PgPool::connect(&db_url).await.unwrap();
+
+    // Unique ids per run: tasks b..b+4 (search, plot, review, commit, plan), job type b.
+    let b = 100_000 + (rand_12() % 800_000) as i32 * 10;
+    let (search, plot, review, commit, plan) = (b, b + 1, b + 2, b + 3, b + 4);
+    for (id, name) in [(search, "Search"), (plot, "Plot Parcel"), (review, "Review Plotted Parcel"), (commit, "Commit Parcel"), (plan, "Generate Title Deed Plan")] {
+        sqlx::query("INSERT INTO cadastre.wf_task (id, name) VALUES ($1, $2)").bind(id).bind(name).execute(&pool).await.unwrap();
+    }
+    sqlx::query("INSERT INTO cadastre.wf_step (id, name, commands) VALUES ($1, 'Generate Title Deed Plan', ARRAY['{0FF462C4-AB8B-4735-B153-11284B5B2E6E}'])")
+        .bind(b).execute(&pool).await.unwrap();
+    sqlx::query("INSERT INTO cadastre.wf_task_step (task_id, step_id, ord) VALUES ($1, $2, 1)").bind(plan).bind(b).execute(&pool).await.unwrap();
+    sqlx::query("INSERT INTO cadastre.wf_job_type (id, name, start_task_id, end_task_id) VALUES ($1, 'Deed Plan (test)', $2, $3)")
+        .bind(b).bind(search).bind(plan).execute(&pool).await.unwrap();
+    for (from, to) in [(search, plot), (search, plan), (plot, review), (review, commit), (review, plot), (commit, plan)] {
+        sqlx::query("INSERT INTO cadastre.wf_task_flow (job_type_id, task_id, next_task_id) VALUES ($1, $2, $3)")
+            .bind(b).bind(from).bind(to).execute(&pool).await.unwrap();
+    }
+    let max_before: i32 = sqlx::query_scalar("SELECT COALESCE(max(id), 0) FROM cadastre.wf_job_instance").fetch_one(&pool).await.unwrap();
+
+    let (st, job) = send(&app, "POST", "/api/v1/wf/jobs", None,
+        Some(json!({"job_type_id": b, "name": "Job-PL00001", "lrs_transaction_number": "PLS000000001"}))).await;
+    assert_eq!(st, StatusCode::CREATED, "{job}");
+    let id = job["job"]["id"].as_i64().unwrap();
+    assert!(id as i32 > max_before, "new job ids continue above existing (imported) ones");
+    assert_eq!(job["job"]["current_task_id"], search);
+    assert_eq!(job["job"]["status_label"], "In progress");
+
+    let adv_url = format!("/api/v1/wf/jobs/{id}/advance");
+    let adv = |body: Value| send(&app, "POST", &adv_url, None, Some(body));
+    // A branch needs a choice.
+    let (st, _) = adv(json!({})).await;
+    assert_eq!(st, StatusCode::CONFLICT);
+    let (st, d) = adv(json!({"to_task_id": plot})).await;
+    assert_eq!(st, StatusCode::OK, "{d}");
+    let (_, d) = adv(json!({})).await; // the only path
+    assert_eq!(d["job"]["current_task_id"], review);
+    let (_, d) = adv(json!({"to_task_id": plot, "comment": "replot"})).await; // rework
+    assert_eq!(d["job"]["current_task_id"], plot);
+    let (_, _) = adv(json!({})).await;
+    let (st, _) = adv(json!({"to_task_id": plan})).await; // not an edge from review
+    assert_eq!(st, StatusCode::CONFLICT);
+    let (_, _) = adv(json!({"to_task_id": commit})).await;
+    let (_, d) = adv(json!({})).await;
+    assert_eq!(d["job"]["current_task_id"], plan);
+    assert_eq!(d["can_complete"], true);
+    assert_eq!(d["steps"][0]["commands"][0], "{0FF462C4-AB8B-4735-B153-11284B5B2E6E}");
+    let (st, d) = adv(json!({"comment": "plan issued"})).await;
+    assert_eq!(st, StatusCode::OK);
+    assert_eq!(d["job"]["status_label"], "Completed");
+    assert!(d["job"]["ended"].is_string());
+    let (st, _) = adv(json!({})).await;
+    assert_eq!(st, StatusCode::CONFLICT, "a completed job does not move");
+
+    let tasks: Vec<i64> = d["history"].as_array().unwrap().iter().map(|h| h["task_id"].as_i64().unwrap()).collect();
+    assert_eq!(tasks, [search, plot, review, plot, review, commit, plan].map(i64::from).to_vec());
+    assert!(d["history"].as_array().unwrap().iter().all(|h| h["ended"].is_string()));
+    // End Job: from any task, as cancelled (status 9); a closed job cannot be ended again.
+    let (_, other) = send(&app, "POST", "/api/v1/wf/jobs", None, Some(json!({"job_type_id": b, "name": "Job-PL00002"}))).await;
+    let oid = other["job"]["id"].as_i64().unwrap();
+    let (st, e) = send(&app, "POST", &format!("/api/v1/wf/jobs/{oid}/end"), None, Some(json!({"outcome": "cancelled", "comment": "duplicate application"}))).await;
+    assert_eq!(st, StatusCode::OK, "{e}");
+    assert_eq!(e["job"]["status"], 9);
+    assert_eq!(e["job"]["status_label"], "Cancelled");
+    assert!(e["history"].as_array().unwrap().iter().all(|h| h["ended"].is_string()));
+    let (st, _) = send(&app, "POST", &format!("/api/v1/wf/jobs/{oid}/end"), None, Some(json!({"outcome": "completed"}))).await;
+    assert_eq!(st, StatusCode::CONFLICT);
+
+    let (_, v) = send(&app, "GET", "/api/v1/audit/verify", None, None).await;
+    assert_eq!(v["ok"], true, "{v}");
+}
+
+/// Editing under an Aumentum job: job area rules, commit task, AllowOverlap = 0, discard.
+#[tokio::test]
+async fn job_editing_follows_job_area_and_commit_rules() {
+    let Some(db_url) = test_db_url() else {
+        eprintln!("skipping: CADASTRE_TEST_DATABASE_URL not set");
+        return;
+    };
+    let app = routes::router(state_with(AuthMode::Disabled, None, &db_url).await);
+    let pool = sqlx::PgPool::connect(&db_url).await.unwrap();
+    let b = 200_000 + (rand_12() % 700_000) as i32 * 10;
+    let (construct, commit_t, plan) = (b, b + 1, b + 2);
+    for (id, name) in [(construct, "Construct Parcel"), (commit_t, "Commit Parcel"), (plan, "Generate Title Deed Plan")] {
+        sqlx::query("INSERT INTO cadastre.wf_task (id, name) VALUES ($1, $2)").bind(id).bind(name).execute(&pool).await.unwrap();
+    }
+    sqlx::query("INSERT INTO cadastre.wf_step (id, name, commands) VALUES ($1, 'Commit Parcel', ARRAY[$2])")
+        .bind(b).bind(cadastre_server::routes::wf::COMMIT_TOOL).execute(&pool).await.unwrap();
+    sqlx::query("INSERT INTO cadastre.wf_task_step (task_id, step_id) VALUES ($1, $2)").bind(commit_t).bind(b).execute(&pool).await.unwrap();
+    sqlx::query("INSERT INTO cadastre.wf_job_type (id, name, start_task_id, end_task_id) VALUES ($1, 'Editing (test)', $2, $3)")
+        .bind(b).bind(construct).bind(plan).execute(&pool).await.unwrap();
+    for (f, t) in [(construct, commit_t), (commit_t, plan)] {
+        sqlx::query("INSERT INTO cadastre.wf_task_flow (job_type_id, task_id, next_task_id) VALUES ($1, $2, $3)").bind(b).bind(f).bind(t).execute(&pool).await.unwrap();
+    }
+    // Somewhere unique per run (no other test's parcels there), inside UTM zone 32N.
+    let x0 = 150_000.0 + ((b / 10) % 60_000) as f64 * 10.0;
+    let y0 = 9_000_000.0; // far north of the other tests' parcels
+
+    let (_, d) = send(&app, "POST", "/api/v1/wf/jobs", None, Some(json!({"job_type_id": b, "name": "Job-PL1"}))).await;
+    let id = d["job"]["id"].as_i64().unwrap();
+    let (st, e) = send(&app, "POST", &format!("/api/v1/wf/jobs/{id}/editing"), None, None).await;
+    assert_eq!(st, StatusCode::OK, "{e}");
+    let cjob = e["cadastre_job_id"].as_str().unwrap().to_string();
+    let draft_url = format!("/api/v1/jobs/{cjob}/parcels");
+    let draft = |x: f64, s: f64| send(&app, "POST", &draft_url, None, Some(json!({"geometry": square(x, y0 + 10.0, s)})));
+
+    let (st, _) = draft(x0 + 10.0, 20.0).await;
+    assert_eq!(st, StatusCode::CONFLICT, "no job area yet");
+    let (st, _) = send(&app, "PUT", &format!("/api/v1/wf/jobs/{id}/area"), None, Some(json!({"geometry": square(5_000_000.0, 990.0, 200.0)}))).await;
+    assert_eq!(st, StatusCode::BAD_REQUEST, "a job area outside UTM 32N is refused");
+    let (st, e) = send(&app, "PUT", &format!("/api/v1/wf/jobs/{id}/area"), None, Some(json!({"geometry": square(x0, y0, 200.0)}))).await;
+    assert_eq!(st, StatusCode::OK, "{e}");
+    assert_eq!(e["area_status"], "open");
+    let (st, r) = draft(x0 + 190.0, 50.0).await; // crosses the area's edge
+    assert_eq!(st, StatusCode::CONFLICT);
+    assert_eq!(r["message"], cadastre_server::routes::wf::OUTSIDE_JOB_AREA);
+    let (st, _) = draft(x0 + 10.0, 20.0).await;
+    assert_eq!(st, StatusCode::CREATED);
+    let (st, _) = draft(x0 + 50.0, 20.0).await;
+    assert_eq!(st, StatusCode::CREATED);
+
+    let (st, _) = send(&app, "POST", &format!("/api/v1/wf/jobs/{id}/commit"), None, None).await;
+    assert_eq!(st, StatusCode::CONFLICT, "commit only at the commit task");
+    let (_, _) = send(&app, "POST", &format!("/api/v1/wf/jobs/{id}/advance"), None, Some(json!({}))).await;
+    let (st, _) = send(&app, "POST", &format!("/api/v1/wf/jobs/{id}/advance"), None, Some(json!({}))).await;
+    assert_eq!(st, StatusCode::CONFLICT, "cannot leave the commit task with drafts");
+
+    // A posted parcel under one draft: AllowOverlap = 0 refuses the commit, naming it.
+    let blocker = format!("PL{:012}", 900_000_000_000u64 + b as u64);
+    sqlx::query("INSERT INTO cadastre.parcel (parcel_number, geom, status) VALUES ($1, ST_GeomFromText($2, 32632), 'posted')")
+        .bind(&blocker)
+        .bind(format!("POLYGON(({a} {b0},{c} {b0},{c} {b1},{a} {b1},{a} {b0}))", a = x0 + 15.0, c = x0 + 25.0, b0 = y0 + 15.0, b1 = y0 + 25.0))
+        .execute(&pool).await.unwrap();
+    let (st, r) = send(&app, "POST", &format!("/api/v1/wf/jobs/{id}/commit"), None, None).await;
+    assert_eq!(st, StatusCode::CONFLICT, "{r}");
+    assert!(r["message"].as_str().unwrap().contains(&blocker));
+    sqlx::query("DELETE FROM cadastre.parcel WHERE parcel_number = $1").bind(&blocker).execute(&pool).await.unwrap();
+
+    let (st, c) = send(&app, "POST", &format!("/api/v1/wf/jobs/{id}/commit"), None, None).await;
+    assert_eq!(st, StatusCode::OK, "{c}");
+    assert_eq!(c["parcel_numbers"].as_array().unwrap().len(), 2);
+    assert_eq!(c["editing"]["drafts"], 0);
+
+    // A closed area takes no edits; discard; delete the area once it is empty.
+    let (_, e) = send(&app, "POST", &format!("/api/v1/wf/jobs/{id}/area/close"), None, None).await;
+    assert_eq!(e["area_status"], "closed");
+    let (st, _) = draft(x0 + 100.0, 20.0).await;
+    assert_eq!(st, StatusCode::CONFLICT);
+    let (_, _) = send(&app, "POST", &format!("/api/v1/wf/jobs/{id}/area/reopen"), None, None).await;
+    let (st, _) = draft(x0 + 100.0, 20.0).await;
+    assert_eq!(st, StatusCode::CREATED);
+    let (st, _) = send(&app, "DELETE", &format!("/api/v1/wf/jobs/{id}/area"), None, None).await;
+    assert_eq!(st, StatusCode::CONFLICT, "drafts block deleting the area");
+    let (_, e) = send(&app, "POST", &format!("/api/v1/wf/jobs/{id}/discard"), None, None).await;
+    assert_eq!(e["drafts"], 0);
+    let (st, e) = send(&app, "DELETE", &format!("/api/v1/wf/jobs/{id}/area"), None, None).await;
+    assert_eq!(st, StatusCode::OK);
+    assert!(e["area"].is_null());
+    let (st, d) = send(&app, "POST", &format!("/api/v1/wf/jobs/{id}/advance"), None, Some(json!({}))).await;
+    assert_eq!(st, StatusCode::OK, "{d}");
+    assert_eq!(d["job"]["current_task_id"], plan);
+}

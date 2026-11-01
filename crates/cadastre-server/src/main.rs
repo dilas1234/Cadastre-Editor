@@ -36,6 +36,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     tracing::info!("database connected and migrations applied");
 
     let bind_addr = config.bind_addr.clone();
+    // Task notifications: sent while an SMTP server is configured (mail.* settings).
+    tokio::spawn(cadastre_server::mail::run_outbox(pool.clone()));
     let state = AppState { pool, config, jwks };
 
     let app = routes::router(state).merge(

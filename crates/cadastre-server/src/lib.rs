@@ -18,4 +18,6 @@ pub mod raster;
 pub mod report;
 pub mod routes;
 pub mod shp;
+pub mod mail;
 pub mod state;
+pub mod wfengine;

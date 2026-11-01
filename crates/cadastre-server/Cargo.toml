@@ -15,7 +15,7 @@ cadastre-core = { path = "../cadastre-core" }
 cadastre-import = { path = "../cadastre-import" }
 
 # Async runtime + web framework
-tokio = { version = "1", features = ["macros", "rt-multi-thread", "signal"] }
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "signal", "net", "io-util", "time", "fs"] }
 axum = "0.8"
 tower = { version = "0.5", features = ["util"] }
 tower-http = { version = "0.6", features = ["trace", "cors"] }
