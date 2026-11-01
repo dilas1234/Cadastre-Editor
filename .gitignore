@@ -12,3 +12,7 @@ Cargo.lock.orig
 # editor/tooling
 .idea/
 .vscode/
+/home/katie/Desktop/Pictda/Cadastre-Editor/tools/aumentum-inventory/aumentum-db.md
+# Local scripts/notes that contain database credentials. Never commit.
+/dump_all_tables.py
+tools/aumentum-inventory/aumentum-db.md
