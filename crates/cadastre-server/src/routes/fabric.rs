@@ -10,8 +10,8 @@ use cadastre_core::{Bearing, CoreError, Point};
 
 use crate::error::{ApiResult, AppError};
 use crate::models::{
-    AdjustRequest, AdjustResponse, FabricValidateRequest, LineResidualDto, ObservationDto,
-    OverlapDto, PointDto, TopologyReportDto,
+    AdjustRequest, AdjustResponse, FabricValidateRequest, GapDto, LineResidualDto, NearMissDto,
+    ObservationDto, OverlapDto, PointDto, TopologyReportDto,
 };
 use crate::routes::tolerances;
 use crate::state::AppState;
@@ -55,6 +55,26 @@ pub async fn validate(
             })
             .collect(),
         duplicate_beacons: report.duplicate_beacons.iter().map(|&(a, b)| [a, b]).collect(),
+        gaps: report
+            .gaps
+            .iter()
+            .map(|g| GapDto {
+                ring: g.ring.iter().map(|p| PointDto { x: p.x, y: p.y }).collect(),
+                area: g.area,
+            })
+            .collect(),
+        self_intersections: report.self_intersections,
+        near_misses: report
+            .near_misses
+            .iter()
+            .map(|n| NearMissDto {
+                a_parcel: n.a_parcel,
+                a_vertex: n.a_vertex,
+                b_parcel: n.b_parcel,
+                b_vertex: n.b_vertex,
+                distance: n.distance,
+            })
+            .collect(),
         is_clean,
     }))
 }

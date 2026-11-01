@@ -21,6 +21,9 @@ source = ["dep:tiberius", "dep:tokio", "dep:tokio-util", "dep:futures-util"]
 sink = ["dep:sqlx", "dep:tokio"]
 live = ["source", "sink"]
 
+[dev-dependencies]
+serde_json = "1"
+
 [dependencies]
 cadastre-core = { path = "../cadastre-core" }
 serde = { version = "1", features = ["derive"] }

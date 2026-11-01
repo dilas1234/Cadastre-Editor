@@ -278,6 +278,7 @@ dependencies = [
  "proptest",
  "rstar",
  "serde",
+ "serde_json",
  "thiserror 2.0.21",
 ]
 
@@ -288,6 +289,7 @@ dependencies = [
  "cadastre-core",
  "futures-util",
  "serde",
+ "serde_json",
  "sqlx",
  "thiserror 2.0.21",
  "tiberius",
@@ -302,6 +304,7 @@ dependencies = [
  "axum",
  "base64 0.22.1",
  "cadastre-core",
+ "cadastre-import",
  "chrono",
  "png",
  "rand 0.8.8",

@@ -34,8 +34,10 @@ cargo run -p cadastre-server            # migrations run on startup; API on :808
 - OpenAPI/Swagger UI: `http://localhost:8080/swagger-ui`, spec at `/api-docs/openapi.json`.
 - Probes: `GET /health` (liveness), `GET /ready` (DB reachable).
 - Resources: tolerances, beacons, parcels (+ search), `workflow`, `jobs` (+ transitions/events/
-  parcels/post), `sessions` (+ locks), `survey/check` (live closure/area), `fabric/validate` +
-  `fabric/adjust`, `audit` (+ verify), and job `report.pdf` / `siteplan.pdf`. See `docs/server.md`.
+  parcels/post/import), `sessions` (+ locks), `survey/check` (live closure/area), `survey/tools`
+  (the 35 computation tools), `import` (preview/attributes/world files), `fabric/validate` +
+  `fabric/adjust`, `audit` (+ verify), and job `report.pdf` / `siteplan.pdf`. See
+  `docs/server.md` and `docs/survey-computation-and-import.md`.
 - `CADASTRE_AUTH=disabled` runs every request as a dev superuser. Set `enabled` to require a
   Keycloak bearer token whose RS256 signature is verified against the JWKS (fetched from the
   issuer, or supplied via `CADASTRE_KEYCLOAK_JWKS_JSON`/`_PATH`).

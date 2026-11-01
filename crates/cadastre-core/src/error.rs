@@ -39,4 +39,16 @@ pub enum CoreError {
     /// A value was not finite where a finite value was required.
     #[error("expected a finite value for {0}")]
     NotFinite(&'static str),
+
+    /// A computation was given input it cannot use (missing, zero-length, out of range …).
+    #[error("invalid input: {0}")]
+    InvalidInput(String),
+
+    /// A computation has no geometric solution (parallel lines, collinear curve points …).
+    #[error("no solution: {0}")]
+    NoSolution(String),
+
+    /// A named tool does not exist in the computation registry.
+    #[error("unknown computation tool `{0}`")]
+    UnknownTool(String),
 }

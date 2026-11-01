@@ -1,0 +1,65 @@
+{
+  "name": "rounded-corner-parcel",
+  "source": "Survey plan tabulation (synthetic regression fixture; replace with a scanned plan when supplied)",
+  "crs": "EPSG:32632",
+  "start": {
+    "x": 352440.677,
+    "y": 1233094.048
+  },
+  "stated_area": 4463.5,
+  "legs": [
+    {
+      "type": "line",
+      "bearing_deg": 0.0,
+      "distance": 50.0
+    },
+    {
+      "type": "line",
+      "bearing_deg": 90.0,
+      "distance": 50.0
+    },
+    {
+      "type": "curve",
+      "radius": 50.0,
+      "arc_length": 78.53981633974483,
+      "chord_bearing_deg": 135.0,
+      "turn": "right"
+    },
+    {
+      "type": "line",
+      "bearing_deg": 270.0,
+      "distance": 100.0
+    }
+  ],
+  "expected": {
+    "vertices": [
+      {
+        "x": 352440.677,
+        "y": 1233094.048
+      },
+      {
+        "x": 352440.677,
+        "y": 1233144.048
+      },
+      {
+        "x": 352490.677,
+        "y": 1233144.048
+      },
+      {
+        "x": 352540.677,
+        "y": 1233094.048
+      },
+      {
+        "x": 352440.677,
+        "y": 1233094.048
+      }
+    ],
+    "area": 4463.495439011199,
+    "perimeter": 278.53981633974485,
+    "closure": {
+      "misclosure_east": 0.0,
+      "misclosure_north": 0.0,
+      "linear_misclosure": 0.0
+    }
+  }
+}

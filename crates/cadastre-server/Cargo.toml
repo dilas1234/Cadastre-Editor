@@ -12,6 +12,7 @@ workspace = true
 
 [dependencies]
 cadastre-core = { path = "../cadastre-core" }
+cadastre-import = { path = "../cadastre-import" }
 
 # Async runtime + web framework
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "signal"] }

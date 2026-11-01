@@ -482,6 +482,30 @@ pub struct OverlapDto {
     pub area: f64,
 }
 
+/// Anchored shared boundary for a near-coincident pair of vertices.
+#[derive(Clone, Copy, Debug, Serialize, ToSchema)]
+pub struct NearMissDto {
+    /// First parcel index.
+    pub a_parcel: usize,
+    /// Vertex index within the first parcel.
+    pub a_vertex: usize,
+    /// Second parcel index.
+    pub b_parcel: usize,
+    /// Vertex index within the second parcel.
+    pub b_vertex: usize,
+    /// Separation (metres).
+    pub distance: f64,
+}
+
+/// An enclosed gap (hole) in the union of parcels.
+#[derive(Clone, Debug, Serialize, ToSchema)]
+pub struct GapDto {
+    /// Boundary of the gap.
+    pub ring: Vec<PointDto>,
+    /// Area of the gap (m²).
+    pub area: f64,
+}
+
 /// Topology findings (FR-ADJ-04).
 #[derive(Clone, Debug, Serialize, ToSchema)]
 pub struct TopologyReportDto {
@@ -493,6 +517,12 @@ pub struct TopologyReportDto {
     pub overlaps: Vec<OverlapDto>,
     /// Beacon index pairs closer than the duplicate tolerance.
     pub duplicate_beacons: Vec<[usize; 2]>,
+    /// Enclosed gaps between parcels.
+    pub gaps: Vec<GapDto>,
+    /// Parcels whose boundary crosses itself.
+    pub self_intersections: Vec<usize>,
+    /// Vertices on different parcels that are close but not coincident.
+    pub near_misses: Vec<NearMissDto>,
     /// Whether the fabric is free of all of the above.
     pub is_clean: bool,
 }

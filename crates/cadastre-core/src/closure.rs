@@ -48,7 +48,9 @@ pub fn closure(traverse: &Traverse) -> Result<Closure> {
     let misclosure_east = end.x - start.x;
     let misclosure_north = end.y - start.y;
     let linear_misclosure = misclosure_east.hypot(misclosure_north);
-    let perimeter = cogo::traverse_length(traverse);
+    // Precision is measured against the length actually surveyed, so curved legs contribute
+    // their arc length rather than their shorter chord.
+    let perimeter = cogo::traverse_arc_length(traverse);
 
     let misclosure_bearing =
         Bearing::from_angle(Angle::from_radians(misclosure_east.atan2(misclosure_north)));

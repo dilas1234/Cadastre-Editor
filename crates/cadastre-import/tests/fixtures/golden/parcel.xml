@@ -1,0 +1,21 @@
+<?xml version="1.0"?>
+<LandXML xmlns="http://www.landxml.org/schema/LandXML-1.2" version="1.2">
+  <Units><Metric linearUnit="meter" areaUnit="squareMeter"/></Units>
+  <CoordinateSystem name="WGS 84 / UTM zone 32N" epsgCode="32632"/>
+  <CgPoints>
+    <CgPoint name="1001" code="BC">1233094.048 352440.677</CgPoint>
+    <CgPoint name="1002" code="BC">1233144.048 352440.677</CgPoint>
+    <CgPoint name="1003" code="BC">1233144.048 352540.677</CgPoint>
+    <CgPoint name="1004" code="BC">1233094.048 352540.677</CgPoint>
+  </CgPoints>
+  <Parcels>
+    <Parcel name="PL-TEST-1" area="5000">
+      <CoordGeom>
+        <Line><Start>1233094.048 352440.677</Start><End>1233144.048 352440.677</End></Line>
+        <Line><Start>1233144.048 352440.677</Start><End>1233144.048 352540.677</End></Line>
+        <Line><Start>1233144.048 352540.677</Start><End>1233094.048 352540.677</End></Line>
+        <Line><Start>1233094.048 352540.677</Start><End>1233094.048 352440.677</End></Line>
+      </CoordGeom>
+    </Parcel>
+  </Parcels>
+</LandXML>
