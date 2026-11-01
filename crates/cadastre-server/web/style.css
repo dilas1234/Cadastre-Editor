@@ -157,6 +157,19 @@ table.legs input { width: 100%; border: 0; height: 18px; text-align: right; }
 table.legs td.n { width: 18px; color: #666; }
 table.legs button { border: 0; background: none; color: var(--bad); cursor: pointer; }
 .checkout { white-space: pre-line; background: #fafafa; border: 1px solid #ddd; padding: 4px; margin-top: 4px; }
+table.legs tr.selrow td { background: #fff6cf; }
+
+/* ---- Create Features window ---- */
+.cfHdr { font-weight: 600; color: #2a2a2a; margin: 6px 0 2px; }
+.cfList, .cfTools { border: 1px solid #c5ccd6; background: #fff; margin: 2px 0; max-height: 150px; overflow: auto; }
+.cfTools { margin-top: 6px; }
+.cfRow { display: flex; align-items: center; gap: 5px; padding: 2px 4px; cursor: pointer; }
+.cfRow:hover { background: var(--hover); }
+.cfRow.sel { background: var(--press); }
+.cfRow .ic { width: 16px; height: 16px; }
+
+/* ---- Catalog drag-and-drop target highlight ---- */
+.dropok { outline: 2px dashed #2a72c8; outline-offset: -3px; background: rgba(42,114,200,.05); }
 
 /* ---- status bar ---- */
 #statusbar { height: 22px; display: flex; align-items: center; background: var(--chrome); padding: 0 6px; flex: none;

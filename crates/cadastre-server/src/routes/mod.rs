@@ -37,6 +37,9 @@ pub fn router(state: AppState) -> Router {
         .route("/api/v1/catalog/items", get(catalog::items))
         .route("/api/v1/catalog/databases", get(catalog::databases))
         .route("/api/v1/catalog/database/items", get(catalog::database_items))
+        .route("/api/v1/catalog/raster/info", get(catalog::raster_info))
+        .route("/api/v1/catalog/raster/overview", get(catalog::raster_overview))
+        .route("/api/v1/catalog/shapefile", get(catalog::shapefile))
         .route("/api/v1/parcels.geojson", get(viewer::parcels_geojson))
         .route("/api/v1/beacons.geojson", get(viewer::beacons_geojson))
         .route(

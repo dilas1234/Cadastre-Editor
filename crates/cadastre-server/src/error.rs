@@ -28,6 +28,10 @@ pub enum AppError {
     #[error("{0}")]
     Conflict(String),
 
+    /// The request was well-formed but cannot be fulfilled (e.g. a raster too large to preview).
+    #[error("{0}")]
+    UnprocessableEntity(String),
+
     /// A database error. The detail is logged, not returned to the client.
     #[error("database error")]
     Database(#[from] sqlx::Error),
@@ -41,6 +45,7 @@ impl AppError {
             AppError::Unauthorized(_) => StatusCode::UNAUTHORIZED,
             AppError::Forbidden(_) => StatusCode::FORBIDDEN,
             AppError::Conflict(_) => StatusCode::CONFLICT,
+            AppError::UnprocessableEntity(_) => StatusCode::UNPROCESSABLE_ENTITY,
             AppError::Database(_) => StatusCode::INTERNAL_SERVER_ERROR,
         }
     }

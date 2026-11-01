@@ -54,7 +54,28 @@ const state = {
   graphics: JSON.parse(localStorage.getItem("cad.graphics") || "[]"),
   bookmarks: JSON.parse(localStorage.getItem("cad.bookmarks") || "[]"),
   tocView: "drawing",
+  dynLayers: [], // rasters/datasets dragged from the Catalog onto the TOC
 };
+let dynSeq = 1;
+// Ensure proj4 knows a projected CRS by EPSG; our data is UTM 32N, so that is pre-defined and any
+// unknown code falls back to it (the Catalog rasters are all 32632).
+function ensureProj(epsg) {
+  const code = "EPSG:" + epsg;
+  if (epsg === 4326 || proj4.defs(code)) return code;
+  if (epsg === 32632) return "EPSG:32632";
+  return "EPSG:32632";
+}
+
+// Digitizing / edit session (ArcMap Editor). Vertices are kept in EPSG:32632 metres.
+const edit = { active: false, template: "parcel", geomType: "polygon", construction: "polygon", verts: [], sel: -1, snapping: true };
+// Feature templates in the Create Features window; each maps to a layer and a geometry type.
+const FEATURE_TEMPLATES = [
+  { id: "parcel", name: `${REGION}_Parcels`, geom: "polygon", icon: "polygonFc", tools: ["polygon", "autocomplete", "rightangle"] },
+  { id: "line", name: `${REGION}_Lines`, geom: "line", icon: "lineFc", tools: ["line"] },
+  { id: "point", name: `${REGION}_CtrlPnts`, geom: "point", icon: "pointFc", tools: ["point"] },
+];
+const CTOOL_NAME = { polygon: "Polygon", autocomplete: "Auto Complete Polygon", rightangle: "Right Angle", line: "Line", point: "Point" };
+const CTOOL_ICON = { polygon: "ctPolygon", autocomplete: "ctAutoComplete", rightangle: "ctRightAngle", line: "ctLine", point: "ctPoint" };
 
 /* =====================================================================================
  * Map
@@ -114,6 +135,16 @@ map.once("style.load", async () => {
   map.addSource("measure", { type: "geojson", data: empty() });
   map.addLayer({ id: "measure-line", type: "line", source: "measure",
     paint: { "line-color": "#ff00ff", "line-width": 2, "line-dasharray": [2, 1] } });
+
+  // Digitizing sketch (fill + segments + vertices). Last/selected vertex is drawn red.
+  map.addSource("sketch", { type: "geojson", data: empty() });
+  map.addLayer({ id: "sketch-fill", type: "fill", source: "sketch", filter: ["==", "$type", "Polygon"],
+    paint: { "fill-color": "#00e5ff", "fill-opacity": 0.12 } });
+  map.addLayer({ id: "sketch-line", type: "line", source: "sketch", filter: ["==", "$type", "LineString"],
+    paint: { "line-color": "#00b7d4", "line-width": 2 } });
+  map.addLayer({ id: "sketch-vtx", type: "circle", source: "sketch", filter: ["==", "$type", "Point"],
+    paint: { "circle-radius": 4, "circle-color": ["case", ["boolean", ["get", "sel"], false], "#ff2a2a", "#1a8a2a"],
+      "circle-stroke-color": "#063", "circle-stroke-width": 1.4 } });
 
   await Promise.all([loadParcels(true), loadBeacons(), loadJobs()]);
   renderGraphics();
@@ -247,6 +278,8 @@ const MENUS = () => ({
     { label: "Table Of Contents", checked: () => !$("tocPane").classList.contains("hidden"), action: () => togglePane("tocPane") },
     { label: "Catalog", icon: "catalog", checked: () => !$("catalogPane").classList.contains("hidden"), action: () => togglePane("catalogPane") },
     { label: "Tasks", icon: "tasks", action: () => openTask(taskSel()) },
+    { label: "Create Features", icon: "createFeatures", action: () => (edit.active ? openCreateFeatures() : startEditing()) },
+    { label: "Editor Toolbar", checked: () => !toolbarHidden("tb-editor"), action: () => toggleToolbar("tb-editor") },
     { label: "Identify", icon: "identify", action: () => setTool("identify") },
   ],
   Help: [
@@ -293,9 +326,12 @@ function openMenu(m, name) { m.querySelector(".menuList")?.remove(); m.append(me
 function closeMenus() { document.querySelectorAll(".menu.open, .ctx").forEach((m) => (m.classList.contains("ctx") ? m.remove() : m.classList.remove("open"))); }
 document.addEventListener("mousedown", (ev) => { if (!ev.target.closest(".menu, .ctx")) closeMenus(); });
 document.addEventListener("keydown", (ev) => {
+  const inField = /INPUT|SELECT|TEXTAREA/.test(document.activeElement.tagName);
   if (ev.key === "Escape") { closeMenus(); cancelInteraction(); }
   if (ev.key === "F5") { ev.preventDefault(); refreshAll(); }
-  if (ev.key === "Delete" && !/INPUT|SELECT|TEXTAREA/.test(document.activeElement.tagName)) deleteSelectedGraphics();
+  if (ev.key === "F2" && state.tool === "sketch") { ev.preventDefault(); finishSketch(); }
+  if (ev.key === "Backspace" && !inField && edit.active && edit.verts.length) { ev.preventDefault(); edit.verts.pop(); edit.sel = edit.verts.length - 1; drawSketch(); refreshSketchProps(); updateEditorButtons(); }
+  if (ev.key === "Delete" && !inField) deleteSelectedGraphics();
 });
 
 // --- toolbars ---
@@ -365,7 +401,21 @@ const TOOLBAR_DEFS = [
     { kind: "color", id: "colLine", icon: "lineColor", tip: "Line Color", value: "#7a2a9a" },
     { kind: "color", id: "colMarker", icon: "markerColor", tip: "Marker Color", value: "#1aa31a" },
   ] },
-  { id: "tb-cadastre", name: "Cadastre", row: 2, indent: true, items: [
+  { id: "tb-editor", name: "Editor", row: 2, indent: true, items: [
+    { kind: "drop", label: "Editor", menu: () => editorMenu() },
+    { kind: "tool", tool: "sketch", icon: "sketchTool", tip: "Sketch tool: click to add vertices, double-click to finish" },
+    { kind: "tool", tool: "editVertex", icon: "editTool", tip: "Edit tool: drag sketch vertices to move them" },
+    { kind: "btn", icon: "trace", tip: "Trace", disabled: true },
+    { kind: "sep" },
+    { kind: "btn", id: "edCreate", icon: "createFeatures", tip: "Create Features window", action: () => openCreateFeatures() },
+    { kind: "btn", id: "edProps", icon: "sketchProps", tip: "Edit Sketch Properties", action: () => openSketchProps() },
+    { kind: "sep" },
+    { kind: "btn", id: "edFinish", icon: "finishSketch", tip: "Finish Sketch (F2)", action: () => finishSketch() },
+    { kind: "btn", id: "edDelete", icon: "deleteSketch", tip: "Delete Sketch", action: () => deleteSketch() },
+    { kind: "btn", id: "edSnap", icon: "snapping", tip: "Snapping on/off", action: () => toggleSnapping() },
+    { kind: "btn", icon: "attributes", tip: "Attributes", disabled: true },
+  ] },
+  { id: "tb-cadastre", name: "Cadastre", row: 2, items: [
     { kind: "label", text: "Region:" },
     { kind: "custom", render: () => h("select", { class: "regionBox", id: "regionBox", title: "Region" }, h("option", {}, REGION)) },
     { kind: "btn", icon: "refresh", tip: "Refresh region data", action: () => refreshAll() },
@@ -525,6 +575,10 @@ function effectiveVisible(l) {
 }
 function applyVisibility() {
   for (const l of allLeaves()) for (const id of l.map) if (map.getLayer(id)) map.setLayoutProperty(id, "visibility", effectiveVisible(l) ? "visible" : "none");
+  applyDynVisibility();
+}
+function applyDynVisibility() {
+  for (const l of state.dynLayers) for (const id of l.map) if (map.getLayer(id)) map.setLayoutProperty(id, "visibility", l.visible ? "visible" : "none");
 }
 function legendSym(e) {
   if (e.text) return null;
@@ -574,7 +628,7 @@ function buildTOC() {
   dfRow.addEventListener("click", () => { tocSelected = "dataframe"; buildTOC(); });
   df.append(dfRow);
   const ul = h("ul");
-  if (state.tocView === "drawing") LAYERS.forEach((l) => ul.append(layerNode(l)));
+  if (state.tocView === "drawing") { state.dynLayers.forEach((l) => ul.append(dynLayerNode(l))); LAYERS.forEach((l) => ul.append(layerNode(l))); }
   else if (state.tocView === "source") {
     const bySrc = new Map();
     for (const l of allLeaves()) { const k = l.source.split(" ")[0]; if (!bySrc.has(k)) bySrc.set(k, []); bySrc.get(k).push(l); }
@@ -600,6 +654,70 @@ function zoomToLayer(l) {
     lines: state.surveyFC, points: state.surveyFC }[l.id];
   if (!fc || !zoomToFC(fc)) status(`${l.name}: nothing to zoom to`);
 }
+// --- dropped Catalog layers (rasters) ---
+function dynBounds(l) {
+  const xs = l.bbox.map((c) => c[0]), ys = l.bbox.map((c) => c[1]);
+  return [[Math.min(...xs), Math.min(...ys)], [Math.max(...xs), Math.max(...ys)]];
+}
+function dynLayerNode(l) {
+  const li = h("li");
+  const cb = h("input", { type: "checkbox", checked: l.visible, title: "Visible" });
+  cb.addEventListener("click", (ev) => { ev.stopPropagation(); l.visible = cb.checked; applyDynVisibility(); });
+  const icName = l.kind === "raster" ? "raster" : "lineFc";
+  const row = h("div", { class: "node", title: l.unc || l.name }, h("span", { class: "tw none" }), cb, h("span", { html: icon(icName) }),
+    h("span", { class: `lbl${tocSelected === l.id ? " sel" : ""}` }, l.name));
+  row.addEventListener("click", () => { tocSelected = l.id; buildTOC(); });
+  row.addEventListener("dblclick", () => map.fitBounds(dynBounds(l), { padding: 40 }));
+  row.addEventListener("contextmenu", (ev) => {
+    ev.preventDefault(); tocSelected = l.id; buildTOC();
+    contextMenu([
+      { label: "Zoom To Layer", icon: "fullExtent", action: () => map.fitBounds(dynBounds(l), { padding: 40 }) },
+      { label: l.visible ? "Hide Layer" : "Show Layer", action: () => { l.visible = !l.visible; applyDynVisibility(); buildTOC(); } },
+      { label: "Transparency 50%", action: () => { l.map.forEach((id) => map.getLayer(id) && map.setPaintProperty(id, "raster-opacity", 0.5)); }, disabled: l.kind !== "raster" },
+      { label: "Full opacity", action: () => { l.map.forEach((id) => map.getLayer(id) && map.setPaintProperty(id, "raster-opacity", 1)); }, disabled: l.kind !== "raster" },
+      "-",
+      { label: "Remove", action: () => removeDynLayer(l) },
+    ], ev.clientX, ev.clientY);
+  });
+  li.append(row);
+  return li;
+}
+function removeDynLayer(l) {
+  for (const id of l.map) if (map.getLayer(id)) map.removeLayer(id);
+  if (l.src && map.getSource(l.src)) map.removeSource(l.src);
+  if (l.gfxId) { state.graphics = state.graphics.filter((g) => g.id !== l.gfxId); renderGraphics(); }
+  state.dynLayers = state.dynLayers.filter((x) => x !== l);
+  buildTOC();
+}
+// Put rasters just above the base imagery so cadastral vectors stay on top.
+const firstVectorLayer = () => ["parcels-fill", "drafts-fill", "beacons-pt"].find((id) => map.getLayer(id));
+async function addRasterLayer(node) {
+  const { folder, path, name } = node;
+  status(`Adding ${name}…`);
+  let info;
+  try { info = await api(`/api/v1/catalog/raster/info?folder=${folder}&path=${encodeURIComponent(path)}`); }
+  catch (e) { status(`Could not read ${name}: ${e.message}`); alert(`Could not read ${name}:\n${e.message}`); return; }
+  const code = ensureProj(info.epsg || 32632);
+  const toLLc = (x, y) => (code === "EPSG:4326" ? [x, y] : proj4(code, "EPSG:4326", [x, y]));
+  const [minx, miny, maxx, maxy] = info.bbox;
+  const tl = toLLc(minx, maxy), tr = toLLc(maxx, maxy), br = toLLc(maxx, miny), bl = toLLc(minx, miny);
+  const id = "r" + dynSeq++;
+  const srcId = "rsrc-" + id, lyrId = "rlyr-" + id;
+  if (info.decodable) {
+    const url = `/api/v1/catalog/raster/overview?folder=${folder}&path=${encodeURIComponent(path)}&max=2048`;
+    map.addSource(srcId, { type: "image", url, coordinates: [tl, tr, br, bl] });
+    map.addLayer({ id: lyrId, type: "raster", source: srcId, paint: { "raster-opacity": 1 } }, firstVectorLayer());
+    state.dynLayers.unshift({ id, name, kind: "raster", map: [lyrId], src: srcId, bbox: [tl, tr, br, bl], visible: true, unc: catUNC(node) });
+    status(`${name} added to the map.`);
+  } else {
+    const gfxId = addGraphic({ type: "line", pts: [tl, tr, br, bl, tl] });
+    state.dynLayers.unshift({ id, name: name + " (extent)", kind: "rasterExtent", map: [], bbox: [tl, tr, br, bl], visible: true, unc: catUNC(node), gfxId });
+    status(`${name}: too large to preview without tiling — added its extent. Full pixels need the ortho tiling pipeline.`);
+  }
+  buildTOC();
+  map.fitBounds(dynBounds(state.dynLayers[0]), { padding: 40 });
+}
+
 function layerContextMenu(l, x, y) {
   contextMenu([
     { label: "Zoom To Layer", icon: "fullExtent", action: () => zoomToLayer(l), disabled: l.kind === "raster" || l.kind === "graphics" },
@@ -655,8 +773,11 @@ function tocOptions() {
 const TOOL_CURSOR = {
   pan: "", zoomIn: "zoom-in", zoomOut: "zoom-out", select: "crosshair", selectEl: "default",
   identify: "crosshair", measure: "crosshair", survey: "crosshair", rect: "crosshair", text: "text",
+  sketch: "crosshair", editVertex: "pointer",
 };
 function setTool(tool) {
+  // The sketch/edit tools require an active edit session, like ArcMap's "Start Editing".
+  if ((tool === "sketch" || tool === "editVertex") && !edit.active) { startEditing(tool); return; }
   state.tool = tool;
   for (const [t, btns] of toolButtons) btns.forEach((b) => b.classList.toggle("active", t === tool));
   const c = map.getContainer(); c.className = c.className.replace(/\btool-\S+/g, "").trim(); c.classList.add("tool-" + tool);
@@ -665,7 +786,11 @@ function setTool(tool) {
   if (tool === "pan") map.dragPan.enable(); else map.dragPan.disable();
   if (tool !== "measure") clearMeasure();
 }
-function cancelInteraction() { if (box) { box.el.remove(); box = null; } if (state.tool === "measure") clearMeasure(); }
+function cancelInteraction() {
+  if (box) { box.el.remove(); box = null; }
+  if (state.tool === "measure") clearMeasure();
+  if (edit.active && edit.verts.length) { clearSketch(); refreshSketchProps(); updateEditorButtons(); status("Sketch cancelled."); }
+}
 
 // extent history
 function pushHistory() {
@@ -745,9 +870,13 @@ map.on("click", (e) => {
     case "survey": setSurveyStart(e.lngLat); break;
     case "text": addTextGraphic(e.lngLat); break;
     case "selectEl": selectGraphicAt(e); break;
+    case "sketch": sketchClick(e); break;
   }
 });
-map.on("dblclick", (e) => { if (state.tool === "measure") { e.preventDefault(); finishMeasure(); } });
+map.on("dblclick", (e) => {
+  if (state.tool === "measure") { e.preventDefault(); finishMeasure(); }
+  else if (state.tool === "sketch" && edit.verts.length) { e.preventDefault(); finishSketch(); }
+});
 
 // selection
 function selectFeatures(ids, add) {
@@ -1175,6 +1304,198 @@ async function runCheck() {
 }
 
 /* =====================================================================================
+ * Phase 4b — Editor: sketch digitizing (ArcMap Editor toolbar + Create Features /
+ * Construction Tools / Edit Sketch Properties). Click vertices on the imagery to draw a
+ * parcel polygon (or a control point / boundary line); finished parcels post as job drafts
+ * via the same endpoint as COGO survey entry. Vertices are kept in EPSG:32632 metres.
+ * ===================================================================================== */
+function editorMenu() {
+  return [
+    { label: "Start Editing", action: () => startEditing(), disabled: () => edit.active },
+    { label: "Stop Editing", action: stopEditing, disabled: () => !edit.active },
+    { label: "Save Edits", action: saveEdits, disabled: () => !edit.active },
+    "-",
+    { label: "Create Features Window", icon: "createFeatures", action: openCreateFeatures },
+    { label: "Edit Sketch Properties…", icon: "sketchProps", action: openSketchProps, disabled: () => !edit.verts.length },
+    "-",
+    { label: "Snapping", checked: () => edit.snapping, action: toggleSnapping },
+    "-",
+    { label: "Finish Sketch", kbd: "F2", action: finishSketch, disabled: () => !canFinishSketch() },
+    { label: "Delete Sketch", action: deleteSketch, disabled: () => !edit.verts.length },
+  ];
+}
+function startEditing(tool = "sketch") {
+  edit.active = true;
+  selectTemplate(edit.template);
+  openCreateFeatures();
+  setTool(tool);
+  updateEditorButtons();
+  status("Editing started — pick a template in Create Features, then click the map to add vertices (double-click to finish).");
+}
+function stopEditing() {
+  if (edit.verts.length && !confirm("You have an unfinished sketch. Discard it and stop editing?")) return;
+  edit.active = false; clearSketch();
+  $("createFeaturesWin")?.remove(); $("sketchPropsWin")?.remove();
+  setTool("pan"); updateEditorButtons(); status("Editing stopped.");
+}
+function saveEdits() { status("Edits are saved as each feature is finished — drafts are written to the server immediately."); }
+
+function selectTemplate(id) {
+  const t = FEATURE_TEMPLATES.find((x) => x.id === id) || FEATURE_TEMPLATES[0];
+  edit.template = t.id; edit.geomType = t.geom;
+  if (!t.tools.includes(edit.construction)) edit.construction = t.tools[0];
+  drawSketch();
+}
+
+// --- sketching ---
+function sketchClick(e) {
+  const pt = e.point;
+  // A double-click also delivers two clicks at the same spot; don't add a duplicate vertex.
+  if (edit.verts.length) { const last = map.project(toLL(...edit.verts[edit.verts.length - 1])); if (Math.hypot(last.x - pt.x, last.y - pt.y) < 4) return; }
+  let [E, N] = toUTM(e.lngLat.lng, e.lngLat.lat);
+  if (edit.snapping) { const s = snapUTM(pt); if (s) [E, N] = s; }
+  if (edit.geomType === "point") { edit.verts = [[E, N]]; edit.sel = 0; drawSketch(); finishSketch(); return; }
+  edit.verts.push([E, N]); edit.sel = edit.verts.length - 1;
+  drawSketch(); refreshSketchProps(); updateEditorButtons();
+}
+// Snap to the nearest beacon / parcel / draft vertex within ~14px of the cursor.
+function snapUTM(pt) {
+  const layers = ["beacons-pt", "drafts-line", "parcels-line"].filter((l) => map.getLayer(l));
+  if (!layers.length) return null;
+  const feats = map.queryRenderedFeatures([[pt.x - 14, pt.y - 14], [pt.x + 14, pt.y + 14]], { layers });
+  let best = null, bestD = 14;
+  const consider = (ll) => { const p = map.project(ll); const d = Math.hypot(p.x - pt.x, p.y - pt.y); if (d < bestD) { bestD = d; best = ll; } };
+  for (const f of feats) {
+    const g = f.geometry; if (!g) continue;
+    if (g.type === "Point") consider(g.coordinates);
+    else if (g.type === "LineString") g.coordinates.forEach(consider);
+    else if (g.type === "MultiLineString") g.coordinates.flat().forEach(consider);
+    else if (g.type === "Polygon") g.coordinates.flat().forEach(consider);
+    else if (g.type === "MultiPolygon") g.coordinates.flat(2).forEach(consider);
+  }
+  return best ? toUTM(best[0], best[1]) : null;
+}
+function drawSketch() {
+  const ll = edit.verts.map(([e, n]) => toLL(e, n));
+  const feats = [];
+  if (edit.geomType === "polygon" && ll.length >= 3) feats.push({ type: "Feature", geometry: { type: "Polygon", coordinates: [[...ll, ll[0]]] } });
+  if (edit.geomType !== "point" && ll.length >= 2) feats.push({ type: "Feature", geometry: { type: "LineString", coordinates: ll } });
+  ll.forEach((c, i) => feats.push({ type: "Feature", properties: { idx: i, sel: i === edit.sel || (edit.sel < 0 && i === ll.length - 1) }, geometry: { type: "Point", coordinates: c } }));
+  map.getSource("sketch")?.setData({ type: "FeatureCollection", features: feats });
+}
+function clearSketch() { edit.verts = []; edit.sel = -1; map.getSource("sketch")?.setData(empty()); }
+function canFinishSketch() { const n = edit.verts.length; return edit.geomType === "polygon" ? n >= 3 : edit.geomType === "line" ? n >= 2 : n >= 1; }
+async function finishSketch() {
+  if (!canFinishSketch()) { status(`Add ${edit.geomType === "polygon" ? "at least 3" : edit.geomType === "line" ? "at least 2" : "a"} vertex(es) before finishing.`); return; }
+  if (edit.geomType === "polygon") await saveSketchParcel();
+  else if (edit.geomType === "point") await saveSketchPoint();
+  else saveSketchLine();
+}
+async function saveSketchParcel() {
+  if (!state.job) { alert("Choose a Job Area first — a digitized parcel is saved as a draft under a job."); return; }
+  const utm = edit.verts.slice();
+  try {
+    await api(`/api/v1/jobs/${state.job.id}/parcels`, { method: "POST", body: { geometry: { type: "Polygon", coordinates: [[...utm, utm[0]]] }, stated_area: null } });
+    status(`Digitized parcel saved as a draft to ${state.job.reference}. Post the job (once approved) to allocate a UPIN.`);
+    await loadDrafts(); buildCatalog(); clearSketch(); refreshSketchProps(); updateEditorButtons();
+  } catch (e) { alert("Save failed: " + e.message); }
+}
+async function saveSketchPoint() {
+  const [E, N] = edit.verts[0];
+  const number = prompt("Control point number:", "");
+  if (number == null || !number.trim()) return;
+  try {
+    await api("/api/v1/beacons", { method: "POST", body: { number: number.trim(), easting: E, northing: N, is_control: true } });
+    status(`Control point ${number.trim()} created at ${E.toFixed(3)} ${N.toFixed(3)}.`);
+    await loadBeacons(); clearSketch(); refreshSketchProps(); updateEditorButtons();
+  } catch (e) { alert("Create point failed: " + e.message); }
+}
+function saveSketchLine() {
+  const ll = edit.verts.map(([e, n]) => toLL(e, n));
+  addGraphic({ type: "line", pts: ll });
+  status(`Boundary line added to the drawing (${edit.verts.length} vertices).`);
+  clearSketch(); refreshSketchProps(); updateEditorButtons();
+}
+function deleteSketch() { clearSketch(); refreshSketchProps(); updateEditorButtons(); status("Sketch deleted."); }
+function toggleSnapping() { edit.snapping = !edit.snapping; $("edSnap")?.classList.toggle("active", edit.snapping); status(`Snapping ${edit.snapping ? "on" : "off"}.`); }
+function updateEditorButtons() {
+  const set = (id, on) => $(id)?.classList.toggle("disabled", !on);
+  const has = edit.verts.length > 0;
+  set("edFinish", canFinishSketch()); set("edDelete", has); set("edProps", has || edit.active);
+  $("edSnap")?.classList.toggle("active", edit.snapping);
+}
+
+// Dragging an existing sketch vertex (Edit tool, or the Sketch tool if you grab a vertex).
+let vtxDrag = null;
+canvas.addEventListener("mousedown", (ev) => {
+  if (ev.button !== 0 || !(state.tool === "sketch" || state.tool === "editVertex") || !edit.verts.length) return;
+  const r = canvas.getBoundingClientRect(); const px = ev.clientX - r.left, py = ev.clientY - r.top;
+  let hit = -1, hd = 9;
+  edit.verts.forEach(([e, n], i) => { const p = map.project(toLL(e, n)); const d = Math.hypot(p.x - px, p.y - py); if (d < hd) { hd = d; hit = i; } });
+  if (hit >= 0) { ev.preventDefault(); ev.stopPropagation(); vtxDrag = hit; edit.sel = hit; drawSketch(); }
+});
+window.addEventListener("mousemove", (ev) => {
+  if (vtxDrag == null) return;
+  const r = canvas.getBoundingClientRect(); const pt = { x: ev.clientX - r.left, y: ev.clientY - r.top };
+  const ll = map.unproject([pt.x, pt.y]); let [E, N] = toUTM(ll.lng, ll.lat);
+  if (edit.snapping) { const s = snapUTM(pt); if (s) [E, N] = s; }
+  edit.verts[vtxDrag] = [E, N]; drawSketch(); refreshSketchProps();
+});
+window.addEventListener("mouseup", () => { if (vtxDrag != null) { vtxDrag = null; suppressClickUntil = Date.now() + 250; updateEditorButtons(); } });
+
+// --- Create Features window (templates + construction tools) ---
+function openCreateFeatures() {
+  const search = h("input", { class: "tinput", placeholder: "Search", style: "width:100%;margin:3px 0" });
+  const tlist = h("div", { class: "cfList" });
+  const ctools = h("div", { class: "cfTools" });
+  const jobLine = h("p", { class: "muted", style: "margin:6px 0 0" });
+  const renderTools = () => {
+    ctools.innerHTML = ""; const tmpl = FEATURE_TEMPLATES.find((t) => t.id === edit.template);
+    ctools.append(h("div", { class: "cfHdr" }, "Construction Tools"));
+    for (const ct of tmpl.tools) {
+      ctools.append(h("div", { class: `cfRow${edit.construction === ct ? " sel" : ""}`, onclick: () => { edit.construction = ct; renderTools(); } },
+        h("span", { html: icon(CTOOL_ICON[ct]) }), CTOOL_NAME[ct]));
+    }
+  };
+  const renderTmpl = () => {
+    tlist.innerHTML = ""; const q = search.value.trim().toLowerCase();
+    const shown = FEATURE_TEMPLATES.filter((t) => !q || t.name.toLowerCase().includes(q));
+    if (!shown.length) tlist.append(h("p", { class: "muted", style: "padding:4px" }, "There are no templates to show."));
+    for (const t of shown) {
+      tlist.append(h("div", { class: `cfRow${edit.template === t.id ? " sel" : ""}`, onclick: () => { selectTemplate(t.id); renderTmpl(); renderTools(); if (edit.active) setTool("sketch"); } },
+        h("span", { html: icon(t.icon) }), t.name));
+    }
+    jobLine.textContent = state.job ? `Parcels save to job ${state.job.reference}.` : "Pick a Job Area to save parcels into.";
+  };
+  search.oninput = renderTmpl; renderTmpl(); renderTools();
+  floatWindow("Create Features", h("div", {}, h("div", { class: "cfHdr" }, "Create Features"), search, tlist, ctools, jobLine), { id: "createFeaturesWin", width: 240 });
+}
+
+// --- Edit Sketch Properties window (live X/Y vertex table) ---
+function openSketchProps() {
+  const tbl = h("table", { class: "legs" }, h("tr", {}, h("th", {}, "#"), h("th", {}, "X (Easting)"), h("th", {}, "Y (Northing)"), h("th", {}, "")));
+  edit.verts.forEach(([E, N], i) => {
+    const x = h("input", { type: "number", step: "0.001", value: E.toFixed(3), style: "width:92px" });
+    const y = h("input", { type: "number", step: "0.001", value: N.toFixed(3), style: "width:92px" });
+    x.oninput = () => { const v = parseFloat(x.value); if (isFinite(v)) { edit.verts[i][0] = v; drawSketch(); } };
+    y.oninput = () => { const v = parseFloat(y.value); if (isFinite(v)) { edit.verts[i][1] = v; drawSketch(); } };
+    const tr = h("tr", { class: i === edit.sel ? "selrow" : "" }, h("td", { class: "n" }, String(i + 1)), h("td", {}, x), h("td", {}, y),
+      h("td", {}, h("button", { title: "Delete vertex", onclick: () => { edit.verts.splice(i, 1); edit.sel = Math.min(edit.sel, edit.verts.length - 1); drawSketch(); openSketchProps(); updateEditorButtons(); } }, "✕")));
+    tr.addEventListener("click", (ev) => { if (!/INPUT|BUTTON/.test(ev.target.tagName)) { edit.sel = i; drawSketch(); openSketchProps(); } });
+    tbl.append(tr);
+  });
+  if (!edit.verts.length) tbl.append(h("tr", {}, h("td", { colspan: 4, class: "muted" }, "No sketch. Pick the Sketch tool and click the map.")));
+  const body = h("div", {},
+    h("div", { class: "muted" }, `${edit.geomType} sketch — ${edit.verts.length} vertex(es), WGS 84 / UTM 32N metres`),
+    tbl,
+    h("div", { class: "taskNav" },
+      h("button", { class: "btn", disabled: !canFinishSketch(), onclick: finishSketch }, "Finish Sketch"),
+      h("button", { class: "btn", disabled: !edit.verts.length, onclick: deleteSketch }, "Delete Sketch")));
+  floatWindow("Edit Sketch Properties", body, { id: "sketchPropsWin", width: 320 });
+}
+function refreshSketchProps() { if ($("sketchPropsWin")) openSketchProps(); }
+
+/* =====================================================================================
  * Phase 5 — Catalog: live folder connections (e.g. \\PRODUCTIONMC\Image), browsed through the
  * server's read-only /api/v1/catalog endpoints — nothing here is hard-coded.
  * ===================================================================================== */
@@ -1306,6 +1627,13 @@ function catRow(key, depth, inContents) {
   const row = h("div", { class: "node", title: n.folder != null ? catUNC(n) : n.name });
   if (!inContents) row.append(n.expandable ? twisty(isOpen, () => catToggle(key)) : h("span", { class: "tw none" }));
   row.append(h("span", { html: icon(ic) }), h("span", { class: `lbl${cat.selected === key ? " sel" : ""}` }, n.name));
+  if (n.kind === "raster" || n.kind === "shapefile") {
+    row.setAttribute("draggable", "true");
+    row.addEventListener("dragstart", (ev) => {
+      ev.dataTransfer.setData("text/cad-item", key); ev.dataTransfer.effectAllowed = "copy";
+      status(`Drag ${n.name} onto the map or Table Of Contents to add it as a layer.`);
+    });
+  }
   if (inContents && cat.view === "details") {
     row.append(h("span", { class: "catCol" }, n.type || ""), h("span", { class: "catCol num" }, n.size != null ? Math.round(n.size / 1024).toLocaleString() + " KB" : ""));
   }
@@ -1378,13 +1706,15 @@ function drawStyle() {
     family: $("fontBox")?.value || "Arial", size: Number($("sizeBox")?.value || 10),
     bold: $("fmtB")?.classList.contains("active"), italic: $("fmtI")?.classList.contains("active"), underline: $("fmtU")?.classList.contains("active") };
 }
-function addGraphic(g) { state.graphics.push({ id: crypto.randomUUID?.() || String(Date.now()), ...drawStyle(), ...g }); renderGraphics(); }
+function addGraphic(g) { const id = crypto.randomUUID?.() || String(Date.now()); state.graphics.push({ id, ...drawStyle(), ...g }); renderGraphics(); return id; }
 function addTextGraphic(ll) { const text = prompt("Text:", "Text"); if (text) addGraphic({ type: "text", at: [ll.lng, ll.lat], text }); }
 const gfxMarkers = [];
 function renderGraphics() {
   saveGraphics();
   const feats = state.graphics.filter((g) => g.type === "rect").map((g) => ({ type: "Feature", properties: { id: g.id, stroke: g.stroke, fill: g.fill, fillOpacity: 0.35, selected: !!g.selected },
     geometry: { type: "Polygon", coordinates: [[[g.sw[0], g.sw[1]], [g.ne[0], g.sw[1]], [g.ne[0], g.ne[1]], [g.sw[0], g.ne[1]], [g.sw[0], g.sw[1]]]] } }));
+  for (const g of state.graphics.filter((x) => x.type === "line")) feats.push({ type: "Feature", properties: { id: g.id, stroke: g.stroke, fill: g.fill, fillOpacity: 0, selected: !!g.selected },
+    geometry: { type: "LineString", coordinates: g.pts } });
   map.getSource("graphics")?.setData({ type: "FeatureCollection", features: feats });
   gfxMarkers.splice(0).forEach((m) => m.remove());
   for (const g of state.graphics.filter((x) => x.type === "text")) {
@@ -1405,7 +1735,7 @@ function deleteSelectedGraphics() { state.graphics = state.graphics.filter((g) =
 function applyStyleToSelected() { const s = drawStyle(); let n = 0; state.graphics.forEach((g) => { if (g.selected) { Object.assign(g, s); n++; } }); if (n) renderGraphics(); }
 function zoomToGraphics() {
   const sel = state.graphics.filter((g) => g.selected); const gs = sel.length ? sel : state.graphics;
-  const b = new maplibregl.LngLatBounds(); gs.forEach((g) => (g.type === "rect" ? (b.extend(g.sw), b.extend(g.ne)) : b.extend(g.at)));
+  const b = new maplibregl.LngLatBounds(); gs.forEach((g) => (g.type === "rect" ? (b.extend(g.sw), b.extend(g.ne)) : g.type === "line" ? g.pts.forEach((p) => b.extend(p)) : b.extend(g.at)));
   if (!b.isEmpty()) map.fitBounds(b, { padding: 60, maxZoom: 18 });
 }
 
@@ -1413,7 +1743,24 @@ function zoomToGraphics() {
  * Boot
  * ===================================================================================== */
 async function refreshAll() { await Promise.all([loadParcels(false), loadBeacons(), loadJobs(), loadDrafts()]); buildTOC(); await catRefresh(cat.selected); status("Refreshed"); }
+// Drag a raster from the Catalog onto the map or the Table Of Contents to add it as a layer.
+["tocPane", "mapFrame"].forEach((pid) => {
+  const el = $(pid); if (!el) return;
+  el.addEventListener("dragover", (ev) => {
+    if (!ev.dataTransfer.types.includes("text/cad-raster")) return;
+    ev.preventDefault(); ev.dataTransfer.dropEffect = "copy"; el.classList.add("dropok");
+  });
+  el.addEventListener("dragleave", (ev) => { if (ev.target === el) el.classList.remove("dropok"); });
+  el.addEventListener("drop", (ev) => {
+    const key = ev.dataTransfer.getData("text/cad-raster"); el.classList.remove("dropok");
+    if (!key) return;
+    ev.preventDefault();
+    const n = cat.nodes.get(key);
+    if (n && n.kind === "raster") addRasterLayer(n);
+  });
+});
+
 initialDeepLink = initialViewFromURL(); // apply /editor?center=E,N&scale=N before any data arrives
-buildMenus(); buildToolbars(); buildTocTools(); buildTOC(); renderTask(); buildCatalog(); updateNavButtons(); updateScaleBox();
+buildMenus(); buildToolbars(); buildTocTools(); buildTOC(); renderTask(); buildCatalog(); updateNavButtons(); updateScaleBox(); updateEditorButtons();
 loadCatalogRoots();
 loadCatalogDatabases();

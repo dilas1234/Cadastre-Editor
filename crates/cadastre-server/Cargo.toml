@@ -44,6 +44,11 @@ utoipa-swagger-ui = { version = "9", features = ["axum"] }
 # Editor web assets, embedded into the binary (self-contained deploy, no loose files at runtime).
 rust-embed = "8"
 
+# Raster overview rendering for the Catalog (drag a .tif to the map). Both are pure-Rust
+# (tiff -> weezl/jpeg-decoder/flate2, png -> miniz_oxide), so no GDAL/C deps — win7-safe (NFR-02).
+tiff = "0.11"
+png = "0.17"
+
 # Keycloak JWT verification. base64 + rsa + sha2 are all pure-Rust (rsa uses
 # num-bigint-dig, no C/ring), so RS256 signature verification does not compromise the
 # win7 server target (NFR-02).

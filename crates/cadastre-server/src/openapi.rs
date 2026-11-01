@@ -5,7 +5,7 @@ use utoipa::OpenApi;
 use crate::models::{
     AdjustRequest, AdjustResponse, AreaCheckDto, AuditEntryDto, AuditVerifyDto, BeaconDto,
     ClosureDto, FabricValidateRequest, JobDto, JobEventDto, JobTransition, LegDto, LineResidualDto,
-    CatalogDatabaseDto, CatalogFolderDto, LockDto, MeDto, NewBeacon, NewJob, NewLock, NewParcel, NewSession, NewStage, NewTransition,
+    CatalogDatabaseDto, CatalogFolderDto, RasterInfoDto, LockDto, MeDto, NewBeacon, NewJob, NewLock, NewParcel, NewSession, NewStage, NewTransition,
     ObservationDto, OverlapDto, ParcelDto, PointDto, PostResult, PromoteResult, SessionDto,
     StageDto, SurveyCheckRequest, SurveyCheckResponse, SurveyChecksDto, TolerancesDto,
     TopologyReportDto, TransitionDto, WorkflowDto,
@@ -31,6 +31,9 @@ use crate::routes::{
         catalog::items,
         catalog::databases,
         catalog::database_items,
+        catalog::raster_info,
+        catalog::raster_overview,
+        catalog::shapefile,
         tolerances::get_tolerances,
         tolerances::put_tolerances,
         beacons::list_beacons,
@@ -65,7 +68,7 @@ use crate::routes::{
     ),
     components(schemas(
         MeDto, crate::catalog::CatalogItem, crate::catalog::ItemKind, CatalogFolderDto,
-        CatalogDatabaseDto, crate::catalog::FeatureClass, TolerancesDto, BeaconDto, NewBeacon, ParcelDto,
+        CatalogDatabaseDto, RasterInfoDto, crate::catalog::FeatureClass, TolerancesDto, BeaconDto, NewBeacon, ParcelDto,
         WorkflowDto, StageDto, TransitionDto, NewStage, NewTransition,
         JobDto, NewJob, JobTransition, JobEventDto,
         SessionDto, NewSession, LockDto, NewLock,

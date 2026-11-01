@@ -13,7 +13,7 @@ use serde::{Deserialize, Serialize};
 use utoipa::ToSchema;
 
 /// A configured folder connection: the name shown in the Catalog and where it is read from.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CatalogFolder {
     /// Display name, e.g. `\\PRODUCTIONMC\Image`.
     pub name: String,
@@ -32,6 +32,32 @@ pub fn parse_folders(spec: &str) -> Vec<CatalogFolder> {
             None => CatalogFolder { name: item.to_string(), path: PathBuf::from(item) },
         })
         .collect()
+}
+
+/// Catalog connections persisted to a JSON file, so they survive a restart that lacks the
+/// `CADASTRE_CATALOG_*` environment variables (e.g. a bare `cargo run` or a double-clicked
+/// binary). Written on every startup that has connections, and read back when the env is unset.
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub struct CatalogConfig {
+    #[serde(default)]
+    pub folders: Vec<CatalogFolder>,
+    #[serde(default)]
+    pub databases: Vec<DatabaseConnection>,
+}
+
+/// Read a saved catalog config; `None` if the file is missing or unreadable/invalid.
+pub fn load_config(path: &Path) -> Option<CatalogConfig> {
+    serde_json::from_str(&fs::read_to_string(path).ok()?).ok()
+}
+
+/// Write the catalog config (creating the parent directory if needed).
+pub fn save_config(path: &Path, cfg: &CatalogConfig) -> std::io::Result<()> {
+    if let Some(dir) = path.parent() {
+        fs::create_dir_all(dir)?;
+    }
+    let text = serde_json::to_string_pretty(cfg)
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
+    fs::write(path, text)
 }
 
 /// What an item is, in ArcCatalog terms. Drives the icon and what the item can do.
@@ -268,7 +294,7 @@ pub fn list(path: &Path) -> std::io::Result<Vec<CatalogItem>> {
 // ---------------------------------------------------------------------------
 
 /// A configured database connection and where its feature-class snapshot lives.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DatabaseConnection {
     /// Display name, e.g. `Plateau_State.sde`.
     pub name: String,
@@ -320,6 +346,20 @@ pub fn feature_classes(conn: &DatabaseConnection) -> std::io::Result<Vec<Feature
 mod tests {
     use super::*;
     use std::io::Cursor;
+
+    #[test]
+    fn catalog_config_round_trips_and_is_missing_safe() {
+        let dir = std::env::temp_dir().join(format!("cadcfg-{}", std::process::id()));
+        let path = dir.join("catalog.json");
+        assert!(load_config(&path).is_none(), "missing file -> None");
+        let cfg = CatalogConfig {
+            folders: vec![CatalogFolder { name: r"\\X\Image".into(), path: PathBuf::from("/mnt/x") }],
+            databases: vec![DatabaseConnection { name: "Plateau_State.sde".into(), snapshot: PathBuf::from("/x.json") }],
+        };
+        save_config(&path, &cfg).unwrap();
+        assert_eq!(load_config(&path), Some(cfg));
+        let _ = fs::remove_dir_all(&dir);
+    }
 
     #[test]
     fn parses_database_connections() {

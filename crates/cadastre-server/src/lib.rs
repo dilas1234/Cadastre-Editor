@@ -14,6 +14,8 @@ pub mod models;
 pub mod numbering;
 pub mod openapi;
 pub mod pdf;
+pub mod raster;
 pub mod report;
 pub mod routes;
+pub mod shp;
 pub mod state;

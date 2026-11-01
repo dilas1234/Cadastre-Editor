@@ -1,6 +1,7 @@
 //! Runtime configuration, read from the environment at startup.
 
 use std::env;
+use std::path::PathBuf;
 
 /// Whether the Keycloak auth layer verifies tokens or runs in dev-bypass mode.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -59,6 +60,37 @@ impl Config {
             }
         };
 
+        let mut catalog_folders =
+            crate::catalog::parse_folders(&env::var("CADASTRE_CATALOG_FOLDERS").unwrap_or_default());
+        let mut catalog_databases =
+            crate::catalog::parse_databases(&env::var("CADASTRE_CATALOG_DATABASES").unwrap_or_default());
+
+        // Fall back to the saved catalog config file when the env vars are unset, so the Catalog
+        // connections survive a restart that forgets them (per-list: env wins when present).
+        let config_path = catalog_config_path();
+        if catalog_folders.is_empty() || catalog_databases.is_empty() {
+            if let Some(cfg) = config_path.as_deref().and_then(crate::catalog::load_config) {
+                if catalog_folders.is_empty() {
+                    catalog_folders = cfg.folders;
+                }
+                if catalog_databases.is_empty() {
+                    catalog_databases = cfg.databases;
+                }
+            }
+        }
+        // Persist whatever we resolved, so a later bare restart (no env) still has the connections.
+        if let Some(path) = &config_path {
+            if !catalog_folders.is_empty() || !catalog_databases.is_empty() {
+                let cfg = crate::catalog::CatalogConfig {
+                    folders: catalog_folders.clone(),
+                    databases: catalog_databases.clone(),
+                };
+                if let Err(e) = crate::catalog::save_config(path, &cfg) {
+                    eprintln!("warning: could not save catalog config to {}: {e}", path.display());
+                }
+            }
+        }
+
         Ok(Self {
             database_url,
             bind_addr,
@@ -67,10 +99,22 @@ impl Config {
             keycloak_audience: non_empty(env::var("CADASTRE_KEYCLOAK_AUDIENCE").ok()),
             keycloak_jwks_json: non_empty(env::var("CADASTRE_KEYCLOAK_JWKS_JSON").ok()),
             keycloak_jwks_path: non_empty(env::var("CADASTRE_KEYCLOAK_JWKS_PATH").ok()),
-            catalog_folders: crate::catalog::parse_folders(&env::var("CADASTRE_CATALOG_FOLDERS").unwrap_or_default()),
-            catalog_databases: crate::catalog::parse_databases(&env::var("CADASTRE_CATALOG_DATABASES").unwrap_or_default()),
+            catalog_folders,
+            catalog_databases,
         })
     }
+}
+
+/// Where the catalog config file lives: `CADASTRE_CATALOG_CONFIG` if set, else
+/// `~/.cadastre/catalog.json` (`%USERPROFILE%\.cadastre\catalog.json` on Windows).
+fn catalog_config_path() -> Option<PathBuf> {
+    if let Ok(p) = env::var("CADASTRE_CATALOG_CONFIG") {
+        if !p.trim().is_empty() {
+            return Some(PathBuf::from(p.trim()));
+        }
+    }
+    let home = env::var("HOME").or_else(|_| env::var("USERPROFILE")).ok()?;
+    Some(PathBuf::from(home).join(".cadastre").join("catalog.json"))
 }
 
 /// Treat an empty or whitespace-only env var as unset.

@@ -599,3 +599,27 @@ pub struct CatalogDatabaseDto {
     /// Display name, e.g. `Plateau_State.sde`.
     pub name: String,
 }
+
+/// Georeferencing + previewability for a raster (`GET /api/v1/catalog/raster/info`), so the
+/// browser can place its overview PNG on the map by corner coordinates.
+#[derive(Clone, Debug, Serialize, ToSchema)]
+pub struct RasterInfoDto {
+    /// Full-resolution pixel width.
+    pub width: u32,
+    /// Full-resolution pixel height.
+    pub height: u32,
+    /// EPSG code of the raster's CRS, if declared in its GeoKeys.
+    pub epsg: Option<u32>,
+    /// `[minx, miny, maxx, maxy]` in that CRS.
+    pub bbox: [f64; 4],
+    /// Whether a `.ovr` pyramid is present.
+    pub has_overview: bool,
+    /// Whether an overview PNG can be rendered (else only the extent can be shown).
+    pub decodable: bool,
+}
+
+impl From<crate::raster::RasterInfo> for RasterInfoDto {
+    fn from(r: crate::raster::RasterInfo) -> Self {
+        Self { width: r.width, height: r.height, epsg: r.epsg, bbox: r.bbox, has_overview: r.has_overview, decodable: r.decodable }
+    }
+}
