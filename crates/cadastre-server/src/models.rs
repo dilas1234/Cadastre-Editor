@@ -590,3 +590,12 @@ pub struct CatalogFolderDto {
     /// Display name, e.g. the UNC name of the share.
     pub name: String,
 }
+
+/// A Catalog database (geodatabase) connection (`GET /api/v1/catalog/databases`).
+#[derive(Clone, Debug, Serialize, ToSchema)]
+pub struct CatalogDatabaseDto {
+    /// Index to pass as `db` when listing feature classes.
+    pub id: usize,
+    /// Display name, e.g. `Plateau_State.sde`.
+    pub name: String,
+}

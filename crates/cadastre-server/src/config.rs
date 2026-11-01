@@ -31,6 +31,9 @@ pub struct Config {
     pub keycloak_jwks_path: Option<String>,
     /// Catalog folder connections (`CADASTRE_CATALOG_FOLDERS`, `name=path;…`), read-only.
     pub catalog_folders: Vec<crate::catalog::CatalogFolder>,
+    /// Catalog database connections (`CADASTRE_CATALOG_DATABASES`, `name=jsonpath;…`) — geodatabase
+    /// feature-class lists read from a snapshot JSON.
+    pub catalog_databases: Vec<crate::catalog::DatabaseConnection>,
 }
 
 impl Config {
@@ -65,6 +68,7 @@ impl Config {
             keycloak_jwks_json: non_empty(env::var("CADASTRE_KEYCLOAK_JWKS_JSON").ok()),
             keycloak_jwks_path: non_empty(env::var("CADASTRE_KEYCLOAK_JWKS_PATH").ok()),
             catalog_folders: crate::catalog::parse_folders(&env::var("CADASTRE_CATALOG_FOLDERS").unwrap_or_default()),
+            catalog_databases: crate::catalog::parse_databases(&env::var("CADASTRE_CATALOG_DATABASES").unwrap_or_default()),
         })
     }
 }

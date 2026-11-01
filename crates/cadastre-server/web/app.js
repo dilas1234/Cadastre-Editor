@@ -1185,7 +1185,7 @@ const CAT_TYPE = { folder: "Folder", file_geodatabase: "File Geodatabase", toolb
 const shpIcon = (g) => (g === "polyline" ? "lineFc" : g === "point" || g === "multipoint" ? "pointFc" : "polygonFc");
 const cat = {
   nodes: new Map(),           // key -> node
-  open: new Set(["fc"]), selected: null, back: [], fwd: [], contentsVisible: true, view: "list",
+  open: new Set(["fc", "dc"]), selected: null, back: [], fwd: [], contentsVisible: true, view: "list",
 };
 // Node keys: "fc" (Folder Connections), "f:<folder>:<path>" (share items), "tb" / "tb:<tool>" (toolboxes).
 function catNode(key, props) { const n = cat.nodes.get(key) || { key, children: null, loading: false, error: null }; Object.assign(n, props); cat.nodes.set(key, n); return n; }
@@ -1193,6 +1193,7 @@ function catItemKey(folder, path) { return `f:${folder}:${path}`; }
 function catUNC(n) { return n.folder == null ? n.name : (cat.roots[n.folder].name + (n.path ? "\\" + n.path.replace(/\//g, "\\") : "")); }
 cat.roots = [];
 catNode("fc", { name: "Folder Connections", icon: "folderConns", expandable: true, children: [] });
+catNode("dc", { name: "Database Connections", icon: "dbConn", expandable: true, children: [] });
 catNode("tb", { name: "Toolboxes", icon: "toolbox", expandable: true, children: ["tb:validate", "tb:survey"] });
 catNode("tb:validate", { name: "Validate Fabric", icon: "validate", expandable: false, run: () => validateFabric(), type: "Tool" });
 catNode("tb:survey", { name: "Survey Closure Check", icon: "survey", expandable: false, run: () => openTask("survey"), type: "Tool" });
@@ -1208,20 +1209,45 @@ async function loadCatalogRoots() {
   } catch (e) { catNode("fc", { error: "Could not load folder connections: " + e.message }); }
   buildCatalog();
 }
-async function catLoad(key) {
-  const n = cat.nodes.get(key);
-  if (!n || n.children || n.loading || n.folder == null) return;
-  n.loading = true; buildCatalog();
+async function loadCatalogDatabases() {
   try {
-    const items = await api(`/api/v1/catalog/items?folder=${n.folder}&path=${encodeURIComponent(n.path)}`);
-    n.children = items.map((it) => {
-      const path = n.path ? `${n.path}/${it.name}` : it.name;
-      const k = catItemKey(n.folder, path);
-      catNode(k, { name: it.name, kind: it.kind, geometry: it.geometry, expandable: it.expandable, size: it.size, modified: it.modified,
-        folder: n.folder, path, icon: it.kind === "shapefile" ? shpIcon(it.geometry) : CAT_ICON[it.kind] || "folder",
-        type: it.kind === "shapefile" ? `Shapefile (${it.geometry || "?"})` : CAT_TYPE[it.kind] || it.kind });
+    const dbs = await api("/api/v1/catalog/databases");
+    const keys = dbs.map((d) => {
+      const k = `db:${d.id}`;
+      catNode(k, { name: d.name, icon: "dbConn", expandable: true, db: d.id, kind: "database_connection", type: "Database Connection" });
       return k;
     });
+    catNode("dc", { children: keys });
+    if (keys.length) { cat.open.add(keys[0]); await catLoad(keys[0]); }
+  } catch (e) { catNode("dc", { error: "Could not load database connections: " + e.message }); }
+  buildCatalog();
+}
+async function catLoad(key) {
+  const n = cat.nodes.get(key);
+  if (!n || n.children || n.loading) return;
+  if (n.folder == null && n.db == null) return; // only folder & database-connection nodes have children to fetch
+  n.loading = true; buildCatalog();
+  try {
+    if (n.db != null) {
+      // A geodatabase connection: its children are feature classes.
+      const fcs = await api(`/api/v1/catalog/database/items?db=${n.db}`);
+      n.children = fcs.map((fc) => {
+        const k = `dbfc:${n.db}:${fc.name}`;
+        catNode(k, { name: fc.name, geometry: fc.geometry, expandable: false,
+          icon: shpIcon(fc.geometry), type: `Feature Class (${fc.geometry})` });
+        return k;
+      });
+    } else {
+      const items = await api(`/api/v1/catalog/items?folder=${n.folder}&path=${encodeURIComponent(n.path)}`);
+      n.children = items.map((it) => {
+        const path = n.path ? `${n.path}/${it.name}` : it.name;
+        const k = catItemKey(n.folder, path);
+        catNode(k, { name: it.name, kind: it.kind, geometry: it.geometry, expandable: it.expandable, size: it.size, modified: it.modified,
+          folder: n.folder, path, icon: it.kind === "shapefile" ? shpIcon(it.geometry) : CAT_ICON[it.kind] || "folder",
+          type: it.kind === "shapefile" ? `Shapefile (${it.geometry || "?"})` : CAT_TYPE[it.kind] || it.kind });
+        return k;
+      });
+    }
     n.error = null;
   } catch (e) { n.error = e.message; n.children = []; }
   n.loading = false; buildCatalog();
@@ -1303,7 +1329,7 @@ function catSubtree(key) {
 function buildCatalog() {
   if (!$("catTree")) return;
   const tree = $("catTree"); const scroll = tree.scrollTop; tree.innerHTML = "";
-  tree.append(h("ul", { class: "tree ctree" }, catSubtree("fc"), catSubtree("tb")));
+  tree.append(h("ul", { class: "tree ctree" }, catSubtree("fc"), catSubtree("dc"), catSubtree("tb")));
   tree.scrollTop = scroll;
   // Location: the selected location, with its ancestors to step back up.
   const loc = $("catLocation"); loc.innerHTML = "";
@@ -1390,3 +1416,4 @@ async function refreshAll() { await Promise.all([loadParcels(false), loadBeacons
 initialDeepLink = initialViewFromURL(); // apply /editor?center=E,N&scale=N before any data arrives
 buildMenus(); buildToolbars(); buildTocTools(); buildTOC(); renderTask(); buildCatalog(); updateNavButtons(); updateScaleBox();
 loadCatalogRoots();
+loadCatalogDatabases();

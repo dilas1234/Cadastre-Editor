@@ -9,7 +9,7 @@ use std::fs::{self, File};
 use std::io::{Read, Seek, SeekFrom};
 use std::path::{Component, Path, PathBuf};
 
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use utoipa::ToSchema;
 
 /// A configured folder connection: the name shown in the Catalog and where it is read from.
@@ -261,10 +261,74 @@ pub fn list(path: &Path) -> std::io::Result<Vec<CatalogItem>> {
         .collect())
 }
 
+// ---------------------------------------------------------------------------
+// Database (geodatabase) connections — e.g. the ArcSDE `Plateau_State.sde`.
+// The live SQL Server named instance is not TCP-reachable from this server, so the feature-class
+// list is captured out-of-band into a JSON snapshot and read here (refresh by re-snapshotting).
+// ---------------------------------------------------------------------------
+
+/// A configured database connection and where its feature-class snapshot lives.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct DatabaseConnection {
+    /// Display name, e.g. `Plateau_State.sde`.
+    pub name: String,
+    /// JSON snapshot: `{ "feature_classes": [ { "name", "geometry" }, … ] }`.
+    pub snapshot: PathBuf,
+}
+
+/// One feature class inside a geodatabase connection.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+pub struct FeatureClass {
+    /// Feature-class name, e.g. `PLATEAU_STATE_PARCELS`.
+    pub name: String,
+    /// Geometry: `point` | `polyline` | `polygon` | `table`.
+    pub geometry: String,
+}
+
+/// Parse `CADASTRE_CATALOG_DATABASES`: `name=jsonpath` pairs separated by `;`
+/// (e.g. `Plateau_State.sde=/home/u/cadastre-sde.json`).
+pub fn parse_databases(spec: &str) -> Vec<DatabaseConnection> {
+    spec.split(';')
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .filter_map(|item| {
+            item.split_once('=').map(|(name, path)| DatabaseConnection {
+                name: name.trim().to_string(),
+                snapshot: PathBuf::from(path.trim()),
+            })
+        })
+        .collect()
+}
+
+#[derive(Deserialize)]
+struct Snapshot {
+    #[serde(default)]
+    feature_classes: Vec<FeatureClass>,
+}
+
+/// Read a connection's feature classes from its snapshot JSON, sorted by name (ArcCatalog order).
+pub fn feature_classes(conn: &DatabaseConnection) -> std::io::Result<Vec<FeatureClass>> {
+    let text = fs::read_to_string(&conn.snapshot)?;
+    let snap: Snapshot = serde_json::from_str(&text)
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
+    let mut fcs = snap.feature_classes;
+    fcs.sort_by_key(|f| f.name.to_lowercase());
+    Ok(fcs)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::io::Cursor;
+
+    #[test]
+    fn parses_database_connections() {
+        let d = parse_databases(r"Plateau_State.sde=/home/u/sde.json ; Other.sde=/x.json");
+        assert_eq!(d.len(), 2);
+        assert_eq!(d[0].name, "Plateau_State.sde");
+        assert_eq!(d[0].snapshot, PathBuf::from("/home/u/sde.json"));
+        assert!(parse_databases("").is_empty());
+    }
 
     fn names(v: &[(&str, bool)]) -> Vec<(String, bool)> {
         v.iter().map(|(n, d)| (n.to_string(), *d)).collect()

@@ -5,9 +5,9 @@ use axum::Json;
 use serde::Deserialize;
 use utoipa::IntoParams;
 
-use crate::catalog::{self, CatalogItem};
+use crate::catalog::{self, CatalogItem, FeatureClass};
 use crate::error::{ApiResult, AppError};
-use crate::models::CatalogFolderDto;
+use crate::models::{CatalogDatabaseDto, CatalogFolderDto};
 use crate::state::AppState;
 
 /// The folder connections shown under "Folder Connections".
@@ -48,4 +48,38 @@ pub async fn items(State(state): State<AppState>, Query(q): Query<ItemsQuery>) -
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Err(AppError::NotFound(format!("not found: {}", q.path))),
         Err(e) => Err(AppError::BadRequest(format!("cannot read {}: {e}", q.path))),
     }
+}
+
+/// The database (geodatabase) connections shown under "Database Connections".
+#[utoipa::path(get, path = "/api/v1/catalog/databases", tag = "catalog",
+    responses((status = 200, body = [CatalogDatabaseDto])))]
+pub async fn databases(State(state): State<AppState>) -> Json<Vec<CatalogDatabaseDto>> {
+    Json(state.config.catalog_databases.iter().enumerate()
+        .map(|(id, d)| CatalogDatabaseDto { id, name: d.name.clone() })
+        .collect())
+}
+
+/// Which database connection to list.
+#[derive(Debug, Deserialize, IntoParams)]
+#[into_params(parameter_in = Query)]
+pub struct DbItemsQuery {
+    /// Database connection id (from `GET /api/v1/catalog/databases`).
+    pub db: usize,
+}
+
+/// List a geodatabase connection's feature classes.
+#[utoipa::path(get, path = "/api/v1/catalog/database/items", tag = "catalog", params(DbItemsQuery),
+    responses((status = 200, body = [FeatureClass]), (status = 404, description = "Unknown connection")))]
+pub async fn database_items(
+    State(state): State<AppState>,
+    Query(q): Query<DbItemsQuery>,
+) -> ApiResult<Json<Vec<FeatureClass>>> {
+    let conn = state.config.catalog_databases.get(q.db)
+        .ok_or_else(|| AppError::NotFound(format!("no database connection {}", q.db)))?
+        .clone();
+    let fcs = tokio::task::spawn_blocking(move || catalog::feature_classes(&conn))
+        .await
+        .map_err(|e| AppError::BadRequest(format!("listing failed: {e}")))?
+        .map_err(|e| AppError::BadRequest(format!("cannot read snapshot: {e}")))?;
+    Ok(Json(fcs))
 }

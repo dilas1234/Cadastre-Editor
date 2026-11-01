@@ -35,6 +35,8 @@ pub fn router(state: AppState) -> Router {
         .route("/api/v1/me", get(me::me))
         .route("/api/v1/catalog", get(catalog::folders))
         .route("/api/v1/catalog/items", get(catalog::items))
+        .route("/api/v1/catalog/databases", get(catalog::databases))
+        .route("/api/v1/catalog/database/items", get(catalog::database_items))
         .route("/api/v1/parcels.geojson", get(viewer::parcels_geojson))
         .route("/api/v1/beacons.geojson", get(viewer::beacons_geojson))
         .route(
