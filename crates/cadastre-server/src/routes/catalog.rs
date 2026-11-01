@@ -97,6 +97,9 @@ pub struct RasterQuery {
     /// Target longest side (pixels) for the overview PNG; clamped to 256..=4096. Default 2048.
     #[serde(default)]
     pub max: Option<u32>,
+    /// Treat this 8-bit value (in every band) as transparent background, as ArcMap's "Display
+    /// Background Value" does (e.g. `0` for a black collar). Overrides the file's NoData.
+    pub background: Option<u8>,
 }
 
 /// Resolve a raster query to an absolute filesystem path under its folder connection.
@@ -128,7 +131,7 @@ pub async fn raster_info(State(state): State<AppState>, Query(q): Query<RasterQu
 pub async fn raster_overview(State(state): State<AppState>, Query(q): Query<RasterQuery>) -> ApiResult<Response> {
     let path = raster_path(&state, &q)?;
     let max = q.max.unwrap_or(2048).clamp(256, 4096);
-    let png = tokio::task::spawn_blocking(move || crate::raster::render_overview(&path, max))
+    let png = tokio::task::spawn_blocking(move || crate::raster::render_overview(&path, max, q.background))
         .await
         .map_err(|e| AppError::BadRequest(format!("raster render failed: {e}")))?
         .map_err(|e| AppError::UnprocessableEntity(format!("cannot preview raster: {e}")))?;

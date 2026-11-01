@@ -112,7 +112,9 @@ pub fn read_info(main: &Path) -> Result<RasterInfo> {
 /// Picks the smallest pyramid level whose longest side is still >= `max_px` (so the result is
 /// crisp after down-sampling) and decodes only that level. Errors if no level is within
 /// [`DECODE_CAP`] (caller should fall back to showing just the extent).
-pub fn render_overview(main: &Path, max_px: u32) -> Result<(Vec<u8>, u32, u32)> {
+/// `background`: an 8-bit value to show as transparent in every band (ArcMap's "Display Background
+/// Value"); when `None`, the file's own NoData value is used, if it has a usable one.
+pub fn render_overview(main: &Path, max_px: u32, background: Option<u8>) -> Result<(Vec<u8>, u32, u32)> {
     let src = {
         let o = ovr_path(main);
         if o.exists() { o } else { main.to_path_buf() }
@@ -134,24 +136,32 @@ pub fn render_overview(main: &Path, max_px: u32) -> Result<(Vec<u8>, u32, u32)> 
         d.next_image().map_err(tiff_err)?;
     }
     let (w, h) = d.dimensions().map_err(tiff_err)?;
-    let rgba = read_level_rgba(&mut d, w, h)?;
+    let rgba = read_level_rgba(&mut d, w, h, background.or_else(|| nodata_u8(main)))?;
     let (small, nw, nh) = downsample(&rgba, w, h, max_px);
     let png = encode_png(&small, nw, nh)?;
     Ok((png, nw, nh))
 }
 
-/// First element of an integer tag, if present.
+/// First element of an integer tag, if present. Uses the integer accessor: `into_f64_vec` fails on
+/// a single SHORT value, which made PlanarConfiguration (284) read as absent, so planar colour
+/// overviews were decoded as their first band only (grey).
 fn tag1(d: &mut Decoder<File>, tag: u16) -> Option<u32> {
     d.find_tag(Tag::from_u16_exhaustive(tag)).ok().flatten()
-        .and_then(|v| v.into_f64_vec().ok())
-        .and_then(|v| v.first().map(|f| *f as u32))
+        .and_then(|v| v.into_u64_vec().ok())
+        .and_then(|v| v.first().and_then(|n| u32::try_from(*n).ok()))
 }
 
-/// Decode the *current* IFD into interleaved RGBA8. Uses the crate's `read_image_to_buffer`, which
-/// reconstructs every plane (tiling, edges, deflate, predictor all handled); we then interleave.
-/// GDAL `.ovr` overviews here are *planar* (R/G/B as separate planes), which the crate lays out
-/// consecutively — the old `read_image` returns only the first plane.
-fn read_level_rgba(d: &mut Decoder<File>, w: u32, h: u32) -> Result<Vec<u8>> {
+/// Decode the *current* IFD into interleaved RGBA8.
+///
+/// * Chunky (interleaved) colour: decoded whole with `read_image`.
+/// * Planar colour (GDAL `.ovr` pyramids store R, G and B as separate planes): each band is
+///   assembled chunk by chunk with `read_chunk`, which returns one plane per chunk (chunks are
+///   ordered plane by plane). Edge chunks are clipped to the image. This avoids `read_image`,
+///   which for planar images yields only the first plane, so the ortho previewed as grey.
+/// * Single band: grey.
+///
+/// Pixels equal to `nodata` in every band become transparent (GDAL NoData collars).
+fn read_level_rgba(d: &mut Decoder<File>, w: u32, h: u32, nodata: Option<u8>) -> Result<Vec<u8>> {
     let color = d.colortype().map_err(tiff_err)?;
     let spp = tag1(d, 277).unwrap_or(match color {
         ColorType::RGB(_) => 3,
@@ -163,39 +173,104 @@ fn read_level_rgba(d: &mut Decoder<File>, w: u32, h: u32) -> Result<Vec<u8>> {
         return Err(Error::new(ErrorKind::Unsupported, format!("unsupported bit depth {bits} (only 8-bit rasters preview)")));
     }
     let planar = tag1(d, 284).unwrap_or(1) == 2;
-
-    // `read_image` places all tiles/strips correctly (deflate + predictor handled); for *chunky*
-    // images it returns interleaved samples, for *planar* ones only the first plane. We render
-    // chunky multi-band as colour and planar/single-band as grayscale — the planar colour path in
-    // this `tiff` release is unreliable (see read_image_to_buffer).
-    let buf = match d.read_image().map_err(tiff_err)? {
-        DecodingResult::U8(v) => v,
-        _ => return Err(Error::new(ErrorKind::Unsupported, "unsupported sample type (only 8-bit rasters preview)".to_string())),
-    };
-
     let wh = w as usize * h as usize;
     let mut rgba = vec![0u8; wh * 4];
-    if !planar && spp >= 3 && buf.len() >= wh * spp {
-        for p in 0..wh {
-            let s = p * spp;
-            rgba[p * 4] = buf[s];
-            rgba[p * 4 + 1] = buf[s + 1];
-            rgba[p * 4 + 2] = buf[s + 2];
-            rgba[p * 4 + 3] = 255;
-        }
-    } else if buf.len() >= wh {
-        // Grayscale, or the first plane of a planar image.
-        for p in 0..wh {
-            let g = buf[p];
-            rgba[p * 4] = g;
-            rgba[p * 4 + 1] = g;
-            rgba[p * 4 + 2] = g;
-            rgba[p * 4 + 3] = 255;
+    for px in rgba.chunks_exact_mut(4) {
+        px[3] = 255;
+    }
+
+    if planar && spp >= 3 {
+        // Chunk grid of one plane.
+        let (cw, chh) = d.chunk_dimensions();
+        let (across, per_plane) = match d.get_chunk_type() {
+            tiff::decoder::ChunkType::Tile => {
+                let across = w.div_ceil(cw);
+                (across, across * h.div_ceil(chh))
+            }
+            tiff::decoder::ChunkType::Strip => (1, h.div_ceil(chh)),
+        };
+        // R, G, B, and alpha when there is a fourth band.
+        for plane in 0..spp.min(4) {
+            for i in 0..per_plane {
+                let idx = plane as u32 * per_plane + i;
+                let data = match d.read_chunk(idx).map_err(tiff_err)? {
+                    DecodingResult::U8(v) => v,
+                    _ => return Err(Error::new(ErrorKind::Unsupported, "unsupported sample type (only 8-bit rasters preview)")),
+                };
+                // Row width is the tile width, or what remains of the image in the last column
+                // (the library trims right padding for every plane). Row count follows from the
+                // data: the library trims bottom padding only for the first plane's chunks, so
+                // other planes' bottom tiles arrive full height; place_chunk clips at the edge.
+                let (tx, ty) = ((i % across) * cw, (i / across) * chh);
+                let stride = match d.get_chunk_type() {
+                    tiff::decoder::ChunkType::Tile => cw.min(w - tx),
+                    tiff::decoder::ChunkType::Strip => w,
+                };
+                place_chunk(&mut rgba, (w, h), plane, (tx, ty), stride, &data);
+            }
         }
     } else {
-        return Err(Error::new(ErrorKind::Unsupported, format!("decoded buffer too small ({} for {wh}px)", buf.len())));
+        let buf = match d.read_image().map_err(tiff_err)? {
+            DecodingResult::U8(v) => v,
+            _ => return Err(Error::new(ErrorKind::Unsupported, "unsupported sample type (only 8-bit rasters preview)".to_string())),
+        };
+        if !planar && spp >= 3 && buf.len() >= wh * spp {
+            for p in 0..wh {
+                let s = p * spp;
+                rgba[p * 4..p * 4 + 3].copy_from_slice(&buf[s..s + 3]);
+                if spp >= 4 {
+                    rgba[p * 4 + 3] = buf[s + 3];
+                }
+            }
+        } else if buf.len() >= wh {
+            // Grayscale (or a planar image with fewer than three bands: its first band).
+            for p in 0..wh {
+                rgba[p * 4..p * 4 + 3].fill(buf[p]);
+            }
+        } else {
+            return Err(Error::new(ErrorKind::Unsupported, format!("decoded buffer too small ({} for {wh}px)", buf.len())));
+        }
+    }
+    if let Some(nd) = nodata {
+        for px in rgba.chunks_exact_mut(4) {
+            if px[0] == nd && px[1] == nd && px[2] == nd {
+                px[3] = 0;
+            }
+        }
     }
     Ok(rgba)
+}
+
+/// Copy one decoded single-band chunk (row stride `stride`, origin `(tx, ty)`) into band `plane` of
+/// an interleaved RGBA image of size `(w, h)`, clipping whatever lies past the image edge.
+fn place_chunk(rgba: &mut [u8], (w, h): (u32, u32), plane: usize, (tx, ty): (u32, u32), stride: u32, data: &[u8]) {
+    let rows = data.len() as u32 / stride.max(1);
+    for y in 0..rows {
+        let gy = ty + y;
+        if gy >= h {
+            break;
+        }
+        for x in 0..stride {
+            let gx = tx + x;
+            if gx >= w {
+                break;
+            }
+            rgba[((gy * w + gx) * 4) as usize + plane] = data[(y * stride + x) as usize];
+        }
+    }
+}
+
+/// GDAL's NoData value (TIFF tag 42113, ASCII), when it is an 8-bit value. Read from the main
+/// file, else its `.ovr`.
+fn nodata_u8(main: &Path) -> Option<u8> {
+    let read = |p: &Path| -> Option<u8> {
+        let mut d = open(p).ok()?;
+        let v = d.find_tag(Tag::Unknown(42113)).ok().flatten()?;
+        let s = v.into_string().ok()?;
+        let f: f64 = s.trim_matches(char::from(0)).trim().parse().ok()?;
+        (f.fract() == 0.0 && (0.0..=255.0).contains(&f)).then_some(f as u8)
+    };
+    read(main).or_else(|| read(&ovr_path(main)))
 }
 
 /// Nearest-neighbour down-sample so the longest side is <= `max_px`. (An overview that is already
@@ -231,4 +306,30 @@ fn encode_png(rgba: &[u8], w: u32, h: u32) -> Result<Vec<u8>> {
         writer.write_image_data(rgba).map_err(|e| Error::other(format!("png: {e}")))?;
     }
     Ok(buf)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::place_chunk;
+
+    /// A 3x3 RGBA image assembled from 2x2 tiles, one band at a time, as a planar `.ovr` stores it.
+    #[test]
+    fn planar_tiles_land_in_their_band_and_are_clipped_at_the_edges() {
+        let (w, h) = (3u32, 3u32);
+        let mut rgba = vec![0u8; (w * h * 4) as usize];
+        // Tile grid 2x2 of 2x2 tiles; values encode band*100 + tile*10 + position.
+        for plane in 0..3usize {
+            for (i, (tx, ty)) in [(0, 0), (2, 0), (0, 2), (2, 2)].into_iter().enumerate() {
+                let data: Vec<u8> = (0..4).map(|p| (plane * 100 + i * 10 + p) as u8).collect();
+                place_chunk(&mut rgba, (w, h), plane, (tx, ty), 2, &data);
+            }
+        }
+        let px = |x: u32, y: u32| &rgba[((y * w + x) * 4) as usize..((y * w + x) * 4 + 4) as usize];
+        assert_eq!(px(0, 0)[..3], [0, 100, 200]); // tile 0, position 0, in R, G, B
+        assert_eq!(px(1, 1)[..3], [3, 103, 203]); // tile 0, position 3
+        assert_eq!(px(2, 0)[..3], [10, 110, 210]); // tile 1 starts at x = 2
+        assert_eq!(px(2, 2)[..3], [30, 130, 230]); // bottom-right tile, only its first pixel fits
+        assert_eq!(px(0, 2)[..3], [20, 120, 220]);
+        assert!(rgba.chunks_exact(4).all(|p| p[3] == 0), "place_chunk never writes alpha unless asked");
+    }
 }

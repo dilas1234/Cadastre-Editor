@@ -60,9 +60,13 @@ impl ImportReport {
     }
 }
 
-/// Validate and stage a batch of raw parcels. Invalid rows become exceptions; parcel numbers that
-/// appear more than once are moved wholesale to exceptions (the target schema requires a unique
-/// parcel number, so duplicates need review rather than silent loss).
+/// Validate and stage a batch of raw parcels. Invalid rows become exceptions.
+///
+/// In Aumentum a UPIN keeps its identity through re-survey and mutation: the old geometry is kept
+/// as historic/archived under the same UPIN and the new one is active. So a UPIN that appears on
+/// one active row plus history rows is normal lineage and all of its rows are staged. Only a UPIN
+/// held by two or more *active* rows is a genuine conflict (the live fabric can hold one parcel per
+/// UPIN); those active rows are moved to exceptions for review rather than either being chosen.
 pub fn stage_parcels(raws: &[RawParcel]) -> ImportReport {
     let mut staged: Vec<StagedParcel> = Vec::new();
     let mut exceptions: Vec<Exception> = Vec::new();
@@ -78,9 +82,9 @@ pub fn stage_parcels(raws: &[RawParcel]) -> ImportReport {
         }
     }
 
-    // Detect duplicate parcel numbers among the validated rows.
+    // Detect parcel numbers held by more than one current (active) row.
     let mut counts: HashMap<&str, usize> = HashMap::new();
-    for p in &staged {
+    for p in staged.iter().filter(|p| p.status.is_current()) {
         *counts.entry(p.parcel_number.as_str()).or_default() += 1;
     }
     let dup_numbers: std::collections::HashSet<String> = counts
@@ -92,7 +96,7 @@ pub fn stage_parcels(raws: &[RawParcel]) -> ImportReport {
     if !dup_numbers.is_empty() {
         let (dups, keep): (Vec<_>, Vec<_>) = staged
             .into_iter()
-            .partition(|p| dup_numbers.contains(&p.parcel_number));
+            .partition(|p| p.status.is_current() && dup_numbers.contains(&p.parcel_number));
         staged = keep;
         for p in dups {
             exceptions.push(Exception {
@@ -157,10 +161,10 @@ mod tests {
     }
 
     #[test]
-    fn duplicate_parcel_numbers_are_moved_to_exceptions() {
+    fn two_active_parcels_with_one_upin_are_moved_to_exceptions() {
         let raws = vec![
             raw(1, Some("PL1"), 2, Some(SQUARE)),
-            raw(2, Some("PL1"), 3, Some(SQUARE)), // same UPIN -> both become exceptions
+            raw(2, Some("PL1"), 2, Some(SQUARE)), // two ACTIVE rows, same UPIN -> both for review
             raw(3, Some("PL2"), 2, Some(SQUARE)),
         ];
         let r = stage_parcels(&raws);
@@ -168,5 +172,21 @@ mod tests {
         assert_eq!(r.staged[0].parcel_number, "PL2");
         assert_eq!(r.exception_count(), 2);
         assert!(r.exceptions.iter().all(|e| e.kind == ExceptionKind::DuplicateUpin));
+    }
+
+    #[test]
+    fn a_upin_with_one_active_row_and_history_is_lineage_not_a_conflict() {
+        // As on production: PL000000002470 is active (re-surveyed) and also archived (old shape).
+        let raws = vec![
+            raw(6388, Some("PL000000002470"), 2, Some(SQUARE)), // active
+            raw(7192, Some("PL000000002470"), 4, Some(SQUARE)), // archived predecessor
+            raw(6387, Some("PL000000002469"), 4, Some(SQUARE)), // two archived rows: history only
+            raw(7191, Some("PL000000002469"), 4, Some(SQUARE)),
+        ];
+        let r = stage_parcels(&raws);
+        assert_eq!(r.exception_count(), 0, "{:?}", r.exceptions);
+        assert_eq!(r.staged_count(), 4);
+        assert_eq!(r.status_counts.get("active"), Some(&1));
+        assert_eq!(r.status_counts.get("archived"), Some(&3));
     }
 }

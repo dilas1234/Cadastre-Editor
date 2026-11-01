@@ -1,0 +1,4 @@
+parcels.psv: OBJECTIDs 1 and 3 only (2 deleted, 5 deleted later, 4 in an unposted version; 9 is base and stays, it is a '0' placeholder parcel row)
+parcel-attributes.psv: header + OBJECTIDs 1 and 3 (7 belongs to the unposted version); pipes/newlines in values flattened
+beacons.psv: ABUZ|488215.125|1100080.5 and E2|500000|1100000
+upins-issued.psv: header + PL000000000001..005 and PLT000000000001 ('0' excluded)

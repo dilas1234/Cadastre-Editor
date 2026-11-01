@@ -389,11 +389,39 @@ async fn promote_import_run_into_live_fabric() {
     )
     .bind(run_id).bind(&bnum).execute(&pool).await.unwrap();
 
+    // An attribute record carrying a Registry link, and a UPIN known only from Aumentum history.
+    let object_id = (rand_12() % 2_000_000_000) as i32;
+    let history_upin = format!("PL{:012}", rand_12());
+    sqlx::query(
+        "INSERT INTO import.parcel_attribute (run_id, object_id, upin, plot, block, plan_number, status, \
+           parcel_area, area_unit, creation_date, lrs_id, linkage_status, linkage_date) \
+         VALUES ($1, $2, $3, '15', 'B3', 'PSG 12', 'Active', '3095.34', '2', '2017-03-01T10:00:00', 'LRS-000981', '1', '20170302')",
+    )
+    .bind(run_id).bind(object_id).bind(&upin).execute(&pool).await.unwrap();
+    sqlx::query("INSERT INTO import.issued_upin (run_id, upin, first_source, occurrences) VALUES ($1, $2, 'parcels-history', 1)")
+        .bind(run_id).bind(&history_upin).execute(&pool).await.unwrap();
+
     // Promote: only the active parcel + the beacon go live.
     let (st, res) = send(&app, "POST", &format!("/api/v1/import/promote/{run_id}"), None, None).await;
     assert_eq!(st, StatusCode::OK, "{res}");
     assert_eq!(res["parcels_promoted"], 1);
     assert_eq!(res["beacons_promoted"], 1);
+    assert_eq!(res["attributes_promoted"], 1);
+
+    // The Registry linkage survives promotion, typed; imported beacons are control points; a UPIN
+    // seen only in Aumentum history is reserved.
+    let (lrs, linked, area): (Option<String>, Option<i16>, Option<f64>) = sqlx::query_as(
+        "SELECT lrs_id, linkage_status, parcel_area FROM cadastre.parcel_attribute WHERE object_id = $1",
+    )
+    .bind(object_id).fetch_one(&pool).await.unwrap();
+    assert_eq!((lrs.as_deref(), linked), (Some("LRS-000981"), Some(1)));
+    assert!((area.unwrap() - 3095.34).abs() < 1e-6);
+    let control: bool = sqlx::query_scalar("SELECT is_control FROM cadastre.beacon WHERE number = $1")
+        .bind(&bnum).fetch_one(&pool).await.unwrap();
+    assert!(control, "imported Aumentum coordinates are control points");
+    let reserved: i64 = sqlx::query_scalar("SELECT count(*) FROM cadastre.issued_upin WHERE upin = $1")
+        .bind(&history_upin).fetch_one(&pool).await.unwrap();
+    assert_eq!(reserved, 1);
 
     // The active parcel is now in the live fabric, posted; the historic one is not.
     let (_, found) = send(&app, "GET", &format!("/api/v1/parcels/search?number={upin}"), None, None).await;
@@ -415,10 +443,89 @@ async fn promote_import_run_into_live_fabric() {
     assert_eq!(st, StatusCode::NOT_FOUND);
 }
 
-/// A pseudo-random 12-digit number for a unique UPIN per test run.
+/// A UPIN is the Registry's link to a parcel, so one issued anywhere (an imported historic parcel,
+/// an import exception, or a ledger entry) must never be allocated again by posting
+/// (regression: the allocator started at 1 and ignored imported Aumentum UPINs).
+#[tokio::test]
+async fn posting_never_reuses_an_issued_upin() {
+    let Some(db_url) = test_db_url() else {
+        eprintln!("skipping: CADASTRE_TEST_DATABASE_URL not set");
+        return;
+    };
+    let app = routes::router(state_with(AuthMode::Disabled, None, &db_url).await);
+    let pool = sqlx::PgPool::connect(&db_url).await.unwrap();
+
+    // Work above everything already issued in this database (other tests run concurrently).
+    let base: i64 = sqlx::query_scalar(
+        "SELECT GREATEST(COALESCE(max(substring(upin FROM 3)::bigint), 0), \
+                (SELECT last_value FROM cadastre.parcel_number_seq)) \
+         FROM cadastre.issued_upin WHERE upin ~ '^PL[0-9]{12}$'",
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    let active = format!("PL{:012}", base + 100);
+    let historic = format!("PL{:012}", base + 1_000); // not promoted, but issued
+    let excepted = format!("PL{:012}", base + 2_000); // a duplicate-UPIN exception, still issued
+
+    let run_id: i64 = sqlx::query_scalar(
+        "INSERT INTO import.run (parcels, beacons, exceptions) VALUES (2, 0, 1) RETURNING id",
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    for (num, status) in [(&active, "active"), (&historic, "historic")] {
+        sqlx::query(
+            "INSERT INTO import.parcel (run_id, source_object_id, parcel_number, status, srid, computed_area, geom) \
+             VALUES ($1, 1, $2, $3, 32632, 10000, ST_GeomFromText('POLYGON((3000 3000,3100 3000,3100 3100,3000 3100,3000 3000))', 32632))",
+        )
+        .bind(run_id).bind(num).bind(status).execute(&pool).await.unwrap();
+    }
+    sqlx::query("INSERT INTO import.exception (run_id, source_object_id, parcel_number, kind) VALUES ($1, 7, $2, 'DuplicateUpin')")
+        .bind(run_id).bind(&excepted).execute(&pool).await.unwrap();
+
+    let (st, res) = send(&app, "POST", &format!("/api/v1/import/promote/{run_id}"), None, None).await;
+    assert_eq!(st, StatusCode::OK, "{res}");
+
+    // Every UPIN in the run is in the ledger, whatever its status.
+    for upin in [&active, &historic, &excepted] {
+        let n: i64 = sqlx::query_scalar("SELECT count(*) FROM cadastre.issued_upin WHERE upin = $1")
+            .bind(upin).fetch_one(&pool).await.unwrap();
+        assert_eq!(n, 1, "{upin} missing from the ledger");
+    }
+
+    // A job posted now gets a UPIN above every issued one, never a reused one.
+    let reference = format!("JOB-{}", Uuid::new_v4());
+    let (_, job) = send(&app, "POST", "/api/v1/jobs", None,
+        Some(json!({"reference": reference, "job_type": "capture"}))).await;
+    let job_id = job["id"].as_str().unwrap().to_string();
+    let (st, p) = send(&app, "POST", &format!("/api/v1/jobs/{job_id}/parcels"), None,
+        Some(json!({"geometry": square(3500.0, 3500.0, 40.0)}))).await;
+    assert_eq!(st, StatusCode::CREATED, "{p}");
+    for action in ["submit", "start_review", "approve"] {
+        let (st, j) = send(&app, "POST", &format!("/api/v1/jobs/{job_id}/transition"), None,
+            Some(json!({ "action": action }))).await;
+        assert_eq!(st, StatusCode::OK, "{action}: {j}");
+    }
+    let (st, result) = send(&app, "POST", &format!("/api/v1/jobs/{job_id}/post"), None, None).await;
+    assert_eq!(st, StatusCode::OK, "{result}");
+    let posted = result["parcel_numbers"][0].as_str().unwrap().to_string();
+    let posted_n: i64 = posted[2..].parse().unwrap();
+    assert!(posted_n > base + 2_000, "posted {posted} is not above the issued {excepted}");
+    let n: i64 = sqlx::query_scalar("SELECT count(*) FROM cadastre.issued_upin WHERE upin = $1 AND source = 'posted'")
+        .bind(&posted).fetch_one(&pool).await.unwrap();
+    assert_eq!(n, 1, "the posted UPIN is recorded in the ledger");
+
+    // The ledger is append-only: an issued UPIN cannot be deleted or rewritten.
+    assert!(sqlx::query("DELETE FROM cadastre.issued_upin WHERE upin = $1").bind(&historic).execute(&pool).await.is_err());
+    assert!(sqlx::query("UPDATE cadastre.issued_upin SET upin = 'X' WHERE upin = $1").bind(&historic).execute(&pool).await.is_err());
+}
+
+/// A pseudo-random number for a unique UPIN per test run (formatted to 12 digits). Kept below
+/// 10^11 so that tests allocating above every issued UPIN still fit the 12-digit format.
 fn rand_12() -> u64 {
     use std::time::{SystemTime, UNIX_EPOCH};
-    (SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos() as u64) % 1_000_000_000_000
+    (SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos() as u64) % 100_000_000_000
 }
 
 /// Send a request and return (status, content-type, raw body bytes) — for non-JSON responses.

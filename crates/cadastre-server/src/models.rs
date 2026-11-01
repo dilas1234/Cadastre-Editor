@@ -248,6 +248,9 @@ pub struct PromoteResult {
     pub parcels_promoted: usize,
     /// Beacons inserted/updated into `cadastre.beacon`.
     pub beacons_promoted: usize,
+    /// Parcel attribute records (incl. Registry linkage) inserted/updated into
+    /// `cadastre.parcel_attribute`.
+    pub attributes_promoted: usize,
 }
 
 /// Result of posting a job's parcels.

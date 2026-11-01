@@ -1,3 +1,9 @@
 # Server inventory output: contains usernames, hostnames and licence data. Never commit.
 aumentum-*.txt
 aumentum-docs/
+aumentum-capture/
+lrs-inventory-*.txt
+lrs-capture/
+aumentum-db.md
+lrs-sql.env
+aumentum-export/
