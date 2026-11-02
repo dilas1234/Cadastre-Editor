@@ -1686,3 +1686,67 @@ async fn mutations_separate_and_free_mutation() {
         assert_eq!(st, "historic", "{k} was replaced by its mutation");
     }
 }
+
+/// Phase 5: a link made in the Registry reaches the Cadastre: the parcel's attribute record takes
+/// the Registry's values (GISUpdatedFields), one event per link (re-reads change nothing), and the
+/// editor's list shows it with the parcel and, once created, the job serving its transaction.
+#[tokio::test]
+async fn registry_links_sync_into_the_cadastre() {
+    let Some(db_url) = test_db_url() else {
+        eprintln!("skipping: CADASTRE_TEST_DATABASE_URL not set");
+        return;
+    };
+    let app = routes::router(state_with(AuthMode::Disabled, None, &db_url).await);
+    let pool = sqlx::PgPool::connect(&db_url).await.unwrap();
+    let n = rand_12() % 1_000_000_000;
+    let upin = format!("PLR{n:09}");
+    let ghost = format!("PLG{n:09}");
+    let (su, txn) = (format!("PLT{n}"), format!("PLS{n}"));
+    sqlx::query("INSERT INTO cadastre.parcel (parcel_number, geom, computed_area, status) VALUES ($1, ST_MakeEnvelope(1000, 9000000, 1020, 9000020, 32632), 400, 'posted')")
+        .bind(&upin).execute(&pool).await.unwrap();
+    let oid = 600_000_000 + (n % 100_000_000) as i32;
+    sqlx::query("INSERT INTO cadastre.parcel_attribute (object_id, upin, status, linkage_status, property_number, plot) VALUES ($1, $2, '0', 0, NULL, 'plot 7')")
+        .bind(oid).bind(&upin).execute(&pool).await.unwrap();
+    let at = chrono::Utc::now().naive_utc() - chrono::Duration::minutes(5);
+    let at = chrono::NaiveDateTime::parse_from_str(&at.format("%Y-%m-%d %H:%M:%S").to_string(), "%Y-%m-%d %H:%M:%S").unwrap();
+    let link = |u: &str| cadastre_server::registry_sync::RegistryLink {
+        su_id: su.clone(), upin: u.to_string(), refnum: Some(format!("PL{n}")), linked_at: at,
+        transaction_number: txn.clone(), transaction_status_code: "transaction_lodged".into(), transaction_status: "Active".into(),
+        lot: Some("12".into()), block: Some("B".into()),
+    };
+    let links = vec![link(&upin), link(&ghost)];
+    let (new, updated, unmatched) = cadastre_server::registry_sync::apply(&pool, &links).await.unwrap();
+    assert_eq!((new, updated, unmatched), (2, 1, 1), "the ghost UPIN has no parcel");
+    let rec: (Option<String>, Option<i16>, Option<String>, Option<String>, Option<String>) = sqlx::query_as(
+        "SELECT lrs_id, linkage_status, linkage_date, property_number, plot FROM cadastre.parcel_attribute WHERE object_id = $1")
+        .bind(oid).fetch_one(&pool).await.unwrap();
+    assert_eq!(rec, (Some(su.clone()), Some(1), Some(at.format("%Y-%m-%d").to_string()), Some(format!("PL{n}")), Some("plot 7".into())),
+        "LRSID, LinkageStatus, LinkageDate, PropertyNumber from the Registry; Plot untouched");
+    // The same links read again: nothing changes, no new events.
+    assert_eq!(cadastre_server::registry_sync::apply(&pool, &links).await.unwrap(), (0, 0, 0));
+
+    let (st, list) = send(&app, "GET", "/api/v1/registry/links?days=2", None, None).await;
+    assert_eq!(st, StatusCode::OK);
+    let mine: Vec<&Value> = list.as_array().unwrap().iter().filter(|l| l["su_id"] == su.as_str()).collect();
+    assert_eq!(mine.len(), 2, "{list}");
+    let real = mine.iter().find(|l| l["upin"] == upin.as_str()).unwrap();
+    assert!(real["parcel_id"].is_string(), "{real}");
+    assert_eq!((real["transaction_number"].as_str(), real["lot"].as_str()), (Some(txn.as_str()), Some("12")));
+    assert!(real["job_instance_id"].is_null());
+    assert!(mine.iter().find(|l| l["upin"] == ghost.as_str()).unwrap()["parcel_id"].is_null());
+
+    // A job for the transaction appears on the link.
+    let jt = 900_000 + (n % 90_000) as i32 * 10;
+    sqlx::query("INSERT INTO cadastre.wf_task (id, name) VALUES ($1, 'Deed Plan (test)')").bind(jt).execute(&pool).await.unwrap();
+    sqlx::query("INSERT INTO cadastre.wf_job_type (id, name, start_task_id, end_task_id) VALUES ($1, 'Deed Plan (test)', $1, $1)").bind(jt).execute(&pool).await.unwrap();
+    let (st, j) = send(&app, "POST", "/api/v1/wf/jobs", None, Some(json!({"job_type_id": jt, "name": format!("Job-PL{n}"), "lrs_transaction_number": txn}))).await;
+    assert_eq!(st, StatusCode::CREATED, "{j}");
+    let (_, list) = send(&app, "GET", "/api/v1/registry/links?days=2", None, None).await;
+    let real = list.as_array().unwrap().iter().find(|l| l["upin"] == upin.as_str()).unwrap().clone();
+    assert_eq!(real["job_instance_id"], j["job"]["id"], "{real}");
+    assert_eq!(real["job_name"].as_str(), Some(format!("Job-PL{n}").as_str()));
+
+    let (st, s) = send(&app, "GET", "/api/v1/registry/status", None, None).await;
+    assert_eq!(st, StatusCode::OK);
+    assert!(s.get("enabled").is_some(), "{s}");
+}

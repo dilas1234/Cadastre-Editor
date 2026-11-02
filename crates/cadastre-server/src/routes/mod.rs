@@ -13,6 +13,7 @@ pub mod me;
 pub mod mutations;
 pub mod parcels;
 pub mod promote;
+pub mod registry;
 pub mod reports;
 pub mod sessions;
 pub mod survey;
@@ -90,6 +91,9 @@ pub fn router(state: AppState) -> Router {
         .route("/api/v1/wf/jobs/{id}/mutations", get(mutations::list).post(mutations::create))
         .route("/api/v1/wf/jobs/{id}/mutations/{group}", delete(mutations::cancel))
         .route("/api/v1/wf/jobs/{id}/mutations/{group}/keep-upin", put(mutations::keep_upin))
+        .route("/api/v1/registry/links", get(registry::links))
+        .route("/api/v1/registry/status", get(registry::status))
+        .route("/api/v1/registry/sync", post(registry::sync_now))
         // Live survey check (FR-COG-02/03)
         .route("/api/v1/survey/check", post(survey::check_survey))
         // The 35 computation tools (COGO, curves, area, transformations, geodetic)

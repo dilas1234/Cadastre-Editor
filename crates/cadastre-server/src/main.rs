@@ -38,6 +38,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let bind_addr = config.bind_addr.clone();
     // Task notifications: sent while an SMTP server is configured (mail.* settings).
     tokio::spawn(cadastre_server::mail::run_outbox(pool.clone()));
+    // Registry links: read from the Aumentum Registry every minute while it is configured
+    // (CADASTRE_REGISTRY_URL / _USER / _PASSWORD). The Registry is only read.
+    match cadastre_server::lrs::LrsConfig::from_env() {
+        Some(cfg) => { tokio::spawn(cadastre_server::registry_sync::run(pool.clone(), cfg)); }
+        None => tracing::info!("Registry link sync off (CADASTRE_REGISTRY_URL / _USER / _PASSWORD not set)"),
+    }
     let state = AppState { pool, config, jwks };
 
     let app = routes::router(state).merge(

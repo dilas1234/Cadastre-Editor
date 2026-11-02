@@ -61,6 +61,8 @@ sha2 = { version = "0.10", features = ["oid"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 thiserror = "2"
+# Aumentum Registry (LRS) SOAP responses (Phase 5).
+quick-xml = "0.37"
 
 [dev-dependencies]
 # RSA keypair generation for JWT verification tests.

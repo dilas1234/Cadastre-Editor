@@ -1035,7 +1035,9 @@ function buildTocTools() {
   const tasksBtn = h("span", { class: `tb${tasksOpen() && !wfOpen() ? " active" : ""}`, title: "Tasks", html: icon("tasks") });
   tasksBtn.onclick = () => { showWorkflow(false); showTasks(true); buildTocTools(); };
   t.append(tasksBtn);
-  const wfBtn = h("span", { class: `tb${wfOpen() ? " active" : ""}`, title: "Workflow (job instances)", html: icon("jobOpen") });
+  const waiting = registryWaiting();
+  const wfBtn = h("span", { class: `tb${wfOpen() ? " active" : ""}`, title: "Workflow (job instances)" + (waiting ? ` — ${waiting} Registry link(s) waiting for a job` : ""), html: icon("jobOpen"), style: "position:relative" });
+  if (waiting) wfBtn.append(h("span", { class: "regBadge" }, String(waiting)));
   wfBtn.onclick = () => openWorkflow();
   t.append(wfBtn);
   t.append(h("span", { class: "tb", title: "Options…", html: icon("options"), onclick: () => tocOptions() }));
@@ -2883,7 +2885,76 @@ async function openWorkflow() {
     try { [wf.defs, wf.principals] = await Promise.all([api("/api/v1/wf/definitions"), api("/api/v1/wf/principals")]); }
     catch (e) { $("wfBody").innerHTML = ""; $("wfBody").append(h("p", { class: "muted", style: "padding:8px" }, "Could not load the workflow: " + e.message)); return; }
   }
-  await wfLoadJobs(true);
+  await registryLoad(); await wfLoadJobs(true);
+}
+/* =====================================================================================
+ * Phase 5 — Linked from the Registry. The server reads the Aumentum Registry every minute
+ * (read-only) and records each property the Registry admin links to a parcel; the parcel's link
+ * fields are filled in at once. Here: the list, and a job for the transaction to input points.
+ * ===================================================================================== */
+const reg = { links: [], status: null, open: true, busy: false, loaded: false };
+const registryWaiting = () => reg.links.filter((l) => !l.job_instance_id && l.parcel_id).length;
+async function registryLoad() {
+  try { [reg.links, reg.status] = await Promise.all([api("/api/v1/registry/links?days=14"), api("/api/v1/registry/status")]); reg.loaded = true; }
+  catch (e) { reg.status = { enabled: false, error: e.message }; }
+  buildTocTools();
+}
+setInterval(async () => { await registryLoad(); if (wfOpen() && !reg.busy) renderWorkflow(); }, 60000);
+setTimeout(registryLoad, 1500);
+const regTime = (s) => (s ? s.replace("T", " ").slice(0, 16) : "—");
+async function registryCheckNow() {
+  reg.busy = true; renderWorkflow();
+  try { const r = await api("/api/v1/registry/sync", { method: "POST" }); notify(r.new ? `${r.new} new Registry link(s).` : "No new Registry links."); }
+  catch (e) { notify("Registry: " + e.message, "err"); }
+  reg.busy = false; await registryLoad(); renderWorkflow();
+}
+async function registryZoom(l) {
+  try { const r = await api("/api/v1/parcels/search?number=" + encodeURIComponent(l.upin)); if (r.length) goToResult(r[0]); else status(`${l.upin} is not in the fabric.`); }
+  catch (e) { status(e.message); }
+}
+// A job for the transaction, as the Registry created them in Aumentum: job type 9 "Deed Plan
+// Creationv2", named Job-<property number>, carrying the transaction number.
+async function registryStartJob(l) {
+  const types = (wf.defs?.job_types || []).filter((t) => t.active && t.start_task_id);
+  const type = types.find((t) => t.id === 9) || types[0];
+  if (!type) { alert("No active job type to start."); return; }
+  const name = `Job-${l.property_number || l.upin}`;
+  if (!confirm(`Start a "${type.name}" job ${name} for Registry transaction ${l.transaction_number} (parcel ${l.upin})?`)) return;
+  try {
+    const d = await api("/api/v1/wf/jobs", { method: "POST", body: { job_type_id: type.id, name, lrs_transaction_number: l.transaction_number, comment: `Registry property ${l.su_id} linked to ${l.upin} on ${regTime(l.linked_at)}` } });
+    await registryLoad(); wf.filter = "open"; wf.q = ""; await wfLoadJobs(true); await wfSelect(d.job.id); await registryZoom(l);
+    status(`Job ${d.job.id} (${name}) started on "${d.job.current_task}". Choose Work On This Job, then input the survey points.`);
+  } catch (e) { alert(e.message); }
+}
+function registrySection() {
+  const sec = h("div", { class: "regSec" });
+  const st = reg.status;
+  const waiting = registryWaiting();
+  const head = h("div", { class: "frow", style: "justify-content:space-between" },
+    h("b", { style: "cursor:pointer", title: "Show / hide", onclick: () => { reg.open = !reg.open; renderWorkflow(); } },
+      `${reg.open ? "▾" : "▸"} Linked from the Registry`, waiting ? h("span", { class: "regBadge inline" }, `${waiting} waiting`) : null),
+    h("button", { class: "btn", style: "min-width:0", disabled: reg.busy || !(st && st.enabled), title: "Read the Registry now (otherwise every minute)", onclick: registryCheckNow }, reg.busy ? "Checking…" : "Check now"));
+  sec.append(head);
+  if (!reg.open) return sec;
+  const last = st && st.last;
+  sec.append(h("div", { class: "muted", style: "padding:0 6px" },
+    !st ? "Loading…" : !st.enabled ? "The Registry connection is not configured on this server." :
+    !last ? "Waiting for the first check…" :
+    last.ok ? `Registry read ${regTime(last.at)} UTC · ${reg.links.length} link(s) in the last 14 days` : `Last check failed ${regTime(last.at)}: ${last.error}`));
+  const list = h("div", { class: "regList" });
+  if (st && st.enabled && reg.loaded && !reg.links.length) list.append(h("p", { class: "muted", style: "padding:4px 6px" }, "No links yet."));
+  for (const l of reg.links) {
+    const job = l.job_instance_id
+      ? h("button", { class: "btn", style: "min-width:0", title: `Open ${l.job_name || "job " + l.job_instance_id}`, onclick: () => wfSelect(l.job_instance_id) }, "Open job")
+      : h("button", { class: "btn", style: "min-width:0", disabled: !l.parcel_id, title: l.parcel_id ? "Start a job for this transaction to input the survey points" : "This UPIN has no parcel in the fabric", onclick: () => registryStartJob(l) }, "Start job");
+    list.append(h("div", { class: "wfRow regRow" + (l.job_instance_id ? "" : " todo"), title: `Registry property ${l.su_id} · transaction ${l.transaction_number} (${l.transaction_status})` },
+      h("div", { class: "wfRowTop" }, h("b", {}, l.upin), h("span", { class: "muted" }, regTime(l.linked_at))),
+      h("div", { class: "frow", style: "justify-content:space-between;margin:0" },
+        h("span", { class: "muted" }, `${l.property_number || "—"} · ${l.transaction_number} · ${l.transaction_status}${l.job_name ? " · " + l.job_name : ""}${l.parcel_id ? "" : " · not in the fabric"}`),
+        h("span", {}, h("button", { class: "btn", style: "min-width:0", disabled: !l.parcel_id, onclick: () => registryZoom(l) }, "Zoom"), " ", job))));
+  }
+  sec.append(list);
+  return sec;
 }
 // A step command as a readable tool name: "Ils.MultiCadastre.Desktop.CreateJobAreaCommand" -> "Create Job Area".
 function wfToolName(cmd) {
@@ -2942,6 +3013,7 @@ function renderWorkflow() {
         h("option", { value: "" }, "All job types"), ...types.map((t) => h("option", { value: t.id, selected: String(t.id) === String(wf.jobType) }, t.name)))),
     h("div", { class: "frow" }, search, h("button", { class: "btn", style: "min-width:0", onclick: () => { wf.q = search.value; wfLoadJobs(true); } }, "Find"))));
 
+  body.append(registrySection());
   const list = h("div", { class: "wfList" });
   if (!wf.jobs.length) list.append(h("p", { class: "muted", style: "padding:6px" }, wf.defs ? "No jobs match." : "Loading…"));
   for (const j of wf.jobs) {

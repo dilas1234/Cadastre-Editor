@@ -261,3 +261,11 @@ table.legs tr.selrow td { background: #fff6cf; }
 .toast.warn { background: #9a5a00; }
 .toast.err { background: #a01818; }
 .toast.fade { opacity: 0; }
+
+/* Phase 5: Linked from the Registry (Workflow panel). */
+.regSec { border-bottom: 1px solid var(--border, #c8c8c8); padding: 2px 0 4px; }
+.regList { max-height: 220px; overflow-y: auto; }
+.regRow.todo { border-left: 3px solid #d08000; }
+.regBadge { position: absolute; top: -3px; right: -4px; min-width: 14px; height: 14px; padding: 0 3px; border-radius: 7px;
+  background: #d08000; color: #fff; font-size: 10px; line-height: 14px; text-align: center; font-weight: bold; }
+.regBadge.inline { position: static; display: inline-block; margin-left: 6px; }
