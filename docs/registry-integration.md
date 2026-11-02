@@ -104,6 +104,37 @@ Checked against Aumentum's own code (`MCAdminWebSite.dll`, WebAdmin, decompiled 
 into MCServer's workflow service, whose code is not captured. The `NAME=value|…` format of
 BatchUpdate is therefore still inferred.
 
+### 3.3a The Registry's map: where the admin links (`src/routes/gisviewer.rs`)
+
+The Registry admin links in the Registry desktop (Properties page, map). Its `MapWorkerControl`
+(`ThomsonReuters.Aumentum.Registry.Services`, decompiled 2026-11-02 from the Registry client capture)
+hosts an embedded Internet Explorer on `GISServer`. This Cadastre now serves that page and its service
+at Aumentum's paths, so pointing `GISServer` / `LWAMapURL` here is enough (§5 step 3).
+
+**What the Registry does, and what this Cadastre answers:**
+
+| Registry desktop (MapWorkerControl) | This Cadastre |
+|---|---|
+| POSTs `{GISServer}?ct=indexer&justmap=1&map=property-select&lang=…` with `auth=1&lrsuser=…&lrsticket=…&initparam_inputobjects=…&initparam_extent=…` | `GET/POST /GISViewer/MapWorker.aspx`. The ticket is checked with the Registry (`AuthenticationService.isTicketValid`), then a map page is served. A missing or bad ticket gets a refusal page (checked live 2026-11-02). |
+| Input objects: `ScriptableInputEntitiesGroup[]` (the properties being linked and their search fields, e.g. UPIN), as JSON → base64 → `[BEGIN]…[END]` (or `<base64Binary …>…[END]`) | Decoded. Each property is listed on the left, its search values are looked up, matching parcels are drawn and pre-selected, and the map zooms to them. |
+| Waits for element `silverlightControl`; sets `indexerEvents` to `Map Ready` and clicks it | Both elements exist. `indexerEvents` becomes `Map Ready` once the searches finish. |
+| `doAction("SelectionSet","GetSelectedObjects")` | `ScriptableEntitiesGroup[]`: per parcel `ObjectID` (the attribute record's OBJECTID, Aumentum's own), `InputUUID` (which property it is for), `Attributes` (UPIN, LRSID, PropertyNumber, Plot, Block, ParcelID, LinkageStatus), encoded `[BEGIN]…[END]`. |
+| `doAction("Map","GetExtentAsString")` | `ScriptableEnvelope` in EPSG:32632 (WKID 32632). |
+| `doAction("Editor","IsEditInProgress")` | `false` (the map does not edit). |
+| On Link: copies the UPIN into the Registry property itself, then calls `{GISServer}/../WebServices/CadastralWebService.asmx` → `UpdateCadastralData` with `SecurityHeader{User, Password = ticket}` | `POST /GISViewer/WebServices/CadastralWebService.asmx` (namespace `http://www.landsystems.com/multicadastre/in4/service`). It checks the ticket, then writes the values (LRSID, LinkageStatus, LinkageDate, PropertyNumber, Plot, Block, …) onto the parcel's attribute record, either by `UpdateRecordByOID` (OBJECTID) or by `UpdateRecordByFields` (matching `PrimaryFields`, skipping `ExculdeFeatures`). Audit: `registry_map_update`. `GetVariables` and `DetectNeighbours` answer empty. |
+
+The page is ES5 with Leaflet 1.9.4 (`web/vendor/leaflet/`) and `X-UA-Compatible: IE=edge`, because
+the Registry's browser is IE11. Esri World Imagery is the background. Parcels load by view
+(`GET /GISViewer/data/parcels?token=…&bbox=…`) or by search (`…&field=UPIN|PropertyNumber|LRSID|Plot|Block&value=…`).
+The `token` is the map session, issued only after the Registry ticket is accepted, and lasts 8 hours.
+The admin can also find a parcel by hand and click parcels to select or deselect them.
+
+Two paths write the link into the Cadastre, and either one is enough. `UpdateCadastralData`
+writes it at once. The link poll (§3.1) also sees it within a minute. The second write changes
+nothing, because values are written only where they differ.
+
+`CADASTRE_GISVIEWER_OPEN=1` opens the map without a ticket. It is for development only, never production.
+
 ### 3.3 Writing to the Registry: sending the plan back (`src/routes/registry.rs`)
 
 Only on a user's action, and only with `CADASTRE_REGISTRY_WRITE=1`:
@@ -148,6 +179,9 @@ Only on a user's action, and only with `CADASTRE_REGISTRY_WRITE=1`:
 | POST | `/api/v1/wf/jobs/{id}/registry/send-plan`, GET `…/sent` | Send the plan; what was sent |
 | POST | `/api/v1/registry/link`, `/api/v1/registry/unlink` | Off (linking is done in the Registry) |
 | GET/POST | `/ApplicationServerAdmin/WebServices/LRSWebServices.asmx` | The Registry's job service (§3.2) |
+| GET/POST | `/GISViewer/MapWorker.aspx` | The Registry's map (§3.3a) |
+| GET | `/GISViewer/data/parcels` | The map's parcels (map session token) |
+| POST | `/GISViewer/WebServices/CadastralWebService.asmx` | `UpdateCadastralData` on Link (§3.3a) |
 
 ---
 
@@ -162,6 +196,7 @@ In the server's environment (`~/.config/cadastre/server.env` on the dev PC):
 | `CADASTRE_REGISTRY_WRITE` | `1`: allow writing to the Registry on user action (send plan). |
 | `CADASTRE_REGISTRY_POLL_SECS` / `_RECONCILE_SECS` | Link check (60) and unlink check (900) intervals. |
 | `CADASTRE_MC_SERVICE_USER` / `_PASSWORD` | The account the Registry signs in with to the job service. It must equal the Registry's `multicadastre` `mcUserName` / `mcPassword`. **Set on 2026-11-02 from `.env` as `Administrator@plagis.com`, but the Registry sends `administrator`**: make the two names equal (here or in the Registry) before cut-over. Without that the Registry is refused. |
+| `CADASTRE_GISVIEWER_OPEN` | `1` opens the Registry's map without a ticket. Development only. |
 | `CADASTRE_REGISTRY_CADASTRE_LINKING` | `1` re-enables linking from the Cadastre (off: PLAGIS links in the Registry). |
 
 Settings in the database (`cadastre.app_setting`): `aumentum.Integration.SurveyPlanFromMC`
@@ -174,15 +209,16 @@ Settings in the database (`cadastre.app_setting`): `aumentum.Integration.SurveyP
 
 Until these steps are done, the Registry keeps creating jobs in, and linking against, Aumentum.
 Digitisers can still start jobs here (Find file → Start digitising), but **parcels committed here
-cannot be linked by the Registry admin until step 3 is done**: the Registry's map still shows
+cannot be linked by the Registry admin until step 3 is done**: until then the Registry's map shows
 Aumentum's parcels only.
 
 1. Set `CADASTRE_MC_SERVICE_USER` / `_PASSWORD` (see §4) and restart the server.
 2. Registry admin: `multicadastre` → `mcServiceAddress` = `http://<this server>/ApplicationServerAdmin/WebServices/LRSWebServices.asmx`.
    The Registry then creates jobs here and reads parcels and points from here.
-3. Registry admin: `mcintegration` → `GISServer` and `LWAMapURL` = this server's map page for the
-   Registry. **Still to build:** it must speak the bridge the Registry's `MapWorkerControl`
-   expects (§6). Then the admin links parcels committed in this Cadastre.
+3. Registry admin: `mcintegration` → `GISServer` and `LWAMapURL` = `http://<this server>/GISViewer/MapWorker.aspx`
+   (§3.3a). The Registry desktops must reach this server over HTTP, and this server must reach the
+   Registry API (it checks each ticket there). The admin then links parcels committed in this Cadastre
+   exactly as before.
 4. Sync the Registry server's clock (it runs ~19 minutes fast).
 5. Run both systems side by side on a few files, then retire Aumentum's job service and map.
 
@@ -192,7 +228,7 @@ Aumentum's parcels only.
 
 | Item | Needs | Status |
 |---|---|---|
-| **The Registry's map** (where the admin links). Replace GISViewer's `MapWorker.aspx` so the Registry's desktop (`ThomsonReuters.Aumentum.Registry.PLAGIS.RegistryDesktop`, Properties page with `mapvisible`) shows and returns this Cadastre's parcels. | GISViewer's side is captured. Its script bridge objects are `Map` (layers, visibility, extent, MapReady), `SelectionSet` (`GetSelectedObjects`, `GetSelectedFeatures` → entities with name/value attributes, e.g. UPIN), `SearchFeaturesByClick` (FeatureClick / FeatureDoubleClick, `ActivateLayerEvents`) and `ScriptLink` / `Scriptable` (`Execute`, `DoActions`, `RegisterLayerAction`, `RegisterLayerCallbackAction`, `GetSelectedFeatures`). Still needed: the Registry desktop's own libraries (what it sends through `DoActions` / `Execute`). Run `RUN-ME-REGISTRY-CLIENT-CAPTURE.cmd` (Registry only, about a minute). | Waiting for the Registry client capture |
+| **The Registry's map** (where the admin links) | Built (§3.3a) from the decompiled `MapWorkerControl`. Tested as the Registry drives it, and the ticket check was tried live. The Registry desktop has not opened it yet. After §5 step 3, link one test file first and check the parcel and the Registry property. | Built; first Registry trial to do |
 | **Job service vs Aumentum** | Checked against `MCAdminWebSite.dll` and corrected (2026-11-02): unassigned start, priority, RejectJob discards the job's edits, status wording, job type answers, exact transaction match. BatchUpdate / points live in MCServer (not captured). | Done, except BatchUpdate's format |
 | **Title deed template parity**: Aumentum's `Plan_.mxd` / `PSG_Plan_.mxd` layout, print, and sending the plan straight from it. | Phase 6 (deed plans). Today the template is the site plan PDF; the plan image is attached and sent. | Planned |
 | `CADASTRE_MC_SERVICE_USER` / `_PASSWORD` | Administrator copies the Registry's `mcUserName` / `mcPassword`. | To do |
@@ -214,6 +250,10 @@ Registry:
   upload payloads.
 * `registry_job_service_like_aumentum`: the job service called as the Registry's Java client calls
   it (Authenticate, cookie, GetAllJobs, CreateJobInstance, …, LogOut, WSDL).
+* `registry_map_like_aumentum_gisviewer`: the map page opened with a good and a bad ticket, the
+  Registry's encoded input objects, the data endpoints, and `UpdateCadastralData` by OBJECTID and by fields.
+* Headless Chrome (2026-11-02, live data): `Map Ready`, `GetSelectedObjects` → OBJECTID 593031 /
+  PL000000022581, extent in WKID 32632, no script errors.
 * Unit tests in `lrs.rs` (a real Registry response, payload builders), `registry.rs` (link rules),
   `registry_sync.rs` and `mcservice.rs` (request parsing, bearings).
 

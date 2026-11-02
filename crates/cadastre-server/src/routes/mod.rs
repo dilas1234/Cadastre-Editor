@@ -6,6 +6,7 @@ pub mod catalog;
 pub mod editor;
 pub mod fci;
 pub mod fabric;
+pub mod gisviewer;
 pub mod health;
 pub mod import;
 pub mod jobs;
@@ -97,6 +98,10 @@ pub fn router(state: AppState) -> Router {
         .route("/api/v1/registry/sync", post(registry::sync_now))
         // The Registry's job service, at Aumentum's path (Registry setting mcServiceAddress).
         .route(mcservice::PATH, get(mcservice::get).post(mcservice::post))
+        // The Registry's map (Registry settings GISServer / LWAMapURL) and its link service.
+        .route(gisviewer::PAGE, get(gisviewer::page).post(gisviewer::page))
+        .route("/GISViewer/data/parcels", get(gisviewer::data))
+        .route(gisviewer::SERVICE, get(gisviewer::service_get).post(gisviewer::service))
         .route("/api/v1/registry/reconcile", post(registry::reconcile_now))
         .route("/api/v1/registry/find", get(registry::find))
         .route("/api/v1/registry/parcels/{upin}/work", get(registry::parcel_work))

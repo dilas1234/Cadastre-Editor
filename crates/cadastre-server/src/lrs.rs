@@ -237,6 +237,17 @@ impl Session {
     }
 }
 
+/// Whether a Registry user's session ticket is valid (`AuthenticationService.isTicketValid`), as
+/// Aumentum's GISViewer checked the Registry user its map window was opened for.
+pub async fn ticket_valid(cfg: &LrsConfig, user: &str, ticket: &str) -> Result<bool, LrsError> {
+    let offset = clock_offset(cfg).await?;
+    let s = Session { cfg: cfg.clone(), ticket: ticket.to_string(), offset };
+    let header = s.security_header().replace(&format!("<wsse:Username>{}</wsse:Username>", escape(&cfg.user)), &format!("<wsse:Username>{}</wsse:Username>", escape(user)));
+    let body = format!("<auth:isTicketValid xmlns:auth=\"{AUTH}\"><auth:ticket>{}</auth:ticket></auth:isTicketValid>", escape(ticket));
+    let xml = soap(cfg, "AuthenticationService", &format!("{AUTH}/isTicketValid"), &header, &body).await?;
+    Ok(find_text(&xml, "result").is_some_and(|v| v.eq_ignore_ascii_case("true")))
+}
+
 fn find_text(xml: &str, local_name: &str) -> Option<String> {
     use quick_xml::events::Event;
     let mut r = quick_xml::Reader::from_str(xml);

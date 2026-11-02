@@ -1857,6 +1857,8 @@ impl FakeRegistry {
                         ok("workspace://SpacesStore/fake-content".into())
                     } else if line.contains("AuthenticationService") && body.contains("startSession") {
                         ok("<r><startSessionReturn><ticket>TICKET-1</ticket></startSessionReturn></r>".into())
+                    } else if line.contains("AuthenticationService") && body.contains("isTicketValid") {
+                        ok(format!("<r><result>{}</result></r>", body.contains("<auth:ticket>GOOD-TICKET</auth:ticket>")))
                     } else if line.contains("AuthenticationService") {
                         ok("<r/>".into())
                     } else if line.contains("IntegrationService") {
@@ -2097,4 +2099,79 @@ async fn registry_job_service_like_aumentum() {
     let req = Request::builder().uri(format!("{path}?WSDL")).header(header::HOST, "10.10.10.128:8080").body(Body::empty()).unwrap();
     let w = String::from_utf8(to_bytes(app.clone().oneshot(req).await.unwrap().into_body(), usize::MAX).await.unwrap().to_vec()).unwrap();
     assert!(w.contains("location=\"http://10.10.10.128:8080/ApplicationServerAdmin/WebServices/LRSWebServices.asmx\""), "the WSDL points at this server");
+}
+
+
+/// The Registry's map window (Aumentum GISViewer MapWorker.aspx) and its link service
+/// (CadastralWebService.asmx UpdateCadastralData), driven as the Registry desktop drives them.
+#[tokio::test]
+async fn registry_map_like_aumentum_gisviewer() {
+    let Some(db_url) = test_db_url() else {
+        eprintln!("skipping: CADASTRE_TEST_DATABASE_URL not set");
+        return;
+    };
+    let _guard = REGISTRY_SNAPSHOT.lock().await;
+    let n = rand_12() % 1_000_000_000;
+    let fake = FakeRegistry::start(format!("PLTM{n}"), None).await;
+    std::env::set_var("CADASTRE_REGISTRY_URL", &fake.url);
+    std::env::set_var("CADASTRE_REGISTRY_USER", "tester");
+    std::env::set_var("CADASTRE_REGISTRY_PASSWORD", "secret");
+    std::env::remove_var("CADASTRE_GISVIEWER_OPEN");
+    let app = routes::router(state_with(AuthMode::Disabled, None, &db_url).await);
+    let pool = sqlx::PgPool::connect(&db_url).await.unwrap();
+    let upin = format!("PLM{n:09}");
+    let oid = 800_000_000 + (n % 100_000_000) as i32;
+    sqlx::query("INSERT INTO cadastre.parcel (parcel_number, geom, computed_area, status) VALUES ($1, ST_MakeEnvelope(300000, 1100000, 300020, 1100020, 32632), 400, 'posted')")
+        .bind(&upin).execute(&pool).await.unwrap();
+    sqlx::query("INSERT INTO cadastre.parcel_attribute (object_id, upin, status, linkage_status) VALUES ($1, $2, '0', 0)").bind(oid).bind(&upin).execute(&pool).await.unwrap();
+
+    let post = |body: String, uri: &str| Request::builder().method("POST").uri(uri.to_string()).header(header::CONTENT_TYPE, "application/x-www-form-urlencoded").body(Body::from(body)).unwrap();
+    let html = |r: axum::response::Response| async move { String::from_utf8(to_bytes(r.into_body(), usize::MAX).await.unwrap().to_vec()).unwrap() };
+    // A bad ticket is refused.
+    let r = app.clone().oneshot(post("auth=1&lrsuser=ragoro&lrsticket=BAD".into(), "/GISViewer/MapWorker.aspx?ct=indexer&justmap=1&map=property-select&lang=en-US")).await.unwrap();
+    let page = html(r).await;
+    assert!(page.contains("not valid") && !page.contains("silverlightControl"), "{page}");
+    // The Registry's input objects, as its SerializerUtils encodes them.
+    let input = json!([{ "LayerName": "Plateau_State_Parcels", "IsReadOnly": false, "IsSelectionSet": true,
+        "Fields": [{ "Name": "UPIN", "Alias": "UPIN", "IsLayerField": true, "IsPrimary": true }],
+        "Entities": [{ "UUID": 0, "Attributes": [{ "Name": "UPIN", "Value": upin }] }] }]);
+    let enc = format!("<base64Binary xmlns:xsi=\"x\">{}[END]", base64::Engine::encode(&base64::engine::general_purpose::STANDARD, input.to_string()));
+    let form = format!("auth=1&lrsuser=ragoro&lrsticket=GOOD-TICKET&initparam_inputobjects={}", urlencoding(&enc));
+    let r = app.clone().oneshot(post(form, "/GISViewer/MapWorker.aspx?ct=indexer&justmap=1&map=property-select&lang=en-US")).await.unwrap();
+    assert_eq!(r.status(), StatusCode::OK);
+    let page = html(r).await;
+    for need in ["id=\"silverlightControl\"", "id=\"indexerEvents\"", "window.doAction", "IE=edge", &upin] { assert!(page.contains(need), "page lacks {need}"); }
+    let token = page.split("\"token\":\"").nth(1).unwrap().split('"').next().unwrap().to_string();
+    let (st, fc) = send(&app, "GET", &format!("/GISViewer/data/parcels?token={token}&field=UPIN&value={upin}"), None, None).await;
+    assert_eq!(st, StatusCode::OK);
+    assert_eq!(fc["features"][0]["properties"]["OBJECTID"], oid);
+    let (st, fc) = send(&app, "GET", &format!("/GISViewer/data/parcels?token={token}&bbox=5.1,9.9,5.2,10.0"), None, None).await;
+    assert_eq!(st, StatusCode::OK, "{fc}");
+    let (st, _) = send(&app, "GET", &format!("/GISViewer/data/parcels?token=nope&field=UPIN&value={upin}"), None, None).await;
+    assert_eq!(st, StatusCode::UNAUTHORIZED);
+
+    // The Registry links: UpdateCadastralData by OBJECTID, signed with the user's ticket.
+    let soap = |ticket: &str, records: &str| format!(r#"<?xml version="1.0" encoding="utf-8"?><soap:Envelope xmlns:soap="http://schemas.xmlsoap.org/soap/envelope/" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xmlns:xsd="http://www.w3.org/2001/XMLSchema"><soap:Header><SecurityHeader xmlns="http://www.landsystems.com/multicadastre/in4/service"><User>ragoro</User><Password>{ticket}</Password></SecurityHeader></soap:Header><soap:Body><UpdateCadastralData xmlns="http://www.landsystems.com/multicadastre/in4/service"><updateList><UpdateDataList><LayerNameOrAlias>sde.SDE.Plateau_State_Parcels</LayerNameOrAlias><Records>{records}</Records></UpdateDataList></updateList></UpdateCadastralData></soap:Body></soap:Envelope>"#);
+    let call = |b: String| Request::builder().method("POST").uri("/GISViewer/WebServices/CadastralWebService.asmx").header(header::CONTENT_TYPE, "text/xml; charset=utf-8").body(Body::from(b)).unwrap();
+    let by_oid = format!(r#"<UpdateRecord xsi:type="UpdateRecordByOID"><Values><UpdateValue><Field>LRSID</Field><Value xsi:type="xsd:string">PLTM{n}</Value></UpdateValue><UpdateValue><Field>LinkageStatus</Field><Value xsi:type="xsd:int">1</Value></UpdateValue><UpdateValue><Field>LinkageDate</Field><Value xsi:type="xsd:string">20261102</Value></UpdateValue><UpdateValue><Field>PropertyNumber</Field><Value xsi:type="xsd:string">PL{n}</Value></UpdateValue></Values><ObjectID>{oid}</ObjectID></UpdateRecord>"#);
+    let out = html(app.clone().oneshot(call(soap("BAD", &by_oid))).await.unwrap()).await;
+    assert!(out.contains("<Error>"), "{out}");
+    let out = html(app.clone().oneshot(call(soap("GOOD-TICKET", &by_oid))).await.unwrap()).await;
+    assert!(out.contains("UpdateCadastralDataResponse") && !out.contains("<Error>"), "{out}");
+    let rec: (Option<String>, Option<i16>, Option<String>, Option<String>) = sqlx::query_as("SELECT lrs_id, linkage_status, linkage_date, property_number FROM cadastre.parcel_attribute WHERE object_id = $1")
+        .bind(oid).fetch_one(&pool).await.unwrap();
+    assert_eq!(rec, (Some(format!("PLTM{n}")), Some(1), Some("20261102".into()), Some(format!("PL{n}"))));
+    let audits: i64 = sqlx::query_scalar("SELECT count(*) FROM cadastre.audit_log WHERE action = 'registry_map_update' AND entity_id = $1").bind(&upin).fetch_one(&pool).await.unwrap();
+    assert_eq!(audits, 1);
+    // Unlink by fields (the UPIN), values to nil.
+    let by_fields = format!(r#"<UpdateRecord xsi:type="UpdateRecordByFields"><Values><UpdateValue><Field>LRSID</Field><Value xsi:nil="true" /></UpdateValue><UpdateValue><Field>LinkageStatus</Field><Value xsi:type="xsd:int">0</Value></UpdateValue></Values><PrimaryFields><UpdateValue><Field>UPIN</Field><Value xsi:type="xsd:string">{upin}</Value></UpdateValue></PrimaryFields></UpdateRecord>"#);
+    let out = html(app.clone().oneshot(call(soap("GOOD-TICKET", &by_fields))).await.unwrap()).await;
+    assert!(!out.contains("<Error>"), "{out}");
+    let rec: (Option<String>, Option<i16>) = sqlx::query_as("SELECT lrs_id, linkage_status FROM cadastre.parcel_attribute WHERE object_id = $1").bind(oid).fetch_one(&pool).await.unwrap();
+    assert_eq!(rec, (None, Some(0)));
+    for k in ["CADASTRE_REGISTRY_URL", "CADASTRE_REGISTRY_USER", "CADASTRE_REGISTRY_PASSWORD"] { std::env::remove_var(k); }
+}
+
+fn urlencoding(s: &str) -> String {
+    s.bytes().map(|b| if b.is_ascii_alphanumeric() || b"-_.~".contains(&b) { (b as char).to_string() } else { format!("%{b:02X}") }).collect()
 }
