@@ -1928,6 +1928,9 @@ async fn registry_write_back_like_aumentum() {
     assert!(fake.bodies("SaveEntity").is_empty());
 
     std::env::set_var("CADASTRE_REGISTRY_WRITE", "1");
+    let (st, r) = send(&app, "POST", "/api/v1/registry/link", None, Some(link.clone())).await;
+    assert_eq!(st, StatusCode::CONFLICT, "linking from the Cadastre is off unless switched on: {r}");
+    std::env::set_var("CADASTRE_REGISTRY_CADASTRE_LINKING", "1");
     let (st, r) = send(&app, "POST", "/api/v1/registry/link", None, Some(json!({"transaction_number": "TXNCLOSED", "su_id": su, "upin": upin}))).await;
     assert_eq!(st, StatusCode::CONFLICT, "a Completed transaction is closed: {r}");
     let (st, r) = send(&app, "POST", "/api/v1/registry/link", None, Some(link.clone())).await;
@@ -1993,5 +1996,100 @@ async fn registry_write_back_like_aumentum() {
     let (st, _) = send(&app, "POST", "/api/v1/registry/unlink", None, Some(json!({"upin": upin}))).await;
     assert_eq!(st, StatusCode::CONFLICT, "not linked any more");
     let _ = std::fs::remove_file(format!("files/{rel}"));
-    for k in ["CADASTRE_REGISTRY_URL", "CADASTRE_REGISTRY_USER", "CADASTRE_REGISTRY_PASSWORD", "CADASTRE_REGISTRY_WRITE"] { std::env::remove_var(k); }
+    for k in ["CADASTRE_REGISTRY_URL", "CADASTRE_REGISTRY_USER", "CADASTRE_REGISTRY_PASSWORD", "CADASTRE_REGISTRY_WRITE", "CADASTRE_REGISTRY_CADASTRE_LINKING"] { std::env::remove_var(k); }
+}
+
+/// The Registry's job service (Aumentum LRSWebServices.asmx at its path), called as the Registry's
+/// Java client calls it: Authenticate (session cookie), GetAllJobs → CreateJobInstance with the
+/// transaction parameter, GetJobInstance, ApproveJob, the parcel reads, LogOut.
+#[tokio::test]
+async fn registry_job_service_like_aumentum() {
+    let Some(db_url) = test_db_url() else {
+        eprintln!("skipping: CADASTRE_TEST_DATABASE_URL not set");
+        return;
+    };
+    std::env::set_var("CADASTRE_MC_SERVICE_USER", "administrator");
+    std::env::set_var("CADASTRE_MC_SERVICE_PASSWORD", "s3cret");
+    let app = routes::router(state_with(AuthMode::Disabled, None, &db_url).await);
+    let pool = sqlx::PgPool::connect(&db_url).await.unwrap();
+    let path = cadastre_server::routes::mcservice::PATH;
+    async fn soap(app: &Router, path: &str, op: &str, inner: &str, cookie: Option<&str>) -> (StatusCode, Option<String>, String) {
+        let body = format!("<?xml version=\"1.0\" encoding=\"UTF-8\"?><soapenv:Envelope xmlns:soapenv=\"http://schemas.xmlsoap.org/soap/envelope/\" xmlns:xsd=\"http://www.w3.org/2001/XMLSchema\"><soapenv:Body><{op} xmlns=\"http://tempuri.org/\">{inner}</{op}></soapenv:Body></soapenv:Envelope>");
+        let mut b = Request::builder().method("POST").uri(path).header(header::CONTENT_TYPE, "text/xml; charset=utf-8").header("SOAPAction", format!("\"http://tempuri.org/{op}\""));
+        if let Some(c) = cookie { b = b.header(header::COOKIE, c); }
+        let resp = app.clone().oneshot(b.body(Body::from(body)).unwrap()).await.unwrap();
+        let st = resp.status();
+        let set = resp.headers().get(header::SET_COOKIE).map(|v| v.to_str().unwrap().split(';').next().unwrap().to_string());
+        let text = String::from_utf8(to_bytes(resp.into_body(), usize::MAX).await.unwrap().to_vec()).unwrap();
+        (st, set, text)
+    }
+    let between = |s: &str, a: &str, b: &str| s.split_once(a).and_then(|(_, r)| r.split_once(b)).map(|(v, _)| v.to_string());
+
+    let (st, _, t) = soap(&app, path, "GetAllJobs", "", None).await;
+    assert_eq!(st, StatusCode::INTERNAL_SERVER_ERROR);
+    assert!(t.contains("Not authenticated"), "{t}");
+    let (_, set, t) = soap(&app, path, "Authenticate", "<user>administrator</user><password>wrong</password>", None).await;
+    assert!(t.contains("<AuthenticateResult>false</AuthenticateResult>") && set.is_none(), "{t}");
+    let (_, set, t) = soap(&app, path, "Authenticate", "<user>Administrator</user><password>s3cret</password>", None).await;
+    assert!(t.contains("<AuthenticateResponse xmlns=\"http://tempuri.org/\"><AuthenticateResult>true</AuthenticateResult>"), "{t}");
+    let cookie = set.expect("a session cookie");
+    assert!(cookie.starts_with("ASP.NET_SessionId="));
+
+    // A job type to find by name, as the Registry does (job_deedplan_creation → name).
+    let n = rand_12() % 1_000_000_000;
+    let jt = 920_000 + (n % 90_000) as i32 * 10;
+    let name = format!("Deed Plan Creation (test {n})");
+    sqlx::query("INSERT INTO cadastre.wf_task (id, name) VALUES ($1, 'Search Cadastre for Parcels (test)')").bind(jt).execute(&pool).await.unwrap();
+    sqlx::query("INSERT INTO cadastre.wf_job_type (id, name, start_task_id, end_task_id) VALUES ($1, $2, $1, $1)").bind(jt).bind(&name).execute(&pool).await.unwrap();
+    let (st, _, t) = soap(&app, path, "GetAllJobs", "", Some(&cookie)).await;
+    assert_eq!(st, StatusCode::OK);
+    assert!(t.contains(&format!("<WFJob><ID>{jt}</ID><Name>{name}</Name>")), "{}", &t[..t.len().min(400)]);
+
+    let txn = format!("PLS{:09}", n);
+    let (st, _, t) = soap(&app, path, "CreateJobInstance", &format!("<jobID>{jt}</jobID><instanceName>Job-PL{n}</instanceName><priority>1</priority><comments>Deed Plan Creationv2</comments><parameters>@LRS:[Transaction]:[TransactionNumber]={txn}</parameters>"), Some(&cookie)).await;
+    assert_eq!(st, StatusCode::OK, "{t}");
+    assert!(t.contains(&format!("<CreateJobInstanceResult><LrsTransactionNumber>{txn}</LrsTransactionNumber>")), "{t}");
+    let id: i32 = between(&t, "<ID>", "</ID>").unwrap().parse().unwrap();
+    assert!(t.contains(&format!("<JobID>{jt}</JobID><TaskID>{jt}</TaskID>")) && t.contains("<JobStatus>2</JobStatus>") && t.contains(&format!("<Name>Job-PL{n}</Name>")), "{t}");
+    let row: (Option<String>, Option<String>, i16) = sqlx::query_as("SELECT lrs_transaction_number, parameters, status FROM cadastre.wf_job_instance WHERE id = $1").bind(id).fetch_one(&pool).await.unwrap();
+    assert_eq!(row, (Some(txn.clone()), Some(format!("@LRS:[Transaction]:[TransactionNumber]={txn}")), 2), "the job carries the transaction, as Aumentum's did");
+
+    let (_, _, t) = soap(&app, path, "GetJobInstance", &format!("<jobInstanceId>{id}</jobInstanceId>"), Some(&cookie)).await;
+    assert!(t.contains(&format!("<ID>{id}</ID>")) && t.contains("<Ended xsi:nil=\"true\" />"), "{t}");
+    let digits: i64 = txn.trim_start_matches("PLS").parse().unwrap();
+    let (_, _, t) = soap(&app, path, "GetJobStatusByTransaction", &format!("<transactionNumber>{digits}</transactionNumber>"), Some(&cookie)).await;
+    assert!(t.contains(&format!("<WFJob><ID>{id}</ID>")), "{t}");
+    let (_, _, t) = soap(&app, path, "ApproveJob", &format!("<jobInstanceID>{id}</jobInstanceID>"), Some(&cookie)).await;
+    assert!(t.contains("<ApproveJobResult>true</ApproveJobResult>"), "{t}");
+    let (_, _, t) = soap(&app, path, "IsJobInstanceCompleted", &format!("<jobinstanceID>{id}</jobinstanceID>"), Some(&cookie)).await;
+    assert!(t.contains("<Completed>true</Completed><Status>Approved by the Registry</Status>"), "{t}");
+
+    // The Registry reads a parcel of this Cadastre: points (legs) and attributes.
+    let upin = format!("PLJ{n:09}");
+    let (x, y) = (5000.0 + (n % 1000) as f64 * 50.0, 9_200_000.0);
+    sqlx::query("INSERT INTO cadastre.parcel (parcel_number, geom, computed_area, status) VALUES ($1, ST_SetSRID(ST_GeomFromText(format('POLYGON((%s %s,%s %s,%s %s,%s %s,%s %s))', $2::float8, $3::float8, $2::float8 + 30, $3::float8, $2::float8 + 30, $3::float8 + 40, $2::float8, $3::float8 + 40, $2::float8, $3::float8)), 32632), 1200, 'posted')")
+        .bind(&upin).bind(x).bind(y).execute(&pool).await.unwrap();
+    sqlx::query("INSERT INTO cadastre.beacon (number, geom) VALUES ($1, ST_SetSRID(ST_MakePoint($2, $3), 32632))").bind(format!("BJ{n}")).bind(x).bind(y).execute(&pool).await.unwrap();
+    sqlx::query("INSERT INTO cadastre.parcel_attribute (object_id, upin, status, plot, property_number) VALUES ($1, $2, '0', '12', 'PL55')").bind(400_000_000 + (n % 100_000_000) as i32).bind(&upin).execute(&pool).await.unwrap();
+    let (_, _, t) = soap(&app, path, "GetParcelPointsData", &format!("<pUpin>{upin}</pUpin>"), Some(&cookie)).await;
+    assert_eq!(t.matches("<PointInformationDTO>").count(), 4, "four legs: {t}");
+    assert!(t.contains(&format!("<FromPointName>BJ{n}</FromPointName>")), "beacon names from the fabric: {t}");
+    assert!(t.contains("<Distance>30.000</Distance>") && t.contains("<Distance>40.000</Distance>"), "{t}");
+    assert!(t.contains("<Bearing>90°00'00\"</Bearing>"), "{t}");
+    let (_, _, t) = soap(&app, path, "GetParcelAttributesByUPIN", &format!("<regionName>Plateau_State</regionName><upin>{upin}</upin>"), Some(&cookie)).await;
+    assert!(t.contains("<DataField><FieldName>Plot</FieldName><FieldValue>12</FieldValue></DataField>") && t.contains("<FieldName>PropertyNumber</FieldName><FieldValue>PL55</FieldValue>"), "{t}");
+    let (_, _, t) = soap(&app, path, "GetDomainDetailsByName", "<domainName>d_mutation_type</domainName>", Some(&cookie)).await;
+    assert!(t.contains("<FieldValue>Free Mutation</FieldValue>"), "{t}");
+    let (_, _, t) = soap(&app, path, "BatchUpdateDataFromRegistry", &format!("<parameters>UPIN={upin}|LRSID=PLT9{n}|LinkageStatus=1</parameters>"), Some(&cookie)).await;
+    assert!(t.contains("<Completed>true</Completed><HasError>false</HasError>"), "{t}");
+    let l: (Option<String>, Option<i16>) = sqlx::query_as("SELECT lrs_id, linkage_status FROM cadastre.parcel_attribute WHERE upin = $1").bind(&upin).fetch_one(&pool).await.unwrap();
+    assert_eq!(l, (Some(format!("PLT9{n}")), Some(1)));
+
+    let (_, _, t) = soap(&app, path, "LogOut", "", Some(&cookie)).await;
+    assert!(t.contains("<LogOutResponse xmlns=\"http://tempuri.org/\">"), "{t}");
+    let (st, _, _) = soap(&app, path, "GetAllJobs", "", Some(&cookie)).await;
+    assert_eq!(st, StatusCode::INTERNAL_SERVER_ERROR, "signed out");
+    let req = Request::builder().uri(format!("{path}?WSDL")).header(header::HOST, "10.10.10.128:8080").body(Body::empty()).unwrap();
+    let w = String::from_utf8(to_bytes(app.clone().oneshot(req).await.unwrap().into_body(), usize::MAX).await.unwrap().to_vec()).unwrap();
+    assert!(w.contains("location=\"http://10.10.10.128:8080/ApplicationServerAdmin/WebServices/LRSWebServices.asmx\""), "the WSDL points at this server");
 }

@@ -235,7 +235,7 @@ async fn task_permitted(conn: &mut sqlx::PgConnection, task_id: i32) -> ApiResul
         .await?)
 }
 
-async fn default_assignee(conn: &mut sqlx::PgConnection, task_id: i32) -> ApiResult<Option<i32>> {
+pub(crate) async fn default_assignee(conn: &mut sqlx::PgConnection, task_id: i32) -> ApiResult<Option<i32>> {
     Ok(sqlx::query_scalar("SELECT sid FROM cadastre.wf_task_permission WHERE task_id = $1 AND is_default ORDER BY sid LIMIT 1")
         .bind(task_id)
         .fetch_optional(conn)
@@ -245,7 +245,7 @@ async fn default_assignee(conn: &mut sqlx::PgConnection, task_id: i32) -> ApiRes
 /// Record the Aumentum "UserTask" notification for an assignment. It is sent by the mail outbox
 /// when an SMTP server is configured; otherwise it is kept as 'skipped' with the reason (Aumentum's
 /// production has no SMTP server, so it sends nothing either).
-async fn notify_assignment(conn: &mut sqlx::PgConnection, job_id: i32, task_id: i32, sid: Option<i32>) -> ApiResult<()> {
+pub(crate) async fn notify_assignment(conn: &mut sqlx::PgConnection, job_id: i32, task_id: i32, sid: Option<i32>) -> ApiResult<()> {
     let Some(sid) = sid else { return Ok(()) };
     let row = sqlx::query(
         "SELECT p.is_user, COALESCE(p.name, p.code) AS who, p.email, COALESCE(j.name, 'Job ' || j.id) AS job, t.name AS task,                 m.subject, m.body,                 COALESCE((SELECT value FROM cadastre.app_setting WHERE key = 'mail.smtp_server'), '') <> ''                 AND COALESCE((SELECT value FROM cadastre.app_setting WHERE key = 'mail.from'), '') <> '' AS smtp          FROM cadastre.principal p, cadastre.wf_job_instance j, cadastre.wf_task t, cadastre.mail_template m          WHERE p.sid = $1 AND j.id = $2 AND t.id = $3 AND m.feature = 'UserTask'",

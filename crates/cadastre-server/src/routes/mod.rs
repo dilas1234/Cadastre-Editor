@@ -9,6 +9,7 @@ pub mod fabric;
 pub mod health;
 pub mod import;
 pub mod jobs;
+pub mod mcservice;
 pub mod me;
 pub mod mutations;
 pub mod parcels;
@@ -94,7 +95,12 @@ pub fn router(state: AppState) -> Router {
         .route("/api/v1/registry/links", get(registry::links))
         .route("/api/v1/registry/status", get(registry::status))
         .route("/api/v1/registry/sync", post(registry::sync_now))
+        // The Registry's job service, at Aumentum's path (Registry setting mcServiceAddress).
+        .route(mcservice::PATH, get(mcservice::get).post(mcservice::post))
         .route("/api/v1/registry/reconcile", post(registry::reconcile_now))
+        .route("/api/v1/registry/find", get(registry::find))
+        .route("/api/v1/registry/parcels/{upin}/work", get(registry::parcel_work))
+        .route("/api/v1/registry/start-digitising", post(registry::start_digitising))
         .route("/api/v1/registry/transactions/{number}", get(registry::transaction))
         .route("/api/v1/registry/link", post(registry::link))
         .route("/api/v1/registry/unlink", post(registry::unlink))

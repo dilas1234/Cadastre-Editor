@@ -252,6 +252,7 @@ pub struct RegistryLinkRequest {
     responses((status = 200, body = RegistryPropertyDto), (status = 400, description = "Not a property of that transaction"),
               (status = 409, description = "Already linked, transaction not Active, or writing turned off"), (status = 422, description = "The Registry refused")))]
 pub async fn link(State(state): State<AppState>, user: AuthUser, Json(req): Json<RegistryLinkRequest>) -> ApiResult<Json<RegistryPropertyDto>> {
+    cadastre_linking_allowed()?;
     let actor = crate::routes::wf::resolve_actor(&state, &user).await?;
     let number = ident("transaction number", &req.transaction_number)?;
     let su = ident("property id", &req.su_id)?;
@@ -331,6 +332,7 @@ pub struct RegistryUnlinkRequest {
 #[utoipa::path(post, path = "/api/v1/registry/unlink", tag = "registry", request_body = RegistryUnlinkRequest,
     responses((status = 200), (status = 409, description = "Not linked, transaction not Active, or writing turned off"), (status = 422, description = "The Registry refused")))]
 pub async fn unlink(State(state): State<AppState>, user: AuthUser, Json(req): Json<RegistryUnlinkRequest>) -> ApiResult<Json<serde_json::Value>> {
+    cadastre_linking_allowed()?;
     let actor = crate::routes::wf::resolve_actor(&state, &user).await?;
     let upin = ident("UPIN", &req.upin)?.to_uppercase();
     let cfg = write_config()?;
@@ -438,4 +440,166 @@ pub async fn sent_plans(State(state): State<AppState>, Path(id): Path<i32>) -> A
 pub async fn parcel_events(State(state): State<AppState>, Path(upin): Path<String>) -> ApiResult<Json<Vec<serde_json::Value>>> {
     let upin = ident("UPIN", &upin)?.to_uppercase();
     Ok(Json(registry_sync::events_for(&state.pool, &upin).await?))
+}
+
+#[derive(Debug, Deserialize, IntoParams)]
+#[into_params(parameter_in = Query)]
+pub struct FindQuery {
+    /// A transaction number (PLS…) or a file / property number (PL…).
+    pub q: String,
+}
+
+#[derive(Debug, Serialize, ToSchema)]
+pub struct RegistryFileDto {
+    pub transaction_number: String,
+    pub status_code: String,
+    pub status: String,
+    /// The file (property) number, e.g. PL68955.
+    pub property_number: Option<String>,
+    pub su_id: Option<String>,
+    /// The UPIN the Registry holds for the property, once linked.
+    pub upin: Option<String>,
+    /// The open Cadastre job serving the transaction, if any.
+    pub job_instance_id: Option<i32>,
+    pub job_name: Option<String>,
+}
+
+/// Find a Registry file by transaction (PLS…) or file number (PL…), read live from the Registry,
+/// with the Cadastre job already serving it (the digitising unit's search).
+#[utoipa::path(get, path = "/api/v1/registry/find", tag = "registry", params(FindQuery),
+    responses((status = 200, body = [RegistryFileDto]), (status = 422, description = "The Registry could not be read")))]
+pub async fn find(State(state): State<AppState>, Query(q): Query<FindQuery>) -> ApiResult<Json<Vec<RegistryFileDto>>> {
+    let term = ident("number", &q.q)?.to_uppercase();
+    let cfg = config()?;
+    let by_txn = term.starts_with("PLS") || term.starts_with("P-");
+    let hql = format!(
+        "select t.TransactionNumber, ts.Code, ts.Label, s.Refnum, s.SuID, s.Upin from com.landsystems.lrs.model.Transaction t join t.TransactionStatus ts \
+         left join t.Properties l left join l.SpatialUnits s where {} and (l is null or l.EndLifespanVersion is null) and (s is null or s.EndLifespanVersion is null) \
+         order by t.TransactionNumber desc",
+        if by_txn { format!("t.TransactionNumber = '{term}'") } else { format!("upper(s.Refnum) = '{term}'") }
+    );
+    let session = Session::start(&cfg).await.map_err(registry_err)?;
+    let rows = session.query(&hql, 200).await;
+    session.end().await;
+    let o = |s: &String| Some(s.trim().to_string()).filter(|s| !s.is_empty());
+    let mut out = Vec::new();
+    for r in rows.map_err(registry_err)?.iter().filter(|r| r.len() >= 6) {
+        let job = sqlx::query("SELECT j.id, j.name FROM cadastre.wf_job_instance j JOIN cadastre.wf_job_status s ON s.code = j.status \
+                               WHERE j.lrs_transaction_number = $1 AND s.is_open ORDER BY j.id DESC LIMIT 1")
+            .bind(r[0].trim()).fetch_optional(&state.pool).await?;
+        out.push(RegistryFileDto {
+            transaction_number: r[0].trim().to_string(), status_code: r[1].trim().to_string(), status: r[2].trim().to_string(),
+            property_number: o(&r[3]), su_id: o(&r[4]), upin: o(&r[5]),
+            job_instance_id: job.as_ref().map(|j| j.get("id")), job_name: job.and_then(|j| j.get("name")),
+        });
+    }
+    Ok(Json(out))
+}
+
+#[derive(Debug, Deserialize, ToSchema)]
+pub struct StartDigitisingRequest {
+    pub transaction_number: String,
+    /// The file number for the job's name (Job-PL…); read from the Registry when omitted.
+    pub property_number: Option<String>,
+}
+
+#[derive(Debug, Serialize, ToSchema)]
+pub struct StartedJobDto {
+    pub job_instance_id: i32,
+    pub name: Option<String>,
+    /// false: a job for the transaction was already open, and is returned.
+    pub created: bool,
+}
+
+/// Start the job for a Registry file, as the Registry created them in Aumentum: job type
+/// "Deed Plan Creationv2" (the Registry's job_deedplan_creation), named Job-<file number>, with
+/// parameters @LRS:[Transaction]:[TransactionNumber]=PLS…. An open job of the transaction is
+/// returned instead of a second one.
+#[utoipa::path(post, path = "/api/v1/registry/start-digitising", tag = "registry", request_body = StartDigitisingRequest,
+    responses((status = 200, body = StartedJobDto), (status = 404, description = "No such transaction"), (status = 409, description = "Transaction not Active")))]
+pub async fn start_digitising(State(state): State<AppState>, user: AuthUser, Json(req): Json<StartDigitisingRequest>) -> ApiResult<Json<StartedJobDto>> {
+    let actor = crate::routes::wf::resolve_actor(&state, &user).await?;
+    let txn = ident("transaction number", &req.transaction_number)?.to_uppercase();
+    if let Some(j) = sqlx::query("SELECT j.id, j.name FROM cadastre.wf_job_instance j JOIN cadastre.wf_job_status s ON s.code = j.status \
+                                  WHERE j.lrs_transaction_number = $1 AND s.is_open ORDER BY j.id DESC LIMIT 1")
+        .bind(&txn).fetch_optional(&state.pool).await? {
+        return Ok(Json(StartedJobDto { job_instance_id: j.get("id"), name: j.get("name"), created: false }));
+    }
+    let cfg = config()?;
+    let session = Session::start(&cfg).await.map_err(registry_err)?;
+    let t = load_transaction(&session, &txn).await;
+    session.end().await;
+    let t = t?.ok_or_else(|| AppError::NotFound(format!("Cannot retrieve information of the Transaction. Transaction number:'{txn}'.")))?;
+    if let Some(why) = &t.refused {
+        return Err(AppError::Conflict(why.clone()));
+    }
+    let file = req.property_number.clone().filter(|s| !s.trim().is_empty()).or_else(|| t.properties.iter().find_map(|p| p.refnum.clone()));
+    let job_type: i32 = sqlx::query_scalar("SELECT id FROM cadastre.wf_job_type WHERE active AND lower(name) = lower($1) ORDER BY id LIMIT 1")
+        .bind(registry_sync::setting(&state.pool, "registry.job_deedplan_creation").await?.unwrap_or_else(|| "Deed Plan Creationv2".into()))
+        .fetch_optional(&state.pool).await?.ok_or_else(|| AppError::Conflict("the job type Deed Plan Creationv2 is not active".into()))?;
+    let name = format!("Job-{}", file.as_deref().unwrap_or(&txn));
+    let params = format!("@LRS:[Transaction]:[TransactionNumber]={txn}");
+    let id = crate::routes::mcservice::create_job_instance(&state.pool, job_type, Some(&name), Some("Deed Plan Creationv2"), Some(&params), "1", &actor.label, "registry.start-digitising")
+        .await.map_err(AppError::UnprocessableEntity)?;
+    Ok(Json(StartedJobDto { job_instance_id: id, name: Some(name), created: true }))
+}
+
+#[derive(Debug, Serialize, ToSchema)]
+pub struct ParcelWorkDto {
+    pub upin: String,
+    /// Linked to a Registry property (LinkageStatus 1).
+    pub linked: bool,
+    pub su_id: Option<String>,
+    pub property_number: Option<String>,
+    /// The Registry transaction of the link (from the link the Registry made), if known.
+    pub transaction_number: Option<String>,
+    /// The open job serving that transaction, if any.
+    pub job_instance_id: Option<i32>,
+    pub job_name: Option<String>,
+    pub current_task: Option<String>,
+}
+
+/// What a parcel's title deed work needs: its Registry link and the job of the transaction
+/// (the map's Start edit).
+#[utoipa::path(get, path = "/api/v1/registry/parcels/{upin}/work", tag = "registry", params(("upin" = String, Path, description = "UPIN")),
+    responses((status = 200, body = ParcelWorkDto)))]
+pub async fn parcel_work(State(state): State<AppState>, Path(upin): Path<String>) -> ApiResult<Json<ParcelWorkDto>> {
+    let upin = ident("UPIN", &upin)?.to_uppercase();
+    let a = sqlx::query("SELECT lrs_id, property_number, linkage_status FROM cadastre.parcel_attribute WHERE upin = $1 ORDER BY (status = '0') DESC NULLS LAST, object_id DESC LIMIT 1")
+        .bind(&upin).fetch_optional(&state.pool).await?;
+    let (su, pn, linked) = match &a {
+        Some(r) => (r.get::<Option<String>, _>("lrs_id"), r.get::<Option<String>, _>("property_number"), r.get::<Option<i16>, _>("linkage_status") == Some(1)),
+        None => (None, None, false),
+    };
+    // The transaction: the link the Registry made (sync events), else a job that committed the parcel.
+    let txn: Option<String> = sqlx::query_scalar(
+        "SELECT payload->>'transaction_number' FROM cadastre.audit_log WHERE entity = 'registry_link' AND entity_id = $1 \
+         AND action IN ('registry_link_synced', 'registry_link_made') AND payload->>'transaction_number' <> '' ORDER BY id DESC LIMIT 1",
+    ).bind(&upin).fetch_optional(&state.pool).await?;
+    let txn = match txn {
+        Some(t) => Some(t),
+        None => sqlx::query_scalar("SELECT w.lrs_transaction_number FROM cadastre.parcel p JOIN cadastre.wf_job_instance w ON w.cadastre_job_id = p.job_id \
+                                    WHERE p.parcel_number = $1 AND w.lrs_transaction_number IS NOT NULL ORDER BY w.id DESC LIMIT 1")
+            .bind(&upin).fetch_optional(&state.pool).await?.flatten(),
+    };
+    let job = match &txn {
+        Some(t) => sqlx::query("SELECT j.id, j.name, tk.name AS task FROM cadastre.wf_job_instance j JOIN cadastre.wf_job_status s ON s.code = j.status \
+                                LEFT JOIN cadastre.wf_task tk ON tk.id = j.current_task_id WHERE j.lrs_transaction_number = $1 AND s.is_open ORDER BY j.id DESC LIMIT 1")
+            .bind(t).fetch_optional(&state.pool).await?,
+        None => None,
+    };
+    Ok(Json(ParcelWorkDto {
+        upin, linked, su_id: su, property_number: pn, transaction_number: txn,
+        job_instance_id: job.as_ref().map(|j| j.get("id")), job_name: job.as_ref().and_then(|j| j.get("name")), current_task: job.and_then(|j| j.get("task")),
+    }))
+}
+
+/// Linking is done by the Registry admin in the Registry (PLAGIS, 2026-11-02); the Cadastre's own
+/// link / unlink (Aumentum's desktop LinkParcel) stays off unless CADASTRE_REGISTRY_CADASTRE_LINKING=1.
+fn cadastre_linking_allowed() -> ApiResult<()> {
+    if std::env::var("CADASTRE_REGISTRY_CADASTRE_LINKING").map(|v| v.trim() == "1").unwrap_or(false) {
+        Ok(())
+    } else {
+        Err(AppError::Conflict("Linking is done by the Registry admin in the Registry, not in the Cadastre.".into()))
+    }
 }

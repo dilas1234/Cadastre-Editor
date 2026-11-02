@@ -1186,7 +1186,49 @@ function editDraftAt(pt) {
 map.on("dblclick", (e) => {
   if (state.tool === "measure") { e.preventDefault(); finishMeasure(); }
   else if (state.tool === "sketch" && edit.verts.length) { e.preventDefault(); finishSketch(); }
+  else if (parcelAt(e.point)) { e.preventDefault(); parcelMenu(e); }
 });
+map.on("contextmenu", (e) => { if (state.tool !== "sketch" && parcelAt(e.point)) { e.preventDefault(); parcelMenu(e); } });
+function parcelAt(point) {
+  const layers = ["parcels-fill"].filter((l) => map.getLayer(l));
+  const f = layers.length ? map.queryRenderedFeatures(point, { layers })[0] : null;
+  return f && f.properties.parcel_number ? f : null;
+}
+// The parcel's menu: Start edit opens the title deed work on the parcel's job (Phase 5 flow:
+// the Registry admin has linked the file; the title deed unit works on it and sends it back).
+function parcelMenu(e) {
+  const f = parcelAt(e.point); if (!f) return;
+  const upin = f.properties.parcel_number;
+  const ev = e.originalEvent;
+  selectFeatures([f.properties.id], false);
+  contextMenu([
+    { label: `Start edit — title deed (${upin})`, icon: "editor", action: () => startEditParcel(upin) },
+    { label: "Zoom To Parcel", icon: "fullExtent", action: () => registryZoom(upin) },
+    { label: "Registry File…", icon: "registry", action: () => startEditParcel(upin, true) },
+    "-",
+    { label: "Parcel Lineage…", action: () => lineageOfSelection() },
+  ], ev.clientX, ev.clientY);
+}
+async function startEditParcel(upin, fileOnly) {
+  let w;
+  try { w = await api(`/api/v1/registry/parcels/${encodeURIComponent(upin)}/work`); } catch (e) { alert(e.message); return; }
+  if (fileOnly) { if (w.transaction_number) regFind(w.transaction_number); else alert(`${upin} has no Registry file (transaction) yet.`); return; }
+  if (!w.linked && !w.job_instance_id) { alert(`${upin} is not linked in the Registry yet.\nThe Registry admin links it in the Registry; it then appears under Registry → Linked.`); return; }
+  let job = w.job_instance_id;
+  if (!job) {
+    if (!w.transaction_number) { alert(`${upin} is linked (${w.su_id}), but its Registry transaction is not known here. Find the file under Registry → Find file.`); return; }
+    if (!confirm(`No open job for ${w.transaction_number}. Start the title deed job (Job-${w.property_number || upin})?`)) return;
+    try { job = (await api("/api/v1/registry/start-digitising", { method: "POST", body: { transaction_number: w.transaction_number, property_number: w.property_number } })).job_instance_id; }
+    catch (e) { alert(e.message); return; }
+  }
+  await openWorkflow(); await wfSelect(job);
+  try { await wfWorkOn(job); } catch (e) { notify(e.message, "err"); }
+  stepTools(`Title Deed Plan — ${upin}`, [
+    ["Open the title deed plan (template)", () => window.open(`/api/v1/jobs/${wf.editing.cadastre_job_id}/siteplan.pdf`, "_blank")],
+    ["Send the plan to the Registry…", () => openRegistry({ job, view: "send" })],
+  ]);
+  status(`Working on ${w.job_name || "job " + job} for ${upin}${w.current_task ? " — task: " + w.current_task : ""}.`);
+}
 
 // selection
 function selectFeatures(ids, add) {
@@ -1195,7 +1237,7 @@ function selectFeatures(ids, add) {
   map.setFilter("parcels-sel", ["in", ["get", "id"], ["literal", [...state.selection]]]);
   status(`${state.selection.size} feature(s) selected`);
   if (state.tocView === "selection") buildTOC();
-  if (typeof regOpen === "function" && regOpen() && reg.view === "txn") renderRegistry();
+
 }
 function clearSelection() { selectFeatures([], false); }
 function selectedFC() { return { type: "FeatureCollection", features: state.parcels.features.filter((f) => state.selection.has(f.properties.id)) }; }
@@ -2901,7 +2943,7 @@ async function openWorkflow() {
  * Aumentum's Registry extension (LinkParcel, SendImageCommand), writing to the Registry only on
  * those actions.
  * ===================================================================================== */
-const reg = { links: [], status: null, busy: false, loaded: false, view: "inbox", filter: "all", q: "",
+const reg = { links: [], status: null, busy: false, loaded: false, view: "inbox", filter: "all", q: "", findQ: "", found: null, findErr: "", finding: false,
   txn: null, txnNo: "", txnErr: "", txnLoading: false, job: null, files: [], sent: [], pick: null };
 const registryWaiting = () => reg.links.filter((l) => !l.job_instance_id && l.parcel_id && l.linked_now).length;
 const regOpen = () => !$("regBody").classList.contains("hidden");
@@ -2965,16 +3007,6 @@ async function regLookup(no) {
   reg.txnLoading = true; if (regOpen()) renderRegistry();
   try { reg.txn = await api("/api/v1/registry/transactions/" + encodeURIComponent(reg.txnNo)); } catch (e) { reg.txnErr = e.message; }
   reg.txnLoading = false;
-}
-async function regLinkParcel(p) {
-  const u = selectedUpins();
-  if (u.length !== 1) { alert("Select the one parcel to link (Select tool), then press Link."); return; }
-  if (!confirm(`Link parcel ${u[0]} to the Registry property ${p.su_id} of ${reg.txn.transaction_number}?\nThe Registry property takes the UPIN ${u[0]}.`)) return;
-  await regRun("Link", async () => { await api("/api/v1/registry/link", { method: "POST", body: { transaction_number: reg.txn.transaction_number, su_id: p.su_id, upin: u[0] } }); notify(`${u[0]} linked to ${p.su_id}.`); await regLookup(reg.txnNo); });
-}
-async function regUnlink(upin) {
-  if (!confirm(`Unlink parcel ${upin} from its Registry property?\nThe UPIN is removed from the Registry property and the parcel's link fields are cleared.`)) return;
-  await regRun("Unlink", async () => { await api("/api/v1/registry/unlink", { method: "POST", body: { upin } }); notify(`${upin} unlinked.`); if (reg.txnNo) await regLookup(reg.txnNo); });
 }
 // --- send the plan (Aumentum SendImageCommand: the job's image file → its transaction) ---
 async function regSetJob(id) {
@@ -3042,12 +3074,12 @@ function renderRegistry() {
 
   // Sub-tabs.
   const tab = (key, label) => h("span", { class: "regTab" + (reg.view === key ? " sel" : ""), onclick: () => { reg.view = key; renderRegistry(); } }, label);
-  body.append(h("div", { class: "regTabs" }, tab("inbox", "Inbox"), tab("txn", "Transaction"), tab("send", "Send plan")));
+  body.append(h("div", { class: "regTabs" }, tab("find", "Find file"), tab("inbox", "Linked"), tab("send", "Send plan")));
 
   const scroll = h("div", { class: "regScroll" });
   body.append(scroll);
   if (reg.view === "inbox") regInbox(scroll);
-  else if (reg.view === "txn") regTransactionView(scroll, writes);
+  else if (reg.view === "find") regFindView(scroll);
   else regSendView(scroll, writes);
   scroll.scrollTop = keep;
 }
@@ -3090,41 +3122,54 @@ function regInboxList(list) {
       h("div", { class: "regCardFoot" },
         h("span", { class: "regLinks" },
           regLink("Zoom", "Zoom to the parcel", () => registryZoom(l.upin), !l.parcel_id),
-          regLink("Transaction", "Show the transaction's properties", async () => { reg.view = "txn"; await regLookup(l.transaction_number); renderRegistry(); })),
+          regLink("File", "Show this Registry file", () => regFind(l.transaction_number))),
         main));
     list.append(card);
   }
 }
 
-function regTransactionView(box, writes) {
-  const inp = h("input", { type: "search", class: "regSearch", placeholder: "Transaction number, e.g. PLS000138648", value: reg.txnNo });
-  const go = async () => { await regLookup(inp.value); renderRegistry(); };
+// --- Find file: the digitising unit's search (PL file number or PLS transaction number) ---
+async function regFind(q) {
+  reg.view = "find"; reg.findQ = (q || "").trim().toUpperCase(); reg.found = null; reg.findErr = "";
+  if (!regOpen()) await openRegistry(); else renderRegistry();
+  if (!reg.findQ) return;
+  reg.finding = true; renderRegistry();
+  try { reg.found = await api("/api/v1/registry/find?q=" + encodeURIComponent(reg.findQ)); } catch (e) { reg.findErr = e.message; }
+  reg.finding = false; renderRegistry();
+}
+async function regStartDigitising(f) {
+  if (!confirm(`Start digitising ${f.property_number || f.transaction_number}?\nA "Deed Plan Creationv2" job is created for Registry transaction ${f.transaction_number}, as the Registry created them.`)) return;
+  await regRun("Start digitising", async () => {
+    const r = await api("/api/v1/registry/start-digitising", { method: "POST", body: { transaction_number: f.transaction_number, property_number: f.property_number } });
+    notify(r.created ? `${r.name} created.` : `${r.name || "The job"} was already open for ${f.transaction_number}.`);
+    await registryOpenJob(r.job_instance_id);
+  });
+}
+function regFindView(box) {
+  const inp = h("input", { type: "search", class: "regSearch", placeholder: "File no. (PL68955) or transaction (PLS000139391)", value: reg.findQ });
+  const go = () => regFind(inp.value);
   inp.addEventListener("keydown", (e) => { if (e.key === "Enter") go(); });
-  box.append(h("div", { class: "regBar" }, inp, regIconBtn("Look up", "Read the transaction from the Registry", go, { primary: true })));
-  if (reg.txnLoading) { box.append(h("p", { class: "regEmpty" }, "Reading the Registry…")); return; }
-  if (reg.txnErr) { box.append(h("div", { class: "regEmpty" }, h("b", {}, "Not found"), h("div", { class: "muted" }, reg.txnErr))); return; }
-  const t = reg.txn;
-  if (!t) { box.append(h("div", { class: "regEmpty" }, h("b", {}, "Look up a transaction"), h("div", { class: "muted" }, "See its properties and which parcels they are linked to; link or unlink from here."))); return; }
-  box.append(h("div", { class: "regTxnHead" },
-    h("div", {}, h("span", { class: "regUpin" }, t.transaction_number), " ", regTxnPill(t.status_code, t.status)),
-    h("div", { class: "muted" }, `${t.properties.length} propert${t.properties.length === 1 ? "y" : "ies"}`)));
-  if (!t.open) box.append(h("div", { class: "regNote" }, t.refused + " Only Active transactions can be linked, unlinked or sent a plan."));
-  const sel = selectedUpins();
-  for (const p of t.properties) {
-    const can = t.open && writes && !reg.busy;
-    const why = !writes ? "Writing to the Registry is off on this server" : !t.open ? t.refused : "";
-    const act = p.upin
-      ? [h("span", { class: "regLinks" }, regLink("Zoom", "Zoom to the parcel", () => registryZoom(p.upin))), regIconBtn("Unlink", why || "Remove the link in the Registry and the Cadastre", () => regUnlink(p.upin), { disabled: !can })]
-      : [h("span", { class: "regLinks muted" }, sel.length === 1 ? "" : "Select a parcel on the map"), regIconBtn(sel.length === 1 ? `Link ${sel[0]}` : "Link parcel", why || (sel.length === 1 ? `Link the selected parcel ${sel[0]} to this property` : "Select one parcel on the map first"),
-          () => regLinkParcel(p), { disabled: !can || sel.length !== 1, primary: true })];
-    box.append(h("div", { class: "regCard " + (p.upin ? "job" : "wait"), onclick: () => p.upin && registryZoom(p.upin) },
-      h("div", { class: "regCardTop" }, h("span", { class: "regUpin" }, p.su_id), h("span", { class: "muted regTime" }, p.linked_at ? `${regDay(p.linked_at)} ${regClock(p.linked_at)}` : "")),
-      regStatus(p.upin ? "job" : "wait", p.upin ? `Linked to ${p.upin}` : "Not linked to a parcel"),
-      h("div", { class: "regKv" }, h("div", {}, h("i", {}, "Property No."), p.refnum || "—"), h("div", {}, h("i", {}, "Block / Lot"), `${p.block || "—"} / ${p.lot || "—"}`)),
-      h("div", { class: "regCardFoot" }, ...act)));
+  box.append(h("div", { class: "regBar" }, inp, regIconBtn("Find", "Find the file in the Registry", go, { primary: true })));
+  setTimeout(() => { if (!reg.findQ) inp.focus(); }, 0);
+  if (reg.finding) { box.append(h("p", { class: "regEmpty" }, "Reading the Registry…")); return; }
+  if (reg.findErr) { box.append(h("div", { class: "regEmpty" }, h("b", {}, "Could not search"), h("div", { class: "muted" }, reg.findErr))); return; }
+  if (!reg.found) { box.append(h("div", { class: "regEmpty" }, h("b", {}, "Find a file to digitise"), h("div", { class: "muted" }, "Search by the file number (PL…) or the Registry transaction number (PLS…). Start digitising creates the file's job; open it to add the coordinates and commit."))); return; }
+  if (!reg.found.length) { box.append(h("div", { class: "regEmpty" }, h("b", {}, "Not found in the Registry"), h("div", { class: "muted" }, `No transaction or file ${reg.findQ}.`))); return; }
+  for (const f of reg.found) {
+    const active = f.status_code === "transaction_lodged";
+    const linked = !!f.upin;
+    const main = f.job_instance_id
+      ? regIconBtn("Open job", `Open ${f.job_name || "the job"} in the Workflow`, () => registryOpenJob(f.job_instance_id), { primary: true })
+      : regIconBtn("Start digitising", active ? "Create the file's job and open it" : `The transaction is ${f.status}: only Active files are digitised`, () => regStartDigitising(f), { primary: true, disabled: !active || reg.busy });
+    box.append(h("div", { class: "regCard " + (f.job_instance_id ? "job" : active ? "wait" : "gone") },
+      h("div", { class: "regCardTop" }, h("span", { class: "regUpin" }, f.property_number || f.transaction_number), regTxnPill(f.status_code, f.status)),
+      regStatus(f.job_instance_id ? "job" : linked ? "job" : "wait", f.job_instance_id ? `Job: ${f.job_name || "#" + f.job_instance_id}` : linked ? `Linked in the Registry to ${f.upin}` : "Not digitised / linked yet"),
+      h("div", { class: "regKv" },
+        h("div", {}, h("i", {}, "Transaction"), f.transaction_number),
+        h("div", {}, h("i", {}, "Property"), f.su_id || "—"),
+        h("div", {}, h("i", {}, "UPIN"), f.upin || "— (given at commit; the Registry links it)")),
+      h("div", { class: "regCardFoot" }, h("span", { class: "regLinks" }, regLink("Zoom", "Zoom to the parcel", () => registryZoom(f.upin), !linked)), main)));
   }
-  if (!t.properties.length) box.append(h("p", { class: "regEmpty" }, "The transaction has no properties."));
-  if (t.properties.some((p) => !p.upin) && sel.length !== 1) box.append(h("p", { class: "muted", style: "padding:4px 8px" }, "To link: select the parcel on the map (Select tool), then press Link."));
 }
 
 function regSendView(box, writes) {
@@ -3551,7 +3596,7 @@ function wfStepAction(s) {
       ["Open the job's site plan", () => window.open(`/api/v1/jobs/${wf.editing.cadastre_job_id}/siteplan.pdf`, "_blank")],
       ["Send the plan image to the Registry…", () => openRegistry({ job: jobId, view: "send" })]])), label: "Plan", tip: "Site plan, and sending the plan image to the job's Registry transaction" };
     case 1009: return { run: needJob(() => fciDialog()), label: "Import", tip: "Create parcels from a polygon feature class (shapefile)" };
-    case 1013: return { run: async () => { const d = wf.detail && wf.detail.job.id === jobId ? wf.detail.job : null; await openRegistry({ job: jobId, view: "txn", txn: d && d.lrs_transaction_number }); }, label: "Link", tip: "Link the parcel to the job's Registry transaction (Registry tab)" };
+    case 1013: return { run: async () => { const d = wf.detail && wf.detail.job.id === jobId ? wf.detail.job : null; await regFind(d && d.lrs_transaction_number); }, label: "Link", tip: "Link the parcel to the job's Registry transaction (Registry tab)" };
     case 1020: return { run: needJob(() => stepTools("Merge Parcel", [
       ["1. Select the parcels (Select tool; Shift-click to add)", () => { setTool("select"); status("Click the parcels to merge; Shift-click to add more."); }],
       ["2. Merge the selected parcels", mutationMerge], ["Lineage of the selected parcel…", () => lineageOfSelection()]])), label: "Open", tip: "Merge posted parcels into one (applied at commit)" };
