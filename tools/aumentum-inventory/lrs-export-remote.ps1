@@ -23,7 +23,9 @@
 # -Resume: do not export again; copy back what an earlier run left on the Registry server (its
 # newest lrs-export-* temp folder, or -RemoteDir), skipping files already copied complete.
 param([string]$OutDir = $PSScriptRoot, [string]$Target = 'registry.plagis.com', [switch]$SkipRegistry, [switch]$SkipLocal,
-      [switch]$Resume, [string]$RemoteDir = '')
+      [switch]$Resume, [string]$RemoteDir = '',
+      # PRODUCTIONMC parts to run (all three by default), e.g. -Parts gisviewer
+      [string[]]$Parts = @('desktop', 'com', 'gisviewer'))
 $ErrorActionPreference = 'Stop'
 $root = Join-Path $OutDir 'lrs-export'
 New-Item -ItemType Directory -Path $root -Force | Out-Null
@@ -96,11 +98,20 @@ if (-not $SkipRegistry) {
     New-Item -ItemType Directory -Path (Join-Path $root 'registry') -Force | Out-Null
     # The Registry's own list of the export's files, to check against what arrived.
     [IO.File]::WriteAllLines((Join-Path $root 'registry\_remote-files.txt'), [string[]]@($files | % { "$($_.Len)|$($_.Rel)|$($_.Full)" }), $utf8)
+    # What is already here, from ONE directory walk: checking each file separately over the
+    # Remote Desktop drive (\\tsclient) costs a round trip per file, minutes for 700 files.
+    $have = @{}
+    $regLocal = [IO.Path]::GetFullPath((Join-Path $root 'registry')).TrimEnd('\')
+    foreach ($x in (Get-ChildItem -LiteralPath $regLocal -Recurse -File -Force -ErrorAction SilentlyContinue)) {
+      $full = [IO.Path]::GetFullPath($x.FullName)
+      if ($full.StartsWith($regLocal + '\', [StringComparison]::OrdinalIgnoreCase)) { $have[$full.Substring($regLocal.Length + 1).ToLowerInvariant()] = $x.Length }
+    }
     foreach ($f in $files) {
       $dest = Join-Path $root ('registry\' + $f.Rel)
       $done += $f.Len
       try {
-        if ((Test-Path -LiteralPath $dest) -and (Get-Item -LiteralPath $dest -Force).Length -eq $f.Len) { $skipped++; continue }
+        $k = $f.Rel.ToLowerInvariant()
+        if ($have.ContainsKey($k) -and $have[$k] -eq $f.Len) { $skipped++; continue }
         New-Item -ItemType Directory -Path (Split-Path $dest -Parent) -Force | Out-Null
         $out = [IO.File]::Create($dest)
         try {
@@ -150,6 +161,7 @@ if (-not $SkipLocal) {
   $report.Add("Cadastre side of the Registry link on $env:COMPUTERNAME, $(Get-Date -Format s)")
 
   # Each part on its own: one that fails is reported and the others still run.
+  if ($Parts -contains 'desktop') {
   Write-Host "[a] AUMENTUM REGISTRY extension and the LRS client libraries ..." -ForegroundColor Cyan
   try {
   $desk = @('C:\Program Files (x86)\AUMENTUM\CADASTRE\Desktop', 'C:\Program Files\AUMENTUM\CADASTRE\Desktop') | Where { Test-Path $_ } | Select -First 1
@@ -162,7 +174,9 @@ if (-not $SkipLocal) {
     }
   } else { $report.Add('Cadastre Desktop folder not found (looked in C:\Program Files (x86)\AUMENTUM\CADASTRE\Desktop and C:\Program Files\AUMENTUM\CADASTRE\Desktop)'); Write-Host '  Cadastre Desktop folder not found' -ForegroundColor Yellow }
   } catch { $m = "[a] stopped: $($_.Exception.Message)"; $report.Add($m); Write-Host "  $m" -ForegroundColor Red }
+  }
 
+  if ($Parts -contains 'com') {
   Write-Host "[b] COM registrations of the desktop's commands (CLSID -> class) ..." -ForegroundColor Cyan
   try {
   $rows = New-Object Collections.Generic.List[string]; $rows.Add('clsid|class|assembly|codebase|hive')
@@ -180,7 +194,9 @@ if (-not $SkipLocal) {
   [IO.File]::WriteAllLines((Join-Path $mc 'com-commands.psv'), [string[]]$rows, $utf8)
   $report.Add("COM commands registered: $($rows.Count - 1)")
   } catch { $m = "[b] stopped: $($_.Exception.Message)"; $report.Add($m); Write-Host "  $m" -ForegroundColor Red }
+  }
 
+  if ($Parts -contains 'gisviewer') {
   Write-Host "[c] GISViewer (called back by the Registry) ..." -ForegroundColor Cyan
   try {
   $gv = 'C:\inetpub\wwwroot\GISViewer'
@@ -205,7 +221,10 @@ if (-not $SkipLocal) {
     $report.Add("GISViewer: $($files.Count) files listed")
   } else { $report.Add("GISViewer folder not found ($gv)"); Write-Host "  GISViewer folder not found ($gv)" -ForegroundColor Yellow }
   } catch { $m = "[c] stopped: $($_.Exception.Message)"; $report.Add($m); Write-Host "  $m" -ForegroundColor Red }
-  [IO.File]::WriteAllLines((Join-Path $mc 'productionmc-summary.txt'), [string[]]$report, $utf8)
+  }
+  # A partial run (-Parts) adds to the summary of the earlier full one instead of replacing it.
+  $sumFile = Join-Path $mc 'productionmc-summary.txt'
+  if ($Parts.Count -lt 3 -and (Test-Path $sumFile)) { [IO.File]::AppendAllLines($sumFile, [string[]]$report, $utf8) } else { [IO.File]::WriteAllLines($sumFile, [string[]]$report, $utf8) }
   Write-Host "PRODUCTIONMC part done." -ForegroundColor Green
 }
 Write-Host "`nAll done. Results are in $root" -ForegroundColor Green
