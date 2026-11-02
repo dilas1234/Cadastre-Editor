@@ -262,14 +262,89 @@ table.legs tr.selrow td { background: #fff6cf; }
 .toast.err { background: #a01818; }
 .toast.fade { opacity: 0; }
 
-/* Phase 5: Linked from the Registry (Workflow panel). */
-.regSec { border-bottom: 1px solid var(--border, #c8c8c8); padding: 2px 0 4px; }
-.regList { max-height: 220px; overflow-y: auto; }
-.regRow.todo { border-left: 3px solid #d08000; }
+/* ---- Phase 5: Registry tab ---- */
+#regBody { display: flex; flex-direction: column; overflow: hidden; }
+#regBody:not(.hidden) { display: flex; }
+.regHead { display: flex; align-items: center; justify-content: space-between; gap: 8px; padding: 8px 8px 6px; background: var(--pane-head); border-bottom: 1px solid var(--chrome-line); flex: none; }
+.regConn { display: flex; align-items: center; gap: 8px; min-width: 0; }
+.regConn b { font-size: 12.5px; }
+.regConn .muted { font-size: 11px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.regDot { width: 9px; height: 9px; border-radius: 50%; background: #bbb; flex: none; box-shadow: 0 0 0 2px #fff; }
+.regDot.on { background: #22a33a; }
+.regDot.off { background: var(--bad); }
+.regHeadBtns .regAct { font-size: 15px; width: 28px; padding: 0; }
+.regNote { margin: 6px 8px 0; padding: 5px 8px; background: #fff6df; border: 1px solid #e0b04a; color: #6b4a00; font-size: 11px; border-radius: 2px; flex: none; }
+.regTiles { display: flex; gap: 6px; padding: 8px 8px 4px; flex: none; }
+.regTile { flex: 1; min-width: 0; padding: 5px 6px; background: #fff; border: 1px solid var(--chrome-line); border-top: 3px solid #ccc; cursor: pointer; border-radius: 2px; }
+.regTile:hover { background: #f5faff; }
+.regTile.sel { background: #e5f3ff; border-color: var(--hover-line); }
+.regTile b { display: block; font-size: 18px; line-height: 1.1; }
+.regTile span { display: block; font-size: 10.5px; color: #555; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.regTile.wait { border-top-color: #d08000; } .regTile.wait b { color: #b06a00; }
+.regTile.job { border-top-color: #3a86d6; } .regTile.job b { color: #1f62a8; }
+.regTile.gone { border-top-color: #999; } .regTile.gone b { color: #666; }
+.regTabs { display: flex; gap: 0; padding: 4px 8px 0; border-bottom: 1px solid var(--pane-line); flex: none; }
+.regTab { flex: 1; text-align: center; white-space: nowrap; padding: 5px 4px; margin-bottom: -1px; border: 1px solid transparent; border-bottom: none; cursor: pointer; color: #444; }
+.regTab:hover { background: var(--hover); }
+.regTab.sel { background: #fff; border-color: var(--pane-line); color: var(--text); font-weight: 600; }
+.regScroll { flex: 1; overflow-y: auto; background: #fff; padding-bottom: 10px; }
+.regBar { display: flex; gap: 6px; align-items: center; padding: 8px; position: sticky; top: 0; background: #fff; z-index: 1; border-bottom: 1px solid #f0f0f0; }
+.regSearch { flex: 1; min-width: 0; height: 24px; padding: 0 6px; border: 1px solid #b8b8b8; }
+.regChip { padding: 1px 8px; border-radius: 10px; background: #e5f3ff; border: 1px solid var(--hover-line); cursor: pointer; white-space: nowrap; font-size: 11px; }
+.regDayHead { padding: 8px 10px 3px; font-size: 10.5px; font-weight: 600; letter-spacing: .04em; text-transform: uppercase; color: #777; }
+.regCard { margin: 4px 8px; padding: 7px 9px; border: 1px solid #e1e1e1; border-left: 3px solid #ccc; border-radius: 2px; background: #fff; cursor: pointer; }
+.regCard:hover { border-color: var(--hover-line); background: #f7fbff; }
+.regCard.wait { border-left-color: #d08000; }
+.regCard.job { border-left-color: #3a86d6; }
+.regCard.gone { border-left-color: #aaa; background: #fafafa; }
+.regCard.gone .regUpin { color: #777; text-decoration: line-through; }
+.regCardTop { display: flex; align-items: center; justify-content: space-between; gap: 6px; }
+.regUpin { font-weight: 700; font-size: 13px; letter-spacing: .01em; }
+.regKv { display: grid; gap: 1px; margin: 4px 0 6px; }
+.regKv > div { display: grid; grid-template-columns: 78px 1fr; min-width: 0; }
+.regKv > div > * { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.regKv i { font-style: normal; color: #888; }
+.regStatus { display: flex; align-items: center; gap: 5px; font-size: 11px; font-weight: 600; margin-top: 1px; }
+.regStatusDot { width: 7px; height: 7px; border-radius: 50%; background: #aaa; flex: none; }
+.regStatus.wait { color: #a05f00; } .regStatus.wait .regStatusDot { background: #d08000; }
+.regStatus.job { color: #1f62a8; } .regStatus.job .regStatusDot { background: #3a86d6; }
+.regStatus.gone { color: #777; }
+.regTime { font-size: 11px; white-space: nowrap; }
+.regLinks { display: inline-flex; gap: 12px; font-size: 11.5px; }
+.regLinkBtn { color: #1f62a8; text-decoration: none; }
+.regLinkBtn:hover { text-decoration: underline; }
+.regLinkBtn.off { color: #bbb; pointer-events: none; }
+.regCardFoot { display: flex; align-items: center; justify-content: space-between; gap: 8px; border-top: 1px solid #f0f0f0; padding-top: 5px; }
+.regCardFoot .regAct { margin-left: auto; min-width: 88px; }
+.regCardFoot .muted { font-size: 11px; }
+.regActs { display: inline-flex; gap: 4px; margin-left: auto; }
+.regAct { height: 22px; padding: 0 9px; border: 1px solid #acacac; background: linear-gradient(#fafafa, #ececec); border-radius: 2px; cursor: pointer; white-space: nowrap; }
+.regAct:hover:not(:disabled) { background: var(--hover); border-color: var(--hover-line); }
+.regAct:disabled { color: #aaa; cursor: default; }
+.regAct.primary { background: linear-gradient(#4aa3f0, #2b86d8); border-color: #1f6fb8; color: #fff; font-weight: 600; }
+.regAct.primary:hover:not(:disabled) { background: linear-gradient(#5db0f5, #3591e0); }
+.regAct.primary:disabled { background: #c9d9ea; border-color: #b5c7da; color: #f4f8fc; }
+.regAct.big { height: 30px; width: 100%; font-size: 12.5px; }
+.regPill { font-size: 10.5px; padding: 1px 7px; border-radius: 9px; border: 1px solid; white-space: nowrap; max-width: 60%; overflow: hidden; text-overflow: ellipsis; }
+.regPill.wait { color: #8a5a00; border-color: #e0b04a; background: #fff6df; }
+.regPill.job { color: #0a5aa8; border-color: #7eb4ea; background: #eaf4fd; }
+.regPill.ok { color: #1a6b2a; border-color: #8cc79a; background: #ecf8ef; }
+.regPill.gone { color: #555; border-color: #bbb; background: #f2f2f2; }
+.regEmpty { padding: 24px 16px; text-align: center; color: #555; }
+.regEmpty b { display: block; margin-bottom: 4px; font-size: 12.5px; }
+.regTxnHead { display: flex; align-items: center; justify-content: space-between; gap: 6px; padding: 8px 9px 2px; }
+.regStep { display: flex; gap: 8px; margin: 6px 8px; padding: 6px 8px; border: 1px solid #e6e6e6; border-radius: 2px; }
+.regStepMark { width: 18px; height: 18px; border-radius: 50%; flex: none; display: flex; align-items: center; justify-content: center; font-weight: 700; font-size: 11px; background: #ddd; color: #fff; }
+.regStep.ok .regStepMark { background: #22a33a; }
+.regStep.bad .regStepMark { background: var(--bad); }
+.regStep.bad { background: #fff8f8; border-color: #f0caca; }
+.regFiles { display: grid; grid-template-columns: repeat(auto-fill, minmax(96px, 1fr)); gap: 6px; margin: 0 8px 6px 34px; }
+.regFile { display: flex; flex-direction: column; gap: 3px; padding: 4px; border: 1px solid #ddd; border-radius: 2px; cursor: pointer; font-size: 10.5px; word-break: break-all; position: relative; }
+.regFile.sel { border-color: var(--select); box-shadow: 0 0 0 1px var(--select); }
+.regFile input { position: absolute; top: 4px; left: 4px; margin: 0; }
+.regFile img { width: 100%; height: 64px; object-fit: contain; background: #f4f4f4; }
+.regSendBar { margin: 10px 8px 4px; display: flex; flex-direction: column; gap: 4px; }
+.regSendBar .muted { font-size: 11px; text-align: center; }
+.regSent { padding: 2px 10px; font-size: 11px; }
 .regBadge { position: absolute; top: -3px; right: -4px; min-width: 14px; height: 14px; padding: 0 3px; border-radius: 7px;
   background: #d08000; color: #fff; font-size: 10px; line-height: 14px; text-align: center; font-weight: bold; }
-.regBadge.inline { position: static; display: inline-block; margin-left: 6px; }
-.regRow.gone { opacity: .6; border-left: 3px solid #999; }
-.regTbl { width: 100%; border-collapse: collapse; font-size: 11px; margin: 2px 0 4px; }
-.regTbl th, .regTbl td { text-align: left; padding: 1px 4px; border-bottom: 1px solid var(--border, #ddd); white-space: nowrap; }
-#regBody { overflow-y: auto; }
