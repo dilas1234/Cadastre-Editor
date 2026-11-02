@@ -17,7 +17,7 @@
 
   Copies files only; nothing is changed anywhere. PowerShell 4 compatible.
 #>
-param([string]$OutDir = $PSScriptRoot, [string]$Target = 'registry.plagis.com', [switch]$SkipRegistry)
+param([string]$OutDir = $PSScriptRoot, [string]$Target = 'registry.plagis.com', [switch]$SkipRegistry, [switch]$RegistryOnly)
 $ErrorActionPreference = 'Stop'
 $root = Join-Path $OutDir 'lrs-export\map-capture'
 New-Item -ItemType Directory -Path $root -Force | Out-Null
@@ -53,6 +53,7 @@ function CopyTree([string]$src, [string]$dest, [string]$pattern, [string]$label)
   Write-Host "  ${label}: $n files" -ForegroundColor DarkGray
 }
 
+if (-not $RegistryOnly) {
 Write-Host "[1] GISViewer (the Registry's map) ..." -ForegroundColor Cyan
 CopyTree 'C:\inetpub\wwwroot\GISViewer\Client' (Join-Path $root 'gisviewer\Client') '\.(xap|xaml|zip|xml|config|js)$' 'GISViewer Client'
 CopyTree 'C:\inetpub\wwwroot\GISViewer\bin' (Join-Path $root 'gisviewer\bin') '\.(dll|xml|config)$' 'GISViewer bin'
@@ -66,6 +67,7 @@ if ($wa) {
   CopyTree (Join-Path $wa 'bin') (Join-Path $root 'webadmin\bin') '\.(dll|xml|config)$' 'WebAdmin bin'
   CopyTree $wa (Join-Path $root 'webadmin\root') '^[^\\]+\.(config|asax|aspx)$' 'WebAdmin root'
 } else { $report.Add('WebAdmin not found'); Write-Host '  WebAdmin not found' -ForegroundColor Yellow }
+}
 
 if (-not $SkipRegistry) {
   Write-Host "[3] Registry desktop client (MapWorkerControl), on $Target ..." -ForegroundColor Cyan
@@ -82,7 +84,7 @@ if (-not $SkipRegistry) {
         $dirs = @('C:\Program Files (x86)\Aumentum Registry', 'E:\Program Files (x86)\Aumentum Registry', 'C:\Program Files\Aumentum Registry') | Where { Test-Path $_ }
         foreach ($d in $dirs) {
           Get-ChildItem $d -Recurse -File -ErrorAction SilentlyContinue |
-            Where { ($_.Name -match '^(LRS\.Client\.|LRS\.Core|ILS\.MCPortal|.*MapWorker)' -and $_.Extension -eq '.dll') -or ($_.Extension -eq '.config' -and $_.Length -lt 2MB) } |
+            Where { ($_.Name -match '^(ThomsonReuters\.Aumentum\.Registry|LRS\.|ILS\.|.*MapWorker|.*Silverlight)' -and $_.Extension -match '^\.(dll|exe)$') -or ($_.Extension -eq '.config' -and $_.Length -lt 2MB) } |
             ForEach-Object { New-Object PSObject -Property @{ Full = $_.FullName; Rel = $_.FullName.Substring($d.Length).TrimStart('\'); Len = $_.Length } }
         }
       }
@@ -104,5 +106,6 @@ if (-not $SkipRegistry) {
     Write-Host "  Registry part stopped: $($_.Exception.Message)" -ForegroundColor Red
   }
 }
-[IO.File]::WriteAllLines((Join-Path $root 'map-capture-summary.txt'), [string[]]$report, $utf8)
+$sumName = if ($RegistryOnly) { 'map-capture-registry-summary.txt' } else { 'map-capture-summary.txt' }
+[IO.File]::WriteAllLines((Join-Path $root $sumName), [string[]]$report, $utf8)
 Write-Host "`nDone. Results are in $root" -ForegroundColor Green

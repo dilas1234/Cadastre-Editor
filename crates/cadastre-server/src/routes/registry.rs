@@ -539,7 +539,7 @@ pub async fn start_digitising(State(state): State<AppState>, user: AuthUser, Jso
         .fetch_optional(&state.pool).await?.ok_or_else(|| AppError::Conflict("the job type Deed Plan Creationv2 is not active".into()))?;
     let name = format!("Job-{}", file.as_deref().unwrap_or(&txn));
     let params = format!("@LRS:[Transaction]:[TransactionNumber]={txn}");
-    let id = crate::routes::mcservice::create_job_instance(&state.pool, job_type, Some(&name), Some("Deed Plan Creationv2"), Some(&params), "1", &actor.label, "registry.start-digitising")
+    let id = crate::routes::mcservice::create_job_instance(&state.pool, job_type, Some(&name), Some("Deed Plan Creationv2"), Some(&params), "1", &actor.label, "registry.start-digitising", true)
         .await.map_err(AppError::UnprocessableEntity)?;
     Ok(Json(StartedJobDto { job_instance_id: id, name: Some(name), created: true }))
 }

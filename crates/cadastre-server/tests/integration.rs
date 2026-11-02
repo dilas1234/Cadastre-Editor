@@ -2056,13 +2056,18 @@ async fn registry_job_service_like_aumentum() {
 
     let (_, _, t) = soap(&app, path, "GetJobInstance", &format!("<jobInstanceId>{id}</jobInstanceId>"), Some(&cookie)).await;
     assert!(t.contains(&format!("<ID>{id}</ID>")) && t.contains("<Ended xsi:nil=\"true\" />"), "{t}");
+    // Aumentum compares the stored number with the int it is passed: a PLS number never matches.
     let digits: i64 = txn.trim_start_matches("PLS").parse().unwrap();
     let (_, _, t) = soap(&app, path, "GetJobStatusByTransaction", &format!("<transactionNumber>{digits}</transactionNumber>"), Some(&cookie)).await;
-    assert!(t.contains(&format!("<WFJob><ID>{id}</ID>")), "{t}");
+    assert!(t.contains("<GetJobStatusByTransactionResult></GetJobStatusByTransactionResult>"), "{t}");
+    let (_, _, t) = soap(&app, path, "GetJobStatusByJobInstanceID", &format!("<jobInstanceID>{id}</jobInstanceID>"), Some(&cookie)).await;
+    assert!(t.contains(&format!("<GetJobStatusByJobInstanceIDResult><ID>{jt}</ID><Name>{name}</Name>")), "the job's job type: {t}");
+    let unassigned: Option<i32> = sqlx::query_scalar("SELECT assigned_sid FROM cadastre.wf_job_instance WHERE id = $1").bind(id).fetch_one(&pool).await.unwrap();
+    assert_eq!(unassigned, None, "the Registry's jobs start unassigned (CreateNonAssignedTaskInstance)");
     let (_, _, t) = soap(&app, path, "ApproveJob", &format!("<jobInstanceID>{id}</jobInstanceID>"), Some(&cookie)).await;
     assert!(t.contains("<ApproveJobResult>true</ApproveJobResult>"), "{t}");
     let (_, _, t) = soap(&app, path, "IsJobInstanceCompleted", &format!("<jobinstanceID>{id}</jobinstanceID>"), Some(&cookie)).await;
-    assert!(t.contains("<Completed>true</Completed><Status>Approved by the Registry</Status>"), "{t}");
+    assert!(t.contains("<Completed>true</Completed><Status>Already been approved or rejected</Status>"), "Aumentum's wording: {t}");
 
     // The Registry reads a parcel of this Cadastre: points (legs) and attributes.
     let upin = format!("PLJ{n:09}");

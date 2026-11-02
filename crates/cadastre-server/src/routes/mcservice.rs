@@ -283,14 +283,15 @@ pub async fn post(State(state): State<AppState>, headers: HeaderMap, body: Bytes
 /// digitising): on the job type's start task, its default assignee, carrying the parameters and
 /// the transaction number they name.
 pub async fn create_job_instance(pool: &sqlx::PgPool, job_type: i32, name: Option<&str>, comment: Option<&str>, parameters: Option<&str>,
-    priority: &str, actor: &str, via: &str) -> Result<i32, String> {
+    priority: &str, actor: &str, via: &str, assign_default: bool) -> Result<i32, String> {
     let db = |e: sqlx::Error| e.to_string();
     let txn = parameters.and_then(transaction_from_parameters);
     let start: Option<i32> = sqlx::query_scalar::<_, Option<i32>>("SELECT start_task_id FROM cadastre.wf_job_type WHERE id = $1 AND active")
         .bind(job_type).fetch_optional(pool).await.map_err(db)?.ok_or_else(|| format!("job {job_type} not found"))?;
     let start = start.ok_or_else(|| format!("job {job_type} has no start task"))?;
     let mut tx = pool.begin().await.map_err(db)?;
-    let assignee = crate::routes::wf::default_assignee(&mut tx, start).await.map_err(|e| e.to_string())?;
+    // Aumentum's CreateJobInstance leaves the first task unassigned (CreateNonAssignedTaskInstance).
+    let assignee = if assign_default { crate::routes::wf::default_assignee(&mut tx, start).await.map_err(|e| e.to_string())? } else { None };
     let id: i32 = sqlx::query_scalar(
         "INSERT INTO cadastre.wf_job_instance (job_type_id, current_task_id, assigned_sid, priority, status, name, comment, parameters, lrs_transaction_number, created, started, updated, source) \
          VALUES ($1, $2, $3, $4, 2, $5, $6, $7, $8, now()::timestamp, now()::timestamp, now()::timestamp, 'cadastre') RETURNING id",
@@ -299,7 +300,9 @@ pub async fn create_job_instance(pool: &sqlx::PgPool, job_type: i32, name: Optio
     .fetch_one(&mut *tx).await.map_err(db)?;
     sqlx::query("INSERT INTO cadastre.wf_task_instance (job_instance_id, job_type_id, task_id, sid, assigned, started) VALUES ($1, $2, $3, $4, now()::timestamp, now()::timestamp)")
         .bind(id).bind(job_type).bind(start).bind(assignee).execute(&mut *tx).await.map_err(db)?;
-    crate::routes::wf::notify_assignment(&mut tx, id, start, assignee).await.map_err(|e| e.to_string())?;
+    if assignee.is_some() {
+        crate::routes::wf::notify_assignment(&mut tx, id, start, assignee).await.map_err(|e| e.to_string())?;
+    }
     audit::append(&mut tx, actor, "wf_create", "wf_job_instance", Some(&id.to_string()),
         json!({ "job_type_id": job_type, "task_id": start, "assigned_sid": assignee, "lrs_transaction_number": txn, "parameters": parameters, "via": via }))
         .await.map_err(db)?;
@@ -336,10 +339,13 @@ async fn upins_of_jobs(state: &AppState, ids: &[i32]) -> Result<Vec<String>, Str
     .map_err(|e| e.to_string())
 }
 
-/// Jobs of a transaction. The contract passes the number as an int: match the number's digits.
-async fn jobs_of_transaction(state: &AppState, number: i64) -> Result<Vec<i32>, String> {
-    sqlx::query_scalar("SELECT id FROM cadastre.wf_job_instance WHERE NULLIF(regexp_replace(COALESCE(lrs_transaction_number, ''), '\\D', '', 'g'), '')::bigint = $1 ORDER BY id")
-        .bind(number).fetch_all(&state.pool).await.map_err(|e| e.to_string())
+/// Jobs of a transaction, as Aumentum matched them: the job's
+/// `@LRS:[Transaction]:[TransactionNumber]` parameter equal (ignoring case) to the number the
+/// Registry passes (an int in the contract, so PLS numbers match only if stored as digits).
+async fn jobs_of_transaction(state: &AppState, number: String) -> Result<Vec<i32>, String> {
+    let rows: Vec<(i32, Option<String>)> = sqlx::query_as("SELECT id, parameters FROM cadastre.wf_job_instance WHERE parameters ILIKE '%@LRS:[Transaction]:[TransactionNumber]%' ORDER BY id")
+        .fetch_all(&state.pool).await.map_err(|e| e.to_string())?;
+    Ok(rows.into_iter().filter(|(_, p)| p.as_deref().and_then(transaction_from_parameters).is_some_and(|t| t.eq_ignore_ascii_case(&number))).map(|(id, _)| id).collect())
 }
 
 async fn call(state: &AppState, user: &str, op: &str, p: &HashMap<String, String>) -> Result<String, String> {
@@ -355,8 +361,11 @@ async fn call(state: &AppState, user: &str, op: &str, p: &HashMap<String, String
         }
         "CreateJobInstance" => {
             let job_type = int_param(p, "jobID")?;
+            // Aumentum ConvertUInt2Char: priorities above 2 become '2'.
+            let pr = str_param(p, "priority").and_then(|v| v.parse::<u16>().ok()).unwrap_or(1);
+            let pr = if pr > 2 { "2".to_string() } else { pr.to_string() };
             let id = create_job_instance(&state.pool, job_type, str_param(p, "instanceName"), str_param(p, "comments"), str_param(p, "parameters"),
-                str_param(p, "priority").unwrap_or("1"), &format!("registry:{user}"), "LRSWebServices.CreateJobInstance").await?;
+                &pr, &format!("registry:{user}"), "LRSWebServices.CreateJobInstance", false).await?;
             let r = job_row(state, id).await?.ok_or("job vanished")?;
             job_instance_xml("CreateJobInstanceResult", &r)
         }
@@ -384,17 +393,29 @@ async fn call(state: &AppState, user: &str, op: &str, p: &HashMap<String, String
             el(&format!("{op}Result"), bool_s(n > 0))
         }
         "ApproveJob" => el("ApproveJobResult", bool_s(set_status(state, user, int_param(p, "jobInstanceID")?, 5, "wf_registry_approved").await?)),
-        "RejectJob" => el("RejectJobResult", bool_s(set_status(state, user, int_param(p, "jobInstanceID")?, 7, "wf_registry_rejected").await?)),
+        // Aumentum: DeleteJobAreaByJobInstanceID (the job's unposted edits) then status 7.
+        "RejectJob" => {
+            let id = int_param(p, "jobInstanceID")?;
+            sqlx::query("DELETE FROM cadastre.parcel_lineage WHERE pending AND wf_job_instance_id = $1").bind(id).execute(&state.pool).await.map_err(db)?;
+            sqlx::query("DELETE FROM cadastre.parcel p USING cadastre.wf_job_instance w WHERE w.id = $1 AND p.job_id = w.cadastre_job_id AND p.status = 'draft'")
+                .bind(id).execute(&state.pool).await.map_err(db)?;
+            el("RejectJobResult", bool_s(set_status(state, user, id, 7, "wf_registry_rejected").await?))
+        }
         "CompleteJobInstance" => el("CompleteJobInstanceResult", bool_s(set_status(state, user, int_param(p, "jobInstanceID")?, 3, "wf_registry_completed").await?)),
         // A job the Registry withdraws is cancelled, not erased: its history and parcels stay.
         "DeleteJobInstance" => el("DeleteJobInstanceResult", bool_s(set_status(state, user, int_param(p, "jobInstanceId")?, 9, "wf_registry_deleted").await?)),
+        // Aumentum's wording: 3 "Waiting for LRS Commit", 5/7 "Already been approved or rejected",
+        // 2 "Active", otherwise "Unknown".
         "IsJobInstanceCompleted" => {
-            let r = sqlx::query("SELECT s.label, NOT s.is_open AS done FROM cadastre.wf_job_instance j JOIN cadastre.wf_job_status s ON s.code = j.status WHERE j.id = $1")
-                .bind(int_param(p, "jobinstanceID")?).fetch_optional(&state.pool).await.map_err(db)?;
-            match r {
-                Some(r) => format!("<IsJobInstanceCompletedResult>{}{}</IsJobInstanceCompletedResult>", el("Completed", bool_s(r.get("done"))), el("Status", r.get::<String, _>("label"))),
-                None => String::new(),
-            }
+            let st: Option<i16> = sqlx::query_scalar("SELECT status FROM cadastre.wf_job_instance WHERE id = $1").bind(int_param(p, "jobinstanceID")?)
+                .fetch_optional(&state.pool).await.map_err(db)?;
+            let (done, label) = match st {
+                Some(3) => (true, "Waiting for LRS Commit"),
+                Some(5) | Some(7) => (true, "Already been approved or rejected"),
+                Some(2) => (false, "Active"),
+                _ => (false, "Unknown"),
+            };
+            format!("<IsJobInstanceCompletedResult>{}{}</IsJobInstanceCompletedResult>", el("Completed", bool_s(done)), el("Status", label))
         }
         "GetCurrentTaskInstance" => {
             let r = sqlx::query("SELECT id, job_type_id, task_id, sid, assigned, started, ended, comment, job_instance_id FROM cadastre.wf_task_instance \
@@ -443,8 +464,10 @@ async fn call(state: &AppState, user: &str, op: &str, p: &HashMap<String, String
         }
         "GetAllJobsInstances" => {
             let filter = p.get("filter").and_then(|v| v.trim().parse::<i32>().ok()).unwrap_or(0);
-            let rows = sqlx::query(&format!("SELECT {JOB_COLS} FROM cadastre.wf_job_instance WHERE ($1 = 0 AND status IN (1, 2, 8)) OR ($1 <> 0 AND status = $1) ORDER BY id DESC LIMIT 5000"))
-                .bind(filter).fetch_all(&state.pool).await.map_err(db)?;
+            // Aumentum: 1 active, 2 all, 3 completed; any other filter gives nothing.
+            let cond = match filter { 1 => "status IN (1, 2, 8)", 2 => "true", 3 => "status IN (3, 5, 7)", _ => "false" };
+            let rows = sqlx::query(&format!("SELECT {JOB_COLS} FROM cadastre.wf_job_instance WHERE {cond} ORDER BY id DESC LIMIT 20000"))
+                .fetch_all(&state.pool).await.map_err(db)?;
             let rows: Vec<Vec<(String, Option<String>)>> = rows.iter().map(|r| vec![
                 ("ID".into(), Some(r.get::<i32, _>("id").to_string())), ("JobID".into(), Some(r.get::<i32, _>("job_type_id").to_string())),
                 ("Name".into(), r.get("name")), ("JobStatus".into(), Some(r.get::<i16, _>("status").to_string())),
@@ -470,22 +493,21 @@ async fn call(state: &AppState, user: &str, op: &str, p: &HashMap<String, String
         }
         "GetUpinsByJobInstance" => format!("<GetUpinsByJobInstanceResult>{}</GetUpinsByJobInstanceResult>", strings_xml(&upins_of_jobs(state, &[int_param(p, "jobInstanceID")?]).await?)),
         "GetUpinsByTransaction" => {
-            let n: i64 = p.get("transactionNumber").and_then(|v| v.trim().parse().ok()).ok_or("missing transactionNumber")?;
-            let jobs = jobs_of_transaction(state, n).await?;
+            let jobs = jobs_of_transaction(state, p.get("transactionNumber").map(|v| v.trim().to_string()).ok_or("missing transactionNumber")?).await?;
             format!("<GetUpinsByTransactionResult>{}</GetUpinsByTransactionResult>", strings_xml(&upins_of_jobs(state, &jobs).await?))
         }
+        // Aumentum returns the job's job type (WorkflowService.GetJob(item.JobID)).
         "GetJobStatusByTransaction" | "GetJobStatusByJobInstanceID" => {
             let ids = if op == "GetJobStatusByTransaction" {
-                jobs_of_transaction(state, p.get("transactionNumber").and_then(|v| v.trim().parse().ok()).ok_or("missing transactionNumber")?).await?
+                jobs_of_transaction(state, p.get("transactionNumber").map(|v| v.trim().to_string()).ok_or("missing transactionNumber")?).await?
             } else {
                 vec![int_param(p, "jobInstanceID")?]
             };
-            let rows = sqlx::query("SELECT j.id, COALESCE(j.name, t.name) AS name, s.label, j.job_type_id, COALESCE(jt.start_task_id, 0) AS st, COALESCE(jt.end_task_id, 0) AS et \
-                                    FROM cadastre.wf_job_instance j JOIN cadastre.wf_job_status s ON s.code = j.status LEFT JOIN cadastre.wf_task t ON t.id = j.current_task_id \
-                                    LEFT JOIN cadastre.wf_job_type jt ON jt.id = j.job_type_id WHERE j.id = ANY($1) ORDER BY j.id")
+            let rows = sqlx::query("SELECT jt.id, jt.name, jt.description, COALESCE(jt.start_task_id, 0) AS st, COALESCE(jt.end_task_id, 0) AS et \
+                                    FROM cadastre.wf_job_instance j JOIN cadastre.wf_job_type jt ON jt.id = j.job_type_id WHERE j.id = ANY($1) ORDER BY j.id")
                 .bind(&ids).fetch_all(&state.pool).await.map_err(db)?;
             let one = |r: &sqlx::postgres::PgRow, tag: &str| format!("<{tag}>{}{}{}{}{}</{tag}>", el("ID", r.get::<i32, _>("id")), opt_el("Name", &r.get::<Option<String>, _>("name")),
-                el("Description", r.get::<String, _>("label")), el("StartTaskId", r.get::<i32, _>("st")), el("EndTaskId", r.get::<i32, _>("et")));
+                opt_el("Description", &r.get::<Option<String>, _>("description")), el("StartTaskId", r.get::<i32, _>("st")), el("EndTaskId", r.get::<i32, _>("et")));
             if op == "GetJobStatusByTransaction" {
                 format!("<GetJobStatusByTransactionResult>{}</GetJobStatusByTransactionResult>", rows.iter().map(|r| one(r, "WFJob")).collect::<String>())
             } else {

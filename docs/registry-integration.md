@@ -81,21 +81,28 @@ contract pointing at this server.
 |---|---|
 | `Authenticate(user, password)` / `LogOut` | Checks `CADASTRE_MC_SERVICE_USER` / `_PASSWORD` (= the Registry's `mcUserName` / `mcPassword`); sets the `ASP.NET_SessionId` cookie every later call needs. |
 | `GetAllJobs` | Active job types (ID, Name, …). The Registry finds its job type by **name**. |
-| `CreateJobInstance(jobID, instanceName, priority, comments, parameters)` | Creates the job on the type's start task and default assignee, keeping the parameters. `@LRS:[Transaction]:[TransactionNumber]=PLS…` becomes the job's Registry transaction. Returns the `JobInstance`. |
+| `CreateJobInstance(jobID, instanceName, priority, comments, parameters)` | Creates the job, status 2, on the type's start task **unassigned** (Aumentum `CreateNonAssignedTaskInstance`), priority as Aumentum's `ConvertUInt2Char` (above 2 → `2`), keeping the parameters. `@LRS:[Transaction]:[TransactionNumber]=PLS…` becomes the job's Registry transaction. Returns the `JobInstance`. |
 | `GetJobInstance`, `GetJobInstanceParameters`, `UpdateJobInstance`, `UpdateJobInstanceParameters` | Read / update the job (name, comment, parameters, transaction). |
-| `ApproveJob` / `RejectJob` / `CompleteJobInstance` / `DeleteJobInstance` | Status 5 *Approved by the Registry* / 7 *Rejected by the Registry* / 3 *Completed* / 9 *Cancelled* (a deleted job is cancelled, not erased). Migration 0015 labels 5 and 7. |
-| `IsJobInstanceCompleted`, `GetJobStatusByJobInstanceID`, `GetJobStatusByTransaction` | Job status (the transaction number is passed as an int: its digits are matched). |
+| `ApproveJob` | Ends the open tasks, status 5 (Aumentum: end every task of the user, `ApproveRejectJob(id, 5)`). |
+| `RejectJob` | Discards the job's unposted edits: drafts and pending mutations, Aumentum's `DeleteJobAreaByJobInstanceID`. Then status 7. |
+| `CompleteJobInstance` | Ends the open tasks, status 3. Aumentum's `IsJobInstanceCompleted` calls 3 *"Waiting for LRS Commit"*: the Cadastre's work is done and awaits the Registry's approve / reject. |
+| `DeleteJobInstance` | Aumentum deletes the job; **here it is cancelled (status 9)** so its history and parcels stay. This is a deliberate difference. |
+| `IsJobInstanceCompleted` | Aumentum's wording: 3 → *Waiting for LRS Commit* (completed), 5 / 7 → *Already been approved or rejected* (completed), 2 → *Active*, otherwise *Unknown*. |
+| `GetJobStatusByJobInstanceID`, `GetJobStatusByTransaction` | As Aumentum: the job's **job type** (`WFJob`). The transaction match compares the job's `@LRS:[Transaction]:[TransactionNumber]` with the int the Registry passes, so a PLS number never matches (as in Aumentum). |
 | `GetCurrentTaskInstance`, `CompleteTaskInstance`, `CancelTaskInstance` | The job's task: complete moves on when the task graph has exactly one way on, or ends the job. |
 | `GetUpinsByJobInstance`, `GetUpinsByTransaction` | UPINs the job(s) committed. |
 | `GetParcelAttributesByUPIN`, `GetParcelStatus` | The parcel's attribute record (Aumentum field names) and fabric status. |
 | `GetParcelPointsData(pUpin)` | The parcel's boundary legs: from/to beacon names (from the fabric's beacons), north/east, distance, azimuth, bearing (D°M'S"). |
 | `GetConfiguredRegions`, `GetDomains`, `GetDomainDetailsByName` | `Plateau_State`; Aumentum's coded-value domains (`assets/aumentum-domains.json`). |
 | `BatchUpdateDataFromRegistry(parameters)` | `NAME=value` pairs (`|` / `;` / new lines) keyed by `UPIN`, written to the parcel's attribute record; recorded in the audit log. |
-| `GetAllJobsInstances(filter)` | Open jobs (filter 0) or jobs of that status. |
+| `GetAllJobsInstances(filter)` | As Aumentum: 1 active, 2 all, 3 completed (3 / 5 / 7); otherwise none. |
 
-The parameter format of `BatchUpdateDataFromRegistry`, `GetAllJobsInstances`' filter, and the
-exact semantics of Approve / Reject / Delete are inferred from the Registry's code and data. They
-are to be confirmed against Aumentum's WebAdmin code once captured (§6).
+Checked against Aumentum's own code (`MCAdminWebSite.dll`, WebAdmin, decompiled 2026-11-02:
+`MCAdminWebSite.WebServices.LRSWebServices`). `Authenticate` there is a Cadastre user's sign-in
+(`DataHelper.Login`), so the Registry's `mcUserName` is a Cadastre account. Here that account is
+`CADASTRE_MC_SERVICE_USER` / `_PASSWORD`. `BatchUpdateDataFromRegistry` and `GetParcelPointsData` call
+into MCServer's workflow service, whose code is not captured. The `NAME=value|…` format of
+BatchUpdate is therefore still inferred.
 
 ### 3.3 Writing to the Registry: sending the plan back (`src/routes/registry.rs`)
 
@@ -154,7 +161,7 @@ In the server's environment (`~/.config/cadastre/server.env` on the dev PC):
 | `CADASTRE_REGISTRY_USER` / `_PASSWORD` | The Registry account (Aumentum's MCServer used `admin`). |
 | `CADASTRE_REGISTRY_WRITE` | `1`: allow writing to the Registry on user action (send plan). |
 | `CADASTRE_REGISTRY_POLL_SECS` / `_RECONCILE_SECS` | Link check (60) and unlink check (900) intervals. |
-| `CADASTRE_MC_SERVICE_USER` / `_PASSWORD` | The account the Registry signs in with to the job service: set them to the Registry's `multicadastre` `mcUserName` (`administrator`) and `mcPassword`. **Not set yet**: copying the Registry's password is left to the administrator. Until set, the job service answers "not configured". |
+| `CADASTRE_MC_SERVICE_USER` / `_PASSWORD` | The account the Registry signs in with to the job service. It must equal the Registry's `multicadastre` `mcUserName` / `mcPassword`. **Set on 2026-11-02 from `.env` as `Administrator@plagis.com`, but the Registry sends `administrator`**: make the two names equal (here or in the Registry) before cut-over. Without that the Registry is refused. |
 | `CADASTRE_REGISTRY_CADASTRE_LINKING` | `1` re-enables linking from the Cadastre (off: PLAGIS links in the Registry). |
 
 Settings in the database (`cadastre.app_setting`): `aumentum.Integration.SurveyPlanFromMC`
@@ -185,8 +192,8 @@ Aumentum's parcels only.
 
 | Item | Needs | Status |
 |---|---|---|
-| **The Registry's map** (where the admin links). Replace GISViewer's `MapWorker.aspx` so the Registry's unchanged `MapWorkerControl` shows and returns this Cadastre's parcels. | Run `tools/aumentum-inventory/RUN-ME-REGISTRY-MAP-CAPTURE.cmd` on PRODUCTIONMC. It copies the Silverlight client (`Client.xap`), GISViewer's assemblies, WebAdmin's code, and the Registry client's `LRS.Client.MapWorker.dll`, read-only. | Kit ready; waiting for the run |
-| **Confirm the job service's behaviour** against Aumentum's WebAdmin code (Approve / Reject / Delete, BatchUpdate format). | The same capture (WebAdmin). | Built from the contract and data; to confirm |
+| **The Registry's map** (where the admin links). Replace GISViewer's `MapWorker.aspx` so the Registry's desktop (`ThomsonReuters.Aumentum.Registry.PLAGIS.RegistryDesktop`, Properties page with `mapvisible`) shows and returns this Cadastre's parcels. | GISViewer's side is captured. Its script bridge objects are `Map` (layers, visibility, extent, MapReady), `SelectionSet` (`GetSelectedObjects`, `GetSelectedFeatures` → entities with name/value attributes, e.g. UPIN), `SearchFeaturesByClick` (FeatureClick / FeatureDoubleClick, `ActivateLayerEvents`) and `ScriptLink` / `Scriptable` (`Execute`, `DoActions`, `RegisterLayerAction`, `RegisterLayerCallbackAction`, `GetSelectedFeatures`). Still needed: the Registry desktop's own libraries (what it sends through `DoActions` / `Execute`). Run `RUN-ME-REGISTRY-CLIENT-CAPTURE.cmd` (Registry only, about a minute). | Waiting for the Registry client capture |
+| **Job service vs Aumentum** | Checked against `MCAdminWebSite.dll` and corrected (2026-11-02): unassigned start, priority, RejectJob discards the job's edits, status wording, job type answers, exact transaction match. BatchUpdate / points live in MCServer (not captured). | Done, except BatchUpdate's format |
 | **Title deed template parity**: Aumentum's `Plan_.mxd` / `PSG_Plan_.mxd` layout, print, and sending the plan straight from it. | Phase 6 (deed plans). Today the template is the site plan PDF; the plan image is attached and sent. | Planned |
 | `CADASTRE_MC_SERVICE_USER` / `_PASSWORD` | Administrator copies the Registry's `mcUserName` / `mcPassword`. | To do |
 | Registry server clock (+19 min) | IT. | To do |
