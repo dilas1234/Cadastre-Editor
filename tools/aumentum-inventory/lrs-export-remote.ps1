@@ -20,7 +20,10 @@
   Output: <OutDir>\lrs-export\ (back on the Linux machine via \\tsclient\inventory).
   PowerShell 4 compatible.
 #>
-param([string]$OutDir = $PSScriptRoot, [string]$Target = 'registry.plagis.com', [switch]$SkipRegistry, [switch]$SkipLocal)
+# -Resume: do not export again; copy back what an earlier run left on the Registry server (its
+# newest lrs-export-* temp folder, or -RemoteDir), skipping files already copied complete.
+param([string]$OutDir = $PSScriptRoot, [string]$Target = 'registry.plagis.com', [switch]$SkipRegistry, [switch]$SkipLocal,
+      [switch]$Resume, [string]$RemoteDir = '')
 $ErrorActionPreference = 'Stop'
 $root = Join-Path $OutDir 'lrs-export'
 New-Item -ItemType Directory -Path $root -Force | Out-Null
@@ -55,9 +58,20 @@ if (-not $SkipRegistry) {
     $s = New-PSSession -ComputerName $Target -Credential (Get-Credential)
   }
   try {
-    $remoteDir = Invoke-Command -Session $s -ScriptBlock { Join-Path $env:TEMP ('lrs-export-' + (Get-Date -Format yyyyMMdd-HHmmss)) }
-    Write-Host "Running the read-only Registry export on $Target (about 10-30 minutes) ..." -ForegroundColor Cyan
-    Invoke-Command -Session $s -FilePath $script -ArgumentList $remoteDir, '', $sqlUser, $sqlPassword
+    if ($Resume) {
+      $remoteDir = Invoke-Command -Session $s -ArgumentList $RemoteDir -ScriptBlock {
+        param($d)
+        if ($d) { if (Test-Path $d) { return $d } else { return $null } }
+        Get-ChildItem $env:TEMP -Directory -Filter 'lrs-export-*' | Where { Test-Path (Join-Path $_.FullName 'lrs-export-summary.txt') } |
+          Sort LastWriteTime -Descending | Select -First 1 -Expand FullName
+      }
+      if (-not $remoteDir) { Write-Host "No finished export found on $Target to resume from; run without -Resume." -ForegroundColor Red; exit 1 }
+      Write-Host "Resuming the copy of $remoteDir from $Target (no new export) ..." -ForegroundColor Cyan
+    } else {
+      $remoteDir = Invoke-Command -Session $s -ScriptBlock { Join-Path $env:TEMP ('lrs-export-' + (Get-Date -Format yyyyMMdd-HHmmss)) }
+      Write-Host "Running the read-only Registry export on $Target (about 1-2 hours) ..." -ForegroundColor Cyan
+      Invoke-Command -Session $s -FilePath $script -ArgumentList $remoteDir, '', $sqlUser, $sqlPassword
+    }
     $files = Invoke-Command -Session $s -ArgumentList $remoteDir -ScriptBlock {
       param($d)
       $leaf = '\' + (Split-Path $d -Leaf) + '\'
@@ -66,11 +80,17 @@ if (-not $SkipRegistry) {
         New-Object PSObject -Property @{ Full = $_.FullName; Rel = $(if ($i -ge 0) { $_.FullName.Substring($i + $leaf.Length) } else { $_.Name }); Len = $_.Length }
       }
     }
+    # The structure and rows first, the bulky application files (jars) last.
+    $files = @($files | Sort-Object @{ e = { if ($_.Rel -like 'app\*') { 1 } else { 0 } } }, Rel)
     $total = ($files | Measure-Object Len -Sum).Sum
     Write-Host ("Copying {0} files ({1:N1} MB) back to {2} ..." -f @($files).Count, ($total / 1MB), $root) -ForegroundColor Cyan
-    $chunk = 8MB
+    # 4 MB per call: PowerShell 3/4 remoting refuses any object over 10 MB (an 8 MB chunk is
+    # 10.7 MB as base64, which is what stopped the first run at the first jar).
+    $chunk = 4MB; $done = 0; $skipped = 0
     foreach ($f in $files) {
       $dest = Join-Path $root ('registry\' + $f.Rel)
+      $done += $f.Len
+      if ((Test-Path $dest) -and (Get-Item $dest).Length -eq $f.Len) { $skipped++; continue }
       New-Item -ItemType Directory -Path (Split-Path $dest -Parent) -Force | Out-Null
       $out = [IO.File]::Create($dest)
       try {
@@ -85,8 +105,10 @@ if (-not $SkipRegistry) {
         }
       } finally { $out.Close() }
       if ((Get-Item $dest).Length -ne $f.Len) { throw "copy of $($f.Rel) is incomplete" }
-      Write-Host "  $($f.Rel)"
+      Write-Host ("  {0,5:N1}%  {1}" -f (100.0 * $done / [Math]::Max(1, $total)), $f.Rel)
     }
+    if ($skipped) { Write-Host "  ($skipped files were already here complete)" -ForegroundColor DarkGray }
+    # Only after every file is here complete: remove the temp folder this export created there.
     Invoke-Command -Session $s -ArgumentList $remoteDir -ScriptBlock { param($d) if ($d -like '*\lrs-export-*') { Remove-Item $d -Recurse -Force } }
     Write-Host "Registry part done." -ForegroundColor Green
   }
