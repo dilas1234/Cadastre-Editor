@@ -28,6 +28,12 @@ $ErrorActionPreference = 'Stop'
 $root = Join-Path $OutDir 'lrs-export'
 New-Item -ItemType Directory -Path $root -Force | Out-Null
 $utf8 = New-Object Text.UTF8Encoding($false)
+# Reads a text file another process still writes (IIS keeps its log open).
+function ReadShared([string]$path) {
+  $share = [IO.FileShare]'ReadWrite, Delete'
+  $fs = New-Object IO.FileStream($path, ([IO.FileMode]::Open), ([IO.FileAccess]::Read), $share)
+  try { $r = New-Object IO.StreamReader($fs, $true); $r.ReadToEnd() } finally { $fs.Close() }
+}
 function Mask($s) {
   $s -replace '(?i)((password|pwd|passwd|secret|apikey|api_key|token|ticket)\s*[=:]\s*)[^;"''<\s&]+', '$1****' `
      -replace '(?i)(<(password|pwd|passwd|secret|ticket)[^>]*>)[^<]*', '$1****' `
@@ -152,7 +158,7 @@ if (-not $SkipLocal) {
     $libs = '^(Grm\.Cadastre\.RegistryExtension|IntegrationService|ServiceProxy|WorkFlowService|AuditService|LRS\.|ILS\.|ServiceAgent\.|Aumentum\.Cadastre\.Remote|Ils\.MultiCadastre\.Desktop|Ils\.MultiCadastre\.Extension|Ils\.MultiCadastre\.ParcelLineAge)'
     foreach ($f in (Get-ChildItem $desk -File | Where { $_.Name -match $libs -and $_.Extension -match '^\.(dll|tlb|exe)$' })) { Copy-Item $f.FullName $ext; $report.Add("copied $($f.Name) ($($f.Length) bytes, $($f.VersionInfo.FileVersion))") }
     foreach ($f in (Get-ChildItem $desk -File | Where { $_.Extension -match '^\.(config|xml|settings)$' })) {
-      [IO.File]::WriteAllText((Join-Path $ext $f.Name), (Mask ([IO.File]::ReadAllText($f.FullName))), $utf8); $report.Add("copied (masked) $($f.Name)")
+      [IO.File]::WriteAllText((Join-Path $ext $f.Name), (Mask ((ReadShared $f.FullName))), $utf8); $report.Add("copied (masked) $($f.Name)")
     }
   } else { $report.Add('Cadastre Desktop folder not found (looked in C:\Program Files (x86)\AUMENTUM\CADASTRE\Desktop and C:\Program Files\AUMENTUM\CADASTRE\Desktop)'); Write-Host '  Cadastre Desktop folder not found' -ForegroundColor Yellow }
   } catch { $m = "[a] stopped: $($_.Exception.Message)"; $report.Add($m); Write-Host "  $m" -ForegroundColor Red }
@@ -191,7 +197,7 @@ if (-not $SkipLocal) {
       $asm = $f.Extension -eq '.dll' -and $f.Name -match '(?i)LRS|MapWorker|ILS\.|Grm\.|Aumentum|MCPortal'
       if ($text -or $log -or $asm) {
         $dest = Join-Path $gvOut $rel; New-Item -ItemType Directory -Path (Split-Path $dest -Parent) -Force | Out-Null
-        if ($text -or $log) { [IO.File]::WriteAllText($dest, (Mask ([IO.File]::ReadAllText($f.FullName))), $utf8) } else { Copy-Item $f.FullName $dest }
+        if ($text -or $log) { [IO.File]::WriteAllText($dest, (Mask ((ReadShared $f.FullName))), $utf8) } else { try { Copy-Item $f.FullName $dest } catch { $report.Add("GISViewer: not copied $rel ($($_.Exception.Message))") } }
       }
     }
     New-Item -ItemType Directory -Path $gvOut -Force | Out-Null
