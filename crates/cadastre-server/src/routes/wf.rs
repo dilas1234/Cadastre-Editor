@@ -192,14 +192,14 @@ pub struct WfHold {
 /// The caller as an Aumentum principal: matched by login (`code`) or Windows account
 /// (`os_account`, e.g. PLAGIS\jdoe). Administrators (the `admin` role, Aumentum's `admins`
 /// group or `ds_gral_admin`) may act on any task.
-struct Actor {
-    sid: Option<i32>,
-    sids: Vec<i32>,
-    admin: bool,
-    label: String,
+pub(crate) struct Actor {
+    pub(crate) sid: Option<i32>,
+    pub(crate) sids: Vec<i32>,
+    pub(crate) admin: bool,
+    pub(crate) label: String,
 }
 
-async fn resolve_actor(state: &AppState, user: &AuthUser) -> ApiResult<Actor> {
+pub(crate) async fn resolve_actor(state: &AppState, user: &AuthUser) -> ApiResult<Actor> {
     let login = user.username.clone().unwrap_or_else(|| user.subject.clone());
     let short = login.rsplit('\\').next().unwrap_or(&login).to_lowercase();
     let sid: Option<i32> = sqlx::query_scalar(
@@ -590,6 +590,9 @@ pub async fn advance(State(state): State<AppState>, user: AuthUser, Path(id): Pa
         if drafts > 0 {
             return Err(AppError::Conflict(format!("commit (or discard) the job's {drafts} parcel(s) before finishing this task")));
         }
+        if crate::routes::mutations::has_pending_retirement(&mut tx, id).await? {
+            return Err(AppError::Conflict("commit (or discard) the job's parcel retirement before finishing this task".into()));
+        }
     }
     let (edges, end_task) = graph(&state.pool, job_type_id).await?;
     let decision = wfengine::resolve_advance(&edges, end_task, current, is_open, req.to_task_id).map_err(|e| match e {
@@ -721,6 +724,9 @@ pub async fn hold(State(state): State<AppState>, user: AuthUser, Path(id): Path<
 /// Aumentum's "save job area to parcel fabric" tool. A task whose steps use it is a commit task:
 /// the job's parcels are committed there, and the job may not leave it with work uncommitted.
 pub const COMMIT_TOOL: &str = "{E9CFA8EC-BCBF-420d-8BA8-1ACE00F05C83}";
+/// Aumentum's AddUpinsCommand: a task with it gives new parcels their UPINs (e.g. Merge Parcel),
+/// so it commits like a Commit Parcel task.
+pub const ADD_UPINS_TOOL: &str = "{4F7520B2-C09A-4abd-843E-CDD9F241AE16}";
 /// Aumentum's message when a parcel is drawn outside the job area (from the editor's own log).
 pub const OUTSIDE_JOB_AREA: &str = "You have a point outside the Job Area. All edits must be inside Job Area.";
 
@@ -751,22 +757,25 @@ pub struct WfCommitDto {
     pub parcel_numbers: Vec<String>,
     /// Beacon numbers added to the fabric (as typed by the officer).
     pub beacons_added: Vec<String>,
+    /// Parcels the job's mutations made historic or archived.
+    pub retired: Vec<String>,
     pub editing: WfEditingDto,
 }
 
-async fn is_commit_task(conn: &mut sqlx::PgConnection, task_id: Option<i32>) -> ApiResult<bool> {
+pub(crate) async fn is_commit_task(conn: &mut sqlx::PgConnection, task_id: Option<i32>) -> ApiResult<bool> {
     let Some(task_id) = task_id else { return Ok(false) };
     Ok(sqlx::query_scalar(
         "SELECT EXISTS (SELECT 1 FROM cadastre.wf_task_step ts JOIN cadastre.wf_step s ON s.id = ts.step_id \
-         WHERE ts.task_id = $1 AND EXISTS (SELECT 1 FROM unnest(s.commands) c WHERE upper(c) = upper($2)))",
+         WHERE ts.task_id = $1 AND EXISTS (SELECT 1 FROM unnest(s.commands) c WHERE upper(c) IN (upper($2), upper($3))))",
     )
     .bind(task_id)
     .bind(COMMIT_TOOL)
+    .bind(ADD_UPINS_TOOL)
     .fetch_one(conn)
     .await?)
 }
 
-async fn editing_info(state: &AppState, id: i32) -> ApiResult<WfEditingDto> {
+pub(crate) async fn editing_info(state: &AppState, id: i32) -> ApiResult<WfEditingDto> {
     let row = sqlx::query(
         "SELECT w.current_task_id, w.cadastre_job_id, j.reference, \
                 ST_AsGeoJSON(ST_Transform(a.geom, 4326))::json AS area, ST_AsGeoJSON(a.geom)::json AS area_utm, a.status AS area_status, ST_Area(a.geom) AS area_m2, \
@@ -793,7 +802,7 @@ async fn editing_info(state: &AppState, id: i32) -> ApiResult<WfEditingDto> {
 }
 
 /// Lock an open job for a change by `actor` on its current task; returns its current task.
-async fn lock_open_job(tx: &mut sqlx::PgConnection, id: i32, actor: &Actor) -> ApiResult<Option<i32>> {
+pub(crate) async fn lock_open_job(tx: &mut sqlx::PgConnection, id: i32, actor: &Actor) -> ApiResult<Option<i32>> {
     let row = sqlx::query(
         "SELECT j.current_task_id, s.is_open FROM cadastre.wf_job_instance j JOIN cadastre.wf_job_status s ON s.code = j.status \
          WHERE j.id = $1 FOR UPDATE OF j",
@@ -968,7 +977,9 @@ pub async fn discard(State(state): State<AppState>, user: AuthUser, Path(id): Pa
     .execute(&mut *tx)
     .await?
     .rows_affected();
-    audit::append(&mut tx, &actor.label, "wf_discard", "wf_job_instance", Some(&id.to_string()), json!({ "drafts_discarded": n as i64 })).await?;
+    // Discarding the job's edits also drops its recorded mutations (Phase 4).
+    let m = sqlx::query("DELETE FROM cadastre.parcel_lineage WHERE pending AND wf_job_instance_id = $1").bind(id).execute(&mut *tx).await?.rows_affected();
+    audit::append(&mut tx, &actor.label, "wf_discard", "wf_job_instance", Some(&id.to_string()), json!({ "drafts_discarded": n as i64, "mutation_rows_discarded": m as i64 })).await?;
     tx.commit().await?;
     Ok(Json(editing_info(&state, id).await?))
 }
@@ -994,17 +1005,20 @@ pub async fn commit(State(state): State<AppState>, user: AuthUser, Path(id): Pat
     let job_id: Option<uuid::Uuid> = sqlx::query_scalar("SELECT cadastre_job_id FROM cadastre.wf_job_instance WHERE id = $1").bind(id).fetch_one(&mut *tx).await?;
     let job_id = job_id.ok_or_else(|| AppError::Conflict("the job has no parcels to commit".into()))?;
     let drafts: i64 = sqlx::query_scalar("SELECT count(*) FROM cadastre.parcel WHERE job_id = $1 AND status = 'draft'").bind(job_id).fetch_one(&mut *tx).await?;
-    if drafts == 0 {
+    // Parcels this job's mutations replace or retire (Phase 4): not counted as overlaps.
+    let mutated = crate::routes::mutations::pending_parents(&mut tx, id).await?;
+    if drafts == 0 && !crate::routes::mutations::has_pending_retirement(&mut tx, id).await? {
         return Err(AppError::Conflict("the job has no parcels to commit".into()));
     }
     let allow_overlap: Option<String> = sqlx::query_scalar("SELECT value FROM cadastre.app_setting WHERE key = 'editor.allow_overlap'").fetch_optional(&mut *tx).await?;
     if allow_overlap.as_deref() != Some("1") {
         let clashes: Vec<String> = sqlx::query_scalar(
             "SELECT DISTINCT p.parcel_number FROM cadastre.parcel d JOIN cadastre.parcel p \
-               ON p.status = 'posted' AND p.geom && d.geom AND ST_Area(ST_Intersection(p.geom, d.geom)) > 0.01 \
+               ON p.status = 'posted' AND p.geom && d.geom AND ST_Area(ST_Intersection(p.geom, d.geom)) > 0.01 AND NOT (p.parcel_number = ANY($2)) \
              WHERE d.job_id = $1 AND d.status = 'draft' ORDER BY 1 LIMIT 20",
         )
         .bind(job_id)
+        .bind(&mutated)
         .fetch_all(&mut *tx)
         .await?;
         if !clashes.is_empty() {
@@ -1012,11 +1026,15 @@ pub async fn commit(State(state): State<AppState>, user: AuthUser, Path(id): Pat
         }
     }
     let beacons = crate::routes::wfbeacons::apply(&mut tx, job_id, &req).await?;
-    let numbers = crate::routes::jobs::post_drafts(&mut tx, job_id).await?;
+    // Mutations: parents leave the active fabric before their successors take UPINs.
+    let retired = crate::routes::mutations::retire_parents(&mut tx, id).await?;
+    let posted = crate::routes::jobs::post_drafts_with_ids(&mut tx, job_id).await?;
+    crate::routes::mutations::finalise(&mut tx, id, &posted).await?;
+    let numbers: Vec<String> = posted.into_iter().map(|(_, n)| n).collect();
     sqlx::query("UPDATE cadastre.wf_job_instance SET updated = now()::timestamp WHERE id = $1").bind(id).execute(&mut *tx).await?;
-    audit::append(&mut tx, &actor.label, "wf_commit", "wf_job_instance", Some(&id.to_string()), json!({ "parcel_numbers": numbers, "beacons_added": beacons })).await?;
+    audit::append(&mut tx, &actor.label, "wf_commit", "wf_job_instance", Some(&id.to_string()), json!({ "parcel_numbers": numbers, "beacons_added": beacons, "retired": retired })).await?;
     tx.commit().await?;
-    Ok(Json(WfCommitDto { parcel_numbers: numbers, beacons_added: beacons, editing: editing_info(&state, id).await? }))
+    Ok(Json(WfCommitDto { parcel_numbers: numbers, beacons_added: beacons, retired, editing: editing_info(&state, id).await? }))
 }
 
 #[derive(Deserialize, ToSchema)]
@@ -1063,6 +1081,9 @@ pub async fn end_job(State(state): State<AppState>, user: AuthUser, Path(id): Pa
     .await?;
     if drafts > 0 {
         return Err(AppError::Conflict(format!("commit or discard the job's {drafts} parcel(s) before ending it")));
+    }
+    if crate::routes::mutations::has_pending_retirement(&mut tx, id).await? {
+        return Err(AppError::Conflict("commit or discard the job's parcel retirement before ending it".into()));
     }
     sqlx::query("UPDATE cadastre.wf_task_instance SET ended = now()::timestamp, comment = COALESCE($2, comment) WHERE job_instance_id = $1 AND ended IS NULL")
         .bind(id)

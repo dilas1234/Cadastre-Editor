@@ -196,7 +196,6 @@ pub async fn separate_job_parcel(
     if parts.len() < 2 {
         return Err(AppError::BadRequest("the line must cross the parcel from one edge to another".into()));
     }
-    sqlx::query("DELETE FROM cadastre.parcel WHERE id = $1").bind(parcel_id).execute(&mut *tx).await?;
     let mut out = Vec::new();
     let sql = format!(
         "INSERT INTO cadastre.parcel (job_id, geom, computed_area, status) \
@@ -204,8 +203,21 @@ pub async fn separate_job_parcel(
     );
     for g in &parts {
         let row = sqlx::query(&sql).bind(job_id).bind(g).fetch_one(&mut *tx).await?;
-        out.push(row_to_dto(&row)?);
+        let dto = row_to_dto(&row)?;
+        // A mutation's new parcel separated further: each part inherits its recorded lineage.
+        sqlx::query(
+            "INSERT INTO cadastre.parcel_lineage (parcel_id, status, parent_id, parent_upin, mutation_id, mutation_type, pending, wf_job_instance_id, created_by) \
+             SELECT $2, status, parent_id, parent_upin, mutation_id, mutation_type, true, wf_job_instance_id, created_by \
+             FROM cadastre.parcel_lineage WHERE pending AND parcel_id = $1 AND status = 1",
+        )
+        .bind(parcel_id)
+        .bind(dto.id)
+        .execute(&mut *tx)
+        .await?;
+        out.push(dto);
     }
+    sqlx::query("DELETE FROM cadastre.parcel_lineage WHERE pending AND parcel_id = $1 AND status = 1").bind(parcel_id).execute(&mut *tx).await?;
+    sqlx::query("DELETE FROM cadastre.parcel WHERE id = $1").bind(parcel_id).execute(&mut *tx).await?;
     tx.commit().await?;
     Ok((StatusCode::CREATED, Json(out)))
 }

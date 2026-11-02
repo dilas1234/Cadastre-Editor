@@ -55,7 +55,7 @@ pub async fn promote_run(
         "INSERT INTO cadastre.parcel (parcel_number, geom, computed_area, status) \
          SELECT parcel_number, geom, computed_area, 'posted' FROM import.parcel \
          WHERE run_id = $1 AND status = 'active' AND parcel_number IS NOT NULL \
-         ON CONFLICT (parcel_number) DO UPDATE \
+         ON CONFLICT (parcel_number) WHERE status = 'posted' DO UPDATE \
            SET geom = EXCLUDED.geom, computed_area = EXCLUDED.computed_area, \
                status = 'posted', updated_at = now()",
     )

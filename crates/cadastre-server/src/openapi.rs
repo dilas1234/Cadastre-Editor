@@ -11,7 +11,7 @@ use crate::models::{
     TopologyReportDto, TransitionDto, WorkflowDto,
 };
 use crate::routes::{
-    audit, beacons, catalog, fabric, fci, health, import, jobs, me, parcels, promote, reports, sessions, survey,
+    audit, beacons, catalog, fabric, fci, mutations, health, import, jobs, me, parcels, promote, reports, sessions, survey,
     survey_tools, tolerances, workflow,
 };
 
@@ -77,6 +77,10 @@ use crate::routes::{
         parcels::update_job_parcel,
         parcels::delete_job_parcel,
         parcels::separate_job_parcel,
+        mutations::create,
+        mutations::list,
+        mutations::cancel,
+        mutations::lineage,
         parcels::search_parcels,
         jobs::post_job,
         audit::list_audit,
@@ -103,7 +107,7 @@ use crate::routes::{
         ClosureDto, AreaCheckDto, SurveyChecksDto,
         FabricValidateRequest, TopologyReportDto, OverlapDto,
         AdjustRequest, AdjustResponse, ObservationDto, LineResidualDto,
-        NewParcel, crate::routes::parcels::SeparateRequest, PostResult, AuditEntryDto, AuditVerifyDto, PromoteResult,
+        NewParcel, crate::routes::parcels::SeparateRequest, crate::routes::mutations::MutationRequest, crate::routes::mutations::PendingMutationDto, crate::routes::mutations::LineageDto, crate::routes::mutations::LineageEdgeDto, PostResult, AuditEntryDto, AuditVerifyDto, PromoteResult,
         crate::routes::import::PreviewRequest, crate::routes::import::AttributeImportRequest,
         crate::routes::import::JobImportRequest,
         crate::routes::fci::FciRequest,

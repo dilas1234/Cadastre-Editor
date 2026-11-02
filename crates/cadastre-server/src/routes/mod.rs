@@ -10,6 +10,7 @@ pub mod health;
 pub mod import;
 pub mod jobs;
 pub mod me;
+pub mod mutations;
 pub mod parcels;
 pub mod promote;
 pub mod reports;
@@ -72,6 +73,7 @@ pub fn router(state: AppState) -> Router {
         .route("/api/v1/catalog/shapefile", get(catalog::shapefile))
         .route("/api/v1/parcels.geojson", get(viewer::parcels_geojson))
         .route("/api/v1/beacons.geojson", get(viewer::beacons_geojson))
+        .route("/api/v1/beacons.compact", get(viewer::beacons_compact))
         .route(
             "/api/v1/tolerances",
             get(tolerances::get_tolerances).put(tolerances::put_tolerances),
@@ -84,6 +86,9 @@ pub fn router(state: AppState) -> Router {
         .route("/api/v1/beacons/{id}", get(beacons::get_beacon))
         .route("/api/v1/parcels", get(parcels::list_parcels))
         .route("/api/v1/parcels/search", get(parcels::search_parcels))
+        .route("/api/v1/parcels/lineage", get(mutations::lineage))
+        .route("/api/v1/wf/jobs/{id}/mutations", get(mutations::list).post(mutations::create))
+        .route("/api/v1/wf/jobs/{id}/mutations/{group}", delete(mutations::cancel))
         // Live survey check (FR-COG-02/03)
         .route("/api/v1/survey/check", post(survey::check_survey))
         // The 35 computation tools (COGO, curves, area, transformations, geodetic)
@@ -141,6 +146,8 @@ pub fn router(state: AppState) -> Router {
             "/api/v1/sessions/{id}/locks/{lock_id}",
             delete(sessions::release_lock),
         )
+        // gzip for clients that ask (the map's GeoJSON and beacon lists shrink several-fold).
+        .layer(tower_http::compression::CompressionLayer::new())
         .layer(TraceLayer::new_for_http())
         .with_state(state)
 }

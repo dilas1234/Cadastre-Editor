@@ -251,6 +251,10 @@ map.once("style.load", async () => {
   // Aumentum's Plateau_State_Parcels symbology: thin dark-red outlines; the parcel in focus in
   // red with its vertices dotted.
   map.addLayer({ id: "parcels-line", type: "line", source: "parcels", paint: { "line-color": PARCEL_STROKE, "line-width": 1 } });
+  // Parcel history (Phase 4): shapes replaced by a mutation (historic) or retired (archived).
+  map.addSource("history", { type: "geojson", data: empty(), promoteId: "id" });
+  map.addLayer({ id: "history-fill", type: "fill", source: "history", layout: { visibility: "none" }, paint: { "fill-color": "#888", "fill-opacity": 0.12 } }, "parcels-line");
+  map.addLayer({ id: "history-line", type: "line", source: "history", layout: { visibility: "none" }, paint: { "line-color": "#666", "line-width": 1.2, "line-dasharray": [3, 2] } }, "parcels-line");
   map.addLayer({ id: "parcels-focus", type: "line", source: "parcels", filter: ["==", ["get", "id"], ""],
     paint: { "line-color": "#ff0000", "line-width": 1.6 } });
   map.addSource("focus-vertices", { type: "geojson", data: empty() });
@@ -287,12 +291,6 @@ map.once("style.load", async () => {
   map.addSource("beacons", { type: "geojson", data: empty(), promoteId: "id" });
   map.addLayer({ id: "beacons-pt", type: "circle", source: "beacons", filter: ["==", ["get", "is_control"], true],
     paint: { "circle-radius": 4.5, "circle-color": "#55ff00", "circle-stroke-color": "#1a3d00", "circle-stroke-width": 1 } });
-  // Survey beacons (Aumentum Plateau_State_Points): loaded for the area in view when zoomed in.
-  map.addLayer({ id: "beacons-survey", type: "circle", source: "beacons", filter: ["==", ["get", "is_control"], false],
-    paint: { "circle-radius": 3, "circle-color": "#ffffff", "circle-stroke-color": "#222222", "circle-stroke-width": 1 } });
-  map.addLayer({ id: "beacons-survey-label", type: "symbol", source: "beacons", minzoom: 17, filter: ["==", ["get", "is_control"], false],
-    layout: { "text-field": ["get", "number"], "text-font": ["OpenSans-Regular"], "text-size": 10, "text-offset": [0.6, -0.6], "text-anchor": "bottom-left" },
-    paint: { "text-color": "#222222", "text-halo-color": "#ffffff", "text-halo-width": 1 } });
 
   // Beacons found with Find: ringed in red and labelled.
   map.addSource("found", { type: "geojson", data: empty() });
@@ -343,26 +341,27 @@ async function loadParcels(fit) {
   map.getSource("parcels").setData(state.parcels);
   if (fit && !initialDeepLink) zoomToFC(state.parcels, { animate: false }, true) || map.fitBounds([REGION_BBOX.slice(0, 2), REGION_BBOX.slice(2)], { animate: false });
 }
-// Control points are few and always shown; survey beacons are many (Aumentum's
-// Plateau_State_Points), so only those in view are loaded, once zoomed in to street level.
-const SURVEY_BEACON_MINZOOM = 14;
-let ctrlBeacons = empty(), surveyBeaconSeq = 0, surveyBeaconTimer = null;
+// The map shows the control points only (as before); survey beacons are not drawn, but Find, the
+// Beacon box and the commit window search all of them on the server.
 async function loadBeacons() {
-  try { ctrlBeacons = asFC(await api("/api/v1/beacons.geojson?control=true")); } catch { ctrlBeacons = empty(); }
-  await loadSurveyBeacons();
-}
-async function loadSurveyBeacons() {
-  const seq = ++surveyBeaconSeq;
-  let fc = empty();
-  if (map.getZoom() >= SURVEY_BEACON_MINZOOM) {
-    const b = map.getBounds();
-    try { fc = asFC(await api(`/api/v1/beacons.geojson?control=false&bbox=${[b.getWest(), b.getSouth(), b.getEast(), b.getNorth()].join(",")}`)); } catch { fc = empty(); }
-  }
-  if (seq !== surveyBeaconSeq) return; // a newer view's request superseded this one
-  state.beacons = { type: "FeatureCollection", features: [...ctrlBeacons.features, ...fc.features] };
+  let rows = [];
+  try { rows = (await api("/api/v1/beacons.compact?control=true")).rows; } catch { rows = []; }
+  state.beacons = { type: "FeatureCollection", features: rows.map(([number, easting, northing, is_control]) => ({
+    type: "Feature", geometry: { type: "Point", coordinates: toLL(easting, northing) },
+    properties: { id: number, number, is_control, easting, northing } })) };
   map.getSource("beacons")?.setData(state.beacons);
 }
-map.on("moveend", () => { clearTimeout(surveyBeaconTimer); surveyBeaconTimer = setTimeout(loadSurveyBeacons, 250); });
+let historyTimer = null;
+map.on("moveend", () => { clearTimeout(historyTimer); historyTimer = setTimeout(loadHistory, 250); });
+// The history layer, for the area in view (only while it is switched on).
+let historySeq = 0;
+async function loadHistory() {
+  if (!map.getLayer("history-line") || map.getLayoutProperty("history-line", "visibility") === "none") return;
+  const seq = ++historySeq, b = map.getBounds();
+  let fc = empty();
+  if (map.getZoom() >= 13) { try { fc = asFC(await api(`/api/v1/parcels.geojson?status=retired&limit=5000&bbox=${[b.getWest(), b.getSouth(), b.getEast(), b.getNorth()].join(",")}`)); } catch { fc = empty(); } }
+  if (seq === historySeq) map.getSource("history")?.setData(fc);
+}
 async function loadDrafts() {
   state.drafts = state.job ? asFC(await api(`/api/v1/parcels.geojson?status=draft&limit=5000&job=${state.job.id}`).catch(() => empty())) : empty();
   map.getSource("drafts") && map.getSource("drafts").setData(state.drafts);
@@ -758,6 +757,9 @@ map.on("moveend", updateScaleBox);
 // Layer model (drawing order, top first). Each leaf maps to MapLibre layer ids + legend entries.
 const LAYERS = [
   { id: "cadastral", name: "PLAGIS CADASTRE - Cadastral Fabric", group: true, visible: true, open: true, children: [
+    { id: "history", name: `${REGION}_Parcels (history)`, kind: "polygon", visible: false, open: false,
+      map: ["history-fill", "history-line"], source: "cadastre.parcel (historic / archived; in view when zoomed in)",
+      legend: () => [{ sym: "fill", fill: "#ddd", stroke: "#666", label: "Replaced or retired parcel" }] },
     { id: "parcels", name: `${REGION}_Parcels`, kind: "polygon", visible: true, open: true,
       map: ["parcels-fill", "parcels-line", "parcels-focus", "parcels-focus-vtx", "parcels-sel", "parcels-label"], source: "cadastre.parcel",
       legend: () => [{ sym: "fill", fill: "#fff", stroke: PARCEL_STROKE, label: "<all other values>" },
@@ -769,8 +771,7 @@ const LAYERS = [
     { id: "lines", name: `${REGION}_Lines`, kind: "line", visible: true, open: true,
       map: ["survey-line"], source: "survey traverse (live)", legend: () => [{ sym: "line", stroke: "#e60000", label: "" }] },
     { id: "points", name: `${REGION}_Points`, kind: "point", visible: true, open: true,
-      map: ["survey-pt", "beacons-survey", "beacons-survey-label"], source: "cadastre.beacon (survey beacons in view, when zoomed in) + survey traverse (live)",
-      legend: () => [{ sym: "dot", fill: "#ffffff", stroke: "#222222", label: "Beacon" }, { sym: "cross", label: "Traverse point" }] },
+      map: ["survey-pt"], source: "survey traverse (live)", legend: () => [{ sym: "cross", label: "" }] },
     { id: "ctrl", name: `${REGION}_CtrlPnts`, kind: "point", visible: true, open: true,
       map: ["beacons-pt"], source: "cadastre.beacon", legend: () => [{ sym: "dot", fill: "#55ff00", stroke: "#1a3d00", label: "" }] },
   ] },
@@ -786,6 +787,7 @@ function effectiveVisible(l) {
   return l.visible && (!parent || parent.visible);
 }
 function applyVisibility() {
+  setTimeout(loadHistory, 0);
   for (const l of allLeaves()) for (const id of l.map) if (map.getLayer(id)) map.setLayoutProperty(id, "visibility", effectiveVisible(l) ? "visible" : "none");
   applyDynVisibility();
 }
@@ -1214,15 +1216,17 @@ function focusParcel(f) {
 // identify
 function identifyAt(e) {
   const feats = map.queryRenderedFeatures([[e.point.x - 3, e.point.y - 3], [e.point.x + 3, e.point.y + 3]],
-    { layers: ["beacons-pt", "beacons-survey", "drafts-fill", "parcels-fill"].filter((l) => map.getLayer(l)) });
+    { layers: ["beacons-pt", "drafts-fill", "parcels-fill", "history-fill"].filter((l) => map.getLayer(l) && map.getLayoutProperty(l, "visibility") !== "none") });
   const [E, N] = toUTM(e.lngLat.lng, e.lngLat.lat);
-  const names = { "beacons-pt": `${REGION}_CtrlPnts`, "beacons-survey": `${REGION}_Points`, "drafts-fill": `${REGION}_JobsArea`, "parcels-fill": `${REGION}_Parcels` };
+  const names = { "beacons-pt": `${REGION}_CtrlPnts`, "drafts-fill": `${REGION}_JobsArea`, "parcels-fill": `${REGION}_Parcels`, "history-fill": `${REGION}_Parcels (history)` };
   const body = h("div", {}, h("div", { class: "frow" }, h("label", {}, "Location:"), h("span", {}, `${fmt3(E)}  ${fmt3(N)} Meters`)));
   if (!feats.length) body.append(h("p", { class: "muted" }, "No identified features."));
   for (const f of feats) {
     const p = f.properties;
     const rows = Object.entries(p).filter(([k]) => k !== "id").map(([k, v]) => h("tr", {}, h("th", {}, k), h("td", {}, v == null || v === "null" ? "<Null>" : String(v))));
     body.append(h("h4", { style: "margin:8px 0 3px" }, names[f.layer.id]), h("table", {}, ...rows));
+    if ((f.layer.id === "parcels-fill" || f.layer.id === "history-fill") && p.parcel_number)
+      body.append(h("div", { class: "frow" }, h("button", { class: "btn", onclick: () => lineageWindow(p.parcel_number) }, "Lineage…")));
   }
   const top = feats.find((f) => f.layer.id === "parcels-fill");
   if (top) focusParcel(top);
@@ -2041,7 +2045,7 @@ function sketchClick(e) {
 }
 // Snap to the nearest beacon / parcel / draft vertex within ~14px of the cursor.
 function snapUTM(pt) {
-  const layers = ["beacons-pt", "beacons-survey", "drafts-line", "parcels-line"].filter((l) => map.getLayer(l));
+  const layers = ["beacons-pt", "drafts-line", "parcels-line"].filter((l) => map.getLayer(l));
   if (!layers.length) return null;
   const feats = map.queryRenderedFeatures([[pt.x - 14, pt.y - 14], [pt.x + 14, pt.y + 14]], { layers });
   let best = null, bestD = 14;
@@ -2064,10 +2068,11 @@ function drawSketch() {
   ll.forEach((c, i) => feats.push({ type: "Feature", properties: { idx: i, sel: i === edit.sel || (edit.sel < 0 && i === ll.length - 1) }, geometry: { type: "Point", coordinates: c } }));
   map.getSource("sketch")?.setData({ type: "FeatureCollection", features: feats });
 }
-function clearSketch() { edit.verts = []; edit.sel = -1; edit.editingId = null; map.getSource("sketch")?.setData(empty()); }
-function canFinishSketch() { const n = edit.verts.length; return edit.geomType === "polygon" ? n >= 3 : edit.geomType === "line" ? n >= 2 : n >= 1; }
+function clearSketch() { edit.verts = []; edit.sel = -1; edit.editingId = null; edit.splitMode = false; map.getSource("sketch")?.setData(empty()); }
+function canFinishSketch() { const n = edit.verts.length; return edit.splitMode ? n >= 2 : edit.geomType === "polygon" ? n >= 3 : edit.geomType === "line" ? n >= 2 : n >= 1; }
 async function finishSketch() {
   if (!canFinishSketch()) { status(`Add ${edit.geomType === "polygon" ? "at least 3" : edit.geomType === "line" ? "at least 2" : "a"} vertex(es) before finishing.`); return; }
+  if (edit.splitMode) { await mutationSplit(); return; }
   if (edit.geomType === "polygon" && edit.template === "jobArea") await saveSketchJobArea();
   else if (edit.geomType === "polygon") await saveSketchParcel();
   else if (edit.geomType === "point") await saveSketchPoint();
@@ -2271,6 +2276,12 @@ function computationMenu() {
     "-",
     { label: "Create Donut Parcel", action: () => startPickDraft("donut"), disabled: () => !(edit.geomType === "polygon" && edit.verts.length >= 3 && !edit.editingId) },
     { label: "Parcel Separation", action: () => startPickDraft("separate"), disabled: () => !(edit.verts.length >= 2 && !edit.editingId) },
+    "-",
+    { label: "Split Parcel (sketch a line)", action: startSplitLine },
+    { label: "Merge Selected Parcels", action: mutationMerge },
+    { label: "Re-survey Selected Parcel", action: mutationResurvey },
+    { label: "Retire Selected Parcel…", action: mutationRetire },
+    { label: "Parcel Lineage…", action: () => lineageOfSelection() },
     "-",
     { label: "Create Parcel by FCI (Feature Class Import)…", action: fciDialog },
     { label: "Import Points (Import Wizard)…", action: openImportDialog },
@@ -2482,6 +2493,105 @@ function fciDialog() {
     h("div", { class: "frow" }, h("label", {}, "EPSG:"), epsg),
     h("div", { class: "frow", style: "justify-content:flex-end" }, h("button", { class: "btn", onclick: go }, "Import")), out), { id: "fciWin", width: 460 });
   sync();
+}
+
+/* =====================================================================================
+ * Phase 4 — mutations and lineage (Aumentum: Split Parcel / Merge Parcel steps; re-survey and
+ * retirement from its lineage history). Recorded in the workflow job, applied at commit.
+ * ===================================================================================== */
+const selectedUpins = () => selectedFC().features.map((f) => f.properties.parcel_number).filter(Boolean);
+function needWorkflowJob() {
+  if (wf.editing) return wf.editing.job_instance_id;
+  alert("Open the job in the Workflow panel and choose Work On This Job first."); return null;
+}
+async function afterMutation(msg) {
+  clearSketch(); refreshSketchProps(); updateEditorButtons();
+  await loadDrafts(); await wfRefreshEditing(); if (wf.selected) await wfSelect(wf.selected);
+  notify(msg);
+}
+async function recordMutation(body, msg) {
+  const id = needWorkflowJob(); if (!id) return;
+  try {
+    const r = await api(`/api/v1/wf/jobs/${id}/mutations`, { method: "POST", body });
+    clearSelection(); await afterMutation(typeof msg === "function" ? msg(r) : msg);
+    if (r.drafts.length) zoomToFC(state.drafts, { padding: 80 });
+  } catch (e) { notify(e.message, "err"); }
+}
+function startSplitLine() {
+  const u = selectedUpins();
+  if (u.length !== 1) { alert("Select the one parcel to split first (Select tool)."); return; }
+  if (!needWorkflowJob()) return;
+  if (!edit.active) startEditing("sketch");
+  clearSketch(); selectTemplate("line"); edit.splitMode = true; setTool("sketch"); openSketchProps();
+  status(`Split ${u[0]}: click the line's points across the parcel (or type them), then Finish Sketch.`);
+}
+async function mutationSplit() {
+  const u = selectedUpins();
+  if (u.length !== 1) { alert("Select the one parcel to split (Select tool)."); return; }
+  if (edit.verts.length < 2) { alert("Sketch the split line across the parcel first."); return; }
+  const line = { type: "LineString", coordinates: edit.verts.map((v) => [...v]) };
+  edit.splitMode = false;
+  await recordMutation({ kind: "split", upins: u, line }, (r) => `Split of ${u[0]} recorded: ${r.drafts.length} new parcels (drafts). They replace it when the job's parcels are committed.`);
+}
+async function mutationMerge() {
+  const u = selectedUpins();
+  if (u.length < 2) { alert("Select two or more neighbouring parcels to merge (Select tool, Shift-click to add)."); return; }
+  if (!confirm(`Merge ${u.join(" + ")} into one parcel?`)) return;
+  await recordMutation({ kind: "merge", upins: u }, `Merge of ${u.join(" + ")} recorded (a draft). It replaces them when the job's parcels are committed.`);
+}
+async function mutationResurvey() {
+  const u = selectedUpins();
+  if (u.length !== 1) { alert("Select the one parcel to re-survey (Select tool)."); return; }
+  await recordMutation({ kind: "resurvey", upins: u }, `Re-survey of ${u[0]} recorded: edit its copy with the Edit tool; it replaces ${u[0]} (with a new UPIN) at commit.`);
+}
+function mutationRetire() {
+  const u = selectedUpins();
+  if (!u.length) { alert("Select the parcel(s) to retire (Select tool)."); return; }
+  if (!needWorkflowJob()) return;
+  const reason = h("input", { placeholder: "e.g. RE-SURVEYED, overlapping, WRONGLY DONE", style: "flex:1" });
+  const go = async () => { if (!reason.value.trim()) { reason.focus(); return; } w.remove(); await recordMutation({ kind: "retire", upins: u, reason: reason.value.trim() }, `Retirement of ${u.join(", ")} recorded; applied when the job is committed.`); };
+  reason.addEventListener("keydown", (ev) => ev.key === "Enter" && go());
+  const w = floatWindow("Retire Parcel", h("div", {}, h("p", { style: "margin-top:0" }, `Retire ${u.join(", ")}: archived with this reason (Aumentum's Archive Reason). The UPIN is never reused.`),
+    h("div", { class: "frow" }, h("label", {}, "Reason:"), reason), h("div", { class: "frow", style: "justify-content:flex-end" }, h("button", { class: "btn", onclick: go }, "Retire"))), { id: "retireWin", width: 400 });
+  setTimeout(() => reason.focus(), 0);
+}
+function lineageOfSelection() {
+  const u = selectedUpins();
+  if (u.length) { lineageWindow(u[0]); return; }
+  const v = prompt("Parcel UPIN:", ""); if (v && v.trim()) lineageWindow(v.trim());
+}
+// Lineage: where a parcel came from and what it became (Aumentum's history and mutations made here).
+async function lineageWindow(upin) {
+  let d;
+  try { d = await api(`/api/v1/parcels/lineage?upin=${encodeURIComponent(upin)}`); } catch (e) { alert(e.message); return; }
+  const body = h("div", {});
+  const link = (u) => u ? h("a", { href: "#", onclick: (ev) => { ev.preventDefault(); lineageWindow(u); } }, u) : "?";
+  const groups = new Map();
+  for (const e of d.edges) { const k = `${e.mutation_id || ""}|${e.mutation}|${(e.date || "").slice(0, 10)}`; if (!groups.has(k)) groups.set(k, []); groups.get(k).push(e); }
+  if (!groups.size && !d.retirements.length) body.append(h("p", { class: "muted" }, `No recorded mutations for ${d.upin}.`));
+  for (const [k, es] of groups) {
+    const [, name, date] = k.split("|");
+    const parents = [...new Set(es.map((e) => e.parent_upin))], kids = [...new Set(es.map((e) => e.child_upin))];
+    const row = h("div", { style: `margin:4px 0;padding:4px 6px;border-left:3px solid ${parents.includes(d.upin) || kids.includes(d.upin) ? "#b22222" : "#999"}` },
+      h("b", {}, `${date || "—"}  ${name}`), h("span", { class: "muted" }, es[0].source === "aumentum" ? "  (Aumentum)" : ""), h("br"));
+    parents.forEach((u, i) => { if (i) row.append(" + "); row.append(link(u)); });
+    row.append(" → "); kids.forEach((u, i) => { if (i) row.append(", "); row.append(link(u)); });
+    body.append(row);
+  }
+  for (const r of d.retirements) body.append(h("div", { style: "margin:4px 0;padding:4px 6px;border-left:3px solid #666" }, h("b", {}, `${(r.date || "").slice(0, 10)}  Retired `), link(r.upin), `: ${r.reason || ""}`));
+  if (d.shapes.length) {
+    const t = h("table", { class: "legs", style: "margin-top:6px" }, h("tr", {}, h("th", {}, "UPIN"), h("th", {}, "Status"), h("th", {}, "Area (m²)"), h("th", {}, "")));
+    for (const s of d.shapes) t.append(h("tr", {}, h("td", {}, s.upin), h("td", {}, s.status === "posted" ? "active" : s.status), h("td", {}, s.area.toFixed(2)),
+      h("td", {}, h("button", { class: "btn", style: "min-width:0", onclick: async () => {
+        const l = await api(`/api/v1/parcels/search?number=${encodeURIComponent(s.upin)}`).catch(() => []);
+        const p = l.find((x) => x.parcel_number === s.upin && x.status === s.status);
+        if (!p) return;
+        if (s.status !== "posted") { const lyr = allLeaves().find((x) => x.id === "history"); if (lyr && !lyr.visible) { lyr.visible = true; applyVisibility(); buildTOC(); } }
+        zoomToFC({ type: "FeatureCollection", features: [resultFeature(p)] });
+      } }, "Zoom"))));
+    body.append(h("div", { class: "wfSub", style: "margin-top:6px" }, "Shapes in the fabric"), t);
+  }
+  floatWindow(`Lineage — ${d.upin}`, body, { id: "lineageWin", width: 440 });
 }
 
 /* =====================================================================================
@@ -2787,6 +2897,7 @@ async function wfSelect(id) {
   try { wf.files = await api(`/api/v1/wf/jobs/${id}/files`); } catch { wf.files = []; }
   // The job being worked on: its editing state (e.g. whether it is now at its commit task) follows the job.
   if (wf.editing && wf.editing.job_instance_id === id && wf.selEditing) { wf.editing = wf.selEditing; showJobArea(); }
+  if (wf.editing && wf.editing.job_instance_id === id) { try { wf.mutations = await api(`/api/v1/wf/jobs/${id}/mutations`); } catch { wf.mutations = []; } }
   renderWorkflow();
 }
 const wfDate = (s) => (s ? s.replace("T", " ").slice(0, 16) : "—");
@@ -2938,6 +3049,7 @@ function draftNextStep() {
 // Refresh the worked-on job's editing state (draft count, area) after an edit.
 async function wfRefreshEditing() {
   if (!wf.editing) return;
+  try { wf.mutations = await api(`/api/v1/wf/jobs/${wf.editing.job_instance_id}/mutations`); } catch { wf.mutations = []; }
   try { wf.editing = await api(`/api/v1/wf/jobs/${wf.editing.job_instance_id}/editing`); if (wf.selected === wf.editing.job_instance_id) wf.selEditing = wf.editing; renderWorkflow(); } catch { /* keep the last known state */ }
 }
 // --- Editing under a job: job area, drafts, commit -------------------------------------------
@@ -2981,7 +3093,17 @@ async function wfCommitDialog() {
   const id = wf.editing?.job_instance_id; if (!id) { status("Choose Work On This Job first."); return; }
   let pts;
   try { pts = await api(`/api/v1/wf/jobs/${id}/editing/corners`); } catch (e) { alert(e.message); return; }
-  if (!pts.length) { alert("The job has no draft parcels to commit."); return; }
+  if (!pts.length) {
+    const ret = (wf.mutations || []).filter((m) => m.kind === "retire");
+    if (!ret.length) { alert("The job has no draft parcels to commit."); return; }
+    if (!confirm(`Commit the retirement of ${ret.flatMap((m) => m.parents).join(", ")}?`)) return;
+    try {
+      const r = await api(`/api/v1/wf/jobs/${id}/commit`, { method: "POST", body: { beacons: [] } });
+      wf.editing = r.editing; wf.selEditing = wf.editing; await Promise.all([loadParcels(false), loadDrafts()]); loadHistory();
+      notify(`Retired: ${r.retired.join(", ")}.`); wf.detail = await api("/api/v1/wf/jobs/" + id); await wfRefreshEditing(); renderWorkflow();
+    } catch (e) { notify("Commit failed: " + e.message, "err"); }
+    return;
+  }
   const src = () => map.getSource("corners");
   const inputs = new Map();
   let active = null, zoomOnFocus = false;
@@ -3028,7 +3150,8 @@ async function wfCommitDialog() {
       w.remove(); src()?.setData(empty());
       wf.editing = r.editing; wf.selEditing = wf.editing;
       await Promise.all([loadParcels(false), loadBeacons(), loadDrafts()]); showJobArea();
-      status(`Committed ${r.parcel_numbers.length} parcel(s): ${r.parcel_numbers.join(", ")}; ${r.beacons_added.length} beacon(s) added.`);
+      notify(`Committed ${r.parcel_numbers.length} parcel(s): ${r.parcel_numbers.join(", ")}; ${r.beacons_added.length} beacon(s) added.` + (r.retired?.length ? ` Replaced / retired: ${r.retired.join(", ")}.` : ""));
+      loadHistory(); await wfRefreshEditing();
       wf.detail = await api("/api/v1/wf/jobs/" + id); renderWorkflow();
     } catch (e) { commitBtn.disabled = false; msg.style.color = "#b00"; msg.textContent = e.message; }
   } }, "Commit");
@@ -3066,7 +3189,19 @@ function wfEditingView(j, e) {
     ed.area ? h("button", { class: "btn", onclick: () => { if (confirm("Delete the job area?")) wfEditAction("DELETE", "/area", "Job area deleted."); } }, "Delete Job Area") : null,
     h("button", { class: "btn", disabled: !ed.drafts, onclick: () => { if (confirm(`Discard the job's ${ed.drafts} uncommitted parcel(s)?`)) wfEditAction("POST", "/discard", "Draft parcels discarded."); } }, "Discard Changes"),
     h("button", { class: "btn", onclick: async () => { await loadDrafts(); await wfSelect(j.id); status("Reloaded from the fabric."); } }, "Reload"),
-    ed.is_commit_task ? h("button", { class: "btn", disabled: !ed.drafts, title: "Give the job's draft parcels their UPINs and add them to the fabric", onclick: () => wfCommitDialog() }, "Commit Parcels…") : null));
+    ed.is_commit_task ? h("button", { class: "btn", disabled: !ed.drafts && !(wf.mutations || []).length, title: "Give the job's draft parcels their UPINs and add them to the fabric", onclick: () => wfCommitDialog() }, "Commit Parcels…") : null));
+  // Mutations recorded in the job (Phase 4), applied when the parcels are committed.
+  if ((wf.mutations || []).length) {
+    const ul = h("ul", { class: "wfMutations", style: "margin:4px 0 0;padding-left:18px" });
+    for (const m of wf.mutations) {
+      const what = m.kind === "retire" ? `Retire ${m.parents.join(", ")} (${m.reason || ""})` : `${m.kind[0].toUpperCase() + m.kind.slice(1)} ${m.parents.join(" + ")} → ${m.drafts.length} new parcel(s)`;
+      ul.append(h("li", {}, what, " ", h("button", { class: "btn", style: "min-width:0;padding:0 6px", title: "Cancel this mutation (its draft parcels are removed)", onclick: async () => {
+        if (!confirm(`Cancel: ${what}?`)) return;
+        try { await api(`/api/v1/wf/jobs/${ed.job_instance_id}/mutations/${m.group}`, { method: "DELETE" }); await afterMutation("Mutation cancelled."); } catch (e) { alert(e.message); }
+      } }, "Cancel")));
+    }
+    sec.append(h("div", { class: "wfSub", style: "margin-top:6px" }, "Mutations (applied at commit)"), ul);
+  }
   return sec;
 }
 // What a workflow step's "Open" does in this editor. Steps whose tools belong to later phases say so.
@@ -3095,7 +3230,13 @@ function wfStepAction(s) {
     case 1003: case 1016: case 1017: case 1018: return { run: needJob(() => window.open(`/api/v1/jobs/${wf.editing.cadastre_job_id}/siteplan.pdf`, "_blank")), label: "Plan", tip: "Open the job's site plan (Title Deed Plan layout parity is Phase 6)" };
     case 1009: return { run: needJob(() => fciDialog()), label: "Import", tip: "Create parcels from a polygon feature class (shapefile)" };
     case 1013: return later("Phase 5", "Linking parcels to the Registry");
-    case 1020: case 1021: return later("Phase 4", s.name);
+    case 1020: return { run: needJob(() => stepTools("Merge Parcel", [
+      ["1. Select the parcels (Select tool; Shift-click to add)", () => { setTool("select"); status("Click the parcels to merge; Shift-click to add more."); }],
+      ["2. Merge the selected parcels", mutationMerge], ["Lineage of the selected parcel…", () => lineageOfSelection()]])), label: "Open", tip: "Merge posted parcels into one (applied at commit)" };
+    case 1021: return { run: needJob(() => stepTools("Split Parcel", [
+      ["1. Select the parcel (Select tool)", () => { setTool("select"); status("Click the parcel to split."); }],
+      ["2. Sketch the split line, then Finish Sketch", startSplitLine],
+      ["Re-survey the selected parcel", mutationResurvey], ["Retire the selected parcel…", mutationRetire], ["Lineage of the selected parcel…", () => lineageOfSelection()]])), label: "Open", tip: "Split a posted parcel along a line (applied at commit)" };
     default: return { label: "—", tip: "No editor action for this step" };
   }
 }

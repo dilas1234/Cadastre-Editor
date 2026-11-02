@@ -1427,3 +1427,141 @@ fn shapefile_polygons(polys: &[Vec<(f64, f64)>]) -> Vec<u8> {
     out.extend(recs);
     out
 }
+
+/// Phase 4: mutations recorded in a workflow job and applied at commit, as Aumentum does (from
+/// its parcelLineage history): split (1 -> many), merge (many -> 1), retire (archived with a
+/// reason), cancel; parents become historic/archived, children get new UPINs, lineage is kept.
+#[tokio::test]
+async fn mutations_split_merge_retire_with_lineage() {
+    let Some(db_url) = test_db_url() else {
+        eprintln!("skipping: CADASTRE_TEST_DATABASE_URL not set");
+        return;
+    };
+    let app = routes::router(state_with(AuthMode::Disabled, None, &db_url).await);
+    let pool = sqlx::PgPool::connect(&db_url).await.unwrap();
+    let b = 300_000 + (rand_12() % 600_000) as i32 * 10;
+    let (construct, commit_t, plan) = (b, b + 1, b + 2);
+    for (id, name) in [(construct, "Split Parcel"), (commit_t, "Commit Parcel"), (plan, "Generate Title Deed Plan")] {
+        sqlx::query("INSERT INTO cadastre.wf_task (id, name) VALUES ($1, $2)").bind(id).bind(name).execute(&pool).await.unwrap();
+    }
+    sqlx::query("INSERT INTO cadastre.wf_step (id, name, commands) VALUES ($1, 'Commit Parcel', ARRAY[$2])")
+        .bind(b).bind(cadastre_server::routes::wf::COMMIT_TOOL).execute(&pool).await.unwrap();
+    sqlx::query("INSERT INTO cadastre.wf_task_step (task_id, step_id) VALUES ($1, $2)").bind(commit_t).bind(b).execute(&pool).await.unwrap();
+    sqlx::query("INSERT INTO cadastre.wf_job_type (id, name, start_task_id, end_task_id) VALUES ($1, 'Mutation (test)', $2, $3)")
+        .bind(b).bind(construct).bind(plan).execute(&pool).await.unwrap();
+    for (f, t) in [(construct, commit_t), (commit_t, plan)] {
+        sqlx::query("INSERT INTO cadastre.wf_task_flow (job_type_id, task_id, next_task_id) VALUES ($1, $2, $3)").bind(b).bind(f).bind(t).execute(&pool).await.unwrap();
+    }
+    let x0 = 150_000.0 + ((b / 10) % 60_000) as f64 * 10.0;
+    let y0 = 8_800_000.0;
+    // Four posted parcels: A alone; B and C sharing an edge; D alone.
+    let tag = format!("PLM{}", rand_12() % 1_000_000_000);
+    let upin = |k: &str| format!("{tag}{k}");
+    for (k, x, y) in [("A", 10.0, 10.0), ("B", 60.0, 10.0), ("C", 80.0, 10.0), ("D", 130.0, 10.0)] {
+        sqlx::query("INSERT INTO cadastre.parcel (parcel_number, geom, computed_area, status) VALUES ($1, ST_MakeEnvelope($2, $3, $2 + 20, $3 + 20, 32632), 400, 'posted')")
+            .bind(upin(k)).bind(x0 + x).bind(y0 + y).execute(&pool).await.unwrap();
+    }
+    let (_, d) = send(&app, "POST", "/api/v1/wf/jobs", None, Some(json!({"job_type_id": b, "name": "Job-MUT"}))).await;
+    let id = d["job"]["id"].as_i64().unwrap();
+    let murl = format!("/api/v1/wf/jobs/{id}/mutations");
+    let (st, r) = send(&app, "POST", &murl, None, Some(json!({"kind": "split", "upins": [upin("A")]}))).await;
+    assert_eq!(st, StatusCode::CONFLICT, "editing not started: {r}");
+    send(&app, "POST", &format!("/api/v1/wf/jobs/{id}/editing"), None, None).await;
+    let (st, _) = send(&app, "PUT", &format!("/api/v1/wf/jobs/{id}/area"), None, Some(json!({"geometry": square(x0, y0, 200.0)}))).await;
+    assert_eq!(st, StatusCode::OK);
+
+    // Split A along x = x0 + 25.
+    let line = json!({"type": "LineString", "coordinates": [[x0 + 25.0, y0 + 5.0], [x0 + 25.0, y0 + 35.0]]});
+    let (st, split) = send(&app, "POST", &murl, None, Some(json!({"kind": "split", "upins": [upin("A")], "line": line}))).await;
+    assert_eq!(st, StatusCode::CREATED, "{split}");
+    assert_eq!(split["drafts"].as_array().unwrap().len(), 2);
+    let (st, r) = send(&app, "POST", &murl, None, Some(json!({"kind": "resurvey", "upins": [upin("A")]}))).await;
+    assert_eq!(st, StatusCode::CONFLICT, "A is already being mutated: {r}");
+    // Merge B + C (adjacent); B + D do not touch.
+    let (st, r) = send(&app, "POST", &murl, None, Some(json!({"kind": "merge", "upins": [upin("B"), upin("D")]}))).await;
+    assert_eq!(st, StatusCode::BAD_REQUEST, "{r}");
+    let (st, merge) = send(&app, "POST", &murl, None, Some(json!({"kind": "merge", "upins": [upin("B"), upin("C")]}))).await;
+    assert_eq!(st, StatusCode::CREATED, "{merge}");
+    // Retire D: a reason is required.
+    let (st, _) = send(&app, "POST", &murl, None, Some(json!({"kind": "retire", "upins": [upin("D")]}))).await;
+    assert_eq!(st, StatusCode::BAD_REQUEST);
+    let (st, _) = send(&app, "POST", &murl, None, Some(json!({"kind": "retire", "upins": [upin("D")], "reason": "overlapping"}))).await;
+    assert_eq!(st, StatusCode::CREATED);
+    // A re-survey recorded then cancelled leaves nothing behind.
+    sqlx::query("INSERT INTO cadastre.parcel (parcel_number, geom, computed_area, status) VALUES ($1, ST_MakeEnvelope($2, $3, $2 + 20, $3 + 20, 32632), 400, 'posted')")
+        .bind(upin("E")).bind(x0 + 10.0).bind(y0 + 100.0).execute(&pool).await.unwrap();
+    let (_, rs) = send(&app, "POST", &murl, None, Some(json!({"kind": "resurvey", "upins": [upin("E")]}))).await;
+    let (st, _) = send(&app, "DELETE", &format!("{murl}/{}", rs["group"].as_str().unwrap()), None, None).await;
+    assert_eq!(st, StatusCode::NO_CONTENT);
+    let (_, pending) = send(&app, "GET", &murl, None, None).await;
+    assert_eq!(pending.as_array().unwrap().len(), 3, "split, merge, retire pending: {pending}");
+
+    // The parents' Aumentum attribute records (B before C, so B is a merge's source).
+    let oid = 800_000_000 + (rand_12() % 100_000_000) as i32;
+    for (k, o, block, pn) in [("A", oid, "B7", "PL999"), ("B", oid + 1, "B9", "PL111"), ("C", oid + 2, "C1", "PL222")] {
+        sqlx::query("INSERT INTO cadastre.parcel_attribute (object_id, upin, dataset_name, region_name, parcel_name, block, lga, location, property_type, area_unit, property_number, status, lrs_id, linkage_status, plan_number) \
+                     VALUES ($1, $2, 'DS', 'Plateau_State', 'PCL1', $3, '6', '1', '1', 2, $4, '0', $5, 1, 'PLAN-X')")
+            .bind(o).bind(upin(k)).bind(block).bind(pn).bind(format!("LRS-{k}")).execute(&pool).await.unwrap();
+    }
+
+    // Commit at the commit task (beacon numbers typed for every new corner).
+    send(&app, "POST", &format!("/api/v1/wf/jobs/{id}/advance"), None, Some(json!({}))).await;
+    let (_, pts) = send(&app, "GET", &format!("/api/v1/wf/jobs/{id}/editing/corners"), None, None).await;
+    let beacons: Vec<Value> = pts.as_array().unwrap().iter().filter(|p| p["beacon_id"].is_null()).enumerate()
+        .map(|(i, p)| json!({"easting": p["easting"], "northing": p["northing"], "number": format!("{tag}-{i}")})).collect();
+    let (st, c) = send(&app, "POST", &format!("/api/v1/wf/jobs/{id}/commit"), None, Some(json!({"beacons": beacons}))).await;
+    assert_eq!(st, StatusCode::OK, "children overlap their parents, which are being replaced: {c}");
+    let new_upins: Vec<String> = c["parcel_numbers"].as_array().unwrap().iter().map(|v| v.as_str().unwrap().to_string()).collect();
+    assert_eq!(new_upins.len(), 3, "two split parts and one merged parcel: {c}");
+    let mut retired: Vec<String> = c["retired"].as_array().unwrap().iter().map(|v| v.as_str().unwrap().to_string()).collect();
+    retired.sort();
+    assert_eq!(retired, vec![upin("A"), upin("B"), upin("C"), upin("D")]);
+    let status_of = |u: String| { let pool = pool.clone(); async move { sqlx::query_scalar::<_, String>("SELECT string_agg(status, ',' ORDER BY status) FROM cadastre.parcel WHERE parcel_number = $1").bind(u).fetch_one(&pool).await.unwrap() } };
+    assert_eq!(status_of(upin("A")).await, "historic");
+    assert_eq!(status_of(upin("D")).await, "archived");
+    assert_eq!(status_of(upin("E")).await, "posted", "the cancelled re-survey changed nothing");
+    for u in &new_upins { assert_eq!(status_of(u.clone()).await, "posted"); }
+
+    // Attribute inheritance (Aumentum IsMutationInherited): new records for the new parcels.
+    let attrs = sqlx::query_as::<_, (String, Option<String>, Option<String>, Option<String>, Option<String>, Option<String>, Option<f64>, Option<i16>, Option<String>, Option<String>, Option<String>)>(
+        "SELECT upin, parcel_name, block, lga, location, property_number, parcel_area, mutation_type, lrs_id, plan_number, dataset_name FROM cadastre.parcel_attribute WHERE upin = ANY($1) ORDER BY upin")
+        .bind(&new_upins).fetch_all(&pool).await.unwrap();
+    assert_eq!(attrs.len(), 3, "one attribute record per new parcel: {attrs:?}");
+    let split_rows: Vec<_> = attrs.iter().filter(|a| a.7 == Some(1)).collect();
+    let merge_row = attrs.iter().find(|a| a.7 == Some(2)).expect("merged parcel's record");
+    assert_eq!(split_rows.len(), 2);
+    let mut names: Vec<_> = split_rows.iter().map(|a| a.1.clone().unwrap()).collect();
+    names.sort();
+    assert_eq!(names, vec!["PCL1", "PCL2"], "children are named in order");
+    for a in &split_rows {
+        assert_eq!((a.2.as_deref(), a.3.as_deref(), a.4.as_deref(), a.8.as_deref(), a.10.as_deref()), (Some("B7"), Some("6"), Some("1"), Some("LRS-A"), Some("DS")), "inherited from A: {a:?}");
+        assert_eq!((a.5.as_deref(), a.9.as_deref()), (None, None), "Registry property number and plan number are not inherited: {a:?}");
+    }
+    let mut areas: Vec<f64> = split_rows.iter().map(|a| a.6.unwrap().round()).collect();
+    areas.sort_by(f64::total_cmp);
+    assert_eq!(areas, vec![100.0, 300.0], "each child's area from its own shape (the line cuts A 5 m / 15 m)");
+    assert_eq!((merge_row.1.as_deref(), merge_row.2.as_deref(), merge_row.8.as_deref()), (Some("PCL1"), Some("B9"), Some("LRS-B")), "a merge inherits from its first parent: {merge_row:?}");
+    assert!((merge_row.6.unwrap() - 800.0).abs() < 0.01, "{merge_row:?}");
+
+    // Lineage, as Aumentum records it.
+    let (_, la) = send(&app, "GET", &format!("/api/v1/parcels/lineage?upin={}", upin("A")), None, None).await;
+    let kids: Vec<&str> = la["edges"].as_array().unwrap().iter().filter(|e| e["parent_upin"] == upin("A")).map(|e| e["child_upin"].as_str().unwrap()).collect();
+    assert_eq!(kids.len(), 2, "{la}");
+    assert!(la["edges"].as_array().unwrap().iter().all(|e| e["mutation"] == "Split"), "{la}");
+    let merged = new_upins.iter().find(|u| !kids.contains(&u.as_str())).unwrap();
+    let (_, lm) = send(&app, "GET", &format!("/api/v1/parcels/lineage?upin={merged}"), None, None).await;
+    let mut parents: Vec<&str> = lm["edges"].as_array().unwrap().iter().map(|e| e["parent_upin"].as_str().unwrap()).collect();
+    parents.sort();
+    assert_eq!(parents, vec![upin("B").as_str(), upin("C").as_str()], "{lm}");
+    let (_, ld) = send(&app, "GET", &format!("/api/v1/parcels/lineage?upin={}", upin("D")), None, None).await;
+    assert_eq!(ld["retirements"][0]["reason"], "overlapping", "{ld}");
+    let reason: Option<String> = sqlx::query_scalar("SELECT archive_reason FROM cadastre.parcel_attribute WHERE upin = $1").bind(upin("D")).fetch_optional(&pool).await.unwrap().flatten();
+    assert!(reason.is_none(), "no attribute row exists for a test parcel; nothing invented");
+    // The retired shapes are on the history layer; a retired parcel cannot be mutated again.
+    let (_, hist) = send(&app, "GET", "/api/v1/parcels.geojson?status=retired&limit=20000", None, None).await;
+    assert!(hist["features"].as_array().unwrap().iter().any(|f| f["properties"]["parcel_number"] == upin("A")));
+    let (_, e2) = send(&app, "GET", &format!("/api/v1/wf/jobs/{id}/editing"), None, None).await;
+    assert_eq!(e2["drafts"], 0);
+    let (st, _) = send(&app, "POST", &murl, None, Some(json!({"kind": "resurvey", "upins": [upin("A")]}))).await;
+    assert_eq!(st, StatusCode::CONFLICT);
+}

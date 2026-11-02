@@ -226,6 +226,11 @@ pub async fn post_job(
 /// ledger) and make it part of the live fabric. Shared by `POST /jobs/{id}/post` and the
 /// Aumentum workflow's commit. Returns the UPINs, in draft order.
 pub async fn post_drafts(conn: &mut sqlx::PgConnection, job_id: Uuid) -> ApiResult<Vec<String>> {
+    Ok(post_drafts_with_ids(conn, job_id).await?.into_iter().map(|(_, n)| n).collect())
+}
+
+/// As [`post_drafts`], with each draft's id beside its UPIN (lineage needs which became which).
+pub async fn post_drafts_with_ids(conn: &mut sqlx::PgConnection, job_id: Uuid) -> ApiResult<Vec<(Uuid, String)>> {
     let rows = sqlx::query(
         "SELECT id, parcel_number FROM cadastre.parcel \
          WHERE job_id = $1 AND status = 'draft' ORDER BY created_at",
@@ -284,7 +289,7 @@ pub async fn post_drafts(conn: &mut sqlx::PgConnection, job_id: Uuid) -> ApiResu
         .bind(&number)
         .execute(&mut *conn)
         .await?;
-        parcel_numbers.push(number);
+        parcel_numbers.push((parcel_id, number));
     }
 
     Ok(parcel_numbers)
