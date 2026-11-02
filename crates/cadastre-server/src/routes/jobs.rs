@@ -245,6 +245,7 @@ pub async fn post_drafts_with_ids(conn: &mut sqlx::PgConnection, job_id: Uuid) -
     let mut parcel_numbers = Vec::with_capacity(rows.len());
     for row in &rows {
         let parcel_id: Uuid = row.get("id");
+        let fresh = row.get::<Option<String>, _>("parcel_number").is_none();
         let number = match row.get::<Option<String>, _>("parcel_number") {
             Some(existing) => {
                 sqlx::query(
@@ -289,6 +290,44 @@ pub async fn post_drafts_with_ids(conn: &mut sqlx::PgConnection, job_id: Uuid) -
         .bind(&number)
         .execute(&mut *conn)
         .await?;
+
+        // Write the property-document attributes + Registry linkage for the new UPIN, merging what
+        // was captured on the draft with the job's default linkage (its LRS transaction's
+        // property). linkage_status = 1 (linked) when an LRSID is known, else 0 (pending). Status is
+        // stored as Aumentum's code (0 Active, 1 Historic).
+        sqlx::query(
+            "INSERT INTO cadastre.parcel_attribute \
+               (object_id, upin, parcel_id, dataset_name, region_name, property_number, property_type, \
+                plot, block, location, plan_number, lga, parcel_name, area_unit, surveyor_general, \
+                parcel_area, status, lrs_id, linkage_status, linkage_date, creation_date, last_edit_date, updated_at) \
+             SELECT nextval('cadastre.parcel_attribute_objectid_seq'), $2, p.id, \
+                'PLATEAU_STATE_PARCELS', 'Plateau_State', \
+                COALESCE(d.property_number, l.property_number), COALESCE(d.property_type, l.property_type), \
+                COALESCE(d.plot, l.plot), COALESCE(d.block, l.block), d.location, \
+                COALESCE(d.plan_number, l.plan_number), COALESCE(d.lga, l.lga), d.parcel_name, d.area_unit, \
+                d.surveyor_general, ST_Area(p.geom), CASE lower(COALESCE(d.status, 'active')) WHEN 'active' THEN '0' WHEN 'historic' THEN '1' ELSE d.status END, COALESCE(d.lrs_id, l.lrs_id), \
+                CASE WHEN COALESCE(d.lrs_id, l.lrs_id) IS NOT NULL THEN COALESCE(l.linkage_status, 1) ELSE 0 END, \
+                CASE WHEN COALESCE(d.lrs_id, l.lrs_id) IS NOT NULL THEN to_char(now(), 'YYYYMMDD') END, \
+                now(), now(), now() \
+             FROM cadastre.parcel p \
+             LEFT JOIN cadastre.parcel_draft_attribute d ON d.parcel_id = p.id \
+             LEFT JOIN LATERAL ( \
+                 SELECT lk.* FROM cadastre.wf_job_linkage lk \
+                 JOIN cadastre.wf_job_instance wi ON wi.id = lk.wf_job_instance_id \
+                 WHERE wi.cadastre_job_id = p.job_id ORDER BY lk.updated_at DESC LIMIT 1 \
+             ) l ON true \
+             WHERE p.id = $1 AND $3 AND (d.parcel_id IS NOT NULL OR l.wf_job_instance_id IS NOT NULL)",
+        )
+        .bind(parcel_id)
+        .bind(&number)
+        .bind(fresh)
+        .execute(&mut *conn)
+        .await?;
+        sqlx::query("DELETE FROM cadastre.parcel_draft_attribute WHERE parcel_id = $1")
+            .bind(parcel_id)
+            .execute(&mut *conn)
+            .await?;
+
         parcel_numbers.push((parcel_id, number));
     }
 

@@ -312,9 +312,8 @@ pub async fn link(State(state): State<AppState>, user: AuthUser, Json(req): Json
 async fn ensure_attribute_record(conn: &mut sqlx::PgConnection, upin: &str) -> ApiResult<()> {
     let has: bool = sqlx::query_scalar("SELECT EXISTS (SELECT 1 FROM cadastre.parcel_attribute WHERE upin = $1 AND (status = '0' OR status IS NULL))").bind(upin).fetch_one(&mut *conn).await?;
     if !has {
-        sqlx::query("SELECT pg_advisory_xact_lock(hashtext('cadastre.parcel_attribute.object_id'))").execute(&mut *conn).await?;
         sqlx::query("INSERT INTO cadastre.parcel_attribute (object_id, upin, status, creation_date, last_edit_date, parcel_area) \
-                     SELECT (SELECT COALESCE(max(object_id), 0) + 1 FROM cadastre.parcel_attribute), $1, '0', now()::timestamp, now()::timestamp, \
+                     SELECT nextval('cadastre.parcel_attribute_objectid_seq'), $1, '0', now()::timestamp, now()::timestamp, \
                             (SELECT ST_Area(geom) FROM cadastre.parcel WHERE parcel_number = $1 AND status = 'posted' LIMIT 1)")
             .bind(upin).execute(&mut *conn).await?;
     }

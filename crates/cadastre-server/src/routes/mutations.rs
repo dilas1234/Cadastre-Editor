@@ -524,8 +524,8 @@ pub async fn finalise(conn: &mut sqlx::PgConnection, id: i32, posted: &[(Uuid, S
 type MutationGroup = (Option<i16>, Vec<Uuid>, Vec<String>);
 
 async fn inherit_attributes(conn: &mut sqlx::PgConnection, id: i32, posted: &[(Uuid, String)]) -> ApiResult<usize> {
-    // New attribute records continue Aumentum's OBJECTID numbering.
-    sqlx::query("SELECT pg_advisory_xact_lock(hashtext('cadastre.parcel_attribute.object_id'))").execute(&mut *conn).await?;
+    // New attribute records take OBJECTIDs from cadastre.parcel_attribute_objectid_seq (from
+    // 1,000,000,000: never one an Aumentum import carries).
     let order: HashMap<Uuid, usize> = posted.iter().enumerate().map(|(i, (d, _))| (*d, i)).collect();
     let rows = sqlx::query(
         "SELECT mutation_id, mutation_type, parcel_id, parent_upin FROM cadastre.parcel_lineage \
@@ -576,11 +576,29 @@ async fn inherit_attributes(conn: &mut sqlx::PgConnection, id: i32, posted: &[(U
                     continue;
                 }
             }
+            // Attributes captured on the draft were already written at posting: fill only what the
+            // officer left blank from the parent's record.
+            let n = sqlx::query(
+                "UPDATE cadastre.parcel_attribute pa SET mutation_type = $3, parcel_name = COALESCE(pa.parcel_name, $4), \
+                    dataset_name = COALESCE(pa.dataset_name, s.dataset_name), region_name = COALESCE(pa.region_name, s.region_name), \
+                    plot = COALESCE(pa.plot, s.plot), block = COALESCE(pa.block, s.block), location = COALESCE(pa.location, s.location), \
+                    lga = COALESCE(pa.lga, s.lga), property_type = COALESCE(pa.property_type, s.property_type), \
+                    area_unit = COALESCE(pa.area_unit, s.area_unit), parent = COALESCE(pa.parent, s.parent), \
+                    last_edit_date = now()::timestamp, updated_at = now() \
+                 FROM (SELECT 1) one LEFT JOIN cadastre.parcel_attribute s ON s.object_id = $5 \
+                 WHERE pa.upin = $1 AND pa.parcel_id = $2",
+            )
+            .bind(upin.as_str()).bind(child).bind(code).bind(format!("PCL{}", k + 1)).bind(source)
+            .execute(&mut *conn).await?.rows_affected();
+            if n > 0 {
+                written += 1;
+                continue;
+            }
             sqlx::query(
                 "INSERT INTO cadastre.parcel_attribute (object_id, upin, parcel_id, parcel_name, parcel_area, status, mutation_type, \
                     creation_date, last_edit_date, dataset_name, region_name, plot, block, location, lga, property_type, area_unit, \
                     can_rollback, is_strata, lrs_id, linkage_status, parent) \
-                 SELECT (SELECT COALESCE(max(object_id), 0) + 1 FROM cadastre.parcel_attribute), $1, $2, $3, \
+                 SELECT nextval('cadastre.parcel_attribute_objectid_seq'), $1, $2, $3, \
                     (SELECT ST_Area(geom) FROM cadastre.parcel WHERE id = $2), '0', $4, now()::timestamp, now()::timestamp, \
                     s.dataset_name, s.region_name, s.plot, s.block, s.location, s.lga, s.property_type, s.area_unit, \
                     s.can_rollback, s.is_strata, s.lrs_id, s.linkage_status, s.parent \

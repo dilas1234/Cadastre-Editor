@@ -133,6 +133,8 @@ svg.ic { display: block; flex: none; }
 .btn { min-width: 74px; height: 23px; border: 1px solid #acacac; background: linear-gradient(#f0f0f0, #e5e5e5); padding: 0 10px; }
 .btn:hover:not(:disabled) { border-color: #7eb4ea; background: linear-gradient(#ecf4fc, #dcecfc); }
 .btn:disabled { color: var(--muted); }
+.btnPrimary { border-color: #2e7d32; background: linear-gradient(#e8f5e9, #c8e6c9); font-weight: 600; }
+.btnPrimary:hover:not(:disabled) { border-color: #1b5e20; background: linear-gradient(#d4efd6, #b6ddb9); }
 .frow { display: flex; align-items: center; gap: 6px; margin: 4px 0; }
 .frow label { min-width: 70px; }
 .frow input, .frow select { height: 22px; border: 1px solid #abadb3; padding: 0 3px; }
@@ -170,6 +172,12 @@ table.legs tr.selrow td { background: #fff6cf; }
 
 /* ---- Catalog drag-and-drop target highlight ---- */
 .dropok { outline: 2px dashed #2a72c8; outline-offset: -3px; background: rgba(42,114,200,.05); }
+
+/* ---- Update Parcel Attribute dialog ---- */
+.attrTabs { display: flex; gap: 2px; border-bottom: 1px solid #c5ccd6; margin-bottom: 5px; }
+.attrTab { padding: 2px 10px; border: 1px solid #c5ccd6; border-bottom: none; background: #eef1f5; cursor: pointer; font-size: 11px; }
+.attrTab.active { background: #fff; font-weight: 600; margin-bottom: -1px; }
+.roval { flex: 1; min-width: 0; color: #333; background: #f1f1f1; border: 1px solid #ddd; padding: 1px 3px; }
 
 /* ---- status bar ---- */
 #statusbar { height: 22px; display: flex; align-items: center; background: var(--chrome); padding: 0 6px; flex: none;

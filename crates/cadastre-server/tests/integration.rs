@@ -455,11 +455,13 @@ async fn posting_never_reuses_an_issued_upin() {
     let app = routes::router(state_with(AuthMode::Disabled, None, &db_url).await);
     let pool = sqlx::PgPool::connect(&db_url).await.unwrap();
 
-    // Work above everything already issued in this database (other tests run concurrently).
+    // Work above everything already issued in this database (other tests run concurrently), in the
+    // local series: UPINs from 1,000,000,000 up are "structured" ones that never drive the
+    // allocator (migration 0018), checked below.
     let base: i64 = sqlx::query_scalar(
         "SELECT GREATEST(COALESCE(max(substring(upin FROM 3)::bigint), 0), \
                 (SELECT last_value FROM cadastre.parcel_number_seq)) \
-         FROM cadastre.issued_upin WHERE upin ~ '^PL[0-9]{12}$'",
+         FROM cadastre.issued_upin WHERE upin ~ '^PL[0-9]{12}$' AND substring(upin FROM 3)::bigint < 1000000000",
     )
     .fetch_one(&pool)
     .await
@@ -467,6 +469,8 @@ async fn posting_never_reuses_an_issued_upin() {
     let active = format!("PL{:012}", base + 100);
     let historic = format!("PL{:012}", base + 1_000); // not promoted, but issued
     let excepted = format!("PL{:012}", base + 2_000); // a duplicate-UPIN exception, still issued
+    let structured = format!("PL{:012}", 900_000_000_000 + base); // issued, but outside the local series
+    sqlx::query("INSERT INTO cadastre.issued_upin (upin, source) VALUES ($1, 'import')").bind(&structured).execute(&pool).await.unwrap();
 
     let run_id: i64 = sqlx::query_scalar(
         "INSERT INTO import.run (parcels, beacons, exceptions) VALUES (2, 0, 1) RETURNING id",
@@ -512,6 +516,7 @@ async fn posting_never_reuses_an_issued_upin() {
     let posted = result["parcel_numbers"][0].as_str().unwrap().to_string();
     let posted_n: i64 = posted[2..].parse().unwrap();
     assert!(posted_n > base + 2_000, "posted {posted} is not above the issued {excepted}");
+    assert!(posted_n < 1_000_000_000, "a structured UPIN ({structured}) must not drive the allocator: posted {posted}");
     let n: i64 = sqlx::query_scalar("SELECT count(*) FROM cadastre.issued_upin WHERE upin = $1 AND source = 'posted'")
         .bind(&posted).fetch_one(&pool).await.unwrap();
     assert_eq!(n, 1, "the posted UPIN is recorded in the ledger");
@@ -1204,10 +1209,15 @@ async fn job_editing_follows_job_area_and_commit_rules() {
     let (st, r) = draft(x0 + 190.0, 50.0).await; // crosses the area's edge
     assert_eq!(st, StatusCode::CONFLICT);
     assert_eq!(r["message"], cadastre_server::routes::wf::OUTSIDE_JOB_AREA);
-    let (st, _) = draft(x0 + 10.0, 20.0).await;
+    let (st, d1) = draft(x0 + 10.0, 20.0).await;
     assert_eq!(st, StatusCode::CREATED);
     let (st, _) = draft(x0 + 50.0, 20.0).await;
     assert_eq!(st, StatusCode::CREATED);
+    // Update Parcel Attribute on a draft (the property document), carried into its record at commit.
+    let prop = format!("PLT{}", b);
+    let (st, r) = send(&app, "PUT", &format!("/api/v1/parcels/{}/attributes", d1["id"].as_str().unwrap()), None,
+        Some(json!({"property_number": prop, "plot": "12", "status": "Active"}))).await;
+    assert_eq!(st, StatusCode::OK, "{r}");
 
     // Edit Vertices on a saved draft: moved inside the area is saved, outside is refused with
     // Aumentum's message; a draft can be deleted; posted parcels are not drafts.
@@ -1277,6 +1287,15 @@ async fn job_editing_follows_job_area_and_commit_rules() {
         .bind(c["parcel_numbers"].as_array().unwrap().iter().map(|v| v.as_str().unwrap().to_string()).collect::<Vec<_>>())
         .fetch_one(&pool).await.unwrap();
     assert_eq!(linked, 8, "every corner of both parcels is linked to its beacon");
+    let rec: (i32, Option<String>, Option<String>, Option<String>, Option<i16>) = sqlx::query_as(
+        "SELECT object_id, property_number, plot, status, linkage_status FROM cadastre.parcel_attribute WHERE upin = ANY($1)")
+        .bind(c["parcel_numbers"].as_array().unwrap().iter().map(|v| v.as_str().unwrap().to_string()).collect::<Vec<_>>())
+        .fetch_one(&pool).await.unwrap();
+    assert!(rec.0 >= 1_000_000_000, "a new record's OBJECTID never clashes with Aumentum's: {}", rec.0);
+    assert_eq!((rec.1, rec.2, rec.3, rec.4), (Some(prop.clone()), Some("12".into()), Some("0".into()), Some(0)),
+        "captured attributes, Aumentum's status code 0 (Active), not linked until the Registry links it");
+    let (_, found) = send(&app, "GET", &format!("/api/v1/parcels/search?number={prop}"), None, None).await;
+    assert_eq!(found.as_array().unwrap().len(), 1, "found once by its property number: {found}");
     let (_, found) = send(&app, "GET", &format!("/api/v1/beacons/search?q={tag}-3"), None, None).await;
     assert_eq!(found[0]["number"], format!("{tag}-3"), "a committed beacon is found by its number");
 

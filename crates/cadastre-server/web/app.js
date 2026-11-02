@@ -195,7 +195,8 @@ function resolveCrs(epsg) {
 function ensureProj(epsg) { return resolveCrs(epsg).code; }
 
 // Digitizing / edit session (ArcMap Editor). Vertices are kept in EPSG:32632 metres.
-const edit = { active: false, template: "parcel", geomType: "polygon", construction: "polygon", verts: [], sel: -1, snapping: true, editingId: null };
+const edit = { active: false, template: "parcel", geomType: "polygon", construction: "polygon", verts: [], sel: -1, snapping: true, editingId: null,
+  cut: [], tracing: false, trace: null };
 // Beacon numbers that came with typed / pasted points ("CA6782 492951.814 1088827.672"), keyed by
 // coordinates to the mm; the Beacon Numbers window at commit offers them for those corners.
 const pointIds = new Map();
@@ -614,7 +615,8 @@ const TOOLBAR_DEFS = [
     { kind: "drop", label: "Computation", menu: () => computationMenu() },
     { kind: "tool", tool: "sketch", icon: "sketchTool", tip: "Sketch tool: click to add vertices, double-click to finish" },
     { kind: "tool", tool: "editVertex", icon: "editTool", tip: "Edit tool: click a draft parcel to edit its corners; drag vertices to move them" },
-    { kind: "btn", icon: "trace", tip: "Trace", disabled: true },
+    { kind: "btn", id: "edTrace", icon: "trace", tip: "Trace: follow existing boundaries while sketching", action: () => toggleTrace() },
+    { kind: "tool", tool: "cut", icon: "cutPolygons", tip: "Cut Polygons: draw a line across a draft parcel to split it" },
     { kind: "sep" },
     { kind: "btn", id: "edCreate", icon: "createFeatures", tip: "Create Features window", action: () => openCreateFeatures() },
     { kind: "btn", id: "edProps", icon: "sketchProps", tip: "Edit Sketch Properties", action: () => openSketchProps() },
@@ -622,7 +624,9 @@ const TOOLBAR_DEFS = [
     { kind: "btn", id: "edFinish", icon: "finishSketch", tip: "Finish Sketch (F2)", action: () => finishSketch() },
     { kind: "btn", id: "edDelete", icon: "deleteSketch", tip: "Delete Sketch", action: () => deleteSketch() },
     { kind: "btn", id: "edSnap", icon: "snapping", tip: "Snapping on/off", action: () => toggleSnapping() },
-    { kind: "btn", icon: "attributes", tip: "Attributes", disabled: true },
+    { kind: "tool", tool: "attr", icon: "attributes", tip: "Attributes: click a draft parcel to edit its attributes" },
+    { kind: "sep" },
+    { kind: "btn", id: "edPost", icon: "jobPost", tip: "Post Parcel & Finish Job: commit the parcel, allocate its UPIN, complete the workflow", action: () => wfFinishCurrent() },
   ] },
   { id: "tb-cadastre", name: "Cadastre", row: 2, items: [
     { kind: "label", text: "Region:" },
@@ -1067,11 +1071,13 @@ function tocOptions() {
 const TOOL_CURSOR = {
   pan: "", zoomIn: "zoom-in", zoomOut: "zoom-out", select: "crosshair", selectEl: "default",
   identify: "crosshair", measure: "crosshair", survey: "crosshair", rect: "crosshair", text: "text",
-  sketch: "crosshair", editVertex: "pointer",
+  sketch: "crosshair", editVertex: "pointer", cut: "crosshair", attr: "pointer",
 };
 function setTool(tool) {
   // The sketch/edit tools require an active edit session, like ArcMap's "Start Editing".
   if ((tool === "sketch" || tool === "editVertex") && !edit.active) { startEditing(tool); return; }
+  if (tool === "cut" && !edit.active) { startEditing("cut"); return; }
+  if (state.tool === "cut" && tool !== "cut") clearCut();
   state.tool = tool;
   for (const [t, btns] of toolButtons) btns.forEach((b) => b.classList.toggle("active", t === tool));
   const c = map.getContainer(); c.className = c.className.replace(/\btool-\S+/g, "").trim(); c.classList.add("tool-" + tool);
@@ -1083,6 +1089,7 @@ function setTool(tool) {
 function cancelInteraction() {
   if (box) { box.el.remove(); box = null; }
   if (state.tool === "measure") clearMeasure();
+  if (state.tool === "cut" && edit.cut.length) { clearCut(); status("Cut cancelled."); return; }
   if (edit.active && edit.verts.length) { clearSketch(); refreshSketchProps(); updateEditorButtons(); status("Sketch cancelled."); }
 }
 
@@ -1167,6 +1174,8 @@ map.on("click", (e) => {
     case "sketch": sketchClick(e); break;
     case "editVertex": if (!edit.verts.length) editDraftAt(pt); break;
     case "pickDraft": pickDraftAt(pt); break;
+    case "cut": cutClick(e); break;
+    case "attr": attrClick(e); break;
   }
 });
 // Edit tool on a saved draft parcel of the current job: its corners become the sketch, to move,
@@ -1186,7 +1195,12 @@ function editDraftAt(pt) {
 map.on("dblclick", (e) => {
   if (state.tool === "measure") { e.preventDefault(); finishMeasure(); }
   else if (state.tool === "sketch" && edit.verts.length) { e.preventDefault(); finishSketch(); }
+  else if (state.tool === "cut" && edit.cut.length) { e.preventDefault(); finishCut(); }
   else if (parcelAt(e.point)) { e.preventDefault(); parcelMenu(e); }
+});
+// Absolute X, Y: right-click while sketching to key the next vertex by coordinate (Aumentum parity).
+map.on("contextmenu", (e) => {
+  if (edit.active && state.tool === "sketch") { e.preventDefault(); absoluteXYDialog(e.lngLat); }
 });
 map.on("contextmenu", (e) => { if (state.tool !== "sketch" && parcelAt(e.point)) { e.preventDefault(); parcelMenu(e); } });
 function parcelAt(point) {
@@ -1347,7 +1361,7 @@ function showFoundBeacons(list, zoom = true) {
   else zoomToFC(fc, { padding: 80, maxZoom: 18 });
 }
 function findDialog() {
-  const input = h("input", { style: "flex:1", placeholder: "UPIN, plot no., or beacon IDs, e.g. CA6782, SCS01", value: "" });
+  const input = h("input", { style: "flex:1", placeholder: "UPIN, plot, property no. or beacon IDs, e.g. 5621, PL68755, CA6782", value: "" });
   const results = h("div", { style: "margin-top:6px" });
   const run = async () => {
     const q = input.value.trim(); if (!q) return;
@@ -1392,7 +1406,7 @@ function findDialog() {
         if (!beacons.length) { if (parcels.length === 1) goToResult(parcels[0]); else selectFeatures(parcels.map((p) => p.id)); }
       }
       if (!beacons.length && !parcels.length) {
-        results.append(h("div", {}, `Nothing matches "${q}".`), h("div", { class: "muted" }, "Parcels: try the plot number alone (e.g. 5621) or part of the UPIN. Points: the beacon or control point ID."));
+        results.append(h("div", {}, `Nothing matches "${q}".`), h("div", { class: "muted" }, "Parcels: try the plot number alone (e.g. 5621), part of the UPIN, or the property number (e.g. PL68755). Points: the beacon or control point ID."));
       }
     } catch (e) { results.textContent = "Search failed: " + e.message; }
   };
@@ -2051,7 +2065,13 @@ function editorMenu() {
     { label: "Create Features Window", icon: "createFeatures", action: openCreateFeatures },
     { label: "Edit Sketch Properties…", icon: "sketchProps", action: openSketchProps },
     "-",
-    { label: "Snapping", checked: () => edit.snapping, action: toggleSnapping },
+    { label: "Cut Polygons Tool", icon: "cutPolygons", action: () => setTool("cut") },
+    { label: "Attributes", icon: "attributes", action: () => setTool("attr") },
+    { label: "Absolute X, Y…", icon: "goToXY", action: () => { if (!edit.active) startEditing("sketch"); absoluteXYDialog(map.getCenter()); } },
+    { label: "Trace", icon: "trace", checked: () => edit.tracing, action: toggleTrace },
+    { label: "Snapping", icon: "snapping", checked: () => edit.snapping, action: toggleSnapping },
+    "-",
+    { label: "Post Parcel & Finish Job", icon: "jobPost", action: () => wfFinishCurrent() },
     "-",
     { label: "Finish Sketch", kbd: "F2", action: finishSketch, disabled: () => !canFinishSketch() },
     { label: "Delete Sketch", action: deleteSketch, disabled: () => !edit.verts.length },
@@ -2086,9 +2106,12 @@ function sketchClick(e) {
   const pt = e.point;
   // A double-click also delivers two clicks at the same spot; don't add a duplicate vertex.
   if (edit.verts.length) { const last = map.project(toLL(...edit.verts[edit.verts.length - 1])); if (Math.hypot(last.x - pt.x, last.y - pt.y) < 4) return; }
+  // Trace: if the click lands on an existing boundary, follow it instead of free-digitizing.
+  if (edit.tracing && edit.geomType !== "point" && traceClick(pt)) { refreshSketchProps(); updateEditorButtons(); return; }
   let [E, N] = toUTM(e.lngLat.lng, e.lngLat.lat);
   if (edit.snapping) { const s = snapUTM(pt); if (s) [E, N] = s; }
   if (edit.geomType === "point") { edit.verts = [[E, N]]; edit.sel = 0; drawSketch(); finishSketch(); return; }
+  edit.trace = null; // a free click breaks the trace chain
   edit.verts.push([E, N]); edit.sel = edit.verts.length - 1;
   drawSketch(); refreshSketchProps(); updateEditorButtons();
 }
@@ -2117,7 +2140,7 @@ function drawSketch() {
   ll.forEach((c, i) => feats.push({ type: "Feature", properties: { idx: i, sel: i === edit.sel || (edit.sel < 0 && i === ll.length - 1) }, geometry: { type: "Point", coordinates: c } }));
   map.getSource("sketch")?.setData({ type: "FeatureCollection", features: feats });
 }
-function clearSketch() { edit.verts = []; edit.sel = -1; edit.editingId = null; edit.splitMode = false; map.getSource("sketch")?.setData(empty()); }
+function clearSketch() { edit.verts = []; edit.sel = -1; edit.editingId = null; edit.splitMode = false; edit.trace = null; map.getSource("sketch")?.setData(empty()); }
 function canFinishSketch() { const n = edit.verts.length; return edit.splitMode ? n >= 2 : edit.geomType === "polygon" ? n >= 3 : edit.geomType === "line" ? n >= 2 : n >= 1; }
 async function finishSketch() {
   if (!canFinishSketch()) { status(`Add ${edit.geomType === "polygon" ? "at least 3" : edit.geomType === "line" ? "at least 2" : "a"} vertex(es) before finishing.`); return; }
@@ -2137,23 +2160,133 @@ async function saveSketchJobArea() {
     renderWorkflow();
   } catch (e) { alert("Saving the job area failed: " + e.message); }
 }
+// The bounding box of a set of UTM vertices, expanded by `margin` metres, as a closed ring.
+function bboxRingUTM(verts, margin) {
+  let minE = Infinity, minN = Infinity, maxE = -Infinity, maxN = -Infinity;
+  for (const [e, n] of verts) { if (e < minE) minE = e; if (e > maxE) maxE = e; if (n < minN) minN = n; if (n > maxN) maxN = n; }
+  minE -= margin; minN -= margin; maxE += margin; maxN += margin;
+  return [[minE, minN], [maxE, minN], [maxE, maxN], [minE, maxN], [minE, minN]];
+}
+// Ensure the job being worked on has an open job area, deriving one from the sketch if needed. A
+// parcel under a workflow job must sit inside a job area; this keeps Finish Sketch from failing for
+// a missing or closed area, so digitizing flows straight through.
+async function ensureJobArea(utm) {
+  if (!wf.editing || !wf.editing.job_instance_id) return true; // not a workflow job: no area rule
+  const jid = wf.editing.job_instance_id;
+  try {
+    if (!wf.editing.area) {
+      wf.editing = await api(`/api/v1/wf/jobs/${jid}/area`, { method: "PUT", body: { geometry: { type: "Polygon", coordinates: [bboxRingUTM(utm, 25)] } } });
+      wf.selEditing = wf.editing; showJobArea();
+      status("Job area created automatically from the parcel extent.");
+    } else if (wf.editing.area_status === "closed") {
+      wf.editing = await api(`/api/v1/wf/jobs/${jid}/area/reopen`, { method: "POST" });
+      wf.selEditing = wf.editing; showJobArea();
+      status("Job area reopened for editing.");
+    }
+    return true;
+  } catch (e) { alert("Could not prepare the job area: " + e.message); return false; }
+}
 async function saveSketchParcel() {
   if (!state.job) { alert("Choose a Job Area first — a digitized parcel is saved as a draft under a job."); return; }
   const utm = edit.verts.slice();
+  if (!(await ensureJobArea(utm))) return; // keep the sketch so nothing is lost
+  // A draft being re-shaped (Edit tool) shows the attributes already captured on it.
+  let prefill = {};
+  if (edit.editingId) { try { prefill = await api(`/api/v1/parcels/${edit.editingId}/attributes`); } catch { prefill = {}; } }
+  const attrs = await parcelAttrDialog(edit.editingId ? { prefill, title: "Update Parcel Attribute" } : {});
+  if (attrs === null) return; // cancelled — keep the sketch for editing
   try {
     const geometry = { type: "Polygon", coordinates: [[...utm, utm[0]]] };
     if (edit.editingId) {
       await api(`/api/v1/jobs/${state.job.id}/parcels/${edit.editingId}`, { method: "PUT", body: { geometry, stated_area: null } });
+      if (attrs && Object.keys(attrs).length) await api(`/api/v1/parcels/${edit.editingId}/attributes`, { method: "PUT", body: attrs });
       notify(`Draft parcel updated in ${state.job.reference}. ${draftNextStep()}`);
     } else {
-      await api(`/api/v1/jobs/${state.job.id}/parcels`, { method: "POST", body: { geometry, stated_area: null } });
+      const body = { geometry, stated_area: null };
+      if (attrs && Object.keys(attrs).length) body.attributes = attrs;
+      await api(`/api/v1/jobs/${state.job.id}/parcels`, { method: "POST", body });
       if (state.job.reference.startsWith("WF-")) notify(`Parcel saved as a draft to ${state.job.reference}. ${draftNextStep()}`);
       else notify(`Parcel saved to ${state.job.reference}, which is not a workflow job. To work as in Aumentum, open the job in the Workflow panel and choose Work On This Job.`, "warn");
     }
     zoomToUTMRing(utm);
     wfRefreshEditing();
     await loadDrafts(); buildCatalog(); clearSketch(); refreshSketchProps(); updateEditorButtons();
+    renderWorkflow();
   } catch (e) { alert("Save failed: " + e.message); }
+}
+// Property-document capture shown on Finish Sketch (parcel). Resolves to the attributes object
+// (possibly empty), or null if cancelled. Prefills the Registry link + property fields from the
+// job's linkage (its LRS transaction's property), so the surveyor confirms rather than retypes.
+// Plateau State LGAs (for the LGA dropdown), plus common lookup values. Editable in the field.
+const PLATEAU_LGAS = ["Barkin Ladi", "Bassa", "Bokkos", "Jos East", "Jos North", "Jos South", "Kanam",
+  "Kanke", "Langtang North", "Langtang South", "Mangu", "Mikang", "Pankshin", "Qua'an Pan", "Riyom", "Shendam", "Wase"];
+const PROPERTY_TYPES = ["Land Parcel", "Building", "Strata", "Easement", "Road", "Reserve"];
+const PARCEL_STATUSES = ["Active", "Pending", "Historic", "Archived"];
+// Signed area of the current sketch (m², UTM 32N) via the shoelace formula.
+function sketchAreaM2() {
+  const v = edit.verts; if (v.length < 3) return null;
+  let a = 0; for (let i = 0; i < v.length; i++) { const [x1, y1] = v[i], [x2, y2] = v[(i + 1) % v.length]; a += x1 * y2 - x2 * y1; }
+  return Math.abs(a) / 2;
+}
+// The ArcMap/Aumentum "Update Parcel Attribute" form (General + Survey tabs), shown on Finish
+// Sketch. Resolves to the attributes object (possibly empty), or null if cancelled. Prefills the
+// Registry link + property fields from the job's linkage. The UPIN is assigned at commit.
+async function parcelAttrDialog(opts = {}) {
+  let link = {};
+  if (wf.editing && wf.editing.job_instance_id) {
+    try { link = await api(`/api/v1/wf/jobs/${wf.editing.job_instance_id}/linkage`); } catch { link = {}; }
+  }
+  const jobNo = link.property_number || link.lrs_transaction_number || (state.job && state.job.reference) || "";
+  const areaM2 = opts.areaM2 !== undefined ? opts.areaM2 : sketchAreaM2();
+  // Values already captured on the draft (editing) take precedence over the job's linkage defaults.
+  const pf = opts.prefill || {};
+  const pv = (k, d) => (pf[k] != null && pf[k] !== "" ? pf[k] : d);
+  return new Promise((resolve) => {
+    const f = {};
+    const row = (label, ctrl) => h("div", { class: "frow" }, h("label", {}, label), ctrl);
+    const ro = (label, val) => row(label, h("span", { class: "roval" }, val));
+    const txt = (key, val) => { const i = h("input", { value: val || "", style: "flex:1;min-width:0" }); f[key] = i; return i; };
+    const sel = (key, opts, val) => { const s = h("select", { style: "flex:1;min-width:0" }, ...opts.map((o) => h("option", { selected: o === (val || "") }, o))); f[key] = s; return s; };
+
+    const general = h("div", {},
+      ro("UPIN:", "— assigned on commit —"),
+      row("Parcel Name:", txt("parcel_name", pv("parcel_name", ""))),
+      row("Block:", txt("block", pv("block", ""))),
+      ro("Parcel Area:", areaM2 != null ? `${areaM2.toFixed(1)} m²` : "—"),
+      row("Area Unit:", sel("_area_unit", ["sq.m.", "Hectare"], "sq.m.")),
+      row("Property Type:", sel("property_type", PROPERTY_TYPES, pv("property_type", link.property_type || "Land Parcel"))),
+      row("Property Number:", txt("property_number", pv("property_number", link.property_number || jobNo))),
+      row("Plot:", txt("plot", pv("plot", link.plot || ""))),
+      row("Location:", txt("location", pv("location", ""))),
+      row("Plan Number:", txt("plan_number", pv("plan_number", link.plan_number || ""))),
+      row("LGA:", sel("lga", ["", ...PLATEAU_LGAS], pv("lga", link.lga || ""))),
+      row("Status:", sel("status", PARCEL_STATUSES, pv("status", "Active"))),
+      row("Registry ID (LRSID):", txt("lrs_id", pv("lrs_id", link.lrs_id || ""))),
+      ro("Linkage Status:", pv("lrs_id", link.lrs_id) ? "Linked" : "Pending (set on commit)"));
+    const survey = h("div", { class: "hidden" },
+      row("Surveyor-General:", txt("surveyor_general", pv("surveyor_general", ""))),
+      link.lrs_transaction_number ? h("div", { class: "frow muted" }, `LRS transaction: ${link.lrs_transaction_number}`) : null,
+      h("p", { class: "muted" }, "Traverse / control-point detail comes from the Construct Parcel (survey entry) step."));
+
+    const tabG = h("span", { class: "attrTab active" }, "General");
+    const tabS = h("span", { class: "attrTab" }, "Survey");
+    const showTab = (g) => { general.classList.toggle("hidden", !g); survey.classList.toggle("hidden", g); tabG.classList.toggle("active", g); tabS.classList.toggle("active", !g); };
+    tabG.onclick = () => showTab(true); tabS.onclick = () => showTab(false);
+
+    const collect = () => {
+      const o = {};
+      for (const k of ["parcel_name", "block", "property_type", "property_number", "plot", "location", "plan_number", "lga", "status", "surveyor_general", "lrs_id"]) {
+        const v = (f[k]?.value || "").trim(); if (v) o[k] = v;
+      }
+      return o;
+    };
+    const w = floatWindow(opts.title || "Update Parcel Attribute", h("div", {}, h("div", { class: "attrTabs" }, tabG, tabS), general, survey,
+      h("div", { class: "taskNav" },
+        h("button", { class: "btn", onclick: () => { w.remove(); resolve(collect()); } }, opts.saveLabel || "Save parcel"),
+        h("button", { class: "btn", onclick: () => { w.remove(); resolve(null); } }, "Cancel"))),
+      { id: "parcelAttrWin", width: 340 });
+    setTimeout(() => w.querySelector("input")?.focus(), 0);
+  });
 }
 async function saveSketchPoint() {
   const [E, N] = edit.verts[0];
@@ -2173,11 +2306,174 @@ function saveSketchLine() {
 }
 function deleteSketch() { clearSketch(); refreshSketchProps(); updateEditorButtons(); status("Sketch deleted."); }
 function toggleSnapping() { edit.snapping = !edit.snapping; $("edSnap")?.classList.toggle("active", edit.snapping); status(`Snapping ${edit.snapping ? "on" : "off"}.`); }
+
+// --- Trace (follow existing boundaries while sketching) --------------------------------------
+function toggleTrace() {
+  edit.tracing = !edit.tracing; edit.trace = null;
+  $("edTrace")?.classList.toggle("active", edit.tracing);
+  if (edit.tracing) { if (!edit.active) startEditing("sketch"); else setTool("sketch"); }
+  status(edit.tracing ? "Trace on — click along existing parcel boundaries." : "Trace off.");
+}
+// The rings (vertex arrays, in lng/lat) of a GeoJSON geometry.
+function ringsOf(g) {
+  if (!g) return [];
+  if (g.type === "LineString") return [{ coords: g.coordinates, closed: false }];
+  if (g.type === "MultiLineString") return g.coordinates.map((c) => ({ coords: c, closed: false }));
+  if (g.type === "Polygon") return g.coordinates.map((c) => ({ coords: c, closed: true }));
+  if (g.type === "MultiPolygon") return g.coordinates.flat().map((c) => ({ coords: c, closed: true }));
+  return [];
+}
+// The nearest existing-boundary vertex within tolPx of the cursor, with its ring (UTM coords).
+function nearestRingUTM(pt, tolPx) {
+  const layers = ["parcels-line", "drafts-line", "survey-line"].filter((l) => map.getLayer(l));
+  if (!layers.length) return null;
+  const feats = map.queryRenderedFeatures([[pt.x - tolPx, pt.y - tolPx], [pt.x + tolPx, pt.y + tolPx]], { layers });
+  let best = null, bestD = tolPx;
+  feats.forEach((f) => ringsOf(f.geometry).forEach((ring, ri) => {
+    let coords = ring.coords.map(([lng, lat]) => toUTM(lng, lat));
+    // A polygon ring repeats its first point last; index the unique vertices only.
+    if (ring.closed && coords.length > 1) coords = coords.slice(0, -1);
+    const key = (f.id ?? f.properties?.id ?? "r") + ":" + ri;
+    coords.forEach(([E, N], i) => {
+      const p = map.project(toLL(E, N)); const d = Math.hypot(p.x - pt.x, p.y - pt.y);
+      if (d < bestD) { bestD = d; best = { coords, idx: i, key, closed: ring.closed }; }
+    });
+  }));
+  return best;
+}
+// Vertices along a ring between index `from` and `to`, exclusive (the shorter way on a closed ring).
+function ringArc(coords, from, to, closed) {
+  const n = coords.length, out = [];
+  if (from === to || n < 2) return out;
+  if (!closed) { const step = to > from ? 1 : -1; for (let i = from + step; i !== to; i += step) out.push(coords[i]); return out; }
+  const fwd = []; for (let i = (from + 1) % n; i !== to && fwd.length <= n; i = (i + 1) % n) fwd.push(coords[i]);
+  const bwd = []; for (let i = (from - 1 + n) % n; i !== to && bwd.length <= n; i = (i - 1 + n) % n) bwd.push(coords[i]);
+  return fwd.length <= bwd.length ? fwd : bwd;
+}
+// A trace click: snap to the nearest boundary vertex; if the previous vertex was on the same ring,
+// insert the chain of boundary vertices between them. Returns false when no boundary is near.
+function traceClick(pt) {
+  const ring = nearestRingUTM(pt, 16);
+  if (!ring) return false;
+  if (edit.verts.length && edit.trace && edit.trace.key === ring.key) {
+    for (const v of ringArc(ring.coords, edit.trace.idx, ring.idx, ring.closed)) edit.verts.push([v[0], v[1]]);
+  }
+  const [E, N] = ring.coords[ring.idx];
+  edit.verts.push([E, N]); edit.sel = edit.verts.length - 1;
+  edit.trace = { key: ring.key, idx: ring.idx };
+  drawSketch();
+  return true;
+}
+
+// --- Absolute X, Y (key the next sketch vertex by coordinate) --------------------------------
+function absoluteXYDialog(lngLat) {
+  const [E, N] = toUTM(lngLat.lng, lngLat.lat);
+  const xi = h("input", { type: "number", step: "0.001", value: E.toFixed(3), style: "width:110px" });
+  const yi = h("input", { type: "number", step: "0.001", value: N.toFixed(3), style: "width:110px" });
+  const add = () => {
+    const x = parseFloat(xi.value), y = parseFloat(yi.value);
+    if (!isFinite(x) || !isFinite(y)) { status("Enter a valid Easting and Northing."); return; }
+    w.remove();
+    if (edit.geomType === "point") { edit.verts = [[x, y]]; edit.sel = 0; drawSketch(); finishSketch(); return; }
+    edit.trace = null; edit.verts.push([x, y]); edit.sel = edit.verts.length - 1;
+    drawSketch(); refreshSketchProps(); updateEditorButtons();
+  };
+  xi.onkeydown = (ev) => { if (ev.key === "Enter") yi.focus(); };
+  yi.onkeydown = (ev) => { if (ev.key === "Enter") add(); };
+  const w = floatWindow("Absolute X, Y", h("div", {},
+    h("div", { class: "frow" }, h("label", {}, "X (Easting):"), xi),
+    h("div", { class: "frow" }, h("label", {}, "Y (Northing):"), yi),
+    h("div", { class: "taskNav" }, h("button", { class: "btn", onclick: add }, "Add vertex"),
+      h("button", { class: "btn", onclick: () => w.remove() }, "Cancel"))), { id: "absXYWin", width: 240 });
+  setTimeout(() => { xi.focus(); xi.select(); }, 0);
+}
+
+// --- Cut Polygons (split a draft parcel along a drawn line) -----------------------------------
+function cutClick(e) {
+  const pt = e.point;
+  if (edit.cut.length) { const last = map.project(toLL(...edit.cut[edit.cut.length - 1])); if (Math.hypot(last.x - pt.x, last.y - pt.y) < 4) return; }
+  let [E, N] = toUTM(e.lngLat.lng, e.lngLat.lat);
+  if (edit.snapping) { const s = snapUTM(pt); if (s) [E, N] = s; }
+  edit.cut.push([E, N]); drawCut();
+  status("Cut line: click to add points, double-click to split the parcel it crosses.");
+}
+function drawCut() {
+  const ll = edit.cut.map(([e, n]) => toLL(e, n));
+  const feats = [];
+  if (ll.length >= 2) feats.push({ type: "Feature", geometry: { type: "LineString", coordinates: ll } });
+  ll.forEach((c, i) => feats.push({ type: "Feature", properties: { idx: i, sel: i === ll.length - 1 }, geometry: { type: "Point", coordinates: c } }));
+  map.getSource("sketch")?.setData({ type: "FeatureCollection", features: feats });
+}
+function clearCut() { edit.cut = []; if (edit.verts.length) drawSketch(); else map.getSource("sketch")?.setData(empty()); }
+async function finishCut() {
+  if (edit.cut.length < 2) { status("Draw a line across the parcel (two or more points)."); return; }
+  if (!state.job) { alert("Open a job (Work On This Job) before cutting its draft parcels."); return; }
+  const target = draftForCut(edit.cut);
+  if (!target) { alert("The cut line must cross one of the job's draft parcels."); clearCut(); return; }
+  const line = { type: "LineString", coordinates: edit.cut.slice() };
+  try {
+    const parts = await api(`/api/v1/jobs/${state.job.id}/parcels/${target}/cut`, { method: "POST", body: { line } });
+    status(`Parcel cut into ${parts.length} parts.`);
+    await loadDrafts(); buildCatalog(); wfRefreshEditing();
+  } catch (e) { alert("Cut failed: " + e.message); }
+  clearCut();
+}
+// The job draft the cut line crosses: the first whose polygon contains a point sampled along the line.
+function draftForCut(cutUTM) {
+  const ll = cutUTM.map(([e, n]) => toLL(e, n)); // -> [lng, lat]
+  const samples = [];
+  for (let i = 0; i < ll.length; i++) { samples.push([ll[i].lng, ll[i].lat]); if (i + 1 < ll.length) samples.push([(ll[i].lng + ll[i + 1].lng) / 2, (ll[i].lat + ll[i + 1].lat) / 2]); }
+  for (const f of state.drafts.features) if (samples.some((s) => pointInFeature(s, f))) return f.properties.id;
+  return null;
+}
+function pointInFeature(pt, f) {
+  const g = f.geometry; if (!g) return false;
+  const polys = g.type === "Polygon" ? [g.coordinates] : g.type === "MultiPolygon" ? g.coordinates : [];
+  return polys.some((rings) => pointInRing(pt, rings[0]) && !rings.slice(1).some((hole) => pointInRing(pt, hole)));
+}
+function pointInRing(pt, ring) {
+  let inside = false;
+  for (let i = 0, j = ring.length - 1; i < ring.length; j = i++) {
+    const xi = ring[i][0], yi = ring[i][1], xj = ring[j][0], yj = ring[j][1];
+    if (((yi > pt[1]) !== (yj > pt[1])) && (pt[0] < ((xj - xi) * (pt[1] - yi)) / (yj - yi) + xi)) inside = !inside;
+  }
+  return inside;
+}
+
+// --- Attributes (edit a draft parcel's captured attributes) ----------------------------------
+async function attrClick(e) {
+  const layers = ["drafts-fill"].filter((l) => map.getLayer(l));
+  const f = layers.length ? map.queryRenderedFeatures(e.point, { layers })[0] : null;
+  if (!f) { status("Click a draft parcel to edit its attributes."); return; }
+  await editDraftAttributes(f.properties.id);
+}
+async function editDraftAttributes(id) {
+  let prefill = {};
+  try { prefill = await api(`/api/v1/parcels/${id}/attributes`); } catch { prefill = {}; }
+  const draft = state.drafts.features.find((x) => x.properties.id === id);
+  const areaM2 = draft ? featureAreaM2(draft) : null;
+  const attrs = await parcelAttrDialog({ prefill, areaM2, title: "Update Parcel Attribute", saveLabel: "Save attributes" });
+  if (attrs === null) return;
+  try { await api(`/api/v1/parcels/${id}/attributes`, { method: "PUT", body: attrs }); status("Parcel attributes updated."); }
+  catch (e) { alert("Update failed: " + e.message); }
+}
+// Area (m², UTM 32N) of a polygon feature (lng/lat), via the shoelace formula on its outer ring.
+function featureAreaM2(f) {
+  const g = f.geometry; if (!g) return null;
+  const ring = g.type === "Polygon" ? g.coordinates[0] : g.type === "MultiPolygon" ? g.coordinates[0][0] : null;
+  if (!ring || ring.length < 4) return null;
+  const v = ring.map(([lng, lat]) => toUTM(lng, lat));
+  let a = 0; for (let i = 0; i < v.length - 1; i++) a += v[i][0] * v[i + 1][1] - v[i + 1][0] * v[i][1];
+  return Math.abs(a) / 2;
+}
+
 function updateEditorButtons() {
   const set = (id, on) => $(id)?.classList.toggle("disabled", !on);
   const has = edit.verts.length > 0;
   set("edFinish", canFinishSketch()); set("edDelete", has); set("edProps", true);
+  set("edPost", !!(wf.editing && wf.editing.drafts > 0));
   $("edSnap")?.classList.toggle("active", edit.snapping);
+  $("edTrace")?.classList.toggle("active", edit.tracing);
 }
 
 // Dragging an existing sketch vertex (Edit tool, or the Sketch tool if you grab a vertex).
@@ -3402,14 +3698,14 @@ function wfNewJobDialog() {
 // What turns a saved draft into a parcel with a UPIN, for the job being edited.
 function draftNextStep() {
   return wf.editing && state.job && state.job.id === wf.editing.cadastre_job_id
-    ? "Commit it at the job's Commit Parcel task to give it its UPIN."
+    ? "Click Post Parcel & Finish to allocate its UPIN."
     : "Post the job (once approved) to allocate a UPIN.";
 }
 // Refresh the worked-on job's editing state (draft count, area) after an edit.
 async function wfRefreshEditing() {
   if (!wf.editing) return;
   try { wf.mutations = await api(`/api/v1/wf/jobs/${wf.editing.job_instance_id}/mutations`); } catch { wf.mutations = []; }
-  try { wf.editing = await api(`/api/v1/wf/jobs/${wf.editing.job_instance_id}/editing`); if (wf.selected === wf.editing.job_instance_id) wf.selEditing = wf.editing; renderWorkflow(); } catch { /* keep the last known state */ }
+  try { wf.editing = await api(`/api/v1/wf/jobs/${wf.editing.job_instance_id}/editing`); if (wf.selected === wf.editing.job_instance_id) wf.selEditing = wf.editing; renderWorkflow(); updateEditorButtons(); } catch { /* keep the last known state */ }
 }
 // --- Editing under a job: job area, drafts, commit -------------------------------------------
 function showJobArea() {
@@ -3428,7 +3724,7 @@ async function wfWorkOn(jobId) {
     renderJobBox(); $("jobBox").value = job.id; await selectJob(job.id);
     showJobArea();
     if (wf.editing.area) zoomToFC({ type: "FeatureCollection", features: [{ type: "Feature", geometry: wf.editing.area, properties: {} }] });
-    status(wf.editing.area ? `Working on ${wf.detail?.job?.name || "job " + jobId}: draw parcels inside its job area.` : `Working on ${wf.detail?.job?.name || "job " + jobId}: create its job area first (Create Job Area).`);
+    status(wf.editing.area ? `Working on ${wf.detail?.job?.name || "job " + jobId}: draw parcels inside its job area, then Post Parcel & Finish.` : `Working on ${wf.detail?.job?.name || "job " + jobId}: sketch the parcel — its job area is created automatically — then Post Parcel & Finish.`);
   } catch (e) { alert(e.message); }
   renderWorkflow();
 }
@@ -3448,10 +3744,12 @@ async function wfEditAction(method, path, done, body) {
 // list (Aumentum: beacon numbers are entered at commit, never generated). Corners already on a
 // fabric beacon keep its number. A point list (ID Easting Northing per line, as Trimble Business
 // Center prints it) can be pasted to fill the numbers of the corners at those coordinates.
-async function wfCommitDialog() {
+// opts.submit(beacons): post the numbers some other way (Post Parcel & Finish Job) instead of /commit.
+async function wfCommitDialog(opts = {}) {
   const id = wf.editing?.job_instance_id; if (!id) { status("Choose Work On This Job first."); return; }
   let pts;
   try { pts = await api(`/api/v1/wf/jobs/${id}/editing/corners`); } catch (e) { alert(e.message); return; }
+  if (!pts.length && opts.submit) { try { await opts.submit([]); } catch (e) { alert(e.message); } return; }
   if (!pts.length) {
     const ret = (wf.mutations || []).filter((m) => m.kind === "retire");
     if (!ret.length) { alert("The job has no draft parcels to commit."); return; }
@@ -3504,6 +3802,11 @@ async function wfCommitDialog() {
     const blank = pts.filter((p) => !p.beacon_number && !inputs.get(p.point).value.trim()).map((p) => p.point);
     if (blank.length) { msg.style.color = "#b00"; msg.textContent = `Enter the beacon number of point(s) ${blank.join(", ")}.`; inputs.get(blank[0]).focus(); return; }
     commitBtn.disabled = true; msg.style.color = ""; msg.textContent = "Committing…";
+    if (opts.submit) {
+      try { await opts.submit(beacons); w.remove(); src()?.setData(empty()); }
+      catch (e) { commitBtn.disabled = false; msg.style.color = "#b00"; msg.textContent = e.message; }
+      return;
+    }
     try {
       const r = await api(`/api/v1/wf/jobs/${id}/commit`, { method: "POST", body: { beacons } });
       w.remove(); src()?.setData(empty());
@@ -3513,8 +3816,8 @@ async function wfCommitDialog() {
       loadHistory(); await wfRefreshEditing();
       wf.detail = await api("/api/v1/wf/jobs/" + id); renderWorkflow();
     } catch (e) { commitBtn.disabled = false; msg.style.color = "#b00"; msg.textContent = e.message; }
-  } }, "Commit");
-  const w = floatWindow("Commit Parcels — Beacon Numbers", h("div", {},
+  } }, opts.label || "Commit");
+  const w = floatWindow(opts.title || "Commit Parcels — Beacon Numbers", h("div", {},
     h("p", { class: "muted", style: "margin:0 0 6px" }, `${pts.length} corner point(s), numbered on the map. Type each beacon number from the surveyor's point list.`),
     h("div", { style: "max-height:320px;overflow:auto" }, t), paste, h("div", { class: "frow" }, fill), msg,
     h("div", { class: "frow", style: "justify-content:flex-end" }, commitBtn, h("button", { class: "btn", onclick: () => { w.remove(); src()?.setData(empty()); } }, "Cancel"))),
@@ -3565,7 +3868,45 @@ function wfEditingView(j, e) {
     }
     sec.append(h("div", { class: "wfSub", style: "margin-top:6px" }, "Mutations (applied at commit)"), ul);
   }
+  // One-click seamless path: take the job straight to its commit task, post the parcel(s) and
+  // finish the job — no stepping through Review/Commit/Generate by hand.
+  sec.append(h("div", { class: "frow" },
+    h("button", { class: "btn btnPrimary", disabled: !ed.drafts, title: "Post the parcel (allocate its UPIN) and finish the job in one step", onclick: () => wfFinishJob(j) }, "Post Parcel & Finish Job"),
+    h("span", { class: "muted" }, ed.drafts ? `${ed.drafts} parcel(s) ready` : "draw a parcel first")));
   return sec;
+}
+// One-click: post the job's parcel(s) — allocating the UPIN(s) — and finish the workflow. The
+// server walks the job to its commit task, commits, and completes it in one transaction.
+// Post & finish the job currently being worked on (from the editor toolbar / Editor menu).
+async function wfFinishCurrent() {
+  const id = wf.editing?.job_instance_id;
+  if (!id) { status("Work on a job (Workflow pane) before posting."); return; }
+  let job = wf.detail && wf.detail.job && wf.detail.job.id === id ? wf.detail.job : null;
+  if (!job) { try { job = (await api("/api/v1/wf/jobs/" + id)).job; } catch (e) { alert(e.message); return; } }
+  await wfFinishJob(job);
+}
+async function wfFinishJob(j) {
+  const ed = wf.editing;
+  if (!ed || !ed.drafts) { status("Draw a parcel first."); return; }
+  if (!confirm(`Post ${ed.drafts} parcel(s) and finish job ${j.name || "#" + j.id}?\nThis allocates the official UPIN(s) and completes the workflow.`)) return;
+  // The new corners' beacon numbers first, as for Commit Parcels.
+  await wfCommitDialog({ title: "Post Parcel & Finish Job — Beacon Numbers", label: "Post & Finish", submit: (beacons) => wfFinishPost(j, beacons) });
+}
+async function wfFinishPost(j, beacons) {
+  if (wf.busy) return; wf.busy = true;
+  try {
+    const r = await api(`/api/v1/wf/jobs/${j.id}/finish`, { method: "POST", body: { complete: true, beacons } });
+    const nums = (r.parcel_numbers || []).join(", ") || "(none)";
+    status(r.completed ? `Done — ${nums} posted; job completed.` : `${nums} posted.`);
+    alert(`Parcel posted.\nUPIN: ${nums}\n${r.completed ? "Job completed." : "Job now at: " + (r.job?.current_task || "—")}`);
+    await loadParcels(false); await loadDrafts(); showJobArea();
+    wf.detail = await api("/api/v1/wf/jobs/" + j.id);
+    wf.selEditing = await api(`/api/v1/wf/jobs/${j.id}/editing`).catch(() => wf.selEditing);
+    if (wf.editing && wf.editing.job_instance_id === j.id) wf.editing = wf.selEditing;
+    const i = wf.jobs.findIndex((x) => x.id === j.id); if (i >= 0 && r.job) wf.jobs[i] = r.job;
+    loadBeacons();
+  } catch (e) { status(e.message); throw e; }
+  finally { wf.busy = false; renderWorkflow(); }
 }
 // What a workflow step's "Open" does in this editor. Steps whose tools belong to later phases say so.
 function wfStepAction(s) {
