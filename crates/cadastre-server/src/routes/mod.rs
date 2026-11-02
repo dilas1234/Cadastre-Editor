@@ -89,6 +89,7 @@ pub fn router(state: AppState) -> Router {
         .route("/api/v1/parcels/lineage", get(mutations::lineage))
         .route("/api/v1/wf/jobs/{id}/mutations", get(mutations::list).post(mutations::create))
         .route("/api/v1/wf/jobs/{id}/mutations/{group}", delete(mutations::cancel))
+        .route("/api/v1/wf/jobs/{id}/mutations/{group}/keep-upin", put(mutations::keep_upin))
         // Live survey check (FR-COG-02/03)
         .route("/api/v1/survey/check", post(survey::check_survey))
         // The 35 computation tools (COGO, curves, area, transformations, geodetic)

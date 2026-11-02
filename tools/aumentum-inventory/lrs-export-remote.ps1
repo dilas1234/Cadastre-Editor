@@ -73,13 +73,19 @@ if (-not $SkipRegistry) {
         Get-ChildItem $env:TEMP -Directory -Filter 'lrs-export-*' | Where { Test-Path (Join-Path $_.FullName 'lrs-export-summary.txt') } |
           Sort LastWriteTime -Descending | Select -First 1 -Expand FullName
       }
-      if (-not $remoteDir) { Write-Host "No finished export found on $Target to resume from; run without -Resume." -ForegroundColor Red; exit 1 }
-      Write-Host "Resuming the copy of $remoteDir from $Target (no new export) ..." -ForegroundColor Cyan
+      if (-not $remoteDir) {
+        # Nothing left there: an earlier run copied everything and removed its folder.
+        $localSummary = Join-Path $root 'registry\lrs-export-summary.txt'
+        if ((Test-Path $localSummary) -and -not (Test-Path (Join-Path $root 'registry\copy-errors.txt'))) {
+          Write-Host "The Registry export is already complete here (its folder on $Target was removed after a full copy). Nothing to copy." -ForegroundColor Green
+        } else { Write-Host "No finished export found on $Target to resume from; run RUN-ME-REGISTRY-EXPORT.cmd (without -Resume)." -ForegroundColor Red; exit 1 }
+      } else { Write-Host "Resuming the copy of $remoteDir from $Target (no new export) ..." -ForegroundColor Cyan }
     } else {
       $remoteDir = Invoke-Command -Session $s -ScriptBlock { Join-Path $env:TEMP ('lrs-export-' + (Get-Date -Format yyyyMMdd-HHmmss)) }
       Write-Host "Running the read-only Registry export on $Target (about 1-2 hours) ..." -ForegroundColor Cyan
       Invoke-Command -Session $s -FilePath $script -ArgumentList $remoteDir, '', $sqlUser, $sqlPassword
     }
+    if ($remoteDir) {
     $files = Invoke-Command -Session $s -ArgumentList $remoteDir -ScriptBlock {
       param($d)
       $leaf = '\' + (Split-Path $d -Leaf) + '\'
@@ -143,6 +149,7 @@ if (-not $SkipRegistry) {
       # Only after every file is here complete: remove the temp folder this export created there.
       Invoke-Command -Session $s -ArgumentList $remoteDir -ScriptBlock { param($d) if ($d -like '*\lrs-export-*') { Remove-Item $d -Recurse -Force } }
       Write-Host "Registry part done." -ForegroundColor Green
+    }
     }
   }
   catch {

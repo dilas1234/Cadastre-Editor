@@ -1594,7 +1594,8 @@ async fn mutations_separate_and_free_mutation() {
     let y0 = 8_900_000.0;
     let tag = format!("PLN{}", rand_12() % 1_000_000_000);
     let upin = |k: &str| format!("{tag}{k}");
-    for (k, x) in [("F", 10.0), ("G", 60.0)] {
+    // F, G alone; H and I share an edge (an adjustment of both); J alone.
+    for (k, x) in [("F", 10.0), ("G", 60.0), ("H", 100.0), ("I", 120.0), ("J", 160.0)] {
         sqlx::query("INSERT INTO cadastre.parcel (parcel_number, geom, computed_area, status) VALUES ($1, ST_MakeEnvelope($2, $3, $2 + 20, $3 + 20, 32632), 400, 'posted')")
             .bind(upin(k)).bind(x0 + x).bind(y0 + 10.0).execute(&pool).await.unwrap();
     }
@@ -1612,8 +1613,8 @@ async fn mutations_separate_and_free_mutation() {
     // A separation needs its line and one parcel; a free mutation one parcel.
     let (st, r) = send(&app, "POST", &murl, None, Some(json!({"kind": "separate", "upins": [upin("F")]}))).await;
     assert_eq!(st, StatusCode::BAD_REQUEST, "{r}");
-    let (st, r) = send(&app, "POST", &murl, None, Some(json!({"kind": "free", "upins": [upin("F"), upin("G")]}))).await;
-    assert_eq!(st, StatusCode::BAD_REQUEST, "{r}");
+    let (st, r) = send(&app, "POST", &murl, None, Some(json!({"kind": "free", "upins": [upin("G"), upin("J")]}))).await;
+    assert_eq!(st, StatusCode::BAD_REQUEST, "parcels that do not touch: {r}");
     let line = json!({"type": "LineString", "coordinates": [[x0 + 20.0, y0 + 5.0], [x0 + 20.0, y0 + 35.0]]});
     let (st, sep) = send(&app, "POST", &murl, None, Some(json!({"kind": "separate", "upins": [upin("F")], "line": line}))).await;
     assert_eq!(st, StatusCode::CREATED, "{sep}");
@@ -1621,6 +1622,23 @@ async fn mutations_separate_and_free_mutation() {
     let (st, free) = send(&app, "POST", &murl, None, Some(json!({"kind": "free", "upins": [upin("G")]}))).await;
     assert_eq!(st, StatusCode::CREATED, "{free}");
     assert_eq!((free["kind"].as_str(), free["drafts"].as_array().unwrap().len()), (Some("free"), 1));
+    // An adjustment of two adjacent parcels: two copies (n -> n).
+    let (st, adj) = send(&app, "POST", &murl, None, Some(json!({"kind": "resurvey", "upins": [upin("H"), upin("I")]}))).await;
+    assert_eq!(st, StatusCode::CREATED, "{adj}");
+    assert_eq!(adj["drafts"].as_array().unwrap().len(), 2);
+
+    // Separation Configuration: part 1 keeps F's UPIN (Mutation Manager setting on); only a
+    // separation can, and only with one of its own parts.
+    let sep_g = sep["group"].as_str().unwrap();
+    let part1 = sep["drafts"][0].as_str().unwrap().to_string();
+    let (st, r) = send(&app, "PUT", &format!("{murl}/{}/keep-upin", free["group"].as_str().unwrap()), None, Some(json!({"draft": free["drafts"][0]}))).await;
+    assert_eq!(st, StatusCode::BAD_REQUEST, "{r}");
+    let (st, r) = send(&app, "PUT", &format!("{murl}/{sep_g}/keep-upin"), None, Some(json!({"draft": adj["drafts"][0]}))).await;
+    assert_eq!(st, StatusCode::BAD_REQUEST, "{r}");
+    let (st, k) = send(&app, "PUT", &format!("{murl}/{sep_g}/keep-upin"), None, Some(json!({"draft": part1}))).await;
+    assert_eq!(st, StatusCode::OK, "{k}");
+    assert_eq!(k["keeps_upin"].as_str(), Some(part1.as_str()));
+    let f_attr_before: i32 = sqlx::query_scalar("SELECT object_id FROM cadastre.parcel_attribute WHERE upin = $1").bind(upin("F")).fetch_one(&pool).await.unwrap();
 
     send(&app, "POST", &format!("/api/v1/wf/jobs/{id}/advance"), None, Some(json!({}))).await;
     let (_, pts) = send(&app, "GET", &format!("/api/v1/wf/jobs/{id}/editing/corners"), None, None).await;
@@ -1629,22 +1647,41 @@ async fn mutations_separate_and_free_mutation() {
     let (st, c) = send(&app, "POST", &format!("/api/v1/wf/jobs/{id}/commit"), None, Some(json!({"beacons": beacons}))).await;
     assert_eq!(st, StatusCode::OK, "{c}");
     let new_upins: Vec<String> = c["parcel_numbers"].as_array().unwrap().iter().map(|v| v.as_str().unwrap().to_string()).collect();
-    assert_eq!(new_upins.len(), 3, "two separated parts and one free-mutation parcel: {c}");
+    assert_eq!(new_upins.len(), 5, "two separated parts, one free-mutation parcel, two adjusted: {c}");
+    assert!(new_upins.contains(&upin("F")), "the kept part is posted under F's UPIN: {c}");
 
     // Lineage and attribute records carry Aumentum's type codes and names.
     let (_, lf) = send(&app, "GET", &format!("/api/v1/parcels/lineage?upin={}", upin("F")), None, None).await;
     let f_edges: Vec<&Value> = lf["edges"].as_array().unwrap().iter().filter(|e| e["parent_upin"] == upin("F")).collect();
     assert_eq!(f_edges.len(), 2, "{lf}");
+    assert!(f_edges.iter().any(|e| e["child_upin"] == upin("F")), "the kept part's lineage: F -> F: {lf}");
     assert!(f_edges.iter().all(|e| e["mutation"] == "Separated"), "{lf}");
     let (_, lg) = send(&app, "GET", &format!("/api/v1/parcels/lineage?upin={}", upin("G")), None, None).await;
     let g_edges: Vec<&Value> = lg["edges"].as_array().unwrap().iter().filter(|e| e["parent_upin"] == upin("G")).collect();
     assert_eq!(g_edges.len(), 1, "{lg}");
     assert_eq!(g_edges[0]["mutation"], "Free Mutation", "{lg}");
+    // Each adjusted parcel has both H and I as parents.
+    let (_, lh) = send(&app, "GET", &format!("/api/v1/parcels/lineage?upin={}", upin("H")), None, None).await;
+    let adj_kids: std::collections::BTreeSet<String> = lh["edges"].as_array().unwrap().iter().filter(|e| e["parent_upin"] == upin("H")).map(|e| e["child_upin"].as_str().unwrap().to_string()).collect();
+    assert_eq!(adj_kids.len(), 2, "{lh}");
+    for kid in &adj_kids {
+        let (_, lk) = send(&app, "GET", &format!("/api/v1/parcels/lineage?upin={kid}"), None, None).await;
+        let ps: std::collections::BTreeSet<String> = lk["edges"].as_array().unwrap().iter().filter(|e| e["child_upin"] == kid.as_str()).map(|e| e["parent_upin"].as_str().unwrap().to_string()).collect();
+        assert_eq!(ps, [upin("H"), upin("I")].into_iter().collect::<std::collections::BTreeSet<_>>(), "{lk}");
+        assert!(lk["edges"].as_array().unwrap().iter().all(|e| e["mutation"] == "Adjusted (re-survey)"), "{lk}");
+    }
     let mut types: Vec<i16> = sqlx::query_scalar("SELECT mutation_type FROM cadastre.parcel_attribute WHERE upin = ANY($1)")
         .bind(&new_upins).fetch_all(&pool).await.unwrap();
     types.sort();
-    assert_eq!(types, vec![4, 6, 6], "attribute records: Free Mutation once, Separated twice");
-    for k in ["F", "G"] {
+    assert_eq!(types, vec![3, 3, 4, 6, 6], "attribute records: Adjusted twice, Free Mutation once, Separated twice (one is F's own, kept)");
+    // The kept part kept F's attribute record (same OBJECTID, updated, not archived).
+    let f_attr: Vec<(i32, Option<i16>, Option<chrono::NaiveDateTime>)> = sqlx::query_as("SELECT object_id, mutation_type, archive_date FROM cadastre.parcel_attribute WHERE upin = $1")
+        .bind(upin("F")).fetch_all(&pool).await.unwrap();
+    assert_eq!(f_attr.len(), 1, "{f_attr:?}");
+    assert_eq!((f_attr[0].0, f_attr[0].1, f_attr[0].2), (f_attr_before, Some(6), None));
+    let f_status: String = sqlx::query_scalar("SELECT string_agg(status, ',' ORDER BY status) FROM cadastre.parcel WHERE parcel_number = $1").bind(upin("F")).fetch_one(&pool).await.unwrap();
+    assert_eq!(f_status, "historic,posted", "F's old shape is history, its kept part is active");
+    for k in ["G", "H", "I"] {
         let st: String = sqlx::query_scalar("SELECT status FROM cadastre.parcel WHERE parcel_number = $1").bind(upin(k)).fetch_one(&pool).await.unwrap();
         assert_eq!(st, "historic", "{k} was replaced by its mutation");
     }

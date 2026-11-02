@@ -2546,15 +2546,22 @@ async function mutationMerge() {
   if (!confirm(`Merge ${u.join(" + ")} into one parcel?`)) return;
   await recordMutation({ kind: "merge", upins: u }, `Merge of ${u.join(" + ")} recorded (a draft). It replaces them when the job's parcels are committed.`);
 }
+// Aumentum: an adjustment takes n adjacent parcels to n (each new parcel's parents: all n); a
+// free mutation X parcels to Y (reshape, separate or delete the copies). New UPINs for all.
 async function mutationResurvey() {
   const u = selectedUpins();
-  if (u.length !== 1) { alert("Select the one parcel to re-survey (Select tool)."); return; }
-  await recordMutation({ kind: "resurvey", upins: u }, `Re-survey of ${u[0]} recorded: edit its copy with the Edit tool; it replaces ${u[0]} (with a new UPIN) at commit.`);
+  if (!u.length) { alert("Select the parcel(s) to adjust (Select tool; Shift-click to add adjacent parcels)."); return; }
+  await recordMutation({ kind: "resurvey", upins: u }, `Adjustment of ${u.join(" + ")} recorded: edit the ${u.length > 1 ? "copies" : "copy"} with the Edit tool; ${u.length > 1 ? "they replace them" : `it replaces ${u[0]}`} (new UPINs) at commit.`);
 }
 async function mutationFree() {
   const u = selectedUpins();
-  if (u.length !== 1) { alert("Select the one parcel for the free mutation (Select tool)."); return; }
-  await recordMutation({ kind: "free", upins: u }, `Free mutation of ${u[0]} recorded: reshape its copy with the Edit tool; it replaces ${u[0]} (with a new UPIN) at commit.`);
+  if (!u.length) { alert("Select the parcel(s) for the free mutation (Select tool; Shift-click to add adjacent parcels)."); return; }
+  await recordMutation({ kind: "free", upins: u }, `Free mutation of ${u.join(" + ")} recorded: reshape, separate or delete the copies; they replace ${u.join(" + ")} (new UPINs) at commit.`);
+}
+// Aumentum's Separation Configuration: which part keeps the parent's UPIN and attributes.
+async function mutationKeepUpin(jobId, m, draft) {
+  try { await api(`/api/v1/wf/jobs/${jobId}/mutations/${m.group}/keep-upin`, { method: "PUT", body: { draft: draft || null } }); await afterMutation(draft ? `The chosen part keeps ${m.parents[0]}.` : "Every part gets a new UPIN."); }
+  catch (e) { notify(e.message, "err"); }
 }
 function mutationRetire() {
   const u = selectedUpins();
@@ -3207,7 +3214,11 @@ function wfEditingView(j, e) {
     const ul = h("ul", { class: "wfMutations", style: "margin:4px 0 0;padding-left:18px" });
     for (const m of wf.mutations) {
       const what = m.kind === "retire" ? `Retire ${m.parents.join(", ")} (${m.reason || ""})` : `${MUTATION_LABEL[m.kind] || m.kind} ${m.parents.join(" + ")} → ${m.drafts.length} new parcel(s)`;
-      ul.append(h("li", {}, what, " ", h("button", { class: "btn", style: "min-width:0;padding:0 6px", title: "Cancel this mutation (its draft parcels are removed)", onclick: async () => {
+      const keep = m.kind === "separate" ? h("select", { title: "Separation Configuration: the part that keeps the parent's UPIN and attribute record", onchange: (e) => mutationKeepUpin(ed.job_instance_id, m, e.target.value) },
+        h("option", { value: "" }, "every part gets a new UPIN"),
+        ...m.drafts.map((d, i) => { const f = state.drafts.features.find((x) => String(x.properties.id) === String(d));
+          return h("option", { value: d, selected: m.keeps_upin === d }, `part ${i + 1} keeps ${m.parents[0]}${f && f.properties.computed_area ? ` (${Number(f.properties.computed_area).toFixed(1)} m²)` : ""}`); })) : null;
+      ul.append(h("li", {}, what, " ", keep, " ", h("button", { class: "btn", style: "min-width:0;padding:0 6px", title: "Cancel this mutation (its draft parcels are removed)", onclick: async () => {
         if (!confirm(`Cancel: ${what}?`)) return;
         try { await api(`/api/v1/wf/jobs/${ed.job_instance_id}/mutations/${m.group}`, { method: "DELETE" }); await afterMutation("Mutation cancelled."); } catch (e) { alert(e.message); }
       } }, "Cancel")));

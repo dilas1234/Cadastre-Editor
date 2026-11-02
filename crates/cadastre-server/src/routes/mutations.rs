@@ -68,6 +68,9 @@ pub struct PendingMutationDto {
     /// The draft parcels it created (ids).
     pub drafts: Vec<Uuid>,
     pub reason: Option<String>,
+    /// A separation's part that keeps the parent's UPIN and attribute record (Aumentum's
+    /// Separation Configuration), if one was chosen.
+    pub keeps_upin: Option<Uuid>,
 }
 
 fn kind_code(kind: &str) -> ApiResult<Option<i16>> {
@@ -137,7 +140,9 @@ pub async fn create(
     let upins: Vec<String> = req.upins.iter().map(|u| u.trim().to_uppercase()).filter(|u| !u.is_empty()).collect::<BTreeSet<_>>().into_iter().collect();
     match code {
         Some(2) if upins.len() < 2 => return Err(AppError::BadRequest("a merge needs two or more parcels".into())),
-        Some(1) | Some(3) | Some(4) | Some(6) if upins.len() != 1 => return Err(AppError::BadRequest(format!("a {} applies to one parcel", req.kind))),
+        Some(1) | Some(6) if upins.len() != 1 => return Err(AppError::BadRequest(format!("a {} applies to one parcel", req.kind))),
+        // Aumentum: an adjustment is n parcels to n, a free mutation X parcels to Y; one or more.
+        Some(3) | Some(4) if upins.is_empty() => return Err(AppError::BadRequest(format!("choose the parcel(s) for the {}", req.kind))),
         None if upins.is_empty() => return Err(AppError::BadRequest("choose the parcel(s) to retire".into())),
         _ => {}
     }
@@ -203,7 +208,23 @@ pub async fn create(
             }
             vec![g]
         }
-        Some(_) => vec![parents[0].3.clone()],
+        Some(_) => {
+            // Adjustment / free mutation: a copy of each parcel, reshaped in the job. Several
+            // parcels must be contiguous (Aumentum: no mutation of parcels that do not touch).
+            let shapes: Vec<String> = parents.iter().map(|p| p.3.clone()).collect();
+            if shapes.len() > 1 {
+                let gtype: String = sqlx::query_scalar(
+                    "SELECT GeometryType(ST_UnaryUnion(ST_Collect(ST_SetSRID(ST_GeomFromGeoJSON(g), 32632)))) FROM unnest($1::text[]) g",
+                )
+                .bind(&shapes)
+                .fetch_one(&mut *tx)
+                .await?;
+                if gtype != "POLYGON" {
+                    return Err(AppError::BadRequest("the parcels must be adjacent (Aumentum does not mutate parcels that do not touch)".into()));
+                }
+            }
+            shapes
+        }
         None => Vec::new(),
     };
     // Aumentum's rule: edits inside the job area (for a retirement, the retired parcel).
@@ -248,13 +269,15 @@ pub async fn create(
     audit::append(&mut tx, &actor.label, "wf_mutation_recorded", "wf_job_instance", Some(&id.to_string()),
         json!({ "kind": req.kind, "parents": upins, "drafts": drafts.len(), "reason": reason })).await?;
     tx.commit().await?;
-    Ok((StatusCode::CREATED, Json(PendingMutationDto { group, kind: kind_name(code).into(), parents: upins, drafts, reason })))
+    Ok((StatusCode::CREATED, Json(PendingMutationDto { group, kind: kind_name(code).into(), parents: upins, drafts, reason, keeps_upin: None })))
 }
 
 async fn pending_list(conn: &mut sqlx::PgConnection, id: i32) -> ApiResult<Vec<PendingMutationDto>> {
     let rows = sqlx::query(
-        "SELECT mutation_id, mutation_type, status, parcel_id, upin, parent_upin, reason FROM cadastre.parcel_lineage \
-         WHERE pending AND wf_job_instance_id = $1 ORDER BY created_at, mutation_id",
+        "SELECT l.mutation_id, l.mutation_type, l.status, l.parcel_id, l.upin, l.parent_upin, l.reason, \
+                (l.status = 1 AND p.parcel_number IS NOT NULL AND p.parcel_number = l.parent_upin) AS keeps \
+         FROM cadastre.parcel_lineage l LEFT JOIN cadastre.parcel p ON p.id = l.parcel_id AND p.status = 'draft' \
+         WHERE l.pending AND l.wf_job_instance_id = $1 ORDER BY l.created_at, l.mutation_id",
     )
     .bind(id)
     .fetch_all(&mut *conn)
@@ -263,7 +286,7 @@ async fn pending_list(conn: &mut sqlx::PgConnection, id: i32) -> ApiResult<Vec<P
     for r in &rows {
         let g: String = r.get("mutation_id");
         let code: Option<i16> = r.get("mutation_type");
-        let e = by.entry(g.clone()).or_insert_with(|| PendingMutationDto { group: g, kind: kind_name(code).into(), parents: vec![], drafts: vec![], reason: r.get("reason") });
+        let e = by.entry(g.clone()).or_insert_with(|| PendingMutationDto { group: g, kind: kind_name(code).into(), parents: vec![], drafts: vec![], reason: r.get("reason"), keeps_upin: None });
         let st: i16 = r.get("status");
         let parent: Option<String> = if st == 0 { r.get("upin") } else { r.get("parent_upin") };
         if let Some(p) = parent {
@@ -275,6 +298,9 @@ async fn pending_list(conn: &mut sqlx::PgConnection, id: i32) -> ApiResult<Vec<P
             let d: Uuid = r.get("parcel_id");
             if !e.drafts.contains(&d) {
                 e.drafts.push(d);
+            }
+            if r.get::<Option<bool>, _>("keeps").unwrap_or(false) {
+                e.keeps_upin = Some(d);
             }
         }
     }
@@ -309,6 +335,64 @@ pub async fn cancel(State(state): State<AppState>, user: AuthUser, Path((id, gro
     audit::append(&mut tx, &actor.label, "wf_mutation_cancelled", "wf_job_instance", Some(&id.to_string()), json!({ "group": group })).await?;
     tx.commit().await?;
     Ok(StatusCode::NO_CONTENT)
+}
+
+#[derive(Debug, Deserialize, ToSchema)]
+pub struct KeepUpinRequest {
+    /// The separation's part (draft parcel id) that keeps the parent's UPIN; null: none (every
+    /// part gets a new UPIN).
+    pub draft: Option<Uuid>,
+}
+
+/// Aumentum's Separation Configuration: choose the part of a separation that keeps the parent's
+/// UPIN and attribute record (only with the Mutation Manager's keepParentIdAfterMutation on).
+#[utoipa::path(put, path = "/api/v1/wf/jobs/{id}/mutations/{group}/keep-upin", tag = "wf", request_body = KeepUpinRequest,
+    params(("id" = i32, Path, description = "Job instance id"), ("group" = String, Path, description = "Mutation group")),
+    responses((status = 200, body = PendingMutationDto), (status = 400, description = "Not a separation, or not one of its parts"),
+              (status = 404, description = "No such pending mutation"), (status = 409, description = "Keeping the parent UPIN is turned off")))]
+pub async fn keep_upin(
+    State(state): State<AppState>,
+    user: AuthUser,
+    Path((id, group)): Path<(i32, String)>,
+    Json(req): Json<KeepUpinRequest>,
+) -> ApiResult<Json<PendingMutationDto>> {
+    let actor = resolve_actor(&state, &user).await?;
+    let mut tx = state.pool.begin().await?;
+    lock_open_job(&mut tx, id, &actor).await?;
+    tidy_pending(&mut tx, id).await?;
+    let rows = sqlx::query("SELECT DISTINCT parcel_id, parent_upin, mutation_type FROM cadastre.parcel_lineage WHERE pending AND wf_job_instance_id = $1 AND mutation_id = $2 AND status = 1")
+        .bind(id).bind(&group).fetch_all(&mut *tx).await?;
+    if rows.is_empty() {
+        return Err(AppError::NotFound(format!("pending mutation {group}")));
+    }
+    if rows.iter().any(|r| r.get::<Option<i16>, _>("mutation_type") != Some(6)) {
+        return Err(AppError::BadRequest("only a separation can keep the parent's UPIN; every other mutation gives new UPINs".into()));
+    }
+    let parent: String = rows[0].get::<Option<String>, _>("parent_upin").unwrap_or_default();
+    let parts: Vec<Uuid> = rows.iter().map(|r| r.get("parcel_id")).collect();
+    if let Some(d) = req.draft {
+        if !parts.contains(&d) {
+            return Err(AppError::BadRequest("that parcel is not a part of this separation".into()));
+        }
+        let on: Option<String> = sqlx::query_scalar("SELECT value FROM cadastre.app_setting WHERE key = 'aumentum.Mutation.keepParentIdAfterMutation'")
+            .fetch_optional(&mut *tx).await?;
+        if !on.is_some_and(|v| v.trim().eq_ignore_ascii_case("true")) {
+            return Err(AppError::Conflict("keeping the parent's UPIN is turned off (Mutation Manager: keepParentIdAfterMutation)".into()));
+        }
+    }
+    // One part at most holds the parent's UPIN; the others get new UPINs at commit.
+    sqlx::query("UPDATE cadastre.parcel SET parcel_number = NULL, updated_at = now() WHERE id = ANY($1) AND status = 'draft' AND parcel_number = $2")
+        .bind(&parts).bind(&parent).execute(&mut *tx).await?;
+    if let Some(d) = req.draft {
+        sqlx::query("UPDATE cadastre.parcel SET parcel_number = $2, updated_at = now() WHERE id = $1 AND status = 'draft'")
+            .bind(d).bind(&parent).execute(&mut *tx).await?;
+    }
+    audit::append(&mut tx, &actor.label, "wf_mutation_keep_upin", "wf_job_instance", Some(&id.to_string()),
+        json!({ "group": group, "parent": parent, "draft": req.draft })).await?;
+    let dto = pending_list(&mut tx, id).await?.into_iter().find(|m| m.group == group)
+        .ok_or_else(|| AppError::NotFound(format!("pending mutation {group}")))?;
+    tx.commit().await?;
+    Ok(Json(dto))
 }
 
 /// Drop pending lineage rows whose draft no longer exists (a draft deleted or discarded), and
@@ -368,7 +452,11 @@ pub async fn retire_parents(conn: &mut sqlx::PgConnection, id: i32) -> ApiResult
         if n == 0 {
             return Err(AppError::Conflict(format!("{upin} is no longer a posted parcel; cancel that mutation")));
         }
-        // Aumentum's attribute record of the retired parcel.
+        // Aumentum's attribute record of the retired parcel; a separation part that keeps the UPIN
+        // keeps the record too (it is updated when the part is posted).
+        let kept: bool = sqlx::query_scalar("SELECT EXISTS (SELECT 1 FROM cadastre.parcel WHERE parcel_number = $1 AND status = 'draft')")
+            .bind(&upin).fetch_one(&mut *conn).await?;
+        if !kept {
         sqlx::query(
             "UPDATE cadastre.parcel_attribute SET archive_date = now()::timestamp, archive_reason = COALESCE($2, archive_reason), last_edit_date = now()::timestamp \
              WHERE upin = $1 AND (status = '0' OR status IS NULL)",
@@ -377,6 +465,7 @@ pub async fn retire_parents(conn: &mut sqlx::PgConnection, id: i32) -> ApiResult
         .bind(if retire { reason.clone() } else { None })
         .execute(&mut *conn)
         .await?;
+        }
         out.push(upin);
     }
     Ok(out)
@@ -472,6 +561,21 @@ async fn inherit_attributes(conn: &mut sqlx::PgConnection, id: i32, posted: &[(U
         .await?;
         for (k, child) in children.iter().enumerate() {
             let Some(upin) = upin_of.get(child) else { continue };
+            if parents.contains(*upin) {
+                // A separation part that kept the parent's UPIN keeps its attribute record:
+                // only the area, the mutation type and the edit date change.
+                let n = sqlx::query(
+                    "UPDATE cadastre.parcel_attribute SET parcel_area = (SELECT ST_Area(geom) FROM cadastre.parcel WHERE id = $2), \
+                        mutation_type = $3, last_edit_date = now()::timestamp, updated_at = now() \
+                     WHERE upin = $1 AND (status = '0' OR status IS NULL)",
+                )
+                .bind(upin.as_str()).bind(child).bind(code)
+                .execute(&mut *conn).await?.rows_affected();
+                if n > 0 {
+                    written += 1;
+                    continue;
+                }
+            }
             sqlx::query(
                 "INSERT INTO cadastre.parcel_attribute (object_id, upin, parcel_id, parcel_name, parcel_area, status, mutation_type, \
                     creation_date, last_edit_date, dataset_name, region_name, plot, block, location, lga, property_type, area_unit, \
