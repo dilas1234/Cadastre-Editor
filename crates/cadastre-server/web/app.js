@@ -2277,9 +2277,11 @@ function computationMenu() {
     { label: "Create Donut Parcel", action: () => startPickDraft("donut"), disabled: () => !(edit.geomType === "polygon" && edit.verts.length >= 3 && !edit.editingId) },
     { label: "Parcel Separation", action: () => startPickDraft("separate"), disabled: () => !(edit.verts.length >= 2 && !edit.editingId) },
     "-",
-    { label: "Split Parcel (sketch a line)", action: startSplitLine },
+    { label: "Split Parcel (sketch a line)", action: () => startSplitLine() },
     { label: "Merge Selected Parcels", action: mutationMerge },
-    { label: "Re-survey Selected Parcel", action: mutationResurvey },
+    { label: "Re-survey (Adjust) Selected Parcel", action: mutationResurvey },
+    { label: "Free Mutation of Selected Parcel", action: mutationFree },
+    { label: "Separate Selected Parcel (sketch a line)", action: () => startSplitLine("separate") },
     { label: "Retire Selected Parcel…", action: mutationRetire },
     { label: "Parcel Lineage…", action: () => lineageOfSelection() },
     "-",
@@ -2517,21 +2519,26 @@ async function recordMutation(body, msg) {
     if (r.drafts.length) zoomToFC(state.drafts, { padding: 80 });
   } catch (e) { notify(e.message, "err"); }
 }
-function startSplitLine() {
+// Aumentum's mutation types (d_mutation_type), by the kind names the server takes.
+const MUTATION_LABEL = { split: "Split", merge: "Merge", resurvey: "Adjust (re-survey)", free: "Free Mutation", separate: "Separation", retire: "Retire" };
+// A split (type 1) or a separation (type 6): both cut one posted parcel along a sketched line.
+function startSplitLine(kind = "split") {
+  const verb = kind === "separate" ? "separate" : "split";
   const u = selectedUpins();
-  if (u.length !== 1) { alert("Select the one parcel to split first (Select tool)."); return; }
+  if (u.length !== 1) { alert(`Select the one parcel to ${verb} first (Select tool).`); return; }
   if (!needWorkflowJob()) return;
   if (!edit.active) startEditing("sketch");
-  clearSketch(); selectTemplate("line"); edit.splitMode = true; setTool("sketch"); openSketchProps();
-  status(`Split ${u[0]}: click the line's points across the parcel (or type them), then Finish Sketch.`);
+  clearSketch(); selectTemplate("line"); edit.splitMode = kind; setTool("sketch"); openSketchProps();
+  status(`${verb[0].toUpperCase() + verb.slice(1)} ${u[0]}: click the line's points across the parcel (or type them), then Finish Sketch.`);
 }
 async function mutationSplit() {
+  const kind = edit.splitMode === "separate" ? "separate" : "split";
   const u = selectedUpins();
-  if (u.length !== 1) { alert("Select the one parcel to split (Select tool)."); return; }
-  if (edit.verts.length < 2) { alert("Sketch the split line across the parcel first."); return; }
+  if (u.length !== 1) { alert(`Select the one parcel to ${kind} (Select tool).`); return; }
+  if (edit.verts.length < 2) { alert("Sketch the line across the parcel first."); return; }
   const line = { type: "LineString", coordinates: edit.verts.map((v) => [...v]) };
   edit.splitMode = false;
-  await recordMutation({ kind: "split", upins: u, line }, (r) => `Split of ${u[0]} recorded: ${r.drafts.length} new parcels (drafts). They replace it when the job's parcels are committed.`);
+  await recordMutation({ kind, upins: u, line }, (r) => `${MUTATION_LABEL[kind]} of ${u[0]} recorded: ${r.drafts.length} new parcels (drafts). They replace it when the job's parcels are committed.`);
 }
 async function mutationMerge() {
   const u = selectedUpins();
@@ -2543,6 +2550,11 @@ async function mutationResurvey() {
   const u = selectedUpins();
   if (u.length !== 1) { alert("Select the one parcel to re-survey (Select tool)."); return; }
   await recordMutation({ kind: "resurvey", upins: u }, `Re-survey of ${u[0]} recorded: edit its copy with the Edit tool; it replaces ${u[0]} (with a new UPIN) at commit.`);
+}
+async function mutationFree() {
+  const u = selectedUpins();
+  if (u.length !== 1) { alert("Select the one parcel for the free mutation (Select tool)."); return; }
+  await recordMutation({ kind: "free", upins: u }, `Free mutation of ${u[0]} recorded: reshape its copy with the Edit tool; it replaces ${u[0]} (with a new UPIN) at commit.`);
 }
 function mutationRetire() {
   const u = selectedUpins();
@@ -3194,7 +3206,7 @@ function wfEditingView(j, e) {
   if ((wf.mutations || []).length) {
     const ul = h("ul", { class: "wfMutations", style: "margin:4px 0 0;padding-left:18px" });
     for (const m of wf.mutations) {
-      const what = m.kind === "retire" ? `Retire ${m.parents.join(", ")} (${m.reason || ""})` : `${m.kind[0].toUpperCase() + m.kind.slice(1)} ${m.parents.join(" + ")} → ${m.drafts.length} new parcel(s)`;
+      const what = m.kind === "retire" ? `Retire ${m.parents.join(", ")} (${m.reason || ""})` : `${MUTATION_LABEL[m.kind] || m.kind} ${m.parents.join(" + ")} → ${m.drafts.length} new parcel(s)`;
       ul.append(h("li", {}, what, " ", h("button", { class: "btn", style: "min-width:0;padding:0 6px", title: "Cancel this mutation (its draft parcels are removed)", onclick: async () => {
         if (!confirm(`Cancel: ${what}?`)) return;
         try { await api(`/api/v1/wf/jobs/${ed.job_instance_id}/mutations/${m.group}`, { method: "DELETE" }); await afterMutation("Mutation cancelled."); } catch (e) { alert(e.message); }
@@ -3235,8 +3247,9 @@ function wfStepAction(s) {
       ["2. Merge the selected parcels", mutationMerge], ["Lineage of the selected parcel…", () => lineageOfSelection()]])), label: "Open", tip: "Merge posted parcels into one (applied at commit)" };
     case 1021: return { run: needJob(() => stepTools("Split Parcel", [
       ["1. Select the parcel (Select tool)", () => { setTool("select"); status("Click the parcel to split."); }],
-      ["2. Sketch the split line, then Finish Sketch", startSplitLine],
-      ["Re-survey the selected parcel", mutationResurvey], ["Retire the selected parcel…", mutationRetire], ["Lineage of the selected parcel…", () => lineageOfSelection()]])), label: "Open", tip: "Split a posted parcel along a line (applied at commit)" };
+      ["2. Sketch the split line, then Finish Sketch", () => startSplitLine()],
+      ["Separate the selected parcel along a line", () => startSplitLine("separate")],
+      ["Re-survey (adjust) the selected parcel", mutationResurvey], ["Free mutation of the selected parcel", mutationFree], ["Retire the selected parcel…", mutationRetire], ["Lineage of the selected parcel…", () => lineageOfSelection()]])), label: "Open", tip: "Split a posted parcel along a line (applied at commit)" };
     default: return { label: "—", tip: "No editor action for this step" };
   }
 }

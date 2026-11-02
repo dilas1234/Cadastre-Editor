@@ -1565,3 +1565,87 @@ async fn mutations_split_merge_retire_with_lineage() {
     let (st, _) = send(&app, "POST", &murl, None, Some(json!({"kind": "resurvey", "upins": [upin("A")]}))).await;
     assert_eq!(st, StatusCode::CONFLICT);
 }
+
+/// Phase 4: Aumentum's other two mutation types, as its parcelLineage history has them: a
+/// Separation (6, one parcel cut into parts along a line) and a Free Mutation (4, one parcel to
+/// one with a new UPIN). Lineage and attribute records carry the type.
+#[tokio::test]
+async fn mutations_separate_and_free_mutation() {
+    let Some(db_url) = test_db_url() else {
+        eprintln!("skipping: CADASTRE_TEST_DATABASE_URL not set");
+        return;
+    };
+    let app = routes::router(state_with(AuthMode::Disabled, None, &db_url).await);
+    let pool = sqlx::PgPool::connect(&db_url).await.unwrap();
+    let b = 300_001 + (rand_12() % 600_000) as i32 * 10;
+    let (construct, commit_t, plan) = (b, b + 1, b + 2);
+    for (id, name) in [(construct, "Split Parcel"), (commit_t, "Commit Parcel"), (plan, "Generate Title Deed Plan")] {
+        sqlx::query("INSERT INTO cadastre.wf_task (id, name) VALUES ($1, $2)").bind(id).bind(name).execute(&pool).await.unwrap();
+    }
+    sqlx::query("INSERT INTO cadastre.wf_step (id, name, commands) VALUES ($1, 'Commit Parcel', ARRAY[$2])")
+        .bind(b).bind(cadastre_server::routes::wf::COMMIT_TOOL).execute(&pool).await.unwrap();
+    sqlx::query("INSERT INTO cadastre.wf_task_step (task_id, step_id) VALUES ($1, $2)").bind(commit_t).bind(b).execute(&pool).await.unwrap();
+    sqlx::query("INSERT INTO cadastre.wf_job_type (id, name, start_task_id, end_task_id) VALUES ($1, 'Mutation 4/6 (test)', $2, $3)")
+        .bind(b).bind(construct).bind(plan).execute(&pool).await.unwrap();
+    for (f, t) in [(construct, commit_t), (commit_t, plan)] {
+        sqlx::query("INSERT INTO cadastre.wf_task_flow (job_type_id, task_id, next_task_id) VALUES ($1, $2, $3)").bind(b).bind(f).bind(t).execute(&pool).await.unwrap();
+    }
+    let x0 = 150_000.0 + ((b / 10) % 60_000) as f64 * 10.0;
+    let y0 = 8_900_000.0;
+    let tag = format!("PLN{}", rand_12() % 1_000_000_000);
+    let upin = |k: &str| format!("{tag}{k}");
+    for (k, x) in [("F", 10.0), ("G", 60.0)] {
+        sqlx::query("INSERT INTO cadastre.parcel (parcel_number, geom, computed_area, status) VALUES ($1, ST_MakeEnvelope($2, $3, $2 + 20, $3 + 20, 32632), 400, 'posted')")
+            .bind(upin(k)).bind(x0 + x).bind(y0 + 10.0).execute(&pool).await.unwrap();
+    }
+    let oid = 700_000_000 + (rand_12() % 100_000_000) as i32;
+    for (k, o) in [("F", oid), ("G", oid + 1)] {
+        sqlx::query("INSERT INTO cadastre.parcel_attribute (object_id, upin, dataset_name, region_name, parcel_name, block, status) VALUES ($1, $2, 'DS', 'Plateau_State', 'PCL1', 'B1', '0')")
+            .bind(o).bind(upin(k)).execute(&pool).await.unwrap();
+    }
+    let (_, d) = send(&app, "POST", "/api/v1/wf/jobs", None, Some(json!({"job_type_id": b, "name": "Job-MUT46"}))).await;
+    let id = d["job"]["id"].as_i64().unwrap();
+    let murl = format!("/api/v1/wf/jobs/{id}/mutations");
+    send(&app, "POST", &format!("/api/v1/wf/jobs/{id}/editing"), None, None).await;
+    send(&app, "PUT", &format!("/api/v1/wf/jobs/{id}/area"), None, Some(json!({"geometry": square(x0, y0, 200.0)}))).await;
+
+    // A separation needs its line and one parcel; a free mutation one parcel.
+    let (st, r) = send(&app, "POST", &murl, None, Some(json!({"kind": "separate", "upins": [upin("F")]}))).await;
+    assert_eq!(st, StatusCode::BAD_REQUEST, "{r}");
+    let (st, r) = send(&app, "POST", &murl, None, Some(json!({"kind": "free", "upins": [upin("F"), upin("G")]}))).await;
+    assert_eq!(st, StatusCode::BAD_REQUEST, "{r}");
+    let line = json!({"type": "LineString", "coordinates": [[x0 + 20.0, y0 + 5.0], [x0 + 20.0, y0 + 35.0]]});
+    let (st, sep) = send(&app, "POST", &murl, None, Some(json!({"kind": "separate", "upins": [upin("F")], "line": line}))).await;
+    assert_eq!(st, StatusCode::CREATED, "{sep}");
+    assert_eq!((sep["kind"].as_str(), sep["drafts"].as_array().unwrap().len()), (Some("separate"), 2));
+    let (st, free) = send(&app, "POST", &murl, None, Some(json!({"kind": "free", "upins": [upin("G")]}))).await;
+    assert_eq!(st, StatusCode::CREATED, "{free}");
+    assert_eq!((free["kind"].as_str(), free["drafts"].as_array().unwrap().len()), (Some("free"), 1));
+
+    send(&app, "POST", &format!("/api/v1/wf/jobs/{id}/advance"), None, Some(json!({}))).await;
+    let (_, pts) = send(&app, "GET", &format!("/api/v1/wf/jobs/{id}/editing/corners"), None, None).await;
+    let beacons: Vec<Value> = pts.as_array().unwrap().iter().filter(|p| p["beacon_id"].is_null()).enumerate()
+        .map(|(i, p)| json!({"easting": p["easting"], "northing": p["northing"], "number": format!("{tag}-{i}")})).collect();
+    let (st, c) = send(&app, "POST", &format!("/api/v1/wf/jobs/{id}/commit"), None, Some(json!({"beacons": beacons}))).await;
+    assert_eq!(st, StatusCode::OK, "{c}");
+    let new_upins: Vec<String> = c["parcel_numbers"].as_array().unwrap().iter().map(|v| v.as_str().unwrap().to_string()).collect();
+    assert_eq!(new_upins.len(), 3, "two separated parts and one free-mutation parcel: {c}");
+
+    // Lineage and attribute records carry Aumentum's type codes and names.
+    let (_, lf) = send(&app, "GET", &format!("/api/v1/parcels/lineage?upin={}", upin("F")), None, None).await;
+    let f_edges: Vec<&Value> = lf["edges"].as_array().unwrap().iter().filter(|e| e["parent_upin"] == upin("F")).collect();
+    assert_eq!(f_edges.len(), 2, "{lf}");
+    assert!(f_edges.iter().all(|e| e["mutation"] == "Separated"), "{lf}");
+    let (_, lg) = send(&app, "GET", &format!("/api/v1/parcels/lineage?upin={}", upin("G")), None, None).await;
+    let g_edges: Vec<&Value> = lg["edges"].as_array().unwrap().iter().filter(|e| e["parent_upin"] == upin("G")).collect();
+    assert_eq!(g_edges.len(), 1, "{lg}");
+    assert_eq!(g_edges[0]["mutation"], "Free Mutation", "{lg}");
+    let mut types: Vec<i16> = sqlx::query_scalar("SELECT mutation_type FROM cadastre.parcel_attribute WHERE upin = ANY($1)")
+        .bind(&new_upins).fetch_all(&pool).await.unwrap();
+    types.sort();
+    assert_eq!(types, vec![4, 6, 6], "attribute records: Free Mutation once, Separated twice");
+    for k in ["F", "G"] {
+        let st: String = sqlx::query_scalar("SELECT status FROM cadastre.parcel WHERE parcel_number = $1").bind(upin(k)).fetch_one(&pool).await.unwrap();
+        assert_eq!(st, "historic", "{k} was replaced by its mutation");
+    }
+}

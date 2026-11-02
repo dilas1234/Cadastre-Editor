@@ -29,14 +29,18 @@ use crate::error::{ApiResult, AppError};
 use crate::routes::wf::{lock_open_job, resolve_actor};
 use crate::state::AppState;
 
-/// Aumentum mutation type names (codes from dbo.parcelLineage.mutationTypeID).
+/// Aumentum mutation type names (dbo.parcelLineage.mutationTypeID), as Aumentum's own domain
+/// `d_mutation_type` names them (ParcelAttributeTableDefinition.xml): 0 None, 1 Split, 2 Merged,
+/// 3 Adjusted, 4 Free Mutation, 5 COGO, 6 Separated, 7 Conflation.
 pub fn mutation_type_name(code: Option<i16>) -> &'static str {
     match code {
         Some(1) => "Split",
         Some(2) => "Merge",
-        Some(3) => "Re-survey",
-        Some(4) => "Type 4 (to be confirmed by PLAGIS)",
-        Some(6) => "Type 6 (to be confirmed by PLAGIS)",
+        Some(3) => "Adjusted (re-survey)",
+        Some(4) => "Free Mutation",
+        Some(5) => "COGO",
+        Some(6) => "Separated",
+        Some(7) => "Conflation",
         Some(_) => "Other",
         None => "Retire",
     }
@@ -44,11 +48,12 @@ pub fn mutation_type_name(code: Option<i16>) -> &'static str {
 
 #[derive(Debug, Deserialize, ToSchema)]
 pub struct MutationRequest {
-    /// `split`, `merge`, `resurvey` or `retire`.
+    /// `split` (1), `merge` (2), `resurvey` (3, Aumentum "Adjusted"), `free` (4, Free Mutation),
+    /// `separate` (6, Separated) or `retire`.
     pub kind: String,
     /// The posted parcels (UPINs) the mutation applies to.
     pub upins: Vec<String>,
-    /// For a split: a GeoJSON LineString (EPSG:32632) across the parcel.
+    /// For a split or a separation: a GeoJSON LineString (EPSG:32632) across the parcel.
     pub line: Option<serde_json::Value>,
     /// For a retirement: why (Aumentum ArchiveReason).
     pub reason: Option<String>,
@@ -70,8 +75,12 @@ fn kind_code(kind: &str) -> ApiResult<Option<i16>> {
         "split" => Ok(Some(1)),
         "merge" => Ok(Some(2)),
         "resurvey" => Ok(Some(3)),
+        // Aumentum's history: a Free Mutation is one parcel to one (new UPIN), as an adjustment;
+        // a Separation is one parcel cut into parts along a line, as a split.
+        "free" => Ok(Some(4)),
+        "separate" => Ok(Some(6)),
         "retire" => Ok(None),
-        _ => Err(AppError::BadRequest("kind must be split, merge, resurvey or retire".into())),
+        _ => Err(AppError::BadRequest("kind must be split, merge, resurvey, free, separate or retire".into())),
     }
 }
 fn kind_name(code: Option<i16>) -> &'static str {
@@ -79,6 +88,8 @@ fn kind_name(code: Option<i16>) -> &'static str {
         Some(1) => "split",
         Some(2) => "merge",
         Some(3) => "resurvey",
+        Some(4) => "free",
+        Some(6) => "separate",
         _ => "retire",
     }
 }
@@ -126,7 +137,7 @@ pub async fn create(
     let upins: Vec<String> = req.upins.iter().map(|u| u.trim().to_uppercase()).filter(|u| !u.is_empty()).collect::<BTreeSet<_>>().into_iter().collect();
     match code {
         Some(2) if upins.len() < 2 => return Err(AppError::BadRequest("a merge needs two or more parcels".into())),
-        Some(1) | Some(3) if upins.len() != 1 => return Err(AppError::BadRequest(format!("a {} applies to one parcel", req.kind))),
+        Some(1) | Some(3) | Some(4) | Some(6) if upins.len() != 1 => return Err(AppError::BadRequest(format!("a {} applies to one parcel", req.kind))),
         None if upins.is_empty() => return Err(AppError::BadRequest("choose the parcel(s) to retire".into())),
         _ => {}
     }
@@ -164,8 +175,8 @@ pub async fn create(
 
     // The new shapes.
     let new_shapes: Vec<String> = match code {
-        Some(1) => {
-            let line = req.line.as_ref().ok_or_else(|| AppError::BadRequest("a split needs a line across the parcel".into()))?;
+        Some(1) | Some(6) => {
+            let line = req.line.as_ref().ok_or_else(|| AppError::BadRequest(format!("a {} needs a line across the parcel", if code == Some(6) { "separation" } else { "split" })))?;
             let parts: Vec<String> = sqlx::query_scalar(
                 "SELECT ST_AsGeoJSON((ST_Dump(ST_CollectionExtract(ST_Split(ST_SetSRID(ST_GeomFromGeoJSON($1), 32632), ST_SetSRID(ST_GeomFromGeoJSON($2), 32632)), 3))).geom, 3)",
             )
