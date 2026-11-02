@@ -127,6 +127,26 @@ async function api(path, opts = {}) {
 }
 const fmt3 = (v) => Number(v).toFixed(3);
 const status = (msg) => { $("statusMsg").textContent = msg || ""; };
+// A message that cannot be missed (the status bar is easy to overlook): shown over the map for a
+// few seconds, and also written to the status bar.
+function notify(msg, kind = "ok") {
+  status(msg);
+  document.querySelectorAll(".toast").forEach((t) => t.remove());
+  const t = h("div", { class: `toast ${kind}` }, msg);
+  document.body.append(t);
+  setTimeout(() => t.classList.add("fade"), 5500); setTimeout(() => t.remove(), 6500);
+}
+// Keep a sketch built from typed coordinates in view: fit the map to it when it is off-screen.
+function showSketchExtent(force = false) {
+  if (!edit.verts.length) return;
+  const b = map.getBounds();
+  const lls = edit.verts.map(([e, n]) => toLL(e, n));
+  if (!force && lls.every(([x, y]) => b.contains([x, y]))) return;
+  if (lls.length === 1) map.easeTo({ center: lls[0], zoom: Math.max(map.getZoom(), 18) });
+  else zoomToFC({ type: "FeatureCollection", features: lls.map((c) => ({ type: "Feature", geometry: { type: "Point", coordinates: c }, properties: {} })) }, { padding: 120, maxZoom: 19 });
+}
+// After saving: zoom to the saved polygon (UTM ring) so the result is seen.
+function zoomToUTMRing(utm) { zoomToFC({ type: "FeatureCollection", features: [{ type: "Feature", geometry: { type: "Polygon", coordinates: [[...utm, utm[0]].map(([e, n]) => toLL(e, n))] }, properties: {} }] }, { padding: 120, maxZoom: 19 }); }
 
 const REGION = "Plateau_State";
 // Plateau State extent (WGS84). "Full extent" is the region's data, ignoring anything outside it.
@@ -175,8 +195,18 @@ function resolveCrs(epsg) {
 function ensureProj(epsg) { return resolveCrs(epsg).code; }
 
 // Digitizing / edit session (ArcMap Editor). Vertices are kept in EPSG:32632 metres.
-const edit = { active: false, template: "parcel", geomType: "polygon", construction: "polygon", verts: [], sel: -1, snapping: true,
+const edit = { active: false, template: "parcel", geomType: "polygon", construction: "polygon", verts: [], sel: -1, snapping: true, editingId: null,
   cut: [], tracing: false, trace: null };
+// Beacon numbers that came with typed / pasted points ("CA6782 492951.814 1088827.672"), keyed by
+// coordinates to the mm; the Beacon Numbers window at commit offers them for those corners.
+const pointIds = new Map();
+const ptKey = (e, n) => `${Number(e).toFixed(3)} ${Number(n).toFixed(3)}`;
+try { for (const [k, v] of JSON.parse(localStorage.getItem("cad.pointIds") || "[]")) pointIds.set(k, v); } catch { /* storage unavailable */ }
+function rememberPointId(e, n, id) {
+  if (!id) return;
+  pointIds.set(ptKey(e, n), String(id).trim());
+  try { localStorage.setItem("cad.pointIds", JSON.stringify([...pointIds].slice(-5000))); } catch { /* storage unavailable */ }
+}
 // Feature templates in the Create Features window; each maps to a layer and a geometry type.
 const FEATURE_TEMPLATES = [
   { id: "parcel", name: `${REGION}_Parcels`, geom: "polygon", icon: "polygonFc", tools: ["polygon", "autocomplete", "rightangle"] },
@@ -222,6 +252,10 @@ map.once("style.load", async () => {
   // Aumentum's Plateau_State_Parcels symbology: thin dark-red outlines; the parcel in focus in
   // red with its vertices dotted.
   map.addLayer({ id: "parcels-line", type: "line", source: "parcels", paint: { "line-color": PARCEL_STROKE, "line-width": 1 } });
+  // Parcel history (Phase 4): shapes replaced by a mutation (historic) or retired (archived).
+  map.addSource("history", { type: "geojson", data: empty(), promoteId: "id" });
+  map.addLayer({ id: "history-fill", type: "fill", source: "history", layout: { visibility: "none" }, paint: { "fill-color": "#888", "fill-opacity": 0.12 } }, "parcels-line");
+  map.addLayer({ id: "history-line", type: "line", source: "history", layout: { visibility: "none" }, paint: { "line-color": "#666", "line-width": 1.2, "line-dasharray": [3, 2] } }, "parcels-line");
   map.addLayer({ id: "parcels-focus", type: "line", source: "parcels", filter: ["==", ["get", "id"], ""],
     paint: { "line-color": "#ff0000", "line-width": 1.6 } });
   map.addSource("focus-vertices", { type: "geojson", data: empty() });
@@ -256,8 +290,25 @@ map.once("style.load", async () => {
     layout: { "icon-image": "cross", "icon-allow-overlap": true } });
 
   map.addSource("beacons", { type: "geojson", data: empty(), promoteId: "id" });
-  map.addLayer({ id: "beacons-pt", type: "circle", source: "beacons",
+  map.addLayer({ id: "beacons-pt", type: "circle", source: "beacons", filter: ["==", ["get", "is_control"], true],
     paint: { "circle-radius": 4.5, "circle-color": "#55ff00", "circle-stroke-color": "#1a3d00", "circle-stroke-width": 1 } });
+
+  // Beacons found with Find: ringed in red and labelled.
+  map.addSource("found", { type: "geojson", data: empty() });
+  map.addLayer({ id: "found-ring", type: "circle", source: "found",
+    paint: { "circle-radius": 9, "circle-color": "rgba(0,0,0,0)", "circle-stroke-color": "#ff0000", "circle-stroke-width": 2.5 } });
+  map.addLayer({ id: "found-label", type: "symbol", source: "found",
+    layout: { "text-field": ["get", "number"], "text-font": ["OpenSans-Regular"], "text-size": 12, "text-offset": [0.9, -0.9], "text-anchor": "bottom-left", "text-allow-overlap": true },
+    paint: { "text-color": "#ff0000", "text-halo-color": "#ffffff", "text-halo-width": 1.5 } });
+
+  // Corner points of the parcels being committed, numbered for the Beacon Numbers window.
+  map.addSource("corners", { type: "geojson", data: empty() });
+  map.addLayer({ id: "corners-pt", type: "circle", source: "corners",
+    paint: { "circle-radius": ["case", ["boolean", ["get", "active"], false], 8, 5], "circle-color": ["case", ["boolean", ["get", "done"], false], "#00a000", "#ff8c00"],
+      "circle-stroke-color": "#000", "circle-stroke-width": 1 } });
+  map.addLayer({ id: "corners-label", type: "symbol", source: "corners",
+    layout: { "text-field": ["get", "label"], "text-font": ["OpenSans-Regular"], "text-size": 12, "text-offset": [0.8, -0.8], "text-anchor": "bottom-left", "text-allow-overlap": true },
+    paint: { "text-color": "#000", "text-halo-color": "#fff", "text-halo-width": 1.5 } });
 
   map.addSource("graphics", { type: "geojson", data: empty() });
   map.addLayer({ id: "graphics-fill", type: "fill", source: "graphics", filter: ["==", "$type", "Polygon"],
@@ -291,9 +342,26 @@ async function loadParcels(fit) {
   map.getSource("parcels").setData(state.parcels);
   if (fit && !initialDeepLink) zoomToFC(state.parcels, { animate: false }, true) || map.fitBounds([REGION_BBOX.slice(0, 2), REGION_BBOX.slice(2)], { animate: false });
 }
+// The map shows the control points only (as before); survey beacons are not drawn, but Find, the
+// Beacon box and the commit window search all of them on the server.
 async function loadBeacons() {
-  try { state.beacons = asFC(await api("/api/v1/beacons.geojson")); } catch { state.beacons = empty(); }
-  map.getSource("beacons").setData(state.beacons);
+  let rows = [];
+  try { rows = (await api("/api/v1/beacons.compact?control=true")).rows; } catch { rows = []; }
+  state.beacons = { type: "FeatureCollection", features: rows.map(([number, easting, northing, is_control]) => ({
+    type: "Feature", geometry: { type: "Point", coordinates: toLL(easting, northing) },
+    properties: { id: number, number, is_control, easting, northing } })) };
+  map.getSource("beacons")?.setData(state.beacons);
+}
+let historyTimer = null;
+map.on("moveend", () => { clearTimeout(historyTimer); historyTimer = setTimeout(loadHistory, 250); });
+// The history layer, for the area in view (only while it is switched on).
+let historySeq = 0;
+async function loadHistory() {
+  if (!map.getLayer("history-line") || map.getLayoutProperty("history-line", "visibility") === "none") return;
+  const seq = ++historySeq, b = map.getBounds();
+  let fc = empty();
+  if (map.getZoom() >= 13) { try { fc = asFC(await api(`/api/v1/parcels.geojson?status=retired&limit=5000&bbox=${[b.getWest(), b.getSouth(), b.getEast(), b.getNorth()].join(",")}`)); } catch { fc = empty(); } }
+  if (seq === historySeq) map.getSource("history")?.setData(fc);
 }
 async function loadDrafts() {
   state.drafts = state.job ? asFC(await api(`/api/v1/parcels.geojson?status=draft&limit=5000&job=${state.job.id}`).catch(() => empty())) : empty();
@@ -544,8 +612,9 @@ const TOOLBAR_DEFS = [
   ] },
   { id: "tb-editor", name: "Editor", row: 2, indent: true, items: [
     { kind: "drop", label: "Editor", menu: () => editorMenu() },
+    { kind: "drop", label: "Computation", menu: () => computationMenu() },
     { kind: "tool", tool: "sketch", icon: "sketchTool", tip: "Sketch tool: click to add vertices, double-click to finish" },
-    { kind: "tool", tool: "editVertex", icon: "editTool", tip: "Edit tool: drag sketch vertices to move them" },
+    { kind: "tool", tool: "editVertex", icon: "editTool", tip: "Edit tool: click a draft parcel to edit its corners; drag vertices to move them" },
     { kind: "btn", id: "edTrace", icon: "trace", tip: "Trace: follow existing boundaries while sketching", action: () => toggleTrace() },
     { kind: "tool", tool: "cut", icon: "cutPolygons", tip: "Cut Polygons: draw a line across a draft parcel to split it" },
     { kind: "sep" },
@@ -563,7 +632,7 @@ const TOOLBAR_DEFS = [
     { kind: "label", text: "Region:" },
     { kind: "custom", render: () => h("select", { class: "regionBox", id: "regionBox", title: "Region" }, h("option", {}, REGION)) },
     { kind: "btn", icon: "refresh", tip: "Refresh region data", action: () => refreshAll() },
-    { kind: "btn", icon: "find", tip: "Find parcel in region", action: () => findDialog() },
+    { kind: "btn", icon: "find", tip: "Find parcel or beacon in region", action: () => findDialog() },
     { kind: "label", text: "Job Area:" },
     { kind: "custom", render: () => h("select", { class: "jobBox", id: "jobBox", title: "Job Area", onchange: (e) => selectJob(e.target.value) },
         h("option", { value: "" }, "")) },
@@ -692,6 +761,9 @@ map.on("moveend", updateScaleBox);
 // Layer model (drawing order, top first). Each leaf maps to MapLibre layer ids + legend entries.
 const LAYERS = [
   { id: "cadastral", name: "PLAGIS CADASTRE - Cadastral Fabric", group: true, visible: true, open: true, children: [
+    { id: "history", name: `${REGION}_Parcels (history)`, kind: "polygon", visible: false, open: false,
+      map: ["history-fill", "history-line"], source: "cadastre.parcel (historic / archived; in view when zoomed in)",
+      legend: () => [{ sym: "fill", fill: "#ddd", stroke: "#666", label: "Replaced or retired parcel" }] },
     { id: "parcels", name: `${REGION}_Parcels`, kind: "polygon", visible: true, open: true,
       map: ["parcels-fill", "parcels-line", "parcels-focus", "parcels-focus-vtx", "parcels-sel", "parcels-label"], source: "cadastre.parcel",
       legend: () => [{ sym: "fill", fill: "#fff", stroke: PARCEL_STROKE, label: "<all other values>" },
@@ -719,6 +791,7 @@ function effectiveVisible(l) {
   return l.visible && (!parent || parent.visible);
 }
 function applyVisibility() {
+  setTimeout(loadHistory, 0);
   for (const l of allLeaves()) for (const id of l.map) if (map.getLayer(id)) map.setLayoutProperty(id, "visibility", effectiveVisible(l) ? "visible" : "none");
   applyDynVisibility();
 }
@@ -958,17 +1031,23 @@ function buildTocTools() {
   const views = [["drawing", "listDrawing", "List By Drawing Order"], ["source", "listSource", "List By Source"],
     ["visibility", "listVisibility", "List By Visibility"], ["selection", "listSelection", "List By Selection"]];
   for (const [v, ic, tip] of views) {
-    const b = h("span", { class: `tb${state.tocView === v && !tasksOpen() && !wfOpen() ? " active" : ""}`, title: tip, html: icon(ic) });
-    b.onclick = () => { state.tocView = v; showWorkflow(false); showTasks(false); buildTocTools(); buildTOC(); };
+    const b = h("span", { class: `tb${state.tocView === v && !tasksOpen() && !wfOpen() && !regOpen() ? " active" : ""}`, title: tip, html: icon(ic) });
+    b.onclick = () => { state.tocView = v; showRegistry(false); showWorkflow(false); showTasks(false); buildTocTools(); buildTOC(); };
     t.append(b);
   }
   t.append(h("span", { class: "tsep" }));
-  const tasksBtn = h("span", { class: `tb${tasksOpen() && !wfOpen() ? " active" : ""}`, title: "Tasks", html: icon("tasks") });
-  tasksBtn.onclick = () => { showWorkflow(false); showTasks(true); buildTocTools(); };
+  const tasksBtn = h("span", { class: `tb${tasksOpen() && !wfOpen() && !regOpen() ? " active" : ""}`, title: "Tasks", html: icon("tasks") });
+  tasksBtn.onclick = () => { showRegistry(false); showWorkflow(false); showTasks(true); buildTocTools(); };
   t.append(tasksBtn);
   const wfBtn = h("span", { class: `tb${wfOpen() ? " active" : ""}`, title: "Workflow (job instances)", html: icon("jobOpen") });
   wfBtn.onclick = () => openWorkflow();
   t.append(wfBtn);
+  // Registry links: their own tab, apart from the workflow.
+  const waiting = registryWaiting();
+  const regBtn = h("span", { class: `tb${regOpen() ? " active" : ""}`, title: "Registry — links from the Aumentum Registry" + (waiting ? ` (${waiting} waiting for a job)` : ""), html: icon("registry"), style: "position:relative" });
+  if (waiting) regBtn.append(h("span", { class: "regBadge" }, String(waiting)));
+  regBtn.onclick = () => openRegistry();
+  t.append(regBtn);
   t.append(h("span", { class: "tb", title: "Options…", html: icon("options"), onclick: () => tocOptions() }));
 }
 const tasksOpen = () => !$("tasksBody").classList.contains("hidden");
@@ -1093,19 +1172,77 @@ map.on("click", (e) => {
     case "text": addTextGraphic(e.lngLat); break;
     case "selectEl": selectGraphicAt(e); break;
     case "sketch": sketchClick(e); break;
+    case "editVertex": if (!edit.verts.length) editDraftAt(pt); break;
+    case "pickDraft": pickDraftAt(pt); break;
     case "cut": cutClick(e); break;
     case "attr": attrClick(e); break;
   }
 });
+// Edit tool on a saved draft parcel of the current job: its corners become the sketch, to move,
+// retype (Edit Sketch Properties), add or delete; Finish Sketch saves the changed boundary.
+function editDraftAt(pt) {
+  const f = map.queryRenderedFeatures([[pt.x - 3, pt.y - 3], [pt.x + 3, pt.y + 3]], { layers: ["drafts-fill"].filter((l) => map.getLayer(l)) })[0];
+  if (!f) { status("Edit tool: click one of the job's draft parcels to edit its corners."); return; }
+  const d = state.drafts.features.find((x) => String(x.properties.id) === String(f.properties.id));
+  if (!d) return;
+  const ring = d.geometry.type === "MultiPolygon" ? d.geometry.coordinates[0][0] : d.geometry.coordinates[0];
+  selectTemplate("parcel");
+  edit.verts = ring.slice(0, -1).map(([x, y]) => toUTM(x, y).map((v) => Math.round(v * 1000) / 1000));
+  edit.editingId = d.properties.id; edit.sel = -1;
+  drawSketch(); openSketchProps(); updateEditorButtons();
+  status(`Editing draft parcel corners (${edit.verts.length}). Drag them, or retype them in Edit Sketch Properties; Finish Sketch saves.`);
+}
 map.on("dblclick", (e) => {
   if (state.tool === "measure") { e.preventDefault(); finishMeasure(); }
   else if (state.tool === "sketch" && edit.verts.length) { e.preventDefault(); finishSketch(); }
   else if (state.tool === "cut" && edit.cut.length) { e.preventDefault(); finishCut(); }
+  else if (parcelAt(e.point)) { e.preventDefault(); parcelMenu(e); }
 });
 // Absolute X, Y: right-click while sketching to key the next vertex by coordinate (Aumentum parity).
 map.on("contextmenu", (e) => {
   if (edit.active && state.tool === "sketch") { e.preventDefault(); absoluteXYDialog(e.lngLat); }
 });
+map.on("contextmenu", (e) => { if (state.tool !== "sketch" && parcelAt(e.point)) { e.preventDefault(); parcelMenu(e); } });
+function parcelAt(point) {
+  const layers = ["parcels-fill"].filter((l) => map.getLayer(l));
+  const f = layers.length ? map.queryRenderedFeatures(point, { layers })[0] : null;
+  return f && f.properties.parcel_number ? f : null;
+}
+// The parcel's menu: Start edit opens the title deed work on the parcel's job (Phase 5 flow:
+// the Registry admin has linked the file; the title deed unit works on it and sends it back).
+function parcelMenu(e) {
+  const f = parcelAt(e.point); if (!f) return;
+  const upin = f.properties.parcel_number;
+  const ev = e.originalEvent;
+  selectFeatures([f.properties.id], false);
+  contextMenu([
+    { label: `Start edit — title deed (${upin})`, icon: "editor", action: () => startEditParcel(upin) },
+    { label: "Zoom To Parcel", icon: "fullExtent", action: () => registryZoom(upin) },
+    { label: "Registry File…", icon: "registry", action: () => startEditParcel(upin, true) },
+    "-",
+    { label: "Parcel Lineage…", action: () => lineageOfSelection() },
+  ], ev.clientX, ev.clientY);
+}
+async function startEditParcel(upin, fileOnly) {
+  let w;
+  try { w = await api(`/api/v1/registry/parcels/${encodeURIComponent(upin)}/work`); } catch (e) { alert(e.message); return; }
+  if (fileOnly) { if (w.transaction_number) regFind(w.transaction_number); else alert(`${upin} has no Registry file (transaction) yet.`); return; }
+  if (!w.linked && !w.job_instance_id) { alert(`${upin} is not linked in the Registry yet.\nThe Registry admin links it in the Registry; it then appears under Registry → Linked.`); return; }
+  let job = w.job_instance_id;
+  if (!job) {
+    if (!w.transaction_number) { alert(`${upin} is linked (${w.su_id}), but its Registry transaction is not known here. Find the file under Registry → Find file.`); return; }
+    if (!confirm(`No open job for ${w.transaction_number}. Start the title deed job (Job-${w.property_number || upin})?`)) return;
+    try { job = (await api("/api/v1/registry/start-digitising", { method: "POST", body: { transaction_number: w.transaction_number, property_number: w.property_number } })).job_instance_id; }
+    catch (e) { alert(e.message); return; }
+  }
+  await openWorkflow(); await wfSelect(job);
+  try { await wfWorkOn(job); } catch (e) { notify(e.message, "err"); }
+  stepTools(`Title Deed Plan — ${upin}`, [
+    ["Open the title deed plan (template)", () => window.open(`/api/v1/jobs/${wf.editing.cadastre_job_id}/siteplan.pdf`, "_blank")],
+    ["Send the plan to the Registry…", () => openRegistry({ job, view: "send" })],
+  ]);
+  status(`Working on ${w.job_name || "job " + job} for ${upin}${w.current_task ? " — task: " + w.current_task : ""}.`);
+}
 
 // selection
 function selectFeatures(ids, add) {
@@ -1114,6 +1251,7 @@ function selectFeatures(ids, add) {
   map.setFilter("parcels-sel", ["in", ["get", "id"], ["literal", [...state.selection]]]);
   status(`${state.selection.size} feature(s) selected`);
   if (state.tocView === "selection") buildTOC();
+
 }
 function clearSelection() { selectFeatures([], false); }
 function selectedFC() { return { type: "FeatureCollection", features: state.parcels.features.filter((f) => state.selection.has(f.properties.id)) }; }
@@ -1141,15 +1279,17 @@ function focusParcel(f) {
 // identify
 function identifyAt(e) {
   const feats = map.queryRenderedFeatures([[e.point.x - 3, e.point.y - 3], [e.point.x + 3, e.point.y + 3]],
-    { layers: ["beacons-pt", "drafts-fill", "parcels-fill"].filter((l) => map.getLayer(l)) });
+    { layers: ["beacons-pt", "drafts-fill", "parcels-fill", "history-fill"].filter((l) => map.getLayer(l) && map.getLayoutProperty(l, "visibility") !== "none") });
   const [E, N] = toUTM(e.lngLat.lng, e.lngLat.lat);
-  const names = { "beacons-pt": `${REGION}_CtrlPnts`, "drafts-fill": `${REGION}_JobsArea`, "parcels-fill": `${REGION}_Parcels` };
+  const names = { "beacons-pt": `${REGION}_CtrlPnts`, "drafts-fill": `${REGION}_JobsArea`, "parcels-fill": `${REGION}_Parcels`, "history-fill": `${REGION}_Parcels (history)` };
   const body = h("div", {}, h("div", { class: "frow" }, h("label", {}, "Location:"), h("span", {}, `${fmt3(E)}  ${fmt3(N)} Meters`)));
   if (!feats.length) body.append(h("p", { class: "muted" }, "No identified features."));
   for (const f of feats) {
     const p = f.properties;
     const rows = Object.entries(p).filter(([k]) => k !== "id").map(([k, v]) => h("tr", {}, h("th", {}, k), h("td", {}, v == null || v === "null" ? "<Null>" : String(v))));
     body.append(h("h4", { style: "margin:8px 0 3px" }, names[f.layer.id]), h("table", {}, ...rows));
+    if ((f.layer.id === "parcels-fill" || f.layer.id === "history-fill") && p.parcel_number)
+      body.append(h("div", { class: "frow" }, h("button", { class: "btn", onclick: () => lineageWindow(p.parcel_number) }, "Lineage…")));
   }
   const top = feats.find((f) => f.layer.id === "parcels-fill");
   if (top) focusParcel(top);
@@ -1193,34 +1333,86 @@ function goToResult(p) {
   focusParcel(f); selectFeatures([p.id]);
   status(`${p.parcel_number || "(unposted)"} — ${p.status}`);
 }
+// Find: parcels (UPIN / plot number) and beacons / control points (point IDs). Several IDs can be
+// pasted at once, e.g. a surveyor's point list "CA6782, RX1271, GB7772, CA6783, SCS01": every
+// one found is ringed on the map and the view fits them all; the missing ones are listed.
+// PLAGIS wrote the surveyor's beacon CA6782 into Aumentum as C6782A (and back); see the server's
+// plagis_alternate.
+function plagisAlternate(t) {
+  const s = t.trim(); let m;
+  if ((m = s.match(/^([A-Za-z])([A-Za-z])(\d+)$/))) return m[1] + m[3] + m[2];
+  if ((m = s.match(/^([A-Za-z])(\d+)([A-Za-z])$/))) return m[1] + m[3] + m[2];
+  return null;
+}
+function splitFindTerms(q) {
+  let terms = q.split(/[,;\n\t]+/).map((t) => t.trim()).filter(Boolean);
+  if (terms.length === 1) {
+    const words = terms[0].split(/\s+/);
+    if (words.length > 1 && words.every((w) => /^[A-Za-z]+[0-9]+[A-Za-z0-9]*$/.test(w))) terms = words;
+  }
+  return terms;
+}
+function showFoundBeacons(list, zoom = true) {
+  const fc = { type: "FeatureCollection", features: list.map((b) => ({ type: "Feature", geometry: { type: "Point", coordinates: toLL(b.easting, b.northing) },
+    properties: { number: b.number, is_control: b.is_control, easting: b.easting, northing: b.northing } })) };
+  map.getSource("found")?.setData(fc);
+  if (!zoom || !list.length) return;
+  if (list.length === 1) map.flyTo({ center: fc.features[0].geometry.coordinates, zoom: 18 });
+  else zoomToFC(fc, { padding: 80, maxZoom: 18 });
+}
 function findDialog() {
-  const input = h("input", { style: "flex:1", placeholder: "UPIN, plot, or property number, e.g. 5621 or PL68755", value: "" });
+  const input = h("input", { style: "flex:1", placeholder: "UPIN, plot, property no. or beacon IDs, e.g. 5621, PL68755, CA6782", value: "" });
   const results = h("div", { style: "margin-top:6px" });
   const run = async () => {
     const q = input.value.trim(); if (!q) return;
+    const terms = splitFindTerms(q);
     results.textContent = "Searching…";
     try {
-      const list = await api("/api/v1/parcels/search?number=" + encodeURIComponent(q));
+      const [beaconHits, parcels] = await Promise.all([
+        Promise.all(terms.map(async (t) => {
+          const l = await api(`/api/v1/beacons/search?limit=20&q=${encodeURIComponent(t)}`);
+          const alt = plagisAlternate(t);
+          const exact = l.filter((b) => b.number.toUpperCase() === t.toUpperCase() || (alt && b.number.toUpperCase() === alt.toUpperCase()));
+          return { term: t, list: exact.length ? exact : l };
+        })),
+        terms.length === 1 ? api("/api/v1/parcels/search?number=" + encodeURIComponent(q)) : Promise.resolve([]),
+      ]);
       results.innerHTML = "";
-      if (!list.length) {
-        results.append(h("div", {}, `No parcel matches "${q}".`), h("div", { class: "muted" }, "Try the plot number alone (e.g. 5621), part of the UPIN, or the property number (e.g. PL68755)."));
-        return;
+      const beacons = [], seen = new Set(), missing = [];
+      for (const r of beaconHits) {
+        if (!r.list.length) { missing.push(r.term); continue; }
+        for (const b of r.list) if (!seen.has(b.id)) { seen.add(b.id); beacons.push(b); }
       }
-      const t = h("table", {}, h("tr", {}, h("th", {}, "Parcel"), h("th", {}, "Status"), h("th", {}, "Area (m²)")));
-      for (const p of list.slice(0, 200)) {
-        const area = p.computed_area ?? p.stated_area;
-        const tr = h("tr", { style: "cursor:pointer", title: "Zoom to parcel" }, h("td", {}, p.parcel_number || "(unposted)"), h("td", {}, p.status), h("td", {}, area != null ? Number(area).toFixed(1) : "—"));
-        tr.onclick = () => goToResult(p);
-        t.append(tr);
+      if (beacons.length) {
+        const t = h("table", {}, h("tr", {}, h("th", {}, "Point ID"), h("th", {}, "Easting"), h("th", {}, "Northing"), h("th", {}, "Type")));
+        for (const b of beacons) {
+          const tr = h("tr", { style: "cursor:pointer", title: "Zoom to point" }, h("td", {}, b.number), h("td", {}, fmt3(b.easting)), h("td", {}, fmt3(b.northing)), h("td", {}, b.is_control ? "Control" : "Beacon"));
+          tr.onclick = () => showFoundBeacons([b]);
+          t.append(tr);
+        }
+        results.append(h("div", { class: "muted" }, `${beacons.length} point(s) — ringed in red; click a row to zoom`), t);
+        showFoundBeacons(beacons);
+      } else map.getSource("found")?.setData(empty());
+      if (missing.length && terms.length > 1) results.append(h("div", { style: "margin-top:6px;color:#b00" }, `Not found: ${missing.join(", ")}`));
+      if (parcels.length) {
+        const t = h("table", {}, h("tr", {}, h("th", {}, "Parcel"), h("th", {}, "Status"), h("th", {}, "Area (m²)")));
+        for (const p of parcels.slice(0, 200)) {
+          const area = p.computed_area ?? p.stated_area;
+          const tr = h("tr", { style: "cursor:pointer", title: "Zoom to parcel" }, h("td", {}, p.parcel_number || "(unposted)"), h("td", {}, p.status), h("td", {}, area != null ? Number(area).toFixed(1) : "—"));
+          tr.onclick = () => goToResult(p);
+          t.append(tr);
+        }
+        results.append(h("div", { class: "muted", style: "margin-top:6px" }, `${parcels.length} parcel(s)${parcels.length > 200 ? " (first 200 shown)" : ""} — click a row to zoom`), t);
+        if (!beacons.length) { if (parcels.length === 1) goToResult(parcels[0]); else selectFeatures(parcels.map((p) => p.id)); }
       }
-      results.append(h("div", { class: "muted" }, `${list.length} match(es)${list.length > 200 ? " (first 200 shown)" : ""} — click a row to zoom`), t);
-      if (list.length === 1) goToResult(list[0]); // a single hit: go straight there, as Find does
-      else selectFeatures(list.map((p) => p.id));
+      if (!beacons.length && !parcels.length) {
+        results.append(h("div", {}, `Nothing matches "${q}".`), h("div", { class: "muted" }, "Parcels: try the plot number alone (e.g. 5621), part of the UPIN, or the property number (e.g. PL68755). Points: the beacon or control point ID."));
+      }
     } catch (e) { results.textContent = "Search failed: " + e.message; }
   };
   input.addEventListener("keydown", (e) => e.key === "Enter" && run());
   floatWindow("Find", h("div", {}, h("div", { class: "frow" }, h("label", {}, "Find:"), input, h("button", { class: "btn", onclick: run }, "Find")),
-    h("div", { class: "frow" }, h("label", {}, "In layer:"), h("span", {}, `${REGION}_Parcels (parcel_number)`)), results), { id: "findWin", width: 380 });
+    h("div", { class: "frow" }, h("label", {}, "In layers:"), h("span", {}, `${REGION}_Parcels, ${REGION}_Points, ${REGION}_CtrlPnts`)), results), { id: "findWin", width: 420 });
   setTimeout(() => input.focus(), 0);
 }
 
@@ -1554,6 +1746,14 @@ function openImportDialog() {
       out.innerHTML = "";
       out.append(h("p", {}, h("b", {}, `Imported into ${state.job.reference}`)),
         h("p", {}, `${r.created_parcels} draft parcel(s), ${r.created_beacons} beacon(s).`));
+      // Under a workflow job the file's point IDs are kept for the Beacon Numbers window at commit
+      // (Point Creation Report), not made into beacons now.
+      if (r.workflow_job && r.points_for_commit?.length) {
+        for (const q of r.points_for_commit) rememberPointId(q.easting, q.northing, q.id);
+        const t = h("table", { class: "legs" }, h("tr", {}, h("th", {}, "Point"), h("th", {}, "Easting"), h("th", {}, "Northing")));
+        for (const q of r.points_for_commit.slice(0, 200)) t.append(h("tr", {}, h("td", {}, q.id), h("td", {}, fmt3(q.easting)), h("td", {}, fmt3(q.northing))));
+        out.append(h("p", { style: "margin:6px 0 2px" }, h("b", {}, "Point Creation Report"), ` — ${r.points_for_commit.length} point(s); their numbers fill the Beacon Numbers window at commit.`), h("div", { style: "max-height:180px;overflow:auto" }, t));
+      }
       if (r.skipped_boundaries?.length) out.append(h("div", { class: "muted" }, `${r.skipped_boundaries.length} boundary(ies) skipped`));
       if (r.skipped_beacons?.length) out.append(h("div", { class: "muted" }, `${r.skipped_beacons.length} beacon(s) skipped (already present or unnamed)`));
       for (const w of r.warnings || []) out.append(h("div", { class: "muted" }, w));
@@ -1701,6 +1901,28 @@ function renderTask() {
 // The survey task is one continuous form — no Back/Next. Pick a job (inline), drop a start, enter
 // legs with a live closure check, Save. After saving it stays armed for the next parcel.
 const subHead = (t) => h("div", { style: "font-weight:600;margin:9px 0 3px;color:#2a2a2a" }, t);
+// Type-to-search beacon box: searches every control point and survey beacon on the server (not
+// just those loaded on the map), nearest the map centre first, sorted by number otherwise.
+function beaconPicker(onPick) {
+  const id = "beaconList" + Math.random().toString(36).slice(2, 8);
+  const input = h("input", { list: id, placeholder: "— beacon or control point —", style: "flex:1;min-width:0", autocomplete: "off" });
+  const list = h("datalist", { id });
+  let found = [], timer = null, seq = 0;
+  const label = (b) => `${b.number}${b.is_control ? " (control)" : ""}`;
+  const search = async () => {
+    const my = ++seq, c = map.getCenter(), [e, n] = toUTM(c.lng, c.lat);
+    const q = input.value.replace(/ \(control\)$/, "").trim();
+    try { found = await api(`/api/v1/beacons/search?limit=100&q=${encodeURIComponent(q)}&e=${e.toFixed(1)}&n=${n.toFixed(1)}`); } catch { found = []; }
+    if (my !== seq) return;
+    list.replaceChildren(...found.map((b) => h("option", { value: label(b) }, `${fmt3(b.easting)}  ${fmt3(b.northing)}`)));
+  };
+  const pick = () => { const b = found.find((x) => label(x) === input.value || x.number === input.value.trim()); if (b) onPick(b); };
+  input.addEventListener("input", () => { clearTimeout(timer); timer = setTimeout(search, 200); });
+  input.addEventListener("focus", search);
+  input.addEventListener("change", pick);
+  input.addEventListener("keydown", (ev) => { if (ev.key === "Enter") pick(); });
+  return h("span", { style: "display:flex;flex:1;min-width:0" }, input, list);
+}
 function renderSurveyForm(body) {
   const page = h("div", { class: "taskPage" });
 
@@ -1714,11 +1936,11 @@ function renderSurveyForm(body) {
   const N = h("input", { type: "number", step: "0.001", value: task.start ? task.start[1].toFixed(3) : "" });
   const upd = () => { const e = parseFloat(E.value), n = parseFloat(N.value); task.start = isFinite(e) && isFinite(n) ? [e, n] : null; drawTraverse(); scheduleCheck(); };
   E.oninput = upd; N.oninput = upd;
-  const beacon = h("select", { style: "flex:1;min-width:0", onchange: (ev) => { const f = state.beacons.features.find((x) => String(x.properties.id) === ev.target.value); if (f) { task.start = [Number(f.properties.easting), Number(f.properties.northing)]; drawTraverse(); renderTask(); } } },
-    h("option", { value: "" }, "— from control point —"), ...state.beacons.features.slice(0, 2000).map((f) => h("option", { value: f.properties.id }, f.properties.number)));
+  const beacon = beaconPicker((b) => { task.start = [b.easting, b.northing]; drawTraverse(); renderTask(); });
   page.append(subHead("Start point"), h("p", { class: "muted" }, "Click the map (crosshair), pick a control point, or type UTM 32N coordinates."),
     h("div", { class: "frow" }, h("label", {}, "Easting:"), E), h("div", { class: "frow" }, h("label", {}, "Northing:"), N),
-    h("div", { class: "frow" }, h("label", {}, "Beacon:"), beacon));
+    h("div", { class: "frow" }, h("label", {}, "Beacon:"), beacon),
+    h("p", { class: "muted", style: "margin:2px 0 0" }, "Type part of a beacon or control point number; the nearest matches are listed first."));
 
   const tbl = h("table", { class: "legs" }, h("tr", {}, h("th", {}, "#"), h("th", {}, "Bearing"), h("th", {}, "Dist (m)"), h("th", {}, "")));
   task.legs.forEach((l, i) => {
@@ -1860,6 +2082,7 @@ function startEditing(tool = "sketch") {
   selectTemplate(edit.template);
   openCreateFeatures();
   setTool(tool);
+  openSketchProps();
   updateEditorButtons();
   status("Editing started — pick a template in Create Features, then click the map to add vertices (double-click to finish).");
 }
@@ -1917,10 +2140,11 @@ function drawSketch() {
   ll.forEach((c, i) => feats.push({ type: "Feature", properties: { idx: i, sel: i === edit.sel || (edit.sel < 0 && i === ll.length - 1) }, geometry: { type: "Point", coordinates: c } }));
   map.getSource("sketch")?.setData({ type: "FeatureCollection", features: feats });
 }
-function clearSketch() { edit.verts = []; edit.sel = -1; edit.trace = null; map.getSource("sketch")?.setData(empty()); }
-function canFinishSketch() { const n = edit.verts.length; return edit.geomType === "polygon" ? n >= 3 : edit.geomType === "line" ? n >= 2 : n >= 1; }
+function clearSketch() { edit.verts = []; edit.sel = -1; edit.editingId = null; edit.splitMode = false; edit.trace = null; map.getSource("sketch")?.setData(empty()); }
+function canFinishSketch() { const n = edit.verts.length; return edit.splitMode ? n >= 2 : edit.geomType === "polygon" ? n >= 3 : edit.geomType === "line" ? n >= 2 : n >= 1; }
 async function finishSketch() {
   if (!canFinishSketch()) { status(`Add ${edit.geomType === "polygon" ? "at least 3" : edit.geomType === "line" ? "at least 2" : "a"} vertex(es) before finishing.`); return; }
+  if (edit.splitMode) { await mutationSplit(); return; }
   if (edit.geomType === "polygon" && edit.template === "jobArea") await saveSketchJobArea();
   else if (edit.geomType === "polygon") await saveSketchParcel();
   else if (edit.geomType === "point") await saveSketchPoint();
@@ -1931,8 +2155,8 @@ async function saveSketchJobArea() {
   const utm = edit.verts.slice();
   try {
     wf.editing = await api(`/api/v1/wf/jobs/${wf.editing.job_instance_id}/area`, { method: "PUT", body: { geometry: { type: "Polygon", coordinates: [[...utm, utm[0]]] } } });
-    showJobArea(); clearSketch(); refreshSketchProps(); updateEditorButtons();
-    selectTemplate("parcel"); status("Job area saved. Parcels for this job must be drawn inside it.");
+    showJobArea(); clearSketch(); refreshSketchProps(); updateEditorButtons(); zoomToUTMRing(utm);
+    selectTemplate("parcel"); notify(`Job area saved (${Math.round(wf.editing.area_m2 || 0).toLocaleString()} m²). Parcels for this job must be drawn inside it.`);
     renderWorkflow();
   } catch (e) { alert("Saving the job area failed: " + e.message); }
 }
@@ -1966,13 +2190,26 @@ async function saveSketchParcel() {
   if (!state.job) { alert("Choose a Job Area first — a digitized parcel is saved as a draft under a job."); return; }
   const utm = edit.verts.slice();
   if (!(await ensureJobArea(utm))) return; // keep the sketch so nothing is lost
-  const attrs = await parcelAttrDialog();
+  // A draft being re-shaped (Edit tool) shows the attributes already captured on it.
+  let prefill = {};
+  if (edit.editingId) { try { prefill = await api(`/api/v1/parcels/${edit.editingId}/attributes`); } catch { prefill = {}; } }
+  const attrs = await parcelAttrDialog(edit.editingId ? { prefill, title: "Update Parcel Attribute" } : {});
   if (attrs === null) return; // cancelled — keep the sketch for editing
   try {
-    const body = { geometry: { type: "Polygon", coordinates: [[...utm, utm[0]]] }, stated_area: null };
-    if (Object.keys(attrs).length) body.attributes = attrs;
-    await api(`/api/v1/jobs/${state.job.id}/parcels`, { method: "POST", body });
-    status(`Parcel saved as a draft to ${state.job.reference}. ${draftNextStep()}`); wfRefreshEditing();
+    const geometry = { type: "Polygon", coordinates: [[...utm, utm[0]]] };
+    if (edit.editingId) {
+      await api(`/api/v1/jobs/${state.job.id}/parcels/${edit.editingId}`, { method: "PUT", body: { geometry, stated_area: null } });
+      if (attrs && Object.keys(attrs).length) await api(`/api/v1/parcels/${edit.editingId}/attributes`, { method: "PUT", body: attrs });
+      notify(`Draft parcel updated in ${state.job.reference}. ${draftNextStep()}`);
+    } else {
+      const body = { geometry, stated_area: null };
+      if (attrs && Object.keys(attrs).length) body.attributes = attrs;
+      await api(`/api/v1/jobs/${state.job.id}/parcels`, { method: "POST", body });
+      if (state.job.reference.startsWith("WF-")) notify(`Parcel saved as a draft to ${state.job.reference}. ${draftNextStep()}`);
+      else notify(`Parcel saved to ${state.job.reference}, which is not a workflow job. To work as in Aumentum, open the job in the Workflow panel and choose Work On This Job.`, "warn");
+    }
+    zoomToUTMRing(utm);
+    wfRefreshEditing();
     await loadDrafts(); buildCatalog(); clearSketch(); refreshSketchProps(); updateEditorButtons();
     renderWorkflow();
   } catch (e) { alert("Save failed: " + e.message); }
@@ -2298,39 +2535,428 @@ function openSketchProps() {
     tr.addEventListener("click", (ev) => { if (!/INPUT|BUTTON/.test(ev.target.tagName)) { edit.sel = i; drawSketch(); openSketchProps(); } });
     tbl.append(tr);
   });
-  if (!edit.verts.length) tbl.append(h("tr", {}, h("td", { colspan: 4, class: "muted" }, "No vertices yet — type a coordinate below, or pick the Sketch tool and click the map.")));
-
-  // Key in a vertex by coordinate (UTM 32N metres). Starting an edit session if needed, this lets
-  // you build a parcel entirely by typing E/N — or seed the first point, then click the rest.
-  const addE = h("input", { type: "number", step: "0.001", placeholder: "Easting", style: "width:92px" });
-  const addN = h("input", { type: "number", step: "0.001", placeholder: "Northing", style: "width:92px" });
-  const last = edit.verts[edit.verts.length - 1];
-  if (last) { addE.value = last[0].toFixed(3); addN.value = last[1].toFixed(3); }
-  else { const c = map.getCenter(); const [cE, cN] = toUTM(c.lng, c.lat); addE.value = cE.toFixed(3); addN.value = cN.toFixed(3); }
-  const addVertex = () => {
-    const e = parseFloat(addE.value), n = parseFloat(addN.value);
-    if (!isFinite(e) || !isFinite(n)) { status("Enter a valid Easting and Northing."); return; }
-    if (!edit.active) startEditing("sketch");
-    if (edit.geomType === "point") { edit.verts = [[e, n]]; } else { edit.verts.push([e, n]); }
-    edit.sel = edit.verts.length - 1;
-    drawSketch(); openSketchProps(); updateEditorButtons();
-    setTimeout(() => $("sketchPropsWin")?.querySelector("input[placeholder='Easting']")?.focus(), 0);
+  if (!edit.verts.length) tbl.append(h("tr", {}, h("td", { colspan: 4, class: "muted" }, "No points yet: click the map, or type / paste coordinates below.")));
+  // Typing points: Easting/Northing, a beacon number (its coordinates), or a pasted point list.
+  const addPts = (pts) => {
+    if (!edit.active) startEditing("sketch"); // typing can start the edit session (Che)
+    for (const [E, N, id] of pts) {
+      if (edit.geomType === "point") edit.verts = [[E, N]]; else edit.verts.push([E, N]);
+      if (id) rememberPointId(E, N, id);
+    }
+    edit.sel = edit.verts.length - 1; drawSketch(); openSketchProps(); updateEditorButtons(); showSketchExtent();
   };
-  addE.onkeydown = (ev) => { if (ev.key === "Enter") addN.focus(); };
-  addN.onkeydown = (ev) => { if (ev.key === "Enter") addVertex(); };
-
+  const xIn = h("input", { type: "number", step: "0.001", placeholder: "Easting", style: "width:92px" });
+  const yIn = h("input", { type: "number", step: "0.001", placeholder: "Northing", style: "width:92px" });
+  // Seeded with the last vertex, or the map centre, so a nearby point only needs its last digits changed.
+  const last = edit.verts[edit.verts.length - 1];
+  if (last) { xIn.value = last[0].toFixed(3); yIn.value = last[1].toFixed(3); }
+  else { const c = map.getCenter(); const [cE, cN] = toUTM(c.lng, c.lat); xIn.value = cE.toFixed(3); yIn.value = cN.toFixed(3); }
+  const addXY = () => { const E = parseFloat(xIn.value), N = parseFloat(yIn.value); if (!isFinite(E) || !isFinite(N)) { status("Type the Easting and Northing (UTM 32N metres)."); return; } addPts([[E, N]]); setTimeout(() => $("sketchPropsWin")?.querySelector("input[placeholder=Easting]")?.focus(), 0); };
+  yIn.addEventListener("keydown", (ev) => ev.key === "Enter" && addXY());
+  xIn.addEventListener("keydown", (ev) => { if (ev.key === "Enter") yIn.focus(); });
+  const bIn = h("input", { placeholder: "Beacon no., e.g. CA6782", style: "width:150px" });
+  const addBeacon = async () => {
+    const q = bIn.value.trim(); if (!q) return;
+    const alt = plagisAlternate(q);
+    const l = await api(`/api/v1/beacons/search?limit=5&q=${encodeURIComponent(q)}`).catch(() => []);
+    const b = l.find((x) => x.number.toUpperCase() === q.toUpperCase() || (alt && x.number.toUpperCase() === alt.toUpperCase()));
+    if (!b) { status(`Beacon ${q} is not in the fabric; type its coordinates instead.`); return; }
+    addPts([[b.easting, b.northing, b.number]]); status(`Added beacon ${b.number} (${fmt3(b.easting)} ${fmt3(b.northing)}).`);
+  };
+  bIn.addEventListener("keydown", (ev) => ev.key === "Enter" && addBeacon());
+  const paste = h("textarea", { rows: 3, style: "width:100%;box-sizing:border-box;font-family:monospace", placeholder: "Paste points, one per line: Easting Northing, or ID Easting Northing (as in the surveyor's point list), in boundary order" });
+  const addPasted = () => {
+    const pts = [];
+    for (const line of paste.value.split(/\n/)) {
+      const t = line.trim().split(/[\s,;|]+/).filter(Boolean);
+      const hasId = t.length >= 3 && !isFinite(Number(t[0])); // "CA6782 492951.814 1088827.672"
+      const [E, N] = (hasId ? t.slice(1, 3) : t.slice(0, 2)).map(Number);
+      if (isFinite(E) && isFinite(N) && E > 100000 && N > 100000) pts.push([E, N, hasId ? t[0] : null]);
+    }
+    if (!pts.length) { status("No coordinates found in the pasted text."); return; }
+    addPts(pts); status(`Added ${pts.length} point(s).`);
+  };
   const body = h("div", {},
-    h("div", { class: "muted" }, `${edit.geomType} sketch — ${edit.verts.length} vertex(es), WGS 84 / UTM 32N metres`),
-    subHead("Add vertex by coordinate"),
-    h("div", { class: "frow" }, h("label", {}, "E / N:"), addE, addN, h("button", { class: "btn", style: "min-width:0", onclick: addVertex }, "Add")),
-    subHead("Vertices"),
-    tbl,
+    h("div", { class: "muted" }, `${edit.editingId ? "Editing draft parcel — " : ""}${edit.template === "jobArea" ? "job area" : edit.geomType} sketch — ${edit.verts.length} vertex(es), WGS 84 / UTM 32N metres`),
+    h("div", { style: "max-height:260px;overflow:auto" }, tbl),
+    h("div", { class: "cfHdr", style: "margin-top:6px" }, "Add points"),
+    h("div", { class: "frow" }, xIn, yIn, h("button", { class: "btn", style: "min-width:0", onclick: addXY }, "Add")),
+    h("div", { class: "frow" }, bIn, h("button", { class: "btn", style: "min-width:0", onclick: addBeacon }, "Add beacon")),
+    paste, h("div", { class: "frow" }, h("button", { class: "btn", onclick: addPasted }, "Add pasted points")),
     h("div", { class: "taskNav" },
-      h("button", { class: "btn", disabled: !canFinishSketch(), onclick: finishSketch }, "Finish Sketch"),
-      h("button", { class: "btn", disabled: !edit.verts.length, onclick: deleteSketch }, "Delete Sketch")));
+      h("button", { class: "btn", disabled: !canFinishSketch(), onclick: finishSketch }, edit.editingId ? "Save Changes" : "Finish Sketch"),
+      h("button", { class: "btn", disabled: !edit.verts.length, onclick: deleteSketch }, edit.editingId ? "Cancel Edit" : "Delete Sketch"),
+      edit.editingId ? h("button", { class: "btn", onclick: deleteDraftBeingEdited }, "Delete Parcel") : null));
   floatWindow("Edit Sketch Properties", body, { id: "sketchPropsWin", width: 340 });
 }
 function refreshSketchProps() { if ($("sketchPropsWin")) openSketchProps(); }
+async function deleteDraftBeingEdited() {
+  if (!edit.editingId || !state.job || !confirm("Delete this draft parcel from the job?")) return;
+  try {
+    await api(`/api/v1/jobs/${state.job.id}/parcels/${edit.editingId}`, { method: "DELETE" });
+    clearSketch(); await loadDrafts(); wfRefreshEditing(); refreshSketchProps(); updateEditorButtons(); status("Draft parcel deleted.");
+  } catch (e) { alert("Delete failed: " + e.message); }
+}
+
+/* =====================================================================================
+ * Phase 3 — Aumentum's Computation toolbar (ComputationToolbar.*): point and line tools that work
+ * on the sketch, Donut Parcel and Parcel Separation on draft parcels, and Create Parcel by FCI.
+ * Calculations are plane UTM 32N metres; bearings are whole-circle from grid north.
+ * ===================================================================================== */
+// A workflow step's own tools, as a small window of buttons.
+function stepTools(title, items) {
+  const w = floatWindow(title, h("div", { style: "display:flex;flex-direction:column;gap:4px" },
+    ...items.map(([label, fn]) => h("button", { class: "btn", style: "text-align:left", onclick: () => { w.remove(); fn(); } }, label))), { id: "stepToolsWin", width: 330 });
+}
+function computationMenu() {
+  const sel = edit.sel >= 0 && edit.sel < edit.verts.length;
+  return [
+    { label: "List Control Points…", action: listControlPoints },
+    { label: "Link Control To Point…", action: linkControlToPoint, disabled: () => !sel },
+    { label: "Move Point…", action: movePointDialog, disabled: () => !sel },
+    { label: "Point Attributes…", action: pointAttributesDialog, disabled: () => !sel },
+    "-",
+    { label: "Create Multi Point Line…", action: multiPointLineDialog },
+    { label: "Create Connection Line…", action: connectionLineDialog },
+    "-",
+    { label: "Create Donut Parcel", action: () => startPickDraft("donut"), disabled: () => !(edit.geomType === "polygon" && edit.verts.length >= 3 && !edit.editingId) },
+    { label: "Parcel Separation", action: () => startPickDraft("separate"), disabled: () => !(edit.verts.length >= 2 && !edit.editingId) },
+    "-",
+    { label: "Split Parcel (sketch a line)", action: () => startSplitLine() },
+    { label: "Merge Selected Parcels", action: mutationMerge },
+    { label: "Re-survey (Adjust) Selected Parcel", action: mutationResurvey },
+    { label: "Free Mutation of Selected Parcel", action: mutationFree },
+    { label: "Separate Selected Parcel (sketch a line)", action: () => startSplitLine("separate") },
+    { label: "Retire Selected Parcel…", action: mutationRetire },
+    { label: "Parcel Lineage…", action: () => lineageOfSelection() },
+    "-",
+    { label: "Create Parcel by FCI (Feature Class Import)…", action: fciDialog },
+    { label: "Import Points (Import Wizard)…", action: openImportDialog },
+    { label: "Computation Tools (35)…", action: openComputeTools },
+  ];
+}
+// Whole-circle bearing as d°m's" and back; inverse and forward in the plane.
+function fmtDMS(deg) {
+  let d = ((deg % 360) + 360) % 360, D = Math.floor(d), M = Math.floor((d - D) * 60), S = Math.round(((d - D) * 60 - M) * 60);
+  if (S === 60) { S = 0; M++; } if (M === 60) { M = 0; D = (D + 1) % 360; }
+  return `${D}°${String(M).padStart(2, "0")}'${String(S).padStart(2, "0")}"`;
+}
+const inverseUTM = ([e1, n1], [e2, n2]) => ({ bearing: ((Math.atan2(e2 - e1, n2 - n1) * 180 / Math.PI) + 360) % 360, distance: Math.hypot(e2 - e1, n2 - n1) });
+const forwardUTM = ([e, n], bearing, distance) => { const r = bearing * Math.PI / 180; return [e + distance * Math.sin(r), n + distance * Math.cos(r)]; };
+// A point typed as "E N", or a beacon / control point number (either PLAGIS form).
+async function resolvePoint(text) {
+  const t = String(text || "").trim(); if (!t) return null;
+  const nums = t.split(/[\s,;]+/).map(Number);
+  if (nums.length >= 2 && nums.slice(0, 2).every(isFinite)) return { e: nums[0], n: nums[1], id: null };
+  const alt = plagisAlternate(t);
+  const l = await api(`/api/v1/beacons/search?limit=5&q=${encodeURIComponent(t)}`).catch(() => []);
+  const b = l.find((x) => x.number.toUpperCase() === t.toUpperCase() || (alt && x.number.toUpperCase() === alt.toUpperCase()));
+  return b ? { e: b.easting, n: b.northing, id: b.number } : null;
+}
+const needVertex = () => { if (edit.sel >= 0 && edit.sel < edit.verts.length) return true; status("Select a sketch point first (click its row in Edit Sketch Properties, or click it on the map)."); return false; };
+function afterVertexChange(msg) { drawSketch(); refreshSketchProps(); updateEditorButtons(); showSketchExtent(); if (msg) status(msg); }
+
+// List Control Points: control points and beacons nearest the map centre (or matching a number);
+// a row zooms there, or adds the point to the sketch.
+function listControlPoints() {
+  const q = h("input", { placeholder: "Number (blank = nearest the map centre)", style: "flex:1" });
+  const only = h("input", { type: "checkbox", checked: true });
+  const list = h("div", { style: "max-height:330px;overflow:auto;margin-top:6px" });
+  const run = async () => {
+    const c = map.getCenter(), [e, n] = toUTM(c.lng, c.lat);
+    const l = await api(`/api/v1/beacons/search?limit=200&q=${encodeURIComponent(q.value.trim())}&e=${e.toFixed(1)}&n=${n.toFixed(1)}${only.checked ? "&control=true" : ""}`).catch(() => []);
+    const t = h("table", { class: "legs" }, h("tr", {}, h("th", {}, "Point"), h("th", {}, "Easting"), h("th", {}, "Northing"), h("th", {}, "Dist (m)"), h("th", {}, "")));
+    for (const b of l.slice(0, 100)) {
+      const tr = h("tr", { style: "cursor:pointer", title: "Zoom to point" }, h("td", {}, b.number + (b.is_control ? " (control)" : "")), h("td", {}, fmt3(b.easting)), h("td", {}, fmt3(b.northing)),
+        h("td", {}, Math.hypot(b.easting - e, b.northing - n).toFixed(1)),
+        h("td", {}, h("button", { class: "btn", style: "min-width:0", title: "Add to the sketch", onclick: (ev) => { ev.stopPropagation(); if (!edit.active) startEditing("sketch"); edit.verts.push([b.easting, b.northing]); rememberPointId(b.easting, b.northing, b.number); edit.sel = edit.verts.length - 1; afterVertexChange(`Added ${b.number} to the sketch.`); } }, "Add")));
+      tr.onclick = () => showFoundBeacons([b]);
+      t.append(tr);
+    }
+    list.replaceChildren(l.length ? t : h("p", { class: "muted" }, "No points found."));
+  };
+  q.addEventListener("keydown", (ev) => ev.key === "Enter" && run());
+  only.onchange = run;
+  floatWindow("List Control Points", h("div", {}, h("div", { class: "frow" }, q, h("button", { class: "btn", style: "min-width:0", onclick: run }, "List")),
+    h("label", { style: "display:flex;gap:6px;align-items:center" }, only, "Control points only"), list), { id: "listCtrlWin", width: 470 });
+  run();
+}
+// Link Control To Point: the selected sketch point takes a control point's / beacon's exact coordinates.
+function linkControlToPoint() {
+  if (!needVertex()) return;
+  const i = edit.sel, inp = h("input", { placeholder: "e.g. XSK101 or C6782A", style: "flex:1" }), msg = h("div", { class: "muted" });
+  const go = async () => {
+    const p = await resolvePoint(inp.value);
+    if (!p || !p.id) { msg.textContent = `${inp.value.trim()} is not a control point or beacon in the fabric.`; return; }
+    const [e0, n0] = edit.verts[i]; edit.verts[i] = [p.e, p.n]; rememberPointId(p.e, p.n, p.id);
+    w.remove(); afterVertexChange(`Point ${i + 1} linked to ${p.id} (moved ${Math.hypot(p.e - e0, p.n - n0).toFixed(3)} m).`);
+  };
+  inp.addEventListener("keydown", (ev) => ev.key === "Enter" && go());
+  const w = floatWindow("Link Control To Point", h("div", {}, h("p", { class: "muted", style: "margin-top:0" }, `Sketch point ${i + 1}: ${fmt3(edit.verts[i][0])} ${fmt3(edit.verts[i][1])}`),
+    h("div", { class: "frow" }, h("label", {}, "Control point:"), inp, h("button", { class: "btn", style: "min-width:0", onclick: go }, "Link")), msg), { id: "linkCtrlWin", width: 380 });
+  setTimeout(() => inp.focus(), 0);
+}
+// Move Point: to typed coordinates, by a shift, or by a bearing and distance.
+function movePointDialog() {
+  if (!needVertex()) return;
+  const i = edit.sel, [e0, n0] = edit.verts[i];
+  const E = h("input", { type: "number", step: "0.001", value: e0.toFixed(3), style: "width:110px" }), N = h("input", { type: "number", step: "0.001", value: n0.toFixed(3), style: "width:110px" });
+  const dE = h("input", { type: "number", step: "0.001", value: "0", style: "width:80px" }), dN = h("input", { type: "number", step: "0.001", value: "0", style: "width:80px" });
+  const B = h("input", { placeholder: "ddd mm ss", style: "width:100px" }), D = h("input", { type: "number", step: "0.001", style: "width:80px" });
+  const apply = (p, how) => { edit.verts[i] = p; w.remove(); afterVertexChange(`Point ${i + 1} moved ${how} to ${fmt3(p[0])} ${fmt3(p[1])}.`); };
+  const w = floatWindow("Move Point", h("div", {},
+    h("p", { class: "muted", style: "margin-top:0" }, `Sketch point ${i + 1}: ${fmt3(e0)} ${fmt3(n0)}`),
+    h("div", { class: "frow" }, h("label", {}, "To E / N:"), E, N, h("button", { class: "btn", style: "min-width:0", onclick: () => { const p = [parseFloat(E.value), parseFloat(N.value)]; if (p.every(isFinite)) apply(p, "absolutely"); } }, "Move")),
+    h("div", { class: "frow" }, h("label", {}, "By ΔE / ΔN:"), dE, dN, h("button", { class: "btn", style: "min-width:0", onclick: () => { const a = parseFloat(dE.value), b = parseFloat(dN.value); if (isFinite(a) && isFinite(b)) apply([e0 + a, n0 + b], "by a shift"); } }, "Move")),
+    h("div", { class: "frow" }, h("label", {}, "Bearing / dist:"), B, D, h("button", { class: "btn", style: "min-width:0", onclick: () => { const b = parseBearing(B.value), d = parseFloat(D.value); if (isFinite(b) && isFinite(d)) apply(forwardUTM([e0, n0], b, d), `${d} m on ${fmtDMS(b)}`); } }, "Move"))),
+    { id: "movePtWin", width: 420 });
+}
+// Point Attributes: the selected sketch point's beacon number (kept for the commit) and position.
+function pointAttributesDialog() {
+  if (!needVertex()) return;
+  const i = edit.sel, [e, n] = edit.verts[i];
+  const num = h("input", { value: pointIds.get(ptKey(e, n)) || "", placeholder: "e.g. CA6782", style: "width:140px" });
+  const prev = edit.verts[(i - 1 + edit.verts.length) % edit.verts.length], next = edit.verts[(i + 1) % edit.verts.length];
+  const leg = (a, b) => { const r = inverseUTM(a, b); return `${fmtDMS(r.bearing)}  ${r.distance.toFixed(3)} m`; };
+  const save = () => { rememberPointId(e, n, num.value); w.remove(); refreshSketchProps(); status(num.value.trim() ? `Point ${i + 1} is beacon ${num.value.trim()} (used at commit).` : "Point attributes saved."); };
+  num.addEventListener("keydown", (ev) => ev.key === "Enter" && save());
+  const w = floatWindow("Point Attributes", h("div", {},
+    h("table", { class: "legs" },
+      h("tr", {}, h("th", {}, "Point"), h("td", {}, String(i + 1))),
+      h("tr", {}, h("th", {}, "Easting"), h("td", {}, fmt3(e))), h("tr", {}, h("th", {}, "Northing"), h("td", {}, fmt3(n))),
+      edit.verts.length > 1 ? h("tr", {}, h("th", {}, "From previous"), h("td", {}, leg(prev, [e, n]))) : null,
+      edit.verts.length > 1 ? h("tr", {}, h("th", {}, "To next"), h("td", {}, leg([e, n], next))) : null),
+    h("div", { class: "frow" }, h("label", {}, "Beacon number:"), num, h("button", { class: "btn", style: "min-width:0", onclick: save }, "OK"))), { id: "ptAttrWin", width: 360 });
+  setTimeout(() => num.focus(), 0);
+}
+// Create Multi Point Line: points by bearing and distance from a start point (a beacon, E N, or
+// the last sketch point); added to the sketch, or drawn as a line.
+function multiPointLineDialog() {
+  const last = edit.verts[edit.verts.length - 1];
+  const start = h("input", { value: last ? `${last[0].toFixed(3)} ${last[1].toFixed(3)}` : "", placeholder: "Beacon number, or E N", style: "flex:1" });
+  const legs = h("textarea", { rows: 6, style: "width:100%;box-sizing:border-box;font-family:monospace", placeholder: "One leg per line: bearing distance\ne.g. 45 30 00  25.430" });
+  const out = h("div", { class: "muted", style: "margin:4px 0" });
+  const compute = async () => {
+    const s0 = await resolvePoint(start.value); if (!s0) { out.textContent = "Give the start point (a beacon number, or E N)."; return null; }
+    const pts = [[s0.e, s0.n, s0.id]]; let bad = 0;
+    for (const line of legs.value.split(/\n/)) {
+      const t = line.trim().split(/\s+/).filter(Boolean); if (!t.length) continue;
+      const d = parseFloat(t[t.length - 1]), b = parseBearing(t.slice(0, -1).join(" "));
+      if (!isFinite(b) || !isFinite(d) || d <= 0) { bad++; continue; }
+      const [e, n] = forwardUTM(pts[pts.length - 1], b, d); pts.push([e, n, null]);
+    }
+    const end = pts[pts.length - 1];
+    out.textContent = `${pts.length - 1} leg(s)${bad ? `, ${bad} unreadable line(s) skipped` : ""}; end point ${fmt3(end[0])} ${fmt3(end[1])}.`;
+    return pts;
+  };
+  const toSketch = async () => {
+    const pts = await compute(); if (!pts || pts.length < 2) return;
+    if (!edit.active) startEditing("sketch");
+    const startsAtLast = last && Math.hypot(pts[0][0] - last[0], pts[0][1] - last[1]) < 0.0005;
+    for (const [e, n, id] of startsAtLast ? pts.slice(1) : pts) { edit.verts.push([e, n]); rememberPointId(e, n, id); }
+    edit.sel = edit.verts.length - 1; afterVertexChange(`Added ${startsAtLast ? pts.length - 1 : pts.length} point(s) to the sketch.`);
+  };
+  const asLine = async () => { const pts = await compute(); if (!pts || pts.length < 2) return; addGraphic({ type: "line", pts: pts.map(([e, n]) => toLL(e, n)) }); status("Multi point line drawn."); };
+  floatWindow("Create Multi Point Line", h("div", {}, h("div", { class: "frow" }, h("label", {}, "Start:"), start), legs, out,
+    h("div", { class: "frow", style: "justify-content:flex-end" }, h("button", { class: "btn", onclick: compute }, "Compute"), h("button", { class: "btn", onclick: toSketch }, "Add to Sketch"), h("button", { class: "btn", onclick: asLine }, "Draw Line"))),
+    { id: "multiLineWin", width: 420 });
+}
+// Create Connection Line: the bearing and distance between two points (e.g. a control point and a
+// parcel corner), drawn on the map and labelled.
+function connectionLineDialog() {
+  const a = h("input", { placeholder: "From: beacon number, or E N", style: "flex:1" }), b = h("input", { placeholder: "To: beacon number, or E N", style: "flex:1" });
+  if (edit.sel >= 0 && edit.verts[edit.sel]) b.value = `${edit.verts[edit.sel][0].toFixed(3)} ${edit.verts[edit.sel][1].toFixed(3)}`;
+  const out = h("div", { style: "margin:6px 0;font-weight:600" });
+  const go = async () => {
+    const [p, q] = await Promise.all([resolvePoint(a.value), resolvePoint(b.value)]);
+    if (!p || !q) { out.textContent = `${!p ? "From" : "To"} point not found.`; return; }
+    const r = inverseUTM([p.e, p.n], [q.e, q.n]);
+    out.textContent = `${p.id || "From"} → ${q.id || "To"}: ${fmtDMS(r.bearing)}  ${r.distance.toFixed(3)} m`;
+    const A = toLL(p.e, p.n), B = toLL(q.e, q.n);
+    addGraphic({ type: "line", pts: [A, B] });
+    addGraphic({ type: "text", at: [(A[0] + B[0]) / 2, (A[1] + B[1]) / 2], text: `${fmtDMS(r.bearing)} ${r.distance.toFixed(3)}m` });
+    zoomToFC({ type: "FeatureCollection", features: [{ type: "Feature", geometry: { type: "LineString", coordinates: [A, B] }, properties: {} }] }, { padding: 100, maxZoom: 19 });
+  };
+  floatWindow("Create Connection Line", h("div", {}, h("div", { class: "frow" }, a), h("div", { class: "frow" }, b), out,
+    h("div", { class: "frow", style: "justify-content:flex-end" }, h("button", { class: "btn", onclick: go }, "Create"))), { id: "connLineWin", width: 400 });
+}
+// Donut Parcel / Parcel Separation: the current sketch is applied to a draft parcel clicked next.
+let pickDraftMode = null;
+function startPickDraft(mode) {
+  if (!state.job) { alert("Choose the job first (Workflow → Work On This Job)."); return; }
+  pickDraftMode = mode; setTool("pickDraft");
+  status(mode === "donut" ? "Create Donut Parcel: click the draft parcel the sketch is a hole in." : "Parcel Separation: click the draft parcel the sketched line separates.");
+}
+async function pickDraftAt(pt) {
+  const f = map.queryRenderedFeatures([[pt.x - 3, pt.y - 3], [pt.x + 3, pt.y + 3]], { layers: ["drafts-fill"].filter((l) => map.getLayer(l)) })[0];
+  if (!f) { status("Click one of the job's draft parcels."); return; }
+  const d = state.drafts.features.find((x) => String(x.properties.id) === String(f.properties.id)); if (!d) return;
+  const mode = pickDraftMode; pickDraftMode = null; setTool("sketch");
+  try {
+    if (mode === "donut") {
+      const outer = (d.geometry.type === "MultiPolygon" ? d.geometry.coordinates[0] : d.geometry.coordinates).map((ring) => ring.map(([x, y]) => toUTM(x, y).map((v) => Math.round(v * 1000) / 1000)));
+      const hole = [...edit.verts, edit.verts[0]];
+      await api(`/api/v1/jobs/${state.job.id}/parcels/${d.properties.id}`, { method: "PUT", body: { geometry: { type: "Polygon", coordinates: [...outer, hole] }, stated_area: null } });
+      clearSketch(); await loadDrafts(); wfRefreshEditing(); refreshSketchProps(); updateEditorButtons(); notify("Donut parcel created: the sketch is now a hole in the draft parcel.");
+    } else {
+      const parts = await api(`/api/v1/jobs/${state.job.id}/parcels/${d.properties.id}/separate`, { method: "POST", body: { line: { type: "LineString", coordinates: edit.verts.map((v) => [...v]) } } });
+      clearSketch(); await loadDrafts(); wfRefreshEditing(); refreshSketchProps(); updateEditorButtons(); notify(`Parcel separated into ${parts.length} draft parcels.`);
+    }
+  } catch (e) { notify((mode === "donut" ? "Donut parcel" : "Parcel separation") + " failed: " + e.message, "err"); }
+}
+// Create Parcel by FCI: a polygon feature class (shapefile) becomes the job's draft parcels.
+function fciDialog() {
+  if (!state.job) { alert("Choose the job first (Workflow → Work On This Job)."); return; }
+  const node = cat.nodes.get(cat.selected);
+  const catShp = node && node.folder != null && /\.shp$/i.test(node.path || "") ? node : null;
+  const src = h("select", {}, catShp ? h("option", { value: "catalog" }, `Selected in the Catalog: ${catShp.name}`) : null, h("option", { value: "pc" }, "A shapefile on this PC"));
+  const files = h("input", { type: "file", multiple: true, accept: ".shp,.prj,.shx,.dbf" });
+  const epsg = h("input", { type: "number", placeholder: "only if no .prj", style: "width:120px" });
+  const out = h("div", { style: "margin-top:6px" });
+  const pcRow = h("div", { class: "frow" }, h("label", {}, "Files:"), files);
+  const sync = () => { pcRow.style.display = src.value === "pc" ? "" : "none"; }; src.onchange = sync;
+  const b64 = (buf) => { const u = new Uint8Array(buf); let s = ""; for (let i = 0; i < u.length; i += 0x8000) s += String.fromCharCode(...u.subarray(i, i + 0x8000)); return btoa(s); };
+  const go = async () => {
+    let body;
+    if (src.value === "catalog") body = { folder: catShp.folder, path: catShp.path, name: catShp.name };
+    else {
+      const fs = [...files.files], shp = fs.find((f) => /\.shp$/i.test(f.name)), prj = fs.find((f) => /\.prj$/i.test(f.name));
+      if (!shp) { out.textContent = "Choose the .shp (and its .prj) on this PC."; return; }
+      body = { shp_base64: b64(await shp.arrayBuffer()), prj: prj ? await prj.text() : null, name: shp.name };
+    }
+    if (epsg.value) body.epsg = parseInt(epsg.value, 10);
+    out.textContent = "Importing…";
+    try {
+      const r = await api(`/api/v1/jobs/${state.job.id}/import/feature-class`, { method: "POST", body });
+      await loadDrafts(); wfRefreshEditing(); if (state.drafts.features.length) zoomToFC(state.drafts, { padding: 60 });
+      out.replaceChildren(h("p", {}, h("b", {}, `${r.created_parcels} draft parcel(s) created`), ` from ${r.features} feature(s) of ${r.name || "the feature class"}.`),
+        ...(r.skipped || []).map((x) => h("div", { class: "muted" }, `FID ${x.fid}: ${x.reason}`)), ...(r.warnings || []).map((x) => h("div", { class: "muted" }, x)));
+      notify(`Feature class imported: ${r.created_parcels} draft parcel(s) in ${state.job.reference}.`);
+    } catch (e) { out.textContent = "Import failed: " + e.message; }
+  };
+  floatWindow("Create Parcel by FCI", h("div", {},
+    h("p", { class: "muted", style: "margin-top:0" }, `Polygons of a feature class become draft parcels of ${state.job.reference}. Under a workflow job they must all lie inside the job area. Beacon numbers are entered at commit.`),
+    h("div", { class: "frow" }, h("label", {}, "Source:"), src), pcRow,
+    h("div", { class: "frow" }, h("label", {}, "EPSG:"), epsg),
+    h("div", { class: "frow", style: "justify-content:flex-end" }, h("button", { class: "btn", onclick: go }, "Import")), out), { id: "fciWin", width: 460 });
+  sync();
+}
+
+/* =====================================================================================
+ * Phase 4 — mutations and lineage (Aumentum: Split Parcel / Merge Parcel steps; re-survey and
+ * retirement from its lineage history). Recorded in the workflow job, applied at commit.
+ * ===================================================================================== */
+const selectedUpins = () => selectedFC().features.map((f) => f.properties.parcel_number).filter(Boolean);
+function needWorkflowJob() {
+  if (wf.editing) return wf.editing.job_instance_id;
+  alert("Open the job in the Workflow panel and choose Work On This Job first."); return null;
+}
+async function afterMutation(msg) {
+  clearSketch(); refreshSketchProps(); updateEditorButtons();
+  await loadDrafts(); await wfRefreshEditing(); if (wf.selected) await wfSelect(wf.selected);
+  notify(msg);
+}
+async function recordMutation(body, msg) {
+  const id = needWorkflowJob(); if (!id) return;
+  try {
+    const r = await api(`/api/v1/wf/jobs/${id}/mutations`, { method: "POST", body });
+    clearSelection(); await afterMutation(typeof msg === "function" ? msg(r) : msg);
+    if (r.drafts.length) zoomToFC(state.drafts, { padding: 80 });
+  } catch (e) { notify(e.message, "err"); }
+}
+// Aumentum's mutation types (d_mutation_type), by the kind names the server takes.
+const MUTATION_LABEL = { split: "Split", merge: "Merge", resurvey: "Adjust (re-survey)", free: "Free Mutation", separate: "Separation", retire: "Retire" };
+// A split (type 1) or a separation (type 6): both cut one posted parcel along a sketched line.
+function startSplitLine(kind = "split") {
+  const verb = kind === "separate" ? "separate" : "split";
+  const u = selectedUpins();
+  if (u.length !== 1) { alert(`Select the one parcel to ${verb} first (Select tool).`); return; }
+  if (!needWorkflowJob()) return;
+  if (!edit.active) startEditing("sketch");
+  clearSketch(); selectTemplate("line"); edit.splitMode = kind; setTool("sketch"); openSketchProps();
+  status(`${verb[0].toUpperCase() + verb.slice(1)} ${u[0]}: click the line's points across the parcel (or type them), then Finish Sketch.`);
+}
+async function mutationSplit() {
+  const kind = edit.splitMode === "separate" ? "separate" : "split";
+  const u = selectedUpins();
+  if (u.length !== 1) { alert(`Select the one parcel to ${kind} (Select tool).`); return; }
+  if (edit.verts.length < 2) { alert("Sketch the line across the parcel first."); return; }
+  const line = { type: "LineString", coordinates: edit.verts.map((v) => [...v]) };
+  edit.splitMode = false;
+  await recordMutation({ kind, upins: u, line }, (r) => `${MUTATION_LABEL[kind]} of ${u[0]} recorded: ${r.drafts.length} new parcels (drafts). They replace it when the job's parcels are committed.`);
+}
+async function mutationMerge() {
+  const u = selectedUpins();
+  if (u.length < 2) { alert("Select two or more neighbouring parcels to merge (Select tool, Shift-click to add)."); return; }
+  if (!confirm(`Merge ${u.join(" + ")} into one parcel?`)) return;
+  await recordMutation({ kind: "merge", upins: u }, `Merge of ${u.join(" + ")} recorded (a draft). It replaces them when the job's parcels are committed.`);
+}
+// Aumentum: an adjustment takes n adjacent parcels to n (each new parcel's parents: all n); a
+// free mutation X parcels to Y (reshape, separate or delete the copies). New UPINs for all.
+async function mutationResurvey() {
+  const u = selectedUpins();
+  if (!u.length) { alert("Select the parcel(s) to adjust (Select tool; Shift-click to add adjacent parcels)."); return; }
+  await recordMutation({ kind: "resurvey", upins: u }, `Adjustment of ${u.join(" + ")} recorded: edit the ${u.length > 1 ? "copies" : "copy"} with the Edit tool; ${u.length > 1 ? "they replace them" : `it replaces ${u[0]}`} (new UPINs) at commit.`);
+}
+async function mutationFree() {
+  const u = selectedUpins();
+  if (!u.length) { alert("Select the parcel(s) for the free mutation (Select tool; Shift-click to add adjacent parcels)."); return; }
+  await recordMutation({ kind: "free", upins: u }, `Free mutation of ${u.join(" + ")} recorded: reshape, separate or delete the copies; they replace ${u.join(" + ")} (new UPINs) at commit.`);
+}
+// Aumentum's Separation Configuration: which part keeps the parent's UPIN and attributes.
+async function mutationKeepUpin(jobId, m, draft) {
+  try { await api(`/api/v1/wf/jobs/${jobId}/mutations/${m.group}/keep-upin`, { method: "PUT", body: { draft: draft || null } }); await afterMutation(draft ? `The chosen part keeps ${m.parents[0]}.` : "Every part gets a new UPIN."); }
+  catch (e) { notify(e.message, "err"); }
+}
+function mutationRetire() {
+  const u = selectedUpins();
+  if (!u.length) { alert("Select the parcel(s) to retire (Select tool)."); return; }
+  if (!needWorkflowJob()) return;
+  const reason = h("input", { placeholder: "e.g. RE-SURVEYED, overlapping, WRONGLY DONE", style: "flex:1" });
+  const go = async () => { if (!reason.value.trim()) { reason.focus(); return; } w.remove(); await recordMutation({ kind: "retire", upins: u, reason: reason.value.trim() }, `Retirement of ${u.join(", ")} recorded; applied when the job is committed.`); };
+  reason.addEventListener("keydown", (ev) => ev.key === "Enter" && go());
+  const w = floatWindow("Retire Parcel", h("div", {}, h("p", { style: "margin-top:0" }, `Retire ${u.join(", ")}: archived with this reason (Aumentum's Archive Reason). The UPIN is never reused.`),
+    h("div", { class: "frow" }, h("label", {}, "Reason:"), reason), h("div", { class: "frow", style: "justify-content:flex-end" }, h("button", { class: "btn", onclick: go }, "Retire"))), { id: "retireWin", width: 400 });
+  setTimeout(() => reason.focus(), 0);
+}
+function lineageOfSelection() {
+  const u = selectedUpins();
+  if (u.length) { lineageWindow(u[0]); return; }
+  const v = prompt("Parcel UPIN:", ""); if (v && v.trim()) lineageWindow(v.trim());
+}
+// Lineage: where a parcel came from and what it became (Aumentum's history and mutations made here).
+async function lineageWindow(upin) {
+  let d;
+  try { d = await api(`/api/v1/parcels/lineage?upin=${encodeURIComponent(upin)}`); } catch (e) { alert(e.message); return; }
+  const body = h("div", {});
+  const link = (u) => u ? h("a", { href: "#", onclick: (ev) => { ev.preventDefault(); lineageWindow(u); } }, u) : "?";
+  const groups = new Map();
+  for (const e of d.edges) { const k = `${e.mutation_id || ""}|${e.mutation}|${(e.date || "").slice(0, 10)}`; if (!groups.has(k)) groups.set(k, []); groups.get(k).push(e); }
+  if (!groups.size && !d.retirements.length) body.append(h("p", { class: "muted" }, `No recorded mutations for ${d.upin}.`));
+  for (const [k, es] of groups) {
+    const [, name, date] = k.split("|");
+    const parents = [...new Set(es.map((e) => e.parent_upin))], kids = [...new Set(es.map((e) => e.child_upin))];
+    const row = h("div", { style: `margin:4px 0;padding:4px 6px;border-left:3px solid ${parents.includes(d.upin) || kids.includes(d.upin) ? "#b22222" : "#999"}` },
+      h("b", {}, `${date || "—"}  ${name}`), h("span", { class: "muted" }, es[0].source === "aumentum" ? "  (Aumentum)" : ""), h("br"));
+    parents.forEach((u, i) => { if (i) row.append(" + "); row.append(link(u)); });
+    row.append(" → "); kids.forEach((u, i) => { if (i) row.append(", "); row.append(link(u)); });
+    body.append(row);
+  }
+  for (const r of d.retirements) body.append(h("div", { style: "margin:4px 0;padding:4px 6px;border-left:3px solid #666" }, h("b", {}, `${(r.date || "").slice(0, 10)}  Retired `), link(r.upin), `: ${r.reason || ""}`));
+  if (d.shapes.length) {
+    const t = h("table", { class: "legs", style: "margin-top:6px" }, h("tr", {}, h("th", {}, "UPIN"), h("th", {}, "Status"), h("th", {}, "Area (m²)"), h("th", {}, "")));
+    for (const s of d.shapes) t.append(h("tr", {}, h("td", {}, s.upin), h("td", {}, s.status === "posted" ? "active" : s.status), h("td", {}, s.area.toFixed(2)),
+      h("td", {}, h("button", { class: "btn", style: "min-width:0", onclick: async () => {
+        const l = await api(`/api/v1/parcels/search?number=${encodeURIComponent(s.upin)}`).catch(() => []);
+        const p = l.find((x) => x.parcel_number === s.upin && x.status === s.status);
+        if (!p) return;
+        if (s.status !== "posted") { const lyr = allLeaves().find((x) => x.id === "history"); if (lyr && !lyr.visible) { lyr.visible = true; applyVisibility(); buildTOC(); } }
+        zoomToFC({ type: "FeatureCollection", features: [resultFeature(p)] });
+      } }, "Zoom"))));
+    body.append(h("div", { class: "wfSub", style: "margin-top:6px" }, "Shapes in the fabric"), t);
+  }
+  floatWindow(`Lineage — ${d.upin}`, body, { id: "lineageWin", width: 440 });
+}
 
 /* =====================================================================================
  * Phase 5 — Catalog: live folder connections (e.g. \\PRODUCTIONMC\Image), browsed through the
@@ -2591,6 +3217,7 @@ const wf = { defs: null, filter: "open", jobType: "", q: "", jobs: [], total: 0,
 };
 const wfOpen = () => !$("wfBody").classList.contains("hidden");
 function showWorkflow(on) {
+  if (on) showRegistry(false);
   $("wfBody").classList.toggle("hidden", !on);
   if (on) { $("tasksBody").classList.add("hidden"); $("tocBody").classList.add("hidden"); document.querySelector("#tocPane .hscroll").classList.add("hidden"); }
   else if (!tasksOpen()) { $("tocBody").classList.remove("hidden"); document.querySelector("#tocPane .hscroll").classList.remove("hidden"); }
@@ -2603,6 +3230,296 @@ async function openWorkflow() {
     catch (e) { $("wfBody").innerHTML = ""; $("wfBody").append(h("p", { class: "muted", style: "padding:8px" }, "Could not load the workflow: " + e.message)); return; }
   }
   await wfLoadJobs(true);
+}
+/* =====================================================================================
+ * Phase 5 — Registry tab (apart from the Workflow). The server reads the Aumentum Registry every
+ * minute and records each property the Registry admin links to a parcel (the parcel's link
+ * fields follow at once), and unlinks every 15 minutes. From here: start the job for a link,
+ * look up a transaction, link / unlink from the Cadastre, and send the plan to the transaction —
+ * Aumentum's Registry extension (LinkParcel, SendImageCommand), writing to the Registry only on
+ * those actions.
+ * ===================================================================================== */
+const reg = { links: [], status: null, busy: false, loaded: false, view: "inbox", filter: "all", q: "", findQ: "", found: null, findErr: "", finding: false,
+  txn: null, txnNo: "", txnErr: "", txnLoading: false, job: null, files: [], sent: [], pick: null };
+const registryWaiting = () => reg.links.filter((l) => !l.job_instance_id && l.parcel_id && l.linked_now).length;
+const regOpen = () => !$("regBody").classList.contains("hidden");
+function showRegistry(on) {
+  // The Registry needs room: widen the pane while it is open, give the width back after.
+  const pane = $("tocPane");
+  if (on && !reg.widened && pane.getBoundingClientRect().width < 360) { reg.widened = pane.style.width || "auto"; pane.style.width = "360px"; setTimeout(() => map.resize(), 0); }
+  if (!on && reg.widened) { pane.style.width = reg.widened === "auto" ? "" : reg.widened; reg.widened = null; setTimeout(() => map.resize(), 0); }
+  $("regBody").classList.toggle("hidden", !on);
+  const title = document.querySelector("#tocPane .paneHead > span");
+  if (title) title.textContent = on ? "Registry" : "Table Of Contents";
+  if (on) { $("wfBody").classList.add("hidden"); $("tasksBody").classList.add("hidden"); $("tocBody").classList.add("hidden"); document.querySelector("#tocPane .hscroll").classList.add("hidden"); }
+  else if (!tasksOpen() && !wfOpen()) { $("tocBody").classList.remove("hidden"); document.querySelector("#tocPane .hscroll").classList.remove("hidden"); }
+}
+async function openRegistry(opts = {}) {
+  if ($("tocPane").classList.contains("hidden")) togglePane("tocPane");
+  showRegistry(true); buildTocTools();
+  if (!wf.defs) { try { [wf.defs, wf.principals] = await Promise.all([api("/api/v1/wf/definitions"), api("/api/v1/wf/principals")]); } catch { /* job types load later */ } }
+  if (opts.view) reg.view = opts.view;
+  if (opts.job) await regSetJob(opts.job);
+  if (opts.txn) await regLookup(opts.txn);
+  await registryLoad(); renderRegistry();
+}
+async function registryLoad() {
+  try { [reg.links, reg.status] = await Promise.all([api("/api/v1/registry/links?days=14"), api("/api/v1/registry/status")]); reg.loaded = true; }
+  catch (e) { reg.status = { enabled: false, error: e.message }; }
+  buildTocTools();
+}
+setInterval(async () => { await registryLoad(); if (regOpen() && !reg.busy) renderRegistry(); }, 60000);
+setTimeout(registryLoad, 1500);
+const regTime = (s) => (s ? s.replace("T", " ").slice(0, 16) : "—");
+async function regRun(label, fn) {
+  reg.busy = true; renderRegistry();
+  try { await fn(); } catch (e) { notify(`${label}: ${e.message}`, "err"); }
+  reg.busy = false; await registryLoad(); renderRegistry();
+}
+async function registryZoom(upin) {
+  try { const r = await api("/api/v1/parcels/search?number=" + encodeURIComponent(upin)); if (r.length) goToResult(r[0]); else status(`${upin} is not in the fabric.`); }
+  catch (e) { status(e.message); }
+}
+// A job for the transaction, as the Registry created them in Aumentum: job type 9 "Deed Plan
+// Creationv2", named Job-<property number>, carrying the transaction number.
+async function registryStartJob(l) {
+  const types = (wf.defs?.job_types || []).filter((t) => t.active && t.start_task_id);
+  const type = types.find((t) => t.id === 9) || types[0];
+  if (!type) { alert("No active job type to start."); return; }
+  const name = `Job-${l.property_number || l.upin}`;
+  if (!confirm(`Start a "${type.name}" job ${name} for Registry transaction ${l.transaction_number} (parcel ${l.upin})?`)) return;
+  try {
+    const d = await api("/api/v1/wf/jobs", { method: "POST", body: { job_type_id: type.id, name, lrs_transaction_number: l.transaction_number, comment: `Registry property ${l.su_id} linked to ${l.upin} on ${regTime(l.linked_at)}` } });
+    await registryLoad(); renderRegistry(); await registryZoom(l.upin);
+    status(`Job ${d.job.id} (${name}) started on "${d.job.current_task}". Open it in Workflow, choose Work On This Job, then input the survey points.`);
+    if (confirm(`Job ${name} started. Open it in the Workflow now to input the points?`)) registryOpenJob(d.job.id);
+  } catch (e) { alert(e.message); }
+}
+async function registryOpenJob(id) { await openWorkflow(); await wfSelect(id); }
+// --- transaction lookup, link / unlink (Aumentum LinkageManager.LinkParcel) ---
+async function regLookup(no) {
+  reg.txnNo = (no || "").trim().toUpperCase(); reg.txn = null; reg.txnErr = "";
+  if (!reg.txnNo) return;
+  reg.txnLoading = true; if (regOpen()) renderRegistry();
+  try { reg.txn = await api("/api/v1/registry/transactions/" + encodeURIComponent(reg.txnNo)); } catch (e) { reg.txnErr = e.message; }
+  reg.txnLoading = false;
+}
+// --- send the plan (Aumentum SendImageCommand: the job's image file → its transaction) ---
+async function regSetJob(id) {
+  reg.job = null; reg.files = []; reg.sent = [];
+  if (!id) return;
+  try {
+    const d = await api("/api/v1/wf/jobs/" + id);
+    reg.job = d.job;
+    reg.files = (await api(`/api/v1/wf/jobs/${id}/files`)).filter((f) => /\.(jpe?g|png)$/i.test(f.file_name));
+    if (!reg.files.some((f) => f.id === reg.pick)) reg.pick = reg.files.length ? reg.files[reg.files.length - 1].id : null;
+    reg.sent = await api(`/api/v1/wf/jobs/${id}/registry/sent`);
+    if (reg.job.lrs_transaction_number && !reg.txnNo) await regLookup(reg.job.lrs_transaction_number);
+  } catch (e) { notify(e.message, "err"); }
+}
+async function regSendPlan(fileId, fileName) {
+  const t = reg.job.lrs_transaction_number;
+  if (!confirm(`Send the plan image ${fileName} to Registry transaction ${t}?\nIt is filed in the transaction as a Title Deed Plan.`)) return;
+  await regRun("Send plan", async () => { const r = await api(`/api/v1/wf/jobs/${reg.job.id}/registry/send-plan`, { method: "POST", body: { file_id: fileId } }); notify(`${r.file_name} sent to ${r.transaction_number}.`); await regSetJob(reg.job.id); });
+}
+// ---- view ---------------------------------------------------------------------------------
+const regDay = (iso) => {
+  if (!iso) return "Earlier";
+  const d = iso.slice(0, 10), t = new Date(), y = new Date(Date.now() - 864e5), f = (x) => x.toISOString().slice(0, 10);
+  return d === f(t) ? "Today" : d === f(y) ? "Yesterday" : new Date(d + "T12:00:00Z").toLocaleDateString(undefined, { weekday: "short", day: "numeric", month: "short" });
+};
+const regClock = (iso) => (iso ? iso.slice(11, 16) : "");
+const regKind = (l) => (!l.linked_now ? "unlinked" : l.job_instance_id ? "job" : l.parcel_id ? "waiting" : "nofabric");
+const REG_KIND = { waiting: ["Waiting for a job", "wait"], job: ["Job started", "job"], unlinked: ["Unlinked in the Registry", "gone"], nofabric: ["Parcel not in the fabric", "gone"] };
+function regPill(kind, text) { return h("span", { class: "regPill " + REG_KIND[kind][1] }, text || REG_KIND[kind][0]); }
+// A card's status line: a coloured dot and words (fits any pane width).
+function regStatus(cls, text) { return h("div", { class: "regStatus " + cls }, h("span", { class: "regStatusDot" }), text); }
+function regLink(label, title, onclick, disabled) { return h("a", { class: "regLinkBtn" + (disabled ? " off" : ""), title, href: "#", onclick: (e) => { e.preventDefault(); e.stopPropagation(); if (!disabled) onclick(); } }, label); }
+function regIconBtn(label, title, onclick, opts = {}) { return h("button", { class: "regAct" + (opts.primary ? " primary" : ""), title, disabled: !!opts.disabled, onclick: (e) => { e.stopPropagation(); onclick(); } }, label); }
+function regTxnPill(code, label) { return h("span", { class: "regPill " + (code === "transaction_lodged" ? "ok" : "gone") }, label || code); }
+
+function renderRegistry() {
+  const body = $("regBody"); if (!body) return;
+  const keep = body.querySelector(".regScroll")?.scrollTop || 0;
+  body.innerHTML = "";
+  const st = reg.status, last = st && st.last;
+  const up = st && st.enabled && last && last.ok;
+  const writes = st && st.write_enabled;
+
+  // Header: connection, one refresh.
+  body.append(h("div", { class: "regHead" },
+    h("div", { class: "regConn" },
+      h("span", { class: "regDot " + (!st ? "" : up ? "on" : "off") }),
+      h("div", {}, h("b", {}, "Aumentum Registry"),
+        h("div", { class: "muted" }, !st ? "Connecting…" : !st.enabled ? "Not configured on this server" :
+          up ? `Connected · checked ${regClock(last.at)} UTC · every minute` : `Not reachable${last ? " · " + last.error : ""}`))),
+    h("span", { class: "regHeadBtns" },
+      regIconBtn(reg.busy ? "…" : "⟳", "Check the Registry now: new links (every minute) and unlinks (every 15 min)", () => regRun("Registry", async () => {
+        const r = await api("/api/v1/registry/sync", { method: "POST" });
+        const u = await api("/api/v1/registry/reconcile", { method: "POST" }).catch(() => null);
+        notify([r.new ? `${r.new} new link(s)` : "No new links", u && u.unlinked ? `${u.unlinked} unlink(s)` : null].filter(Boolean).join(" · ") + ".");
+      }), { disabled: reg.busy || !(st && st.enabled) }))));
+  if (st && st.enabled && !writes) body.append(h("div", { class: "regNote" }, "Read-only: writing to the Registry (link, unlink, send plan) is turned off on this server."));
+
+  // Summary = filters.
+  const counts = { waiting: 0, job: 0, unlinked: 0 };
+  for (const l of reg.links) { const k = regKind(l); if (k in counts) counts[k]++; }
+  const tile = (key, n, label, cls) => h("div", { class: `regTile ${cls}${reg.filter === key ? " sel" : ""}`, title: `Show ${label.toLowerCase()}`,
+    onclick: () => { reg.filter = reg.filter === key ? "all" : key; reg.view = "inbox"; renderRegistry(); } }, h("b", {}, String(n)), h("span", {}, label));
+  body.append(h("div", { class: "regTiles" }, tile("waiting", counts.waiting, "Waiting", "wait"), tile("job", counts.job, "With job", "job"), tile("unlinked", counts.unlinked, "Unlinked", "gone")));
+
+  // Sub-tabs.
+  const tab = (key, label) => h("span", { class: "regTab" + (reg.view === key ? " sel" : ""), onclick: () => { reg.view = key; renderRegistry(); } }, label);
+  body.append(h("div", { class: "regTabs" }, tab("find", "Find file"), tab("inbox", "Linked"), tab("send", "Send plan")));
+
+  const scroll = h("div", { class: "regScroll" });
+  body.append(scroll);
+  if (reg.view === "inbox") regInbox(scroll);
+  else if (reg.view === "find") regFindView(scroll);
+  else regSendView(scroll, writes);
+  scroll.scrollTop = keep;
+}
+
+function regInbox(box) {
+  const q = h("input", { type: "search", class: "regSearch", placeholder: "Find UPIN, property no. or transaction", value: reg.q });
+  q.addEventListener("input", () => { reg.q = q.value; regInboxList(list); });
+  const filt = reg.filter === "all" ? null : h("span", { class: "regChip", title: "Clear the filter", onclick: () => { reg.filter = "all"; renderRegistry(); } }, REG_KIND[reg.filter][0] + " ✕");
+  box.append(h("div", { class: "regBar" }, q, filt));
+  const list = h("div", {});
+  box.append(list);
+  regInboxList(list);
+}
+function regInboxList(list) {
+  list.innerHTML = "";
+  const st = reg.status;
+  const term = reg.q.trim().toUpperCase();
+  const rows = reg.links.filter((l) => (reg.filter === "all" || regKind(l) === reg.filter)
+    && (!term || [l.upin, l.property_number, l.transaction_number, l.su_id].some((v) => (v || "").toUpperCase().includes(term))));
+  if (!reg.loaded) { list.append(h("p", { class: "regEmpty" }, "Loading…")); return; }
+  if (!rows.length) {
+    list.append(h("div", { class: "regEmpty" }, h("b", {}, reg.links.length ? "Nothing matches" : "No links yet"),
+      h("div", { class: "muted" }, reg.links.length ? "Clear the search or the filter." : st && st.enabled ? "When the Registry admin links a property to a parcel it appears here within a minute." : "")));
+    return;
+  }
+  let day = null;
+  for (const l of rows) {
+    const d = regDay(l.linked_at);
+    if (d !== day) { day = d; list.append(h("div", { class: "regDayHead" }, d)); }
+    const kind = regKind(l);
+    const main = kind === "waiting" ? regIconBtn("Start job", "Start a Deed Plan job for this transaction, to input the survey points", () => registryStartJob(l), { primary: true })
+      : kind === "job" ? regIconBtn("Open job", `Open ${l.job_name || "the job"} in the Workflow`, () => registryOpenJob(l.job_instance_id)) : null;
+    const card = h("div", { class: "regCard " + REG_KIND[kind][1], title: l.parcel_id ? "Click to zoom to the parcel" : "", onclick: () => l.parcel_id && registryZoom(l.upin) },
+      h("div", { class: "regCardTop" }, h("span", { class: "regUpin" }, l.upin), h("span", { class: "muted regTime" }, regClock(l.linked_at))),
+      regStatus(REG_KIND[kind][1], kind === "job" ? `Job started: ${l.job_name || "#" + l.job_instance_id}` : REG_KIND[kind][0]),
+      h("div", { class: "regKv" },
+        h("div", {}, h("i", {}, "Property"), l.property_number || "—"),
+        h("div", {}, h("i", {}, "Transaction"), h("span", {}, l.transaction_number, h("span", { class: "muted" }, ` · ${l.transaction_status}`))),
+        h("div", {}, h("i", {}, "Linked"), l.made_in === "cadastre" ? "from this Cadastre" : "by the Registry")),
+      h("div", { class: "regCardFoot" },
+        h("span", { class: "regLinks" },
+          regLink("Zoom", "Zoom to the parcel", () => registryZoom(l.upin), !l.parcel_id),
+          regLink("File", "Show this Registry file", () => regFind(l.transaction_number))),
+        main));
+    list.append(card);
+  }
+}
+
+// --- Find file: the digitising unit's search (PL file number or PLS transaction number) ---
+async function regFind(q) {
+  reg.view = "find"; reg.findQ = (q || "").trim().toUpperCase(); reg.found = null; reg.findErr = "";
+  if (!regOpen()) await openRegistry(); else renderRegistry();
+  if (!reg.findQ) return;
+  reg.finding = true; renderRegistry();
+  try { reg.found = await api("/api/v1/registry/find?q=" + encodeURIComponent(reg.findQ)); } catch (e) { reg.findErr = e.message; }
+  reg.finding = false; renderRegistry();
+}
+async function regStartDigitising(f) {
+  if (!confirm(`Start digitising ${f.property_number || f.transaction_number}?\nA "Deed Plan Creationv2" job is created for Registry transaction ${f.transaction_number}, as the Registry created them.`)) return;
+  await regRun("Start digitising", async () => {
+    const r = await api("/api/v1/registry/start-digitising", { method: "POST", body: { transaction_number: f.transaction_number, property_number: f.property_number } });
+    notify(r.created ? `${r.name} created.` : `${r.name || "The job"} was already open for ${f.transaction_number}.`);
+    await registryOpenJob(r.job_instance_id);
+  });
+}
+function regFindView(box) {
+  const inp = h("input", { type: "search", class: "regSearch", placeholder: "File no. (PL68955) or transaction (PLS000139391)", value: reg.findQ });
+  const go = () => regFind(inp.value);
+  inp.addEventListener("keydown", (e) => { if (e.key === "Enter") go(); });
+  box.append(h("div", { class: "regBar" }, inp, regIconBtn("Find", "Find the file in the Registry", go, { primary: true })));
+  setTimeout(() => { if (!reg.findQ) inp.focus(); }, 0);
+  if (reg.finding) { box.append(h("p", { class: "regEmpty" }, "Reading the Registry…")); return; }
+  if (reg.findErr) { box.append(h("div", { class: "regEmpty" }, h("b", {}, "Could not search"), h("div", { class: "muted" }, reg.findErr))); return; }
+  if (!reg.found) { box.append(h("div", { class: "regEmpty" }, h("b", {}, "Find a file to digitise"), h("div", { class: "muted" }, "Search by the file number (PL…) or the Registry transaction number (PLS…). Start digitising creates the file's job; open it to add the coordinates and commit."))); return; }
+  if (!reg.found.length) { box.append(h("div", { class: "regEmpty" }, h("b", {}, "Not found in the Registry"), h("div", { class: "muted" }, `No transaction or file ${reg.findQ}.`))); return; }
+  for (const f of reg.found) {
+    const active = f.status_code === "transaction_lodged";
+    const linked = !!f.upin;
+    const main = f.job_instance_id
+      ? regIconBtn("Open job", `Open ${f.job_name || "the job"} in the Workflow`, () => registryOpenJob(f.job_instance_id), { primary: true })
+      : regIconBtn("Start digitising", active ? "Create the file's job and open it" : `The transaction is ${f.status}: only Active files are digitised`, () => regStartDigitising(f), { primary: true, disabled: !active || reg.busy });
+    box.append(h("div", { class: "regCard " + (f.job_instance_id ? "job" : active ? "wait" : "gone") },
+      h("div", { class: "regCardTop" }, h("span", { class: "regUpin" }, f.property_number || f.transaction_number), regTxnPill(f.status_code, f.status)),
+      regStatus(f.job_instance_id ? "job" : linked ? "job" : "wait", f.job_instance_id ? `Job: ${f.job_name || "#" + f.job_instance_id}` : linked ? `Linked in the Registry to ${f.upin}` : "Not digitised / linked yet"),
+      h("div", { class: "regKv" },
+        h("div", {}, h("i", {}, "Transaction"), f.transaction_number),
+        h("div", {}, h("i", {}, "Property"), f.su_id || "—"),
+        h("div", {}, h("i", {}, "UPIN"), f.upin || "— (given at commit; the Registry links it)")),
+      h("div", { class: "regCardFoot" }, h("span", { class: "regLinks" }, regLink("Zoom", "Zoom to the parcel", () => registryZoom(f.upin), !linked)), main)));
+  }
+}
+
+function regSendView(box, writes) {
+  const jobId = reg.job ? reg.job.id : (wf.editing ? wf.editing.job_instance_id : wf.selected);
+  if (!reg.job && jobId) { box.append(h("p", { class: "regEmpty" }, "Loading the job…")); regSetJob(jobId).then(renderRegistry); return; }
+  if (!reg.job) {
+    box.append(h("div", { class: "regEmpty" }, h("b", {}, "No job chosen"), h("div", { class: "muted" }, "Start or open a job from the Inbox, or open one in the Workflow, then come back here.")));
+    return;
+  }
+  const j = reg.job, t = reg.txn && reg.txn.transaction_number === j.lrs_transaction_number ? reg.txn : null;
+  if (j.lrs_transaction_number && !t && !reg.txnLoading && !reg.txnErr) { regLookup(j.lrs_transaction_number).then(renderRegistry); }
+  const other = wf.editing ? wf.editing.job_instance_id : wf.selected;
+  box.append(h("div", { class: "regTxnHead" },
+    h("div", {}, h("span", { class: "regUpin" }, j.name || "Job " + j.id), " ", h("span", { class: "muted" }, "#" + j.id)),
+    other && other !== j.id ? regIconBtn("Use current job", "Use the job open in the Workflow", async () => { await regSetJob(other); renderRegistry(); }) : h("span")));
+  const step = (ok, title, detail) => h("div", { class: "regStep " + (ok === true ? "ok" : ok === false ? "bad" : "") },
+    h("span", { class: "regStepMark" }, ok === true ? "✓" : ok === false ? "!" : "…"), h("div", {}, h("b", {}, title), detail ? h("div", { class: "muted" }, detail) : null));
+  box.append(step(!!j.lrs_transaction_number, "Registry transaction", j.lrs_transaction_number || "This job has no Registry transaction."));
+  if (!j.lrs_transaction_number) return;
+  box.append(step(t ? t.open : reg.txnErr ? false : null, "Transaction is Active", t ? (t.open ? t.status : t.refused) : reg.txnErr || "Checking the Registry…"));
+  const files = h("div", { class: "regFiles" });
+  for (const f of reg.files) {
+    files.append(h("label", { class: "regFile" + (reg.pick === f.id ? " sel" : "") },
+      h("input", { type: "radio", name: "regPick", checked: reg.pick === f.id, onchange: () => { reg.pick = f.id; renderRegistry(); } }),
+      h("img", { src: `/api/v1/wf/files/${f.id}`, alt: "", loading: "lazy" }),
+      h("span", {}, f.file_name)));
+  }
+  // Attach the plan image here (the same job attachment as Workflow → Attachments).
+  const pickFile = h("input", { type: "file", accept: ".jpg,.jpeg,.png,image/jpeg,image/png", style: "display:none" });
+  pickFile.onchange = async () => {
+    const file = pickFile.files[0]; if (!file) return;
+    await regRun("Attach", async () => {
+      await authReady;
+      const r = await fetch(`/api/v1/wf/jobs/${j.id}/files?name=${encodeURIComponent(file.name)}`, { method: "POST", body: file, headers: { "content-type": "application/octet-stream", ...authHeaders() } });
+      if (!r.ok) throw new Error((await r.json().catch(() => ({}))).message || r.statusText);
+      notify(`${file.name} attached to ${j.name || "the job"}.`); await regSetJob(j.id);
+      reg.pick = (reg.files.find((x) => x.file_name === file.name) || {}).id || reg.pick;
+    });
+  };
+  const attach = regIconBtn(reg.files.length ? "Attach another…" : "Attach image…", "Attach the plan image (JPG or PNG) to the job", () => pickFile.click(), { disabled: reg.busy });
+  box.append(step(reg.files.length ? true : false, "Plan image (JPG or PNG)",
+    reg.files.length ? "Choose the image to send." : "Attach the plan image to the job."));
+  box.append(h("div", { style: "margin:-2px 8px 6px 34px" }, attach, pickFile));
+  if (reg.files.length) box.append(files);
+  const f = reg.files.find((x) => x.id === reg.pick);
+  const ready = writes && t && t.open && f && !reg.busy;
+  box.append(h("div", { class: "regSendBar" },
+    h("button", { class: "regAct primary big", disabled: !ready, title: !writes ? "Writing to the Registry is off on this server" : "",
+      onclick: () => regSendPlan(f.id, f.file_name) }, reg.busy ? "Sending…" : f ? `Send ${f.file_name} to ${j.lrs_transaction_number}` : "Send plan"),
+    h("div", { class: "muted" }, "Filed in the transaction as a Title Deed Plan (\"Survey Plan\"), as Aumentum did.")));
+  if (reg.sent.length) {
+    box.append(h("div", { class: "regDayHead" }, "Sent"));
+    for (const x of reg.sent) box.append(h("div", { class: "regSent" }, h("span", { class: "regPill ok" }, "Sent"), ` ${x.detail.file_name} → ${x.detail.transaction_number}`, h("span", { class: "muted" }, ` · ${regDay(x.at)} ${regClock(x.at)} · ${x.by}`)));
+  }
 }
 // A step command as a readable tool name: "Ils.MultiCadastre.Desktop.CreateJobAreaCommand" -> "Create Job Area".
 function wfToolName(cmd) {
@@ -2635,6 +3552,7 @@ async function wfSelect(id) {
   try { wf.files = await api(`/api/v1/wf/jobs/${id}/files`); } catch { wf.files = []; }
   // The job being worked on: its editing state (e.g. whether it is now at its commit task) follows the job.
   if (wf.editing && wf.editing.job_instance_id === id && wf.selEditing) { wf.editing = wf.selEditing; showJobArea(); }
+  if (wf.editing && wf.editing.job_instance_id === id) { try { wf.mutations = await api(`/api/v1/wf/jobs/${id}/mutations`); } catch { wf.mutations = []; } }
   renderWorkflow();
 }
 const wfDate = (s) => (s ? s.replace("T", " ").slice(0, 16) : "—");
@@ -2786,6 +3704,7 @@ function draftNextStep() {
 // Refresh the worked-on job's editing state (draft count, area) after an edit.
 async function wfRefreshEditing() {
   if (!wf.editing) return;
+  try { wf.mutations = await api(`/api/v1/wf/jobs/${wf.editing.job_instance_id}/mutations`); } catch { wf.mutations = []; }
   try { wf.editing = await api(`/api/v1/wf/jobs/${wf.editing.job_instance_id}/editing`); if (wf.selected === wf.editing.job_instance_id) wf.selEditing = wf.editing; renderWorkflow(); updateEditorButtons(); } catch { /* keep the last known state */ }
 }
 // --- Editing under a job: job area, drafts, commit -------------------------------------------
@@ -2821,13 +3740,100 @@ async function wfEditAction(method, path, done, body) {
   } catch (e) { alert(e.message); }
   renderWorkflow();
 }
+// Commit Parcels: the officer types the beacon number of every corner, from the surveyor's point
+// list (Aumentum: beacon numbers are entered at commit, never generated). Corners already on a
+// fabric beacon keep its number. A point list (ID Easting Northing per line, as Trimble Business
+// Center prints it) can be pasted to fill the numbers of the corners at those coordinates.
+// opts.submit(beacons): post the numbers some other way (Post Parcel & Finish Job) instead of /commit.
+async function wfCommitDialog(opts = {}) {
+  const id = wf.editing?.job_instance_id; if (!id) { status("Choose Work On This Job first."); return; }
+  let pts;
+  try { pts = await api(`/api/v1/wf/jobs/${id}/editing/corners`); } catch (e) { alert(e.message); return; }
+  if (!pts.length && opts.submit) { try { await opts.submit([]); } catch (e) { alert(e.message); } return; }
+  if (!pts.length) {
+    const ret = (wf.mutations || []).filter((m) => m.kind === "retire");
+    if (!ret.length) { alert("The job has no draft parcels to commit."); return; }
+    if (!confirm(`Commit the retirement of ${ret.flatMap((m) => m.parents).join(", ")}?`)) return;
+    try {
+      const r = await api(`/api/v1/wf/jobs/${id}/commit`, { method: "POST", body: { beacons: [] } });
+      wf.editing = r.editing; wf.selEditing = wf.editing; await Promise.all([loadParcels(false), loadDrafts()]); loadHistory();
+      notify(`Retired: ${r.retired.join(", ")}.`); wf.detail = await api("/api/v1/wf/jobs/" + id); await wfRefreshEditing(); renderWorkflow();
+    } catch (e) { notify("Commit failed: " + e.message, "err"); }
+    return;
+  }
+  const src = () => map.getSource("corners");
+  const inputs = new Map();
+  let active = null, zoomOnFocus = false;
+  const redraw = () => src()?.setData({ type: "FeatureCollection", features: pts.map((p) => {
+    const v = p.beacon_number || inputs.get(p.point)?.value.trim() || "";
+    return { type: "Feature", geometry: { type: "Point", coordinates: toLL(p.easting, p.northing) },
+      properties: { label: v ? `${p.point}: ${v}` : String(p.point), done: !!v, active: p.point === active } };
+  }) });
+  const msg = h("div", { style: "margin:6px 0;min-height:1.2em" });
+  const t = h("table", { class: "legs" }, h("tr", {}, h("th", {}, "Pt"), h("th", {}, "Easting"), h("th", {}, "Northing"), h("th", {}, "Beacon number")));
+  for (const p of pts) {
+    let cell;
+    if (p.beacon_number) cell = h("span", { title: "This corner is on a beacon already in the fabric" }, `${p.beacon_number} (existing)`);
+    else {
+      cell = h("input", { placeholder: "e.g. CA6782", style: "width:110px", autocomplete: "off", value: pointIds.get(ptKey(p.easting, p.northing)) || "" });
+      cell.addEventListener("input", redraw);
+      cell.addEventListener("focus", () => { active = p.point; redraw(); if (zoomOnFocus) map.easeTo({ center: toLL(p.easting, p.northing), zoom: Math.max(map.getZoom(), 19) }); });
+      cell.addEventListener("keydown", (ev) => { if (ev.key === "Enter") { const all = [...inputs.values()]; const i = all.indexOf(cell); (all[i + 1] || commitBtn).focus(); } });
+      inputs.set(p.point, cell);
+    }
+    t.append(h("tr", {}, h("td", { class: "n" }, String(p.point)), h("td", {}, fmt3(p.easting)), h("td", {}, fmt3(p.northing)), h("td", {}, cell)));
+  }
+  const paste = h("textarea", { rows: 4, style: "width:100%;box-sizing:border-box;font-family:monospace", placeholder: "Optional: paste the point list (ID  Easting  Northing per line) to fill the numbers by coordinates" });
+  const fill = h("button", { class: "btn", onclick: () => {
+    let filled = 0; const unmatched = [];
+    for (const line of paste.value.split(/\n/)) {
+      const m = line.trim().match(/^([A-Za-z0-9][A-Za-z0-9/_.-]*)[\s,;|]+(-?\d+(?:\.\d+)?)[\s,;|]+(-?\d+(?:\.\d+)?)/);
+      if (!m) continue;
+      const [_, num, e, n] = m, E = parseFloat(e), N = parseFloat(n);
+      const p = pts.find((q) => !q.beacon_number && Math.hypot(q.easting - E, q.northing - N) <= 0.05);
+      if (p) { inputs.get(p.point).value = num; filled++; } else unmatched.push(num);
+    }
+    redraw();
+    msg.style.color = unmatched.length ? "#b06000" : "#060";
+    msg.textContent = `Filled ${filled} corner(s).` + (unmatched.length ? ` Not a corner of these parcels: ${unmatched.join(", ")}.` : "");
+  } }, "Fill from point list");
+  const commitBtn = h("button", { class: "btn", onclick: async () => {
+    const beacons = pts.filter((p) => !p.beacon_number).map((p) => ({ easting: p.easting, northing: p.northing, number: inputs.get(p.point).value.trim() }));
+    const blank = pts.filter((p) => !p.beacon_number && !inputs.get(p.point).value.trim()).map((p) => p.point);
+    if (blank.length) { msg.style.color = "#b00"; msg.textContent = `Enter the beacon number of point(s) ${blank.join(", ")}.`; inputs.get(blank[0]).focus(); return; }
+    commitBtn.disabled = true; msg.style.color = ""; msg.textContent = "Committing…";
+    if (opts.submit) {
+      try { await opts.submit(beacons); w.remove(); src()?.setData(empty()); }
+      catch (e) { commitBtn.disabled = false; msg.style.color = "#b00"; msg.textContent = e.message; }
+      return;
+    }
+    try {
+      const r = await api(`/api/v1/wf/jobs/${id}/commit`, { method: "POST", body: { beacons } });
+      w.remove(); src()?.setData(empty());
+      wf.editing = r.editing; wf.selEditing = wf.editing;
+      await Promise.all([loadParcels(false), loadBeacons(), loadDrafts()]); showJobArea();
+      notify(`Committed ${r.parcel_numbers.length} parcel(s): ${r.parcel_numbers.join(", ")}; ${r.beacons_added.length} beacon(s) added.` + (r.retired?.length ? ` Replaced / retired: ${r.retired.join(", ")}.` : ""));
+      loadHistory(); await wfRefreshEditing();
+      wf.detail = await api("/api/v1/wf/jobs/" + id); renderWorkflow();
+    } catch (e) { commitBtn.disabled = false; msg.style.color = "#b00"; msg.textContent = e.message; }
+  } }, opts.label || "Commit");
+  const w = floatWindow(opts.title || "Commit Parcels — Beacon Numbers", h("div", {},
+    h("p", { class: "muted", style: "margin:0 0 6px" }, `${pts.length} corner point(s), numbered on the map. Type each beacon number from the surveyor's point list.`),
+    h("div", { style: "max-height:320px;overflow:auto" }, t), paste, h("div", { class: "frow" }, fill), msg,
+    h("div", { class: "frow", style: "justify-content:flex-end" }, commitBtn, h("button", { class: "btn", onclick: () => { w.remove(); src()?.setData(empty()); } }, "Cancel"))),
+    { id: "commitWin", width: 440 });
+  redraw();
+  zoomToFC({ type: "FeatureCollection", features: pts.map((p) => ({ type: "Feature", geometry: { type: "Point", coordinates: toLL(p.easting, p.northing) }, properties: {} })) }, { padding: 120, maxZoom: 19 });
+  w.querySelector(".fx")?.addEventListener("click", () => src()?.setData(empty()));
+  setTimeout(() => { inputs.values().next().value?.focus(); zoomOnFocus = true; }, 0);
+}
 function wfDrawJobArea() {
   if (!wf.editing) { status("Choose Work On This Job first."); return; }
   if (wf.editing.area_utm) { // start from the existing area so it can be adjusted
     edit.verts = wf.editing.area_utm.coordinates[0].slice(0, -1).map((c) => [c[0], c[1]]);
   }
-  edit.template = "jobArea"; startEditing("sketch"); selectTemplate("jobArea");
-  status("Draw the job area: click its corners, double-click to finish.");
+  edit.template = "jobArea"; startEditing("sketch"); selectTemplate("jobArea"); openSketchProps();
+  status("Job area: click its corners on the map, or type / paste their coordinates in Edit Sketch Properties; then Finish Sketch.");
 }
 function wfEditingView(j, e) {
   const sec = h("div", { class: "wfEditing" }, h("div", { class: "wfSub" }, "Editing"));
@@ -2845,7 +3851,23 @@ function wfEditingView(j, e) {
     ed.area ? h("button", { class: "btn", onclick: () => { if (confirm("Delete the job area?")) wfEditAction("DELETE", "/area", "Job area deleted."); } }, "Delete Job Area") : null,
     h("button", { class: "btn", disabled: !ed.drafts, onclick: () => { if (confirm(`Discard the job's ${ed.drafts} uncommitted parcel(s)?`)) wfEditAction("POST", "/discard", "Draft parcels discarded."); } }, "Discard Changes"),
     h("button", { class: "btn", onclick: async () => { await loadDrafts(); await wfSelect(j.id); status("Reloaded from the fabric."); } }, "Reload"),
-    ed.is_commit_task ? h("button", { class: "btn", disabled: !ed.drafts, title: "Give the job's draft parcels their UPINs and add them to the fabric", onclick: () => wfEditAction("POST", "/commit", "") }, "Commit Parcels") : null));
+    ed.is_commit_task ? h("button", { class: "btn", disabled: !ed.drafts && !(wf.mutations || []).length, title: "Give the job's draft parcels their UPINs and add them to the fabric", onclick: () => wfCommitDialog() }, "Commit Parcels…") : null));
+  // Mutations recorded in the job (Phase 4), applied when the parcels are committed.
+  if ((wf.mutations || []).length) {
+    const ul = h("ul", { class: "wfMutations", style: "margin:4px 0 0;padding-left:18px" });
+    for (const m of wf.mutations) {
+      const what = m.kind === "retire" ? `Retire ${m.parents.join(", ")} (${m.reason || ""})` : `${MUTATION_LABEL[m.kind] || m.kind} ${m.parents.join(" + ")} → ${m.drafts.length} new parcel(s)`;
+      const keep = m.kind === "separate" ? h("select", { title: "Separation Configuration: the part that keeps the parent's UPIN and attribute record", onchange: (e) => mutationKeepUpin(ed.job_instance_id, m, e.target.value) },
+        h("option", { value: "" }, "every part gets a new UPIN"),
+        ...m.drafts.map((d, i) => { const f = state.drafts.features.find((x) => String(x.properties.id) === String(d));
+          return h("option", { value: d, selected: m.keeps_upin === d }, `part ${i + 1} keeps ${m.parents[0]}${f && f.properties.computed_area ? ` (${Number(f.properties.computed_area).toFixed(1)} m²)` : ""}`); })) : null;
+      ul.append(h("li", {}, what, " ", keep, " ", h("button", { class: "btn", style: "min-width:0;padding:0 6px", title: "Cancel this mutation (its draft parcels are removed)", onclick: async () => {
+        if (!confirm(`Cancel: ${what}?`)) return;
+        try { await api(`/api/v1/wf/jobs/${ed.job_instance_id}/mutations/${m.group}`, { method: "DELETE" }); await afterMutation("Mutation cancelled."); } catch (e) { alert(e.message); }
+      } }, "Cancel")));
+    }
+    sec.append(h("div", { class: "wfSub", style: "margin-top:6px" }, "Mutations (applied at commit)"), ul);
+  }
   // One-click seamless path: take the job straight to its commit task, post the parcel(s) and
   // finish the job — no stepping through Review/Commit/Generate by hand.
   sec.append(h("div", { class: "frow" },
@@ -2867,9 +3889,13 @@ async function wfFinishJob(j) {
   const ed = wf.editing;
   if (!ed || !ed.drafts) { status("Draw a parcel first."); return; }
   if (!confirm(`Post ${ed.drafts} parcel(s) and finish job ${j.name || "#" + j.id}?\nThis allocates the official UPIN(s) and completes the workflow.`)) return;
+  // The new corners' beacon numbers first, as for Commit Parcels.
+  await wfCommitDialog({ title: "Post Parcel & Finish Job — Beacon Numbers", label: "Post & Finish", submit: (beacons) => wfFinishPost(j, beacons) });
+}
+async function wfFinishPost(j, beacons) {
   if (wf.busy) return; wf.busy = true;
   try {
-    const r = await api(`/api/v1/wf/jobs/${j.id}/finish`, { method: "POST", body: { complete: true } });
+    const r = await api(`/api/v1/wf/jobs/${j.id}/finish`, { method: "POST", body: { complete: true, beacons } });
     const nums = (r.parcel_numbers || []).join(", ") || "(none)";
     status(r.completed ? `Done — ${nums} posted; job completed.` : `${nums} posted.`);
     alert(`Parcel posted.\nUPIN: ${nums}\n${r.completed ? "Job completed." : "Job now at: " + (r.job?.current_task || "—")}`);
@@ -2878,7 +3904,8 @@ async function wfFinishJob(j) {
     wf.selEditing = await api(`/api/v1/wf/jobs/${j.id}/editing`).catch(() => wf.selEditing);
     if (wf.editing && wf.editing.job_instance_id === j.id) wf.editing = wf.selEditing;
     const i = wf.jobs.findIndex((x) => x.id === j.id); if (i >= 0 && r.job) wf.jobs[i] = r.job;
-  } catch (e) { status(e.message); alert(e.message); }
+    loadBeacons();
+  } catch (e) { status(e.message); throw e; }
   finally { wf.busy = false; renderWorkflow(); }
 }
 // What a workflow step's "Open" does in this editor. Steps whose tools belong to later phases say so.
@@ -2890,16 +3917,35 @@ function wfStepAction(s) {
     case 1: case 1004: return { run: () => { const a = wf.editing?.area; a ? zoomToFC({ type: "FeatureCollection", features: [{ type: "Feature", geometry: a, properties: {} }] }) : map.fitBounds([REGION_BBOX.slice(0, 2), REGION_BBOX.slice(2)]); status(`Region ${REGION} loaded.`); }, tip: "Zoom to the region (or the job area)" };
     case 2: case 1006: return { run: () => { if ($("catalogPane").classList.contains("hidden")) togglePane("catalogPane"); status("Drag the scanned survey plan from the Catalog onto the map to add it."); }, tip: "Add the survey plan image from the Catalog" };
     case 1005: return { run: needJob(wfDrawJobArea), label: "Draw", tip: "Create or edit the job area" };
-    case 3: case 1007: return { run: needJob(() => openTask("survey")), tip: "Enter the survey (COGO traverse)" };
-    case 1019: return { run: needJob(() => { edit.template = "parcel"; startEditing("sketch"); selectTemplate("parcel"); }), tip: "Construct the parcel by digitizing" };
+    case 1007: return { run: needJob(() => openTask("survey")), tip: "Enter the survey (COGO traverse)" };
+    // Aumentum's Construct Parcel / Create Parcel steps carry several tools: offer exactly those.
+    case 1019: return { run: needJob(() => stepTools("Construct Parcel", [
+      ["Digitize Parcel (Sketch)", () => { edit.template = "parcel"; startEditing("sketch"); selectTemplate("parcel"); }],
+      ["Import Feature Class…", fciDialog], ["COGO Tools (survey entry)…", () => openTask("survey")], ["Computation Tools (35)…", openComputeTools]])), tip: "Construct the parcel: digitize, import a feature class, or COGO" };
+    case 3: return { run: needJob(() => stepTools("Create Parcel", [
+      ["Digitize Parcel (Sketch)", () => { edit.template = "parcel"; startEditing("sketch"); selectTemplate("parcel"); }],
+      ["COGO Tools (survey entry)…", () => openTask("survey")], ["Create Connection Line…", connectionLineDialog], ["Create Multi Point Line…", multiPointLineDialog],
+      ["Create Donut Parcel (sketch the hole, then click the parcel)", () => startPickDraft("donut")], ["Parcel Separation (sketch the line, then click the parcel)", () => startPickDraft("separate")],
+      ["Move Point…", movePointDialog], ["Point Attributes…", pointAttributesDialog], ["List Control Points…", listControlPoints]])), tip: "Create the parcel with Aumentum's computation tools" };
     case 1008: return { run: () => validateFabric(), tip: "Validate the fabric (topology)" };
     case 1010: case 1011: case 1015: return { run: () => { setTool("identify"); status("Click a parcel to review its attributes."); }, tip: "Review parcel attributes" };
-    case 1002: case 1012: return { run: needJob(() => wfEditAction("POST", "/commit", "")), label: "Commit", tip: "Commit the job's parcels to the fabric" };
+    case 1002: case 1012: return { run: needJob(() => wfCommitDialog()), label: "Commit", tip: "Commit the job's parcels to the fabric" };
     case 1014: return { run: () => findDialog(), tip: "Search the cadastre for parcels" };
-    case 1003: case 1016: case 1017: case 1018: return { run: needJob(() => window.open(`/api/v1/jobs/${wf.editing.cadastre_job_id}/siteplan.pdf`, "_blank")), label: "Plan", tip: "Open the job's site plan (Title Deed Plan layout parity is Phase 6)" };
-    case 1009: return later("Phase 3", "Feature class import");
-    case 1013: return later("Phase 5", "Linking parcels to the Registry");
-    case 1020: case 1021: return later("Phase 4", s.name);
+    case 1017: return { run: needJob(() => window.open(`/api/v1/jobs/${wf.editing.cadastre_job_id}/siteplan.pdf`, "_blank")), label: "Plan", tip: "Open the job's site plan (Title Deed Plan layout parity is Phase 6)" };
+    // TDP, Generate / Save Title Deed Plan carry Aumentum's SendImageCommand: the plan image to the Registry.
+    case 1003: case 1016: case 1018: return { run: needJob(() => stepTools("Title Deed Plan", [
+      ["Open the job's site plan", () => window.open(`/api/v1/jobs/${wf.editing.cadastre_job_id}/siteplan.pdf`, "_blank")],
+      ["Send the plan image to the Registry…", () => openRegistry({ job: jobId, view: "send" })]])), label: "Plan", tip: "Site plan, and sending the plan image to the job's Registry transaction" };
+    case 1009: return { run: needJob(() => fciDialog()), label: "Import", tip: "Create parcels from a polygon feature class (shapefile)" };
+    case 1013: return { run: async () => { const d = wf.detail && wf.detail.job.id === jobId ? wf.detail.job : null; await regFind(d && d.lrs_transaction_number); }, label: "Link", tip: "Link the parcel to the job's Registry transaction (Registry tab)" };
+    case 1020: return { run: needJob(() => stepTools("Merge Parcel", [
+      ["1. Select the parcels (Select tool; Shift-click to add)", () => { setTool("select"); status("Click the parcels to merge; Shift-click to add more."); }],
+      ["2. Merge the selected parcels", mutationMerge], ["Lineage of the selected parcel…", () => lineageOfSelection()]])), label: "Open", tip: "Merge posted parcels into one (applied at commit)" };
+    case 1021: return { run: needJob(() => stepTools("Split Parcel", [
+      ["1. Select the parcel (Select tool)", () => { setTool("select"); status("Click the parcel to split."); }],
+      ["2. Sketch the split line, then Finish Sketch", () => startSplitLine()],
+      ["Separate the selected parcel along a line", () => startSplitLine("separate")],
+      ["Re-survey (adjust) the selected parcel", mutationResurvey], ["Free mutation of the selected parcel", mutationFree], ["Retire the selected parcel…", mutationRetire], ["Lineage of the selected parcel…", () => lineageOfSelection()]])), label: "Open", tip: "Split a posted parcel along a line (applied at commit)" };
     default: return { label: "—", tip: "No editor action for this step" };
   }
 }

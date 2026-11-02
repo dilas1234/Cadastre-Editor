@@ -222,10 +222,16 @@ pub async fn post_job(
     }))
 }
 
-/// Post a job's draft parcels: give each its official UPIN (above every UPIN ever issued, via the
-/// ledger) and make it part of the live fabric. Shared by `POST /jobs/{id}/post` and the
+/// Post a job's draft parcels: give each its official UPIN (the next in the local series,
+/// `PL` + 12 digits counting up; structured UPINs of 1,000,000,000 and over are kept in the ledger
+/// but never drive the counter, migration 0018) and make it part of the live fabric. Shared by `POST /jobs/{id}/post` and the
 /// Aumentum workflow's commit. Returns the UPINs, in draft order.
 pub async fn post_drafts(conn: &mut sqlx::PgConnection, job_id: Uuid) -> ApiResult<Vec<String>> {
+    Ok(post_drafts_with_ids(conn, job_id).await?.into_iter().map(|(_, n)| n).collect())
+}
+
+/// As [`post_drafts`], with each draft's id beside its UPIN (lineage needs which became which).
+pub async fn post_drafts_with_ids(conn: &mut sqlx::PgConnection, job_id: Uuid) -> ApiResult<Vec<(Uuid, String)>> {
     let rows = sqlx::query(
         "SELECT id, parcel_number FROM cadastre.parcel \
          WHERE job_id = $1 AND status = 'draft' ORDER BY created_at",
@@ -234,12 +240,14 @@ pub async fn post_drafts(conn: &mut sqlx::PgConnection, job_id: Uuid) -> ApiResu
     .fetch_all(&mut *conn)
     .await?;
 
-    // Keep the allocator above every UPIN ever issued (imports included) before allocating.
+    // Keep the allocator above every local-series UPIN ever issued (imports included); the ledger
+    // still refuses any UPIN issued before, structured ones included.
     sqlx::query("SELECT cadastre.sync_upin_sequence()").execute(&mut *conn).await?;
 
     let mut parcel_numbers = Vec::with_capacity(rows.len());
     for row in &rows {
         let parcel_id: Uuid = row.get("id");
+        let fresh = row.get::<Option<String>, _>("parcel_number").is_none();
         let number = match row.get::<Option<String>, _>("parcel_number") {
             Some(existing) => {
                 sqlx::query(
@@ -287,7 +295,8 @@ pub async fn post_drafts(conn: &mut sqlx::PgConnection, job_id: Uuid) -> ApiResu
 
         // Write the property-document attributes + Registry linkage for the new UPIN, merging what
         // was captured on the draft with the job's default linkage (its LRS transaction's
-        // property). linkage_status = 1 (linked) when an LRSID is known, else 0 (pending).
+        // property). linkage_status = 1 (linked) when an LRSID is known, else 0 (pending). Status is
+        // stored as Aumentum's code (0 Active, 1 Historic).
         sqlx::query(
             "INSERT INTO cadastre.parcel_attribute \
                (object_id, upin, parcel_id, dataset_name, region_name, property_number, property_type, \
@@ -298,7 +307,7 @@ pub async fn post_drafts(conn: &mut sqlx::PgConnection, job_id: Uuid) -> ApiResu
                 COALESCE(d.property_number, l.property_number), COALESCE(d.property_type, l.property_type), \
                 COALESCE(d.plot, l.plot), COALESCE(d.block, l.block), d.location, \
                 COALESCE(d.plan_number, l.plan_number), COALESCE(d.lga, l.lga), d.parcel_name, d.area_unit, \
-                d.surveyor_general, ST_Area(p.geom), COALESCE(d.status, 'active'), COALESCE(d.lrs_id, l.lrs_id), \
+                d.surveyor_general, ST_Area(p.geom), CASE lower(COALESCE(d.status, 'active')) WHEN 'active' THEN '0' WHEN 'historic' THEN '1' ELSE d.status END, COALESCE(d.lrs_id, l.lrs_id), \
                 CASE WHEN COALESCE(d.lrs_id, l.lrs_id) IS NOT NULL THEN COALESCE(l.linkage_status, 1) ELSE 0 END, \
                 CASE WHEN COALESCE(d.lrs_id, l.lrs_id) IS NOT NULL THEN to_char(now(), 'YYYYMMDD') END, \
                 now(), now(), now() \
@@ -309,10 +318,11 @@ pub async fn post_drafts(conn: &mut sqlx::PgConnection, job_id: Uuid) -> ApiResu
                  JOIN cadastre.wf_job_instance wi ON wi.id = lk.wf_job_instance_id \
                  WHERE wi.cadastre_job_id = p.job_id ORDER BY lk.updated_at DESC LIMIT 1 \
              ) l ON true \
-             WHERE p.id = $1 AND (d.parcel_id IS NOT NULL OR l.wf_job_instance_id IS NOT NULL)",
+             WHERE p.id = $1 AND $3 AND (d.parcel_id IS NOT NULL OR l.wf_job_instance_id IS NOT NULL)",
         )
         .bind(parcel_id)
         .bind(&number)
+        .bind(fresh)
         .execute(&mut *conn)
         .await?;
         sqlx::query("DELETE FROM cadastre.parcel_draft_attribute WHERE parcel_id = $1")
@@ -320,7 +330,7 @@ pub async fn post_drafts(conn: &mut sqlx::PgConnection, job_id: Uuid) -> ApiResu
             .execute(&mut *conn)
             .await?;
 
-        parcel_numbers.push(number);
+        parcel_numbers.push((parcel_id, number));
     }
 
     Ok(parcel_numbers)

@@ -234,6 +234,32 @@ pub async fn import_into_job(
         }
     }
 
+    // Under an Aumentum workflow job the job's rules apply: every boundary inside the open job
+    // area (else nothing is imported), and beacon numbers are entered at commit, so the file's
+    // point IDs are returned for the Beacon Numbers window instead of becoming beacons now.
+    let workflow_job: bool = sqlx::query_scalar("SELECT EXISTS (SELECT 1 FROM cadastre.wf_job_instance WHERE cadastre_job_id = $1)")
+        .bind(job_id)
+        .fetch_one(&state.pool)
+        .await?;
+    if workflow_job {
+        let mut outside = Vec::new();
+        for boundary in &survey.boundaries {
+            if let Some(g) = ring_geojson(&boundary.ring) {
+                match crate::routes::parcels::job_area_guard(&state, job_id, Some(&g)).await {
+                    Ok(()) => {}
+                    Err(AppError::Conflict(m)) if m == crate::routes::wf::OUTSIDE_JOB_AREA => outside.push(boundary.id.clone()),
+                    Err(e) => return Err(e),
+                }
+            }
+        }
+        if survey.boundaries.is_empty() {
+            crate::routes::parcels::job_area_guard(&state, job_id, None).await?;
+        }
+        if !outside.is_empty() {
+            return Err(AppError::Conflict(format!("{} Outside it: {}.", crate::routes::wf::OUTSIDE_JOB_AREA, outside.join(", "))));
+        }
+    }
+
     let mut tx = state.pool.begin().await?;
     let mut created_parcels = 0usize;
     let mut created_beacons = 0usize;
@@ -270,7 +296,13 @@ pub async fn import_into_job(
         created_parcels += 1;
     }
 
-    if req.create_beacons.unwrap_or(true) {
+    let points_for_commit: Vec<Value> = if workflow_job {
+        survey.points.iter().filter(|p| !p.id.trim().is_empty())
+            .map(|p| json!({"id": p.id.trim(), "easting": p.point.x, "northing": p.point.y})).collect()
+    } else {
+        Vec::new()
+    };
+    if !workflow_job && req.create_beacons.unwrap_or(true) {
         for point in &survey.points {
             if point.id.trim().is_empty() {
                 skipped_beacons.push(json!({"reason": "empty beacon number"}));
@@ -310,6 +342,8 @@ pub async fn import_into_job(
             "created_beacons": created_beacons,
             "skipped_boundaries": skipped_boundaries,
             "skipped_beacons": skipped_beacons,
+            "workflow_job": workflow_job,
+            "points_for_commit": points_for_commit,
             "issues": survey.issues,
             "warnings": warnings,
         })),

@@ -20,4 +20,7 @@ pub mod routes;
 pub mod shp;
 pub mod mail;
 pub mod state;
+pub mod lrs;
+pub mod registry;
+pub mod registry_sync;
 pub mod wfengine;

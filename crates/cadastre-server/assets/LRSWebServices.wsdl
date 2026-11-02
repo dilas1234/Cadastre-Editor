@@ -1,0 +1,1299 @@
+<?xml version="1.0" encoding="utf-8"?>
+<wsdl:definitions xmlns:tm="http://microsoft.com/wsdl/mime/textMatching/" xmlns:soapenc="http://schemas.xmlsoap.org/soap/encoding/" xmlns:mime="http://schemas.xmlsoap.org/wsdl/mime/" xmlns:tns="http://tempuri.org/" xmlns:soap="http://schemas.xmlsoap.org/wsdl/soap/" xmlns:s1="http://microsoft.com/wsdl/types/" xmlns:s="http://www.w3.org/2001/XMLSchema" xmlns:soap12="http://schemas.xmlsoap.org/wsdl/soap12/" xmlns:http="http://schemas.xmlsoap.org/wsdl/http/" targetNamespace="http://tempuri.org/" xmlns:wsdl="http://schemas.xmlsoap.org/wsdl/">
+  <wsdl:types>
+    <s:schema elementFormDefault="qualified" targetNamespace="http://tempuri.org/">
+      <s:import namespace="http://microsoft.com/wsdl/types/" />
+      <s:element name="GetAllJobs">
+        <s:complexType />
+      </s:element>
+      <s:element name="GetAllJobsResponse">
+        <s:complexType>
+          <s:sequence>
+            <s:element minOccurs="0" maxOccurs="1" name="GetAllJobsResult" type="tns:ArrayOfWFJob" />
+          </s:sequence>
+        </s:complexType>
+      </s:element>
+      <s:complexType name="ArrayOfWFJob">
+        <s:sequence>
+          <s:element minOccurs="0" maxOccurs="unbounded" name="WFJob" nillable="true" type="tns:WFJob" />
+        </s:sequence>
+      </s:complexType>
+      <s:complexType name="WFJob">
+        <s:sequence>
+          <s:element minOccurs="1" maxOccurs="1" name="ID" type="s:int" />
+          <s:element minOccurs="0" maxOccurs="1" name="Name" type="s:string" />
+          <s:element minOccurs="0" maxOccurs="1" name="Description" type="s:string" />
+          <s:element minOccurs="1" maxOccurs="1" name="StartTaskId" type="s:int" />
+          <s:element minOccurs="1" maxOccurs="1" name="EndTaskId" type="s:int" />
+          <s:element minOccurs="0" maxOccurs="1" name="WorkflowDesignXML" type="s:string" />
+        </s:sequence>
+      </s:complexType>
+      <s:element name="GetAllJobsInstances">
+        <s:complexType>
+          <s:sequence>
+            <s:element minOccurs="1" maxOccurs="1" name="filter" type="s:int" />
+          </s:sequence>
+        </s:complexType>
+      </s:element>
+      <s:element name="GetAllJobsInstancesResponse">
+        <s:complexType>
+          <s:sequence>
+            <s:element minOccurs="0" maxOccurs="1" name="GetAllJobsInstancesResult" type="tns:ArrayOfDataFieldRow" />
+          </s:sequence>
+        </s:complexType>
+      </s:element>
+      <s:complexType name="ArrayOfDataFieldRow">
+        <s:sequence>
+          <s:element minOccurs="0" maxOccurs="unbounded" name="DataFieldRow" nillable="true" type="tns:DataFieldRow" />
+        </s:sequence>
+      </s:complexType>
+      <s:complexType name="DataFieldRow">
+        <s:sequence>
+          <s:element minOccurs="0" maxOccurs="1" name="FieldsRow" type="tns:ArrayOfDataField" />
+        </s:sequence>
+      </s:complexType>
+      <s:complexType name="ArrayOfDataField">
+        <s:sequence>
+          <s:element minOccurs="0" maxOccurs="unbounded" name="DataField" nillable="true" type="tns:DataField" />
+        </s:sequence>
+      </s:complexType>
+      <s:complexType name="DataField">
+        <s:sequence>
+          <s:element minOccurs="0" maxOccurs="1" name="FieldName" type="s:string" />
+          <s:element minOccurs="0" maxOccurs="1" name="FieldValue" type="s:string" />
+        </s:sequence>
+      </s:complexType>
+      <s:element name="IsJobInstanceCompleted">
+        <s:complexType>
+          <s:sequence>
+            <s:element minOccurs="1" maxOccurs="1" name="jobinstanceID" type="s:int" />
+          </s:sequence>
+        </s:complexType>
+      </s:element>
+      <s:element name="IsJobInstanceCompletedResponse">
+        <s:complexType>
+          <s:sequence>
+            <s:element minOccurs="0" maxOccurs="1" name="IsJobInstanceCompletedResult" type="tns:JobInstanceStatus" />
+          </s:sequence>
+        </s:complexType>
+      </s:element>
+      <s:complexType name="JobInstanceStatus">
+        <s:sequence>
+          <s:element minOccurs="1" maxOccurs="1" name="Completed" type="s:boolean" />
+          <s:element minOccurs="0" maxOccurs="1" name="Status" type="s:string" />
+        </s:sequence>
+      </s:complexType>
+      <s:element name="ApproveJob">
+        <s:complexType>
+          <s:sequence>
+            <s:element minOccurs="1" maxOccurs="1" name="jobInstanceID" type="s:int" />
+          </s:sequence>
+        </s:complexType>
+      </s:element>
+      <s:element name="ApproveJobResponse">
+        <s:complexType>
+          <s:sequence>
+            <s:element minOccurs="1" maxOccurs="1" name="ApproveJobResult" type="s:boolean" />
+          </s:sequence>
+        </s:complexType>
+      </s:element>
+      <s:element name="RejectJob">
+        <s:complexType>
+          <s:sequence>
+            <s:element minOccurs="1" maxOccurs="1" name="jobInstanceID" type="s:int" />
+          </s:sequence>
+        </s:complexType>
+      </s:element>
+      <s:element name="RejectJobResponse">
+        <s:complexType>
+          <s:sequence>
+            <s:element minOccurs="1" maxOccurs="1" name="RejectJobResult" type="s:boolean" />
+          </s:sequence>
+        </s:complexType>
+      </s:element>
+      <s:element name="CreateJobInstance">
+        <s:complexType>
+          <s:sequence>
+            <s:element minOccurs="1" maxOccurs="1" name="jobID" type="s:int" />
+            <s:element minOccurs="0" maxOccurs="1" name="instanceName" type="s:string" />
+            <s:element minOccurs="1" maxOccurs="1" name="priority" type="s:unsignedShort" />
+            <s:element minOccurs="0" maxOccurs="1" name="comments" type="s:string" />
+            <s:element minOccurs="0" maxOccurs="1" name="parameters" type="s:string" />
+          </s:sequence>
+        </s:complexType>
+      </s:element>
+      <s:element name="CreateJobInstanceResponse">
+        <s:complexType>
+          <s:sequence>
+            <s:element minOccurs="0" maxOccurs="1" name="CreateJobInstanceResult" type="tns:JobInstance" />
+          </s:sequence>
+        </s:complexType>
+      </s:element>
+      <s:complexType name="JobInstance">
+        <s:sequence>
+          <s:element minOccurs="0" maxOccurs="1" name="LrsTransactionNumber" type="s:string" />
+          <s:element minOccurs="1" maxOccurs="1" name="ID" type="s:int" />
+          <s:element minOccurs="1" maxOccurs="1" name="JobID" type="s:int" />
+          <s:element minOccurs="1" maxOccurs="1" name="TaskID" type="s:int" />
+          <s:element minOccurs="1" maxOccurs="1" name="Sid" type="s:int" />
+          <s:element minOccurs="1" maxOccurs="1" name="Priority" type="s:unsignedShort" />
+          <s:element minOccurs="1" maxOccurs="1" name="Started" nillable="true" type="s:dateTime" />
+          <s:element minOccurs="1" maxOccurs="1" name="Updated" nillable="true" type="s:dateTime" />
+          <s:element minOccurs="1" maxOccurs="1" name="Ended" nillable="true" type="s:dateTime" />
+          <s:element minOccurs="0" maxOccurs="1" name="Comment" type="s:string" />
+          <s:element minOccurs="0" maxOccurs="1" name="Name" type="s:string" />
+          <s:element minOccurs="0" maxOccurs="1" name="Parameters" type="s:string" />
+          <s:element minOccurs="1" maxOccurs="1" name="JobStatus" type="s:int" />
+        </s:sequence>
+      </s:complexType>
+      <s:element name="CompleteJobInstance">
+        <s:complexType>
+          <s:sequence>
+            <s:element minOccurs="1" maxOccurs="1" name="jobInstanceID" type="s:int" />
+          </s:sequence>
+        </s:complexType>
+      </s:element>
+      <s:element name="CompleteJobInstanceResponse">
+        <s:complexType>
+          <s:sequence>
+            <s:element minOccurs="1" maxOccurs="1" name="CompleteJobInstanceResult" type="s:boolean" />
+          </s:sequence>
+        </s:complexType>
+      </s:element>
+      <s:element name="DeleteJobInstance">
+        <s:complexType>
+          <s:sequence>
+            <s:element minOccurs="1" maxOccurs="1" name="jobInstanceId" type="s:int" />
+          </s:sequence>
+        </s:complexType>
+      </s:element>
+      <s:element name="DeleteJobInstanceResponse">
+        <s:complexType>
+          <s:sequence>
+            <s:element minOccurs="1" maxOccurs="1" name="DeleteJobInstanceResult" type="s:boolean" />
+          </s:sequence>
+        </s:complexType>
+      </s:element>
+      <s:element name="CompleteTaskInstance">
+        <s:complexType>
+          <s:sequence>
+            <s:element minOccurs="1" maxOccurs="1" name="jobInstanceID" type="s:int" />
+          </s:sequence>
+        </s:complexType>
+      </s:element>
+      <s:element name="CompleteTaskInstanceResponse">
+        <s:complexType>
+          <s:sequence>
+            <s:element minOccurs="1" maxOccurs="1" name="CompleteTaskInstanceResult" type="s:boolean" />
+          </s:sequence>
+        </s:complexType>
+      </s:element>
+      <s:element name="CancelTaskInstance">
+        <s:complexType>
+          <s:sequence>
+            <s:element minOccurs="1" maxOccurs="1" name="jobInstanceID" type="s:int" />
+          </s:sequence>
+        </s:complexType>
+      </s:element>
+      <s:element name="CancelTaskInstanceResponse">
+        <s:complexType>
+          <s:sequence>
+            <s:element minOccurs="1" maxOccurs="1" name="CancelTaskInstanceResult" type="s:boolean" />
+          </s:sequence>
+        </s:complexType>
+      </s:element>
+      <s:element name="GetCurrentTaskInstance">
+        <s:complexType>
+          <s:sequence>
+            <s:element minOccurs="1" maxOccurs="1" name="jobInstanceID" type="s:int" />
+          </s:sequence>
+        </s:complexType>
+      </s:element>
+      <s:element name="GetCurrentTaskInstanceResponse">
+        <s:complexType>
+          <s:sequence>
+            <s:element minOccurs="0" maxOccurs="1" name="GetCurrentTaskInstanceResult" type="tns:WFTaskInstance" />
+          </s:sequence>
+        </s:complexType>
+      </s:element>
+      <s:complexType name="WFTaskInstance">
+        <s:sequence>
+          <s:element minOccurs="1" maxOccurs="1" name="ID" type="s:int" />
+          <s:element minOccurs="1" maxOccurs="1" name="JobID" type="s:int" />
+          <s:element minOccurs="1" maxOccurs="1" name="TaskID" type="s:int" />
+          <s:element minOccurs="1" maxOccurs="1" name="Sid" type="s:int" />
+          <s:element minOccurs="1" maxOccurs="1" name="Assigned" type="s:dateTime" />
+          <s:element minOccurs="1" maxOccurs="1" name="Started" type="s:dateTime" />
+          <s:element minOccurs="1" maxOccurs="1" name="Ended" type="s:dateTime" />
+          <s:element minOccurs="0" maxOccurs="1" name="Comment" type="s:string" />
+          <s:element minOccurs="1" maxOccurs="1" name="JobInstanceID" type="s:int" />
+        </s:sequence>
+      </s:complexType>
+      <s:element name="UpdateJobInstance">
+        <s:complexType>
+          <s:sequence>
+            <s:element minOccurs="1" maxOccurs="1" name="jobInstanceID" type="s:int" />
+            <s:element minOccurs="0" maxOccurs="1" name="instanceName" type="s:string" />
+            <s:element minOccurs="1" maxOccurs="1" name="priority" type="s1:char" />
+            <s:element minOccurs="0" maxOccurs="1" name="comments" type="s:string" />
+            <s:element minOccurs="0" maxOccurs="1" name="parameters" type="s:string" />
+          </s:sequence>
+        </s:complexType>
+      </s:element>
+      <s:element name="UpdateJobInstanceResponse">
+        <s:complexType>
+          <s:sequence>
+            <s:element minOccurs="1" maxOccurs="1" name="UpdateJobInstanceResult" type="s:boolean" />
+          </s:sequence>
+        </s:complexType>
+      </s:element>
+      <s:element name="GetJobInstanceParameters">
+        <s:complexType>
+          <s:sequence>
+            <s:element minOccurs="1" maxOccurs="1" name="jobInstanceId" type="s:int" />
+          </s:sequence>
+        </s:complexType>
+      </s:element>
+      <s:element name="GetJobInstanceParametersResponse">
+        <s:complexType>
+          <s:sequence>
+            <s:element minOccurs="0" maxOccurs="1" name="GetJobInstanceParametersResult" type="s:string" />
+          </s:sequence>
+        </s:complexType>
+      </s:element>
+      <s:element name="UpdateJobInstanceParameters">
+        <s:complexType>
+          <s:sequence>
+            <s:element minOccurs="1" maxOccurs="1" name="jobInstanceID" type="s:int" />
+            <s:element minOccurs="0" maxOccurs="1" name="parameters" type="s:string" />
+          </s:sequence>
+        </s:complexType>
+      </s:element>
+      <s:element name="UpdateJobInstanceParametersResponse">
+        <s:complexType>
+          <s:sequence>
+            <s:element minOccurs="1" maxOccurs="1" name="UpdateJobInstanceParametersResult" type="s:boolean" />
+          </s:sequence>
+        </s:complexType>
+      </s:element>
+      <s:element name="GetJobInstance">
+        <s:complexType>
+          <s:sequence>
+            <s:element minOccurs="1" maxOccurs="1" name="jobInstanceId" type="s:int" />
+          </s:sequence>
+        </s:complexType>
+      </s:element>
+      <s:element name="GetJobInstanceResponse">
+        <s:complexType>
+          <s:sequence>
+            <s:element minOccurs="0" maxOccurs="1" name="GetJobInstanceResult" type="tns:JobInstance" />
+          </s:sequence>
+        </s:complexType>
+      </s:element>
+      <s:element name="GetParcelAttributesByUPIN">
+        <s:complexType>
+          <s:sequence>
+            <s:element minOccurs="0" maxOccurs="1" name="regionName" type="s:string" />
+            <s:element minOccurs="0" maxOccurs="1" name="upin" type="s:string" />
+          </s:sequence>
+        </s:complexType>
+      </s:element>
+      <s:element name="GetParcelAttributesByUPINResponse">
+        <s:complexType>
+          <s:sequence>
+            <s:element minOccurs="0" maxOccurs="1" name="GetParcelAttributesByUPINResult" type="tns:ArrayOfDataFieldRow" />
+          </s:sequence>
+        </s:complexType>
+      </s:element>
+      <s:element name="GetConfiguredRegions">
+        <s:complexType />
+      </s:element>
+      <s:element name="GetConfiguredRegionsResponse">
+        <s:complexType>
+          <s:sequence>
+            <s:element minOccurs="0" maxOccurs="1" name="GetConfiguredRegionsResult" type="tns:ArrayOfString" />
+          </s:sequence>
+        </s:complexType>
+      </s:element>
+      <s:complexType name="ArrayOfString">
+        <s:sequence>
+          <s:element minOccurs="0" maxOccurs="unbounded" name="string" nillable="true" type="s:string" />
+        </s:sequence>
+      </s:complexType>
+      <s:element name="GetDomains">
+        <s:complexType />
+      </s:element>
+      <s:element name="GetDomainsResponse">
+        <s:complexType>
+          <s:sequence>
+            <s:element minOccurs="0" maxOccurs="1" name="GetDomainsResult" type="tns:ArrayOfString" />
+          </s:sequence>
+        </s:complexType>
+      </s:element>
+      <s:element name="GetDomainDetailsByName">
+        <s:complexType>
+          <s:sequence>
+            <s:element minOccurs="0" maxOccurs="1" name="domainName" type="s:string" />
+          </s:sequence>
+        </s:complexType>
+      </s:element>
+      <s:element name="GetDomainDetailsByNameResponse">
+        <s:complexType>
+          <s:sequence>
+            <s:element minOccurs="0" maxOccurs="1" name="GetDomainDetailsByNameResult" type="tns:ArrayOfDataFieldRow" />
+          </s:sequence>
+        </s:complexType>
+      </s:element>
+      <s:element name="GetParcelStatus">
+        <s:complexType>
+          <s:sequence>
+            <s:element minOccurs="0" maxOccurs="1" name="regionName" type="s:string" />
+            <s:element minOccurs="0" maxOccurs="1" name="upin" type="s:string" />
+          </s:sequence>
+        </s:complexType>
+      </s:element>
+      <s:element name="GetParcelStatusResponse">
+        <s:complexType>
+          <s:sequence>
+            <s:element minOccurs="0" maxOccurs="1" name="GetParcelStatusResult" type="tns:ArrayOfDataFieldRow" />
+          </s:sequence>
+        </s:complexType>
+      </s:element>
+      <s:element name="GetUpinsByJobInstance">
+        <s:complexType>
+          <s:sequence>
+            <s:element minOccurs="1" maxOccurs="1" name="jobInstanceID" type="s:int" />
+          </s:sequence>
+        </s:complexType>
+      </s:element>
+      <s:element name="GetUpinsByJobInstanceResponse">
+        <s:complexType>
+          <s:sequence>
+            <s:element minOccurs="0" maxOccurs="1" name="GetUpinsByJobInstanceResult" type="tns:ArrayOfString" />
+          </s:sequence>
+        </s:complexType>
+      </s:element>
+      <s:element name="GetUpinsByTransaction">
+        <s:complexType>
+          <s:sequence>
+            <s:element minOccurs="1" maxOccurs="1" name="transactionNumber" type="s:int" />
+          </s:sequence>
+        </s:complexType>
+      </s:element>
+      <s:element name="GetUpinsByTransactionResponse">
+        <s:complexType>
+          <s:sequence>
+            <s:element minOccurs="0" maxOccurs="1" name="GetUpinsByTransactionResult" type="tns:ArrayOfString" />
+          </s:sequence>
+        </s:complexType>
+      </s:element>
+      <s:element name="GetJobStatusByTransaction">
+        <s:complexType>
+          <s:sequence>
+            <s:element minOccurs="1" maxOccurs="1" name="transactionNumber" type="s:int" />
+          </s:sequence>
+        </s:complexType>
+      </s:element>
+      <s:element name="GetJobStatusByTransactionResponse">
+        <s:complexType>
+          <s:sequence>
+            <s:element minOccurs="0" maxOccurs="1" name="GetJobStatusByTransactionResult" type="tns:ArrayOfWFJob" />
+          </s:sequence>
+        </s:complexType>
+      </s:element>
+      <s:element name="GetJobStatusByJobInstanceID">
+        <s:complexType>
+          <s:sequence>
+            <s:element minOccurs="1" maxOccurs="1" name="jobInstanceID" type="s:int" />
+          </s:sequence>
+        </s:complexType>
+      </s:element>
+      <s:element name="GetJobStatusByJobInstanceIDResponse">
+        <s:complexType>
+          <s:sequence>
+            <s:element minOccurs="0" maxOccurs="1" name="GetJobStatusByJobInstanceIDResult" type="tns:WFJob" />
+          </s:sequence>
+        </s:complexType>
+      </s:element>
+      <s:element name="BatchUpdateDataFromRegistry">
+        <s:complexType>
+          <s:sequence>
+            <s:element minOccurs="0" maxOccurs="1" name="parameters" type="s:string" />
+          </s:sequence>
+        </s:complexType>
+      </s:element>
+      <s:element name="BatchUpdateDataFromRegistryResponse">
+        <s:complexType>
+          <s:sequence>
+            <s:element minOccurs="0" maxOccurs="1" name="BatchUpdateDataFromRegistryResult" type="tns:BatchUpdateStatus" />
+          </s:sequence>
+        </s:complexType>
+      </s:element>
+      <s:complexType name="BatchUpdateStatus">
+        <s:sequence>
+          <s:element minOccurs="1" maxOccurs="1" name="Completed" type="s:boolean" />
+          <s:element minOccurs="1" maxOccurs="1" name="HasError" type="s:boolean" />
+          <s:element minOccurs="0" maxOccurs="1" name="Messages" type="tns:ArrayOfString" />
+        </s:sequence>
+      </s:complexType>
+      <s:element name="GetParcelPointsData">
+        <s:complexType>
+          <s:sequence>
+            <s:element minOccurs="0" maxOccurs="1" name="pUpin" type="s:string" />
+          </s:sequence>
+        </s:complexType>
+      </s:element>
+      <s:element name="GetParcelPointsDataResponse">
+        <s:complexType>
+          <s:sequence>
+            <s:element minOccurs="0" maxOccurs="1" name="GetParcelPointsDataResult" type="tns:ArrayOfPointInformationDTO" />
+          </s:sequence>
+        </s:complexType>
+      </s:element>
+      <s:complexType name="ArrayOfPointInformationDTO">
+        <s:sequence>
+          <s:element minOccurs="0" maxOccurs="unbounded" name="PointInformationDTO" nillable="true" type="tns:PointInformationDTO" />
+        </s:sequence>
+      </s:complexType>
+      <s:complexType name="PointInformationDTO">
+        <s:sequence>
+          <s:element minOccurs="0" maxOccurs="1" name="FromPointName" type="s:string" />
+          <s:element minOccurs="1" maxOccurs="1" name="FromNorth" type="s:double" />
+          <s:element minOccurs="1" maxOccurs="1" name="FromEast" type="s:double" />
+          <s:element minOccurs="0" maxOccurs="1" name="ToPointName" type="s:string" />
+          <s:element minOccurs="1" maxOccurs="1" name="ToNorth" type="s:double" />
+          <s:element minOccurs="1" maxOccurs="1" name="ToEast" type="s:double" />
+          <s:element minOccurs="1" maxOccurs="1" name="Distance" type="s:double" />
+          <s:element minOccurs="0" maxOccurs="1" name="Azimuth" type="s:string" />
+          <s:element minOccurs="0" maxOccurs="1" name="Bearing" type="s:string" />
+        </s:sequence>
+      </s:complexType>
+      <s:element name="Authenticate">
+        <s:complexType>
+          <s:sequence>
+            <s:element minOccurs="0" maxOccurs="1" name="user" type="s:string" />
+            <s:element minOccurs="0" maxOccurs="1" name="password" type="s:string" />
+          </s:sequence>
+        </s:complexType>
+      </s:element>
+      <s:element name="AuthenticateResponse">
+        <s:complexType>
+          <s:sequence>
+            <s:element minOccurs="1" maxOccurs="1" name="AuthenticateResult" type="s:boolean" />
+          </s:sequence>
+        </s:complexType>
+      </s:element>
+      <s:element name="LogOut">
+        <s:complexType />
+      </s:element>
+      <s:element name="LogOutResponse">
+        <s:complexType />
+      </s:element>
+    </s:schema>
+    <s:schema elementFormDefault="qualified" targetNamespace="http://microsoft.com/wsdl/types/">
+      <s:simpleType name="char">
+        <s:restriction base="s:unsignedShort" />
+      </s:simpleType>
+    </s:schema>
+  </wsdl:types>
+  <wsdl:message name="GetAllJobsSoapIn">
+    <wsdl:part name="parameters" element="tns:GetAllJobs" />
+  </wsdl:message>
+  <wsdl:message name="GetAllJobsSoapOut">
+    <wsdl:part name="parameters" element="tns:GetAllJobsResponse" />
+  </wsdl:message>
+  <wsdl:message name="GetAllJobsInstancesSoapIn">
+    <wsdl:part name="parameters" element="tns:GetAllJobsInstances" />
+  </wsdl:message>
+  <wsdl:message name="GetAllJobsInstancesSoapOut">
+    <wsdl:part name="parameters" element="tns:GetAllJobsInstancesResponse" />
+  </wsdl:message>
+  <wsdl:message name="IsJobInstanceCompletedSoapIn">
+    <wsdl:part name="parameters" element="tns:IsJobInstanceCompleted" />
+  </wsdl:message>
+  <wsdl:message name="IsJobInstanceCompletedSoapOut">
+    <wsdl:part name="parameters" element="tns:IsJobInstanceCompletedResponse" />
+  </wsdl:message>
+  <wsdl:message name="ApproveJobSoapIn">
+    <wsdl:part name="parameters" element="tns:ApproveJob" />
+  </wsdl:message>
+  <wsdl:message name="ApproveJobSoapOut">
+    <wsdl:part name="parameters" element="tns:ApproveJobResponse" />
+  </wsdl:message>
+  <wsdl:message name="RejectJobSoapIn">
+    <wsdl:part name="parameters" element="tns:RejectJob" />
+  </wsdl:message>
+  <wsdl:message name="RejectJobSoapOut">
+    <wsdl:part name="parameters" element="tns:RejectJobResponse" />
+  </wsdl:message>
+  <wsdl:message name="CreateJobInstanceSoapIn">
+    <wsdl:part name="parameters" element="tns:CreateJobInstance" />
+  </wsdl:message>
+  <wsdl:message name="CreateJobInstanceSoapOut">
+    <wsdl:part name="parameters" element="tns:CreateJobInstanceResponse" />
+  </wsdl:message>
+  <wsdl:message name="CompleteJobInstanceSoapIn">
+    <wsdl:part name="parameters" element="tns:CompleteJobInstance" />
+  </wsdl:message>
+  <wsdl:message name="CompleteJobInstanceSoapOut">
+    <wsdl:part name="parameters" element="tns:CompleteJobInstanceResponse" />
+  </wsdl:message>
+  <wsdl:message name="DeleteJobInstanceSoapIn">
+    <wsdl:part name="parameters" element="tns:DeleteJobInstance" />
+  </wsdl:message>
+  <wsdl:message name="DeleteJobInstanceSoapOut">
+    <wsdl:part name="parameters" element="tns:DeleteJobInstanceResponse" />
+  </wsdl:message>
+  <wsdl:message name="CompleteTaskInstanceSoapIn">
+    <wsdl:part name="parameters" element="tns:CompleteTaskInstance" />
+  </wsdl:message>
+  <wsdl:message name="CompleteTaskInstanceSoapOut">
+    <wsdl:part name="parameters" element="tns:CompleteTaskInstanceResponse" />
+  </wsdl:message>
+  <wsdl:message name="CancelTaskInstanceSoapIn">
+    <wsdl:part name="parameters" element="tns:CancelTaskInstance" />
+  </wsdl:message>
+  <wsdl:message name="CancelTaskInstanceSoapOut">
+    <wsdl:part name="parameters" element="tns:CancelTaskInstanceResponse" />
+  </wsdl:message>
+  <wsdl:message name="GetCurrentTaskInstanceSoapIn">
+    <wsdl:part name="parameters" element="tns:GetCurrentTaskInstance" />
+  </wsdl:message>
+  <wsdl:message name="GetCurrentTaskInstanceSoapOut">
+    <wsdl:part name="parameters" element="tns:GetCurrentTaskInstanceResponse" />
+  </wsdl:message>
+  <wsdl:message name="UpdateJobInstanceSoapIn">
+    <wsdl:part name="parameters" element="tns:UpdateJobInstance" />
+  </wsdl:message>
+  <wsdl:message name="UpdateJobInstanceSoapOut">
+    <wsdl:part name="parameters" element="tns:UpdateJobInstanceResponse" />
+  </wsdl:message>
+  <wsdl:message name="GetJobInstanceParametersSoapIn">
+    <wsdl:part name="parameters" element="tns:GetJobInstanceParameters" />
+  </wsdl:message>
+  <wsdl:message name="GetJobInstanceParametersSoapOut">
+    <wsdl:part name="parameters" element="tns:GetJobInstanceParametersResponse" />
+  </wsdl:message>
+  <wsdl:message name="UpdateJobInstanceParametersSoapIn">
+    <wsdl:part name="parameters" element="tns:UpdateJobInstanceParameters" />
+  </wsdl:message>
+  <wsdl:message name="UpdateJobInstanceParametersSoapOut">
+    <wsdl:part name="parameters" element="tns:UpdateJobInstanceParametersResponse" />
+  </wsdl:message>
+  <wsdl:message name="GetJobInstanceSoapIn">
+    <wsdl:part name="parameters" element="tns:GetJobInstance" />
+  </wsdl:message>
+  <wsdl:message name="GetJobInstanceSoapOut">
+    <wsdl:part name="parameters" element="tns:GetJobInstanceResponse" />
+  </wsdl:message>
+  <wsdl:message name="GetParcelAttributesByUPINSoapIn">
+    <wsdl:part name="parameters" element="tns:GetParcelAttributesByUPIN" />
+  </wsdl:message>
+  <wsdl:message name="GetParcelAttributesByUPINSoapOut">
+    <wsdl:part name="parameters" element="tns:GetParcelAttributesByUPINResponse" />
+  </wsdl:message>
+  <wsdl:message name="GetConfiguredRegionsSoapIn">
+    <wsdl:part name="parameters" element="tns:GetConfiguredRegions" />
+  </wsdl:message>
+  <wsdl:message name="GetConfiguredRegionsSoapOut">
+    <wsdl:part name="parameters" element="tns:GetConfiguredRegionsResponse" />
+  </wsdl:message>
+  <wsdl:message name="GetDomainsSoapIn">
+    <wsdl:part name="parameters" element="tns:GetDomains" />
+  </wsdl:message>
+  <wsdl:message name="GetDomainsSoapOut">
+    <wsdl:part name="parameters" element="tns:GetDomainsResponse" />
+  </wsdl:message>
+  <wsdl:message name="GetDomainDetailsByNameSoapIn">
+    <wsdl:part name="parameters" element="tns:GetDomainDetailsByName" />
+  </wsdl:message>
+  <wsdl:message name="GetDomainDetailsByNameSoapOut">
+    <wsdl:part name="parameters" element="tns:GetDomainDetailsByNameResponse" />
+  </wsdl:message>
+  <wsdl:message name="GetParcelStatusSoapIn">
+    <wsdl:part name="parameters" element="tns:GetParcelStatus" />
+  </wsdl:message>
+  <wsdl:message name="GetParcelStatusSoapOut">
+    <wsdl:part name="parameters" element="tns:GetParcelStatusResponse" />
+  </wsdl:message>
+  <wsdl:message name="GetUpinsByJobInstanceSoapIn">
+    <wsdl:part name="parameters" element="tns:GetUpinsByJobInstance" />
+  </wsdl:message>
+  <wsdl:message name="GetUpinsByJobInstanceSoapOut">
+    <wsdl:part name="parameters" element="tns:GetUpinsByJobInstanceResponse" />
+  </wsdl:message>
+  <wsdl:message name="GetUpinsByTransactionSoapIn">
+    <wsdl:part name="parameters" element="tns:GetUpinsByTransaction" />
+  </wsdl:message>
+  <wsdl:message name="GetUpinsByTransactionSoapOut">
+    <wsdl:part name="parameters" element="tns:GetUpinsByTransactionResponse" />
+  </wsdl:message>
+  <wsdl:message name="GetJobStatusByTransactionSoapIn">
+    <wsdl:part name="parameters" element="tns:GetJobStatusByTransaction" />
+  </wsdl:message>
+  <wsdl:message name="GetJobStatusByTransactionSoapOut">
+    <wsdl:part name="parameters" element="tns:GetJobStatusByTransactionResponse" />
+  </wsdl:message>
+  <wsdl:message name="GetJobStatusByJobInstanceIDSoapIn">
+    <wsdl:part name="parameters" element="tns:GetJobStatusByJobInstanceID" />
+  </wsdl:message>
+  <wsdl:message name="GetJobStatusByJobInstanceIDSoapOut">
+    <wsdl:part name="parameters" element="tns:GetJobStatusByJobInstanceIDResponse" />
+  </wsdl:message>
+  <wsdl:message name="BatchUpdateDataFromRegistrySoapIn">
+    <wsdl:part name="parameters" element="tns:BatchUpdateDataFromRegistry" />
+  </wsdl:message>
+  <wsdl:message name="BatchUpdateDataFromRegistrySoapOut">
+    <wsdl:part name="parameters" element="tns:BatchUpdateDataFromRegistryResponse" />
+  </wsdl:message>
+  <wsdl:message name="GetParcelPointsDataSoapIn">
+    <wsdl:part name="parameters" element="tns:GetParcelPointsData" />
+  </wsdl:message>
+  <wsdl:message name="GetParcelPointsDataSoapOut">
+    <wsdl:part name="parameters" element="tns:GetParcelPointsDataResponse" />
+  </wsdl:message>
+  <wsdl:message name="AuthenticateSoapIn">
+    <wsdl:part name="parameters" element="tns:Authenticate" />
+  </wsdl:message>
+  <wsdl:message name="AuthenticateSoapOut">
+    <wsdl:part name="parameters" element="tns:AuthenticateResponse" />
+  </wsdl:message>
+  <wsdl:message name="LogOutSoapIn">
+    <wsdl:part name="parameters" element="tns:LogOut" />
+  </wsdl:message>
+  <wsdl:message name="LogOutSoapOut">
+    <wsdl:part name="parameters" element="tns:LogOutResponse" />
+  </wsdl:message>
+  <wsdl:portType name="LRSWebServicesSoap">
+    <wsdl:operation name="GetAllJobs">
+      <wsdl:input message="tns:GetAllJobsSoapIn" />
+      <wsdl:output message="tns:GetAllJobsSoapOut" />
+    </wsdl:operation>
+    <wsdl:operation name="GetAllJobsInstances">
+      <wsdl:input message="tns:GetAllJobsInstancesSoapIn" />
+      <wsdl:output message="tns:GetAllJobsInstancesSoapOut" />
+    </wsdl:operation>
+    <wsdl:operation name="IsJobInstanceCompleted">
+      <wsdl:input message="tns:IsJobInstanceCompletedSoapIn" />
+      <wsdl:output message="tns:IsJobInstanceCompletedSoapOut" />
+    </wsdl:operation>
+    <wsdl:operation name="ApproveJob">
+      <wsdl:input message="tns:ApproveJobSoapIn" />
+      <wsdl:output message="tns:ApproveJobSoapOut" />
+    </wsdl:operation>
+    <wsdl:operation name="RejectJob">
+      <wsdl:input message="tns:RejectJobSoapIn" />
+      <wsdl:output message="tns:RejectJobSoapOut" />
+    </wsdl:operation>
+    <wsdl:operation name="CreateJobInstance">
+      <wsdl:input message="tns:CreateJobInstanceSoapIn" />
+      <wsdl:output message="tns:CreateJobInstanceSoapOut" />
+    </wsdl:operation>
+    <wsdl:operation name="CompleteJobInstance">
+      <wsdl:input message="tns:CompleteJobInstanceSoapIn" />
+      <wsdl:output message="tns:CompleteJobInstanceSoapOut" />
+    </wsdl:operation>
+    <wsdl:operation name="DeleteJobInstance">
+      <wsdl:input message="tns:DeleteJobInstanceSoapIn" />
+      <wsdl:output message="tns:DeleteJobInstanceSoapOut" />
+    </wsdl:operation>
+    <wsdl:operation name="CompleteTaskInstance">
+      <wsdl:input message="tns:CompleteTaskInstanceSoapIn" />
+      <wsdl:output message="tns:CompleteTaskInstanceSoapOut" />
+    </wsdl:operation>
+    <wsdl:operation name="CancelTaskInstance">
+      <wsdl:input message="tns:CancelTaskInstanceSoapIn" />
+      <wsdl:output message="tns:CancelTaskInstanceSoapOut" />
+    </wsdl:operation>
+    <wsdl:operation name="GetCurrentTaskInstance">
+      <wsdl:input message="tns:GetCurrentTaskInstanceSoapIn" />
+      <wsdl:output message="tns:GetCurrentTaskInstanceSoapOut" />
+    </wsdl:operation>
+    <wsdl:operation name="UpdateJobInstance">
+      <wsdl:input message="tns:UpdateJobInstanceSoapIn" />
+      <wsdl:output message="tns:UpdateJobInstanceSoapOut" />
+    </wsdl:operation>
+    <wsdl:operation name="GetJobInstanceParameters">
+      <wsdl:input message="tns:GetJobInstanceParametersSoapIn" />
+      <wsdl:output message="tns:GetJobInstanceParametersSoapOut" />
+    </wsdl:operation>
+    <wsdl:operation name="UpdateJobInstanceParameters">
+      <wsdl:input message="tns:UpdateJobInstanceParametersSoapIn" />
+      <wsdl:output message="tns:UpdateJobInstanceParametersSoapOut" />
+    </wsdl:operation>
+    <wsdl:operation name="GetJobInstance">
+      <wsdl:input message="tns:GetJobInstanceSoapIn" />
+      <wsdl:output message="tns:GetJobInstanceSoapOut" />
+    </wsdl:operation>
+    <wsdl:operation name="GetParcelAttributesByUPIN">
+      <wsdl:input message="tns:GetParcelAttributesByUPINSoapIn" />
+      <wsdl:output message="tns:GetParcelAttributesByUPINSoapOut" />
+    </wsdl:operation>
+    <wsdl:operation name="GetConfiguredRegions">
+      <wsdl:input message="tns:GetConfiguredRegionsSoapIn" />
+      <wsdl:output message="tns:GetConfiguredRegionsSoapOut" />
+    </wsdl:operation>
+    <wsdl:operation name="GetDomains">
+      <wsdl:input message="tns:GetDomainsSoapIn" />
+      <wsdl:output message="tns:GetDomainsSoapOut" />
+    </wsdl:operation>
+    <wsdl:operation name="GetDomainDetailsByName">
+      <wsdl:input message="tns:GetDomainDetailsByNameSoapIn" />
+      <wsdl:output message="tns:GetDomainDetailsByNameSoapOut" />
+    </wsdl:operation>
+    <wsdl:operation name="GetParcelStatus">
+      <wsdl:input message="tns:GetParcelStatusSoapIn" />
+      <wsdl:output message="tns:GetParcelStatusSoapOut" />
+    </wsdl:operation>
+    <wsdl:operation name="GetUpinsByJobInstance">
+      <wsdl:input message="tns:GetUpinsByJobInstanceSoapIn" />
+      <wsdl:output message="tns:GetUpinsByJobInstanceSoapOut" />
+    </wsdl:operation>
+    <wsdl:operation name="GetUpinsByTransaction">
+      <wsdl:input message="tns:GetUpinsByTransactionSoapIn" />
+      <wsdl:output message="tns:GetUpinsByTransactionSoapOut" />
+    </wsdl:operation>
+    <wsdl:operation name="GetJobStatusByTransaction">
+      <wsdl:input message="tns:GetJobStatusByTransactionSoapIn" />
+      <wsdl:output message="tns:GetJobStatusByTransactionSoapOut" />
+    </wsdl:operation>
+    <wsdl:operation name="GetJobStatusByJobInstanceID">
+      <wsdl:input message="tns:GetJobStatusByJobInstanceIDSoapIn" />
+      <wsdl:output message="tns:GetJobStatusByJobInstanceIDSoapOut" />
+    </wsdl:operation>
+    <wsdl:operation name="BatchUpdateDataFromRegistry">
+      <wsdl:input message="tns:BatchUpdateDataFromRegistrySoapIn" />
+      <wsdl:output message="tns:BatchUpdateDataFromRegistrySoapOut" />
+    </wsdl:operation>
+    <wsdl:operation name="GetParcelPointsData">
+      <wsdl:input message="tns:GetParcelPointsDataSoapIn" />
+      <wsdl:output message="tns:GetParcelPointsDataSoapOut" />
+    </wsdl:operation>
+    <wsdl:operation name="Authenticate">
+      <wsdl:input message="tns:AuthenticateSoapIn" />
+      <wsdl:output message="tns:AuthenticateSoapOut" />
+    </wsdl:operation>
+    <wsdl:operation name="LogOut">
+      <wsdl:input message="tns:LogOutSoapIn" />
+      <wsdl:output message="tns:LogOutSoapOut" />
+    </wsdl:operation>
+  </wsdl:portType>
+  <wsdl:binding name="LRSWebServicesSoap" type="tns:LRSWebServicesSoap">
+    <soap:binding transport="http://schemas.xmlsoap.org/soap/http" />
+    <wsdl:operation name="GetAllJobs">
+      <soap:operation soapAction="http://tempuri.org/GetAllJobs" style="document" />
+      <wsdl:input>
+        <soap:body use="literal" />
+      </wsdl:input>
+      <wsdl:output>
+        <soap:body use="literal" />
+      </wsdl:output>
+    </wsdl:operation>
+    <wsdl:operation name="GetAllJobsInstances">
+      <soap:operation soapAction="http://tempuri.org/GetAllJobsInstances" style="document" />
+      <wsdl:input>
+        <soap:body use="literal" />
+      </wsdl:input>
+      <wsdl:output>
+        <soap:body use="literal" />
+      </wsdl:output>
+    </wsdl:operation>
+    <wsdl:operation name="IsJobInstanceCompleted">
+      <soap:operation soapAction="http://tempuri.org/IsJobInstanceCompleted" style="document" />
+      <wsdl:input>
+        <soap:body use="literal" />
+      </wsdl:input>
+      <wsdl:output>
+        <soap:body use="literal" />
+      </wsdl:output>
+    </wsdl:operation>
+    <wsdl:operation name="ApproveJob">
+      <soap:operation soapAction="http://tempuri.org/ApproveJob" style="document" />
+      <wsdl:input>
+        <soap:body use="literal" />
+      </wsdl:input>
+      <wsdl:output>
+        <soap:body use="literal" />
+      </wsdl:output>
+    </wsdl:operation>
+    <wsdl:operation name="RejectJob">
+      <soap:operation soapAction="http://tempuri.org/RejectJob" style="document" />
+      <wsdl:input>
+        <soap:body use="literal" />
+      </wsdl:input>
+      <wsdl:output>
+        <soap:body use="literal" />
+      </wsdl:output>
+    </wsdl:operation>
+    <wsdl:operation name="CreateJobInstance">
+      <soap:operation soapAction="http://tempuri.org/CreateJobInstance" style="document" />
+      <wsdl:input>
+        <soap:body use="literal" />
+      </wsdl:input>
+      <wsdl:output>
+        <soap:body use="literal" />
+      </wsdl:output>
+    </wsdl:operation>
+    <wsdl:operation name="CompleteJobInstance">
+      <soap:operation soapAction="http://tempuri.org/CompleteJobInstance" style="document" />
+      <wsdl:input>
+        <soap:body use="literal" />
+      </wsdl:input>
+      <wsdl:output>
+        <soap:body use="literal" />
+      </wsdl:output>
+    </wsdl:operation>
+    <wsdl:operation name="DeleteJobInstance">
+      <soap:operation soapAction="http://tempuri.org/DeleteJobInstance" style="document" />
+      <wsdl:input>
+        <soap:body use="literal" />
+      </wsdl:input>
+      <wsdl:output>
+        <soap:body use="literal" />
+      </wsdl:output>
+    </wsdl:operation>
+    <wsdl:operation name="CompleteTaskInstance">
+      <soap:operation soapAction="http://tempuri.org/CompleteTaskInstance" style="document" />
+      <wsdl:input>
+        <soap:body use="literal" />
+      </wsdl:input>
+      <wsdl:output>
+        <soap:body use="literal" />
+      </wsdl:output>
+    </wsdl:operation>
+    <wsdl:operation name="CancelTaskInstance">
+      <soap:operation soapAction="http://tempuri.org/CancelTaskInstance" style="document" />
+      <wsdl:input>
+        <soap:body use="literal" />
+      </wsdl:input>
+      <wsdl:output>
+        <soap:body use="literal" />
+      </wsdl:output>
+    </wsdl:operation>
+    <wsdl:operation name="GetCurrentTaskInstance">
+      <soap:operation soapAction="http://tempuri.org/GetCurrentTaskInstance" style="document" />
+      <wsdl:input>
+        <soap:body use="literal" />
+      </wsdl:input>
+      <wsdl:output>
+        <soap:body use="literal" />
+      </wsdl:output>
+    </wsdl:operation>
+    <wsdl:operation name="UpdateJobInstance">
+      <soap:operation soapAction="http://tempuri.org/UpdateJobInstance" style="document" />
+      <wsdl:input>
+        <soap:body use="literal" />
+      </wsdl:input>
+      <wsdl:output>
+        <soap:body use="literal" />
+      </wsdl:output>
+    </wsdl:operation>
+    <wsdl:operation name="GetJobInstanceParameters">
+      <soap:operation soapAction="http://tempuri.org/GetJobInstanceParameters" style="document" />
+      <wsdl:input>
+        <soap:body use="literal" />
+      </wsdl:input>
+      <wsdl:output>
+        <soap:body use="literal" />
+      </wsdl:output>
+    </wsdl:operation>
+    <wsdl:operation name="UpdateJobInstanceParameters">
+      <soap:operation soapAction="http://tempuri.org/UpdateJobInstanceParameters" style="document" />
+      <wsdl:input>
+        <soap:body use="literal" />
+      </wsdl:input>
+      <wsdl:output>
+        <soap:body use="literal" />
+      </wsdl:output>
+    </wsdl:operation>
+    <wsdl:operation name="GetJobInstance">
+      <soap:operation soapAction="http://tempuri.org/GetJobInstance" style="document" />
+      <wsdl:input>
+        <soap:body use="literal" />
+      </wsdl:input>
+      <wsdl:output>
+        <soap:body use="literal" />
+      </wsdl:output>
+    </wsdl:operation>
+    <wsdl:operation name="GetParcelAttributesByUPIN">
+      <soap:operation soapAction="http://tempuri.org/GetParcelAttributesByUPIN" style="document" />
+      <wsdl:input>
+        <soap:body use="literal" />
+      </wsdl:input>
+      <wsdl:output>
+        <soap:body use="literal" />
+      </wsdl:output>
+    </wsdl:operation>
+    <wsdl:operation name="GetConfiguredRegions">
+      <soap:operation soapAction="http://tempuri.org/GetConfiguredRegions" style="document" />
+      <wsdl:input>
+        <soap:body use="literal" />
+      </wsdl:input>
+      <wsdl:output>
+        <soap:body use="literal" />
+      </wsdl:output>
+    </wsdl:operation>
+    <wsdl:operation name="GetDomains">
+      <soap:operation soapAction="http://tempuri.org/GetDomains" style="document" />
+      <wsdl:input>
+        <soap:body use="literal" />
+      </wsdl:input>
+      <wsdl:output>
+        <soap:body use="literal" />
+      </wsdl:output>
+    </wsdl:operation>
+    <wsdl:operation name="GetDomainDetailsByName">
+      <soap:operation soapAction="http://tempuri.org/GetDomainDetailsByName" style="document" />
+      <wsdl:input>
+        <soap:body use="literal" />
+      </wsdl:input>
+      <wsdl:output>
+        <soap:body use="literal" />
+      </wsdl:output>
+    </wsdl:operation>
+    <wsdl:operation name="GetParcelStatus">
+      <soap:operation soapAction="http://tempuri.org/GetParcelStatus" style="document" />
+      <wsdl:input>
+        <soap:body use="literal" />
+      </wsdl:input>
+      <wsdl:output>
+        <soap:body use="literal" />
+      </wsdl:output>
+    </wsdl:operation>
+    <wsdl:operation name="GetUpinsByJobInstance">
+      <soap:operation soapAction="http://tempuri.org/GetUpinsByJobInstance" style="document" />
+      <wsdl:input>
+        <soap:body use="literal" />
+      </wsdl:input>
+      <wsdl:output>
+        <soap:body use="literal" />
+      </wsdl:output>
+    </wsdl:operation>
+    <wsdl:operation name="GetUpinsByTransaction">
+      <soap:operation soapAction="http://tempuri.org/GetUpinsByTransaction" style="document" />
+      <wsdl:input>
+        <soap:body use="literal" />
+      </wsdl:input>
+      <wsdl:output>
+        <soap:body use="literal" />
+      </wsdl:output>
+    </wsdl:operation>
+    <wsdl:operation name="GetJobStatusByTransaction">
+      <soap:operation soapAction="http://tempuri.org/GetJobStatusByTransaction" style="document" />
+      <wsdl:input>
+        <soap:body use="literal" />
+      </wsdl:input>
+      <wsdl:output>
+        <soap:body use="literal" />
+      </wsdl:output>
+    </wsdl:operation>
+    <wsdl:operation name="GetJobStatusByJobInstanceID">
+      <soap:operation soapAction="http://tempuri.org/GetJobStatusByJobInstanceID" style="document" />
+      <wsdl:input>
+        <soap:body use="literal" />
+      </wsdl:input>
+      <wsdl:output>
+        <soap:body use="literal" />
+      </wsdl:output>
+    </wsdl:operation>
+    <wsdl:operation name="BatchUpdateDataFromRegistry">
+      <soap:operation soapAction="http://tempuri.org/BatchUpdateDataFromRegistry" style="document" />
+      <wsdl:input>
+        <soap:body use="literal" />
+      </wsdl:input>
+      <wsdl:output>
+        <soap:body use="literal" />
+      </wsdl:output>
+    </wsdl:operation>
+    <wsdl:operation name="GetParcelPointsData">
+      <soap:operation soapAction="http://tempuri.org/GetParcelPointsData" style="document" />
+      <wsdl:input>
+        <soap:body use="literal" />
+      </wsdl:input>
+      <wsdl:output>
+        <soap:body use="literal" />
+      </wsdl:output>
+    </wsdl:operation>
+    <wsdl:operation name="Authenticate">
+      <soap:operation soapAction="http://tempuri.org/Authenticate" style="document" />
+      <wsdl:input>
+        <soap:body use="literal" />
+      </wsdl:input>
+      <wsdl:output>
+        <soap:body use="literal" />
+      </wsdl:output>
+    </wsdl:operation>
+    <wsdl:operation name="LogOut">
+      <soap:operation soapAction="http://tempuri.org/LogOut" style="document" />
+      <wsdl:input>
+        <soap:body use="literal" />
+      </wsdl:input>
+      <wsdl:output>
+        <soap:body use="literal" />
+      </wsdl:output>
+    </wsdl:operation>
+  </wsdl:binding>
+  <wsdl:binding name="LRSWebServicesSoap12" type="tns:LRSWebServicesSoap">
+    <soap12:binding transport="http://schemas.xmlsoap.org/soap/http" />
+    <wsdl:operation name="GetAllJobs">
+      <soap12:operation soapAction="http://tempuri.org/GetAllJobs" style="document" />
+      <wsdl:input>
+        <soap12:body use="literal" />
+      </wsdl:input>
+      <wsdl:output>
+        <soap12:body use="literal" />
+      </wsdl:output>
+    </wsdl:operation>
+    <wsdl:operation name="GetAllJobsInstances">
+      <soap12:operation soapAction="http://tempuri.org/GetAllJobsInstances" style="document" />
+      <wsdl:input>
+        <soap12:body use="literal" />
+      </wsdl:input>
+      <wsdl:output>
+        <soap12:body use="literal" />
+      </wsdl:output>
+    </wsdl:operation>
+    <wsdl:operation name="IsJobInstanceCompleted">
+      <soap12:operation soapAction="http://tempuri.org/IsJobInstanceCompleted" style="document" />
+      <wsdl:input>
+        <soap12:body use="literal" />
+      </wsdl:input>
+      <wsdl:output>
+        <soap12:body use="literal" />
+      </wsdl:output>
+    </wsdl:operation>
+    <wsdl:operation name="ApproveJob">
+      <soap12:operation soapAction="http://tempuri.org/ApproveJob" style="document" />
+      <wsdl:input>
+        <soap12:body use="literal" />
+      </wsdl:input>
+      <wsdl:output>
+        <soap12:body use="literal" />
+      </wsdl:output>
+    </wsdl:operation>
+    <wsdl:operation name="RejectJob">
+      <soap12:operation soapAction="http://tempuri.org/RejectJob" style="document" />
+      <wsdl:input>
+        <soap12:body use="literal" />
+      </wsdl:input>
+      <wsdl:output>
+        <soap12:body use="literal" />
+      </wsdl:output>
+    </wsdl:operation>
+    <wsdl:operation name="CreateJobInstance">
+      <soap12:operation soapAction="http://tempuri.org/CreateJobInstance" style="document" />
+      <wsdl:input>
+        <soap12:body use="literal" />
+      </wsdl:input>
+      <wsdl:output>
+        <soap12:body use="literal" />
+      </wsdl:output>
+    </wsdl:operation>
+    <wsdl:operation name="CompleteJobInstance">
+      <soap12:operation soapAction="http://tempuri.org/CompleteJobInstance" style="document" />
+      <wsdl:input>
+        <soap12:body use="literal" />
+      </wsdl:input>
+      <wsdl:output>
+        <soap12:body use="literal" />
+      </wsdl:output>
+    </wsdl:operation>
+    <wsdl:operation name="DeleteJobInstance">
+      <soap12:operation soapAction="http://tempuri.org/DeleteJobInstance" style="document" />
+      <wsdl:input>
+        <soap12:body use="literal" />
+      </wsdl:input>
+      <wsdl:output>
+        <soap12:body use="literal" />
+      </wsdl:output>
+    </wsdl:operation>
+    <wsdl:operation name="CompleteTaskInstance">
+      <soap12:operation soapAction="http://tempuri.org/CompleteTaskInstance" style="document" />
+      <wsdl:input>
+        <soap12:body use="literal" />
+      </wsdl:input>
+      <wsdl:output>
+        <soap12:body use="literal" />
+      </wsdl:output>
+    </wsdl:operation>
+    <wsdl:operation name="CancelTaskInstance">
+      <soap12:operation soapAction="http://tempuri.org/CancelTaskInstance" style="document" />
+      <wsdl:input>
+        <soap12:body use="literal" />
+      </wsdl:input>
+      <wsdl:output>
+        <soap12:body use="literal" />
+      </wsdl:output>
+    </wsdl:operation>
+    <wsdl:operation name="GetCurrentTaskInstance">
+      <soap12:operation soapAction="http://tempuri.org/GetCurrentTaskInstance" style="document" />
+      <wsdl:input>
+        <soap12:body use="literal" />
+      </wsdl:input>
+      <wsdl:output>
+        <soap12:body use="literal" />
+      </wsdl:output>
+    </wsdl:operation>
+    <wsdl:operation name="UpdateJobInstance">
+      <soap12:operation soapAction="http://tempuri.org/UpdateJobInstance" style="document" />
+      <wsdl:input>
+        <soap12:body use="literal" />
+      </wsdl:input>
+      <wsdl:output>
+        <soap12:body use="literal" />
+      </wsdl:output>
+    </wsdl:operation>
+    <wsdl:operation name="GetJobInstanceParameters">
+      <soap12:operation soapAction="http://tempuri.org/GetJobInstanceParameters" style="document" />
+      <wsdl:input>
+        <soap12:body use="literal" />
+      </wsdl:input>
+      <wsdl:output>
+        <soap12:body use="literal" />
+      </wsdl:output>
+    </wsdl:operation>
+    <wsdl:operation name="UpdateJobInstanceParameters">
+      <soap12:operation soapAction="http://tempuri.org/UpdateJobInstanceParameters" style="document" />
+      <wsdl:input>
+        <soap12:body use="literal" />
+      </wsdl:input>
+      <wsdl:output>
+        <soap12:body use="literal" />
+      </wsdl:output>
+    </wsdl:operation>
+    <wsdl:operation name="GetJobInstance">
+      <soap12:operation soapAction="http://tempuri.org/GetJobInstance" style="document" />
+      <wsdl:input>
+        <soap12:body use="literal" />
+      </wsdl:input>
+      <wsdl:output>
+        <soap12:body use="literal" />
+      </wsdl:output>
+    </wsdl:operation>
+    <wsdl:operation name="GetParcelAttributesByUPIN">
+      <soap12:operation soapAction="http://tempuri.org/GetParcelAttributesByUPIN" style="document" />
+      <wsdl:input>
+        <soap12:body use="literal" />
+      </wsdl:input>
+      <wsdl:output>
+        <soap12:body use="literal" />
+      </wsdl:output>
+    </wsdl:operation>
+    <wsdl:operation name="GetConfiguredRegions">
+      <soap12:operation soapAction="http://tempuri.org/GetConfiguredRegions" style="document" />
+      <wsdl:input>
+        <soap12:body use="literal" />
+      </wsdl:input>
+      <wsdl:output>
+        <soap12:body use="literal" />
+      </wsdl:output>
+    </wsdl:operation>
+    <wsdl:operation name="GetDomains">
+      <soap12:operation soapAction="http://tempuri.org/GetDomains" style="document" />
+      <wsdl:input>
+        <soap12:body use="literal" />
+      </wsdl:input>
+      <wsdl:output>
+        <soap12:body use="literal" />
+      </wsdl:output>
+    </wsdl:operation>
+    <wsdl:operation name="GetDomainDetailsByName">
+      <soap12:operation soapAction="http://tempuri.org/GetDomainDetailsByName" style="document" />
+      <wsdl:input>
+        <soap12:body use="literal" />
+      </wsdl:input>
+      <wsdl:output>
+        <soap12:body use="literal" />
+      </wsdl:output>
+    </wsdl:operation>
+    <wsdl:operation name="GetParcelStatus">
+      <soap12:operation soapAction="http://tempuri.org/GetParcelStatus" style="document" />
+      <wsdl:input>
+        <soap12:body use="literal" />
+      </wsdl:input>
+      <wsdl:output>
+        <soap12:body use="literal" />
+      </wsdl:output>
+    </wsdl:operation>
+    <wsdl:operation name="GetUpinsByJobInstance">
+      <soap12:operation soapAction="http://tempuri.org/GetUpinsByJobInstance" style="document" />
+      <wsdl:input>
+        <soap12:body use="literal" />
+      </wsdl:input>
+      <wsdl:output>
+        <soap12:body use="literal" />
+      </wsdl:output>
+    </wsdl:operation>
+    <wsdl:operation name="GetUpinsByTransaction">
+      <soap12:operation soapAction="http://tempuri.org/GetUpinsByTransaction" style="document" />
+      <wsdl:input>
+        <soap12:body use="literal" />
+      </wsdl:input>
+      <wsdl:output>
+        <soap12:body use="literal" />
+      </wsdl:output>
+    </wsdl:operation>
+    <wsdl:operation name="GetJobStatusByTransaction">
+      <soap12:operation soapAction="http://tempuri.org/GetJobStatusByTransaction" style="document" />
+      <wsdl:input>
+        <soap12:body use="literal" />
+      </wsdl:input>
+      <wsdl:output>
+        <soap12:body use="literal" />
+      </wsdl:output>
+    </wsdl:operation>
+    <wsdl:operation name="GetJobStatusByJobInstanceID">
+      <soap12:operation soapAction="http://tempuri.org/GetJobStatusByJobInstanceID" style="document" />
+      <wsdl:input>
+        <soap12:body use="literal" />
+      </wsdl:input>
+      <wsdl:output>
+        <soap12:body use="literal" />
+      </wsdl:output>
+    </wsdl:operation>
+    <wsdl:operation name="BatchUpdateDataFromRegistry">
+      <soap12:operation soapAction="http://tempuri.org/BatchUpdateDataFromRegistry" style="document" />
+      <wsdl:input>
+        <soap12:body use="literal" />
+      </wsdl:input>
+      <wsdl:output>
+        <soap12:body use="literal" />
+      </wsdl:output>
+    </wsdl:operation>
+    <wsdl:operation name="GetParcelPointsData">
+      <soap12:operation soapAction="http://tempuri.org/GetParcelPointsData" style="document" />
+      <wsdl:input>
+        <soap12:body use="literal" />
+      </wsdl:input>
+      <wsdl:output>
+        <soap12:body use="literal" />
+      </wsdl:output>
+    </wsdl:operation>
+    <wsdl:operation name="Authenticate">
+      <soap12:operation soapAction="http://tempuri.org/Authenticate" style="document" />
+      <wsdl:input>
+        <soap12:body use="literal" />
+      </wsdl:input>
+      <wsdl:output>
+        <soap12:body use="literal" />
+      </wsdl:output>
+    </wsdl:operation>
+    <wsdl:operation name="LogOut">
+      <soap12:operation soapAction="http://tempuri.org/LogOut" style="document" />
+      <wsdl:input>
+        <soap12:body use="literal" />
+      </wsdl:input>
+      <wsdl:output>
+        <soap12:body use="literal" />
+      </wsdl:output>
+    </wsdl:operation>
+  </wsdl:binding>
+  <wsdl:service name="LRSWebServices">
+    <wsdl:port name="LRSWebServicesSoap" binding="tns:LRSWebServicesSoap">
+      <soap:address location="http://172.25.31.93/ApplicationServerAdmin/WebServices/LRSWebServices.asmx" />
+    </wsdl:port>
+    <wsdl:port name="LRSWebServicesSoap12" binding="tns:LRSWebServicesSoap12">
+      <soap12:address location="http://172.25.31.93/ApplicationServerAdmin/WebServices/LRSWebServices.asmx" />
+    </wsdl:port>
+  </wsdl:service>
+</wsdl:definitions>

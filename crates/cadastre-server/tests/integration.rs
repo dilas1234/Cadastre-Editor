@@ -9,7 +9,7 @@ use std::sync::Arc;
 use axum::body::{Body, to_bytes};
 use axum::http::{header, Request, StatusCode};
 use axum::Router;
-use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+use base64::engine::general_purpose::{STANDARD, URL_SAFE_NO_PAD};
 use base64::Engine;
 use serde_json::{json, Value};
 use tower::ServiceExt;
@@ -455,11 +455,13 @@ async fn posting_never_reuses_an_issued_upin() {
     let app = routes::router(state_with(AuthMode::Disabled, None, &db_url).await);
     let pool = sqlx::PgPool::connect(&db_url).await.unwrap();
 
-    // Work above everything already issued in this database (other tests run concurrently).
+    // Work above everything already issued in this database (other tests run concurrently), in the
+    // local series: UPINs from 1,000,000,000 up are "structured" ones that never drive the
+    // allocator (migration 0018), checked below.
     let base: i64 = sqlx::query_scalar(
         "SELECT GREATEST(COALESCE(max(substring(upin FROM 3)::bigint), 0), \
                 (SELECT last_value FROM cadastre.parcel_number_seq)) \
-         FROM cadastre.issued_upin WHERE upin ~ '^PL[0-9]{12}$'",
+         FROM cadastre.issued_upin WHERE upin ~ '^PL[0-9]{12}$' AND substring(upin FROM 3)::bigint < 1000000000",
     )
     .fetch_one(&pool)
     .await
@@ -467,6 +469,8 @@ async fn posting_never_reuses_an_issued_upin() {
     let active = format!("PL{:012}", base + 100);
     let historic = format!("PL{:012}", base + 1_000); // not promoted, but issued
     let excepted = format!("PL{:012}", base + 2_000); // a duplicate-UPIN exception, still issued
+    let structured = format!("PL{:012}", 900_000_000_000 + base); // issued, but outside the local series
+    sqlx::query("INSERT INTO cadastre.issued_upin (upin, source) VALUES ($1, 'import')").bind(&structured).execute(&pool).await.unwrap();
 
     let run_id: i64 = sqlx::query_scalar(
         "INSERT INTO import.run (parcels, beacons, exceptions) VALUES (2, 0, 1) RETURNING id",
@@ -512,6 +516,7 @@ async fn posting_never_reuses_an_issued_upin() {
     let posted = result["parcel_numbers"][0].as_str().unwrap().to_string();
     let posted_n: i64 = posted[2..].parse().unwrap();
     assert!(posted_n > base + 2_000, "posted {posted} is not above the issued {excepted}");
+    assert!(posted_n < 1_000_000_000, "a structured UPIN ({structured}) must not drive the allocator: posted {posted}");
     let n: i64 = sqlx::query_scalar("SELECT count(*) FROM cadastre.issued_upin WHERE upin = $1 AND source = 'posted'")
         .bind(&posted).fetch_one(&pool).await.unwrap();
     assert_eq!(n, 1, "the posted UPIN is recorded in the ledger");
@@ -788,6 +793,17 @@ async fn search_finds_a_parcel_by_its_short_plot_number() {
         let (st, found) = send(&app, "GET", &format!("/api/v1/parcels/search?number={}", typed.replace(' ', "%20")), None, None).await;
         assert_eq!(st, StatusCode::OK);
         assert_eq!(found[0]["parcel_number"], upin, "typed {typed:?}: exact UPIN must rank first: {found}");
+    }
+
+    // The Registry property number on the map label finds the parcel too, spaces and case aside.
+    let pool = sqlx::PgPool::connect(&db_url).await.unwrap();
+    let prop = format!("PL{}", rand_12() % 1_000_000 + 9_000_000);
+    sqlx::query("INSERT INTO cadastre.parcel_attribute (object_id, upin, property_number, status) VALUES ($1, $2, $3, '0')")
+        .bind(-((rand_12() % 1_000_000_000) as i32) - 1).bind(&upin).bind(&prop).execute(&pool).await.unwrap();
+    for typed in [prop.clone(), prop.to_lowercase(), format!("PL {}", &prop[2..])] {
+        let (st, found) = send(&app, "GET", &format!("/api/v1/parcels/search?number={}", typed.replace(' ', "%20")), None, None).await;
+        assert_eq!(st, StatusCode::OK);
+        assert_eq!(found[0]["parcel_number"], upin, "typed property number {typed:?}: {found}");
     }
 }
 
@@ -1193,10 +1209,30 @@ async fn job_editing_follows_job_area_and_commit_rules() {
     let (st, r) = draft(x0 + 190.0, 50.0).await; // crosses the area's edge
     assert_eq!(st, StatusCode::CONFLICT);
     assert_eq!(r["message"], cadastre_server::routes::wf::OUTSIDE_JOB_AREA);
-    let (st, _) = draft(x0 + 10.0, 20.0).await;
+    let (st, d1) = draft(x0 + 10.0, 20.0).await;
     assert_eq!(st, StatusCode::CREATED);
     let (st, _) = draft(x0 + 50.0, 20.0).await;
     assert_eq!(st, StatusCode::CREATED);
+    // Update Parcel Attribute on a draft (the property document), carried into its record at commit.
+    let prop = format!("PLT{}", b);
+    let (st, r) = send(&app, "PUT", &format!("/api/v1/parcels/{}/attributes", d1["id"].as_str().unwrap()), None,
+        Some(json!({"property_number": prop, "plot": "12", "status": "Active"}))).await;
+    assert_eq!(st, StatusCode::OK, "{r}");
+
+    // Edit Vertices on a saved draft: moved inside the area is saved, outside is refused with
+    // Aumentum's message; a draft can be deleted; posted parcels are not drafts.
+    let (st, extra) = draft(x0 + 100.0, 20.0).await;
+    assert_eq!(st, StatusCode::CREATED);
+    let extra_url = format!("{draft_url}/{}", extra["id"].as_str().unwrap());
+    let (st, moved) = send(&app, "PUT", &extra_url, None, Some(json!({"geometry": square(x0 + 120.0, y0 + 30.0, 25.0)}))).await;
+    assert_eq!(st, StatusCode::OK, "{moved}");
+    let (st, r) = send(&app, "PUT", &extra_url, None, Some(json!({"geometry": square(x0 + 190.0, y0 + 30.0, 25.0)}))).await;
+    assert_eq!(st, StatusCode::CONFLICT, "{r}");
+    assert_eq!(r["message"], cadastre_server::routes::wf::OUTSIDE_JOB_AREA);
+    let (st, _) = send(&app, "DELETE", &extra_url, None, None).await;
+    assert_eq!(st, StatusCode::NO_CONTENT);
+    let (st, _) = send(&app, "DELETE", &extra_url, None, None).await;
+    assert_eq!(st, StatusCode::NOT_FOUND);
 
     let (st, _) = send(&app, "POST", &format!("/api/v1/wf/jobs/{id}/commit"), None, None).await;
     assert_eq!(st, StatusCode::CONFLICT, "commit only at the commit task");
@@ -1215,10 +1251,53 @@ async fn job_editing_follows_job_area_and_commit_rules() {
     assert!(r["message"].as_str().unwrap().contains(&blocker));
     sqlx::query("DELETE FROM cadastre.parcel WHERE parcel_number = $1").bind(&blocker).execute(&pool).await.unwrap();
 
-    let (st, c) = send(&app, "POST", &format!("/api/v1/wf/jobs/{id}/commit"), None, None).await;
+    // Beacon numbers are typed by the officer at commit, never generated. One corner lies on a
+    // fabric beacon already (a shared pillar): it keeps that beacon's number.
+    let tag = format!("B{}", rand_12() % 100_000_000);
+    let (st, _) = send(&app, "POST", "/api/v1/beacons", None,
+        Some(json!({"number": format!("{tag}X"), "easting": x0 + 10.0, "northing": y0 + 10.0}))).await;
+    assert_eq!(st, StatusCode::CREATED);
+    let (st, pts) = send(&app, "GET", &format!("/api/v1/wf/jobs/{id}/editing/corners"), None, None).await;
+    assert_eq!(st, StatusCode::OK, "{pts}");
+    let pts = pts.as_array().unwrap().clone();
+    assert_eq!(pts.len(), 8, "two separate squares: 8 corner points");
+    assert_eq!(pts.iter().filter(|p| p["beacon_number"] == format!("{tag}X")).count(), 1, "the shared pillar keeps its number");
+    let new_pts: Vec<&Value> = pts.iter().filter(|p| p["beacon_id"].is_null()).collect();
+    let typed = |numbers: Vec<String>| json!({"beacons": new_pts.iter().zip(numbers).map(|(p, n)| json!({"easting": p["easting"], "northing": p["northing"], "number": n})).collect::<Vec<_>>()});
+
+    let (st, r) = send(&app, "POST", &format!("/api/v1/wf/jobs/{id}/commit"), None, None).await;
+    assert_eq!(st, StatusCode::CONFLICT, "no beacon numbers typed: {r}");
+    assert!(r["message"].as_str().unwrap().contains("beacon number of every corner"), "{r}");
+    let mut numbers: Vec<String> = (1..=7).map(|i| format!("{tag}-{i}")).collect();
+    numbers[6] = numbers[5].clone();
+    let (st, r) = send(&app, "POST", &format!("/api/v1/wf/jobs/{id}/commit"), None, Some(typed(numbers.clone()))).await;
+    assert_eq!(st, StatusCode::BAD_REQUEST, "one number for two corners: {r}");
+    numbers[6] = format!("{tag}x").to_lowercase().to_uppercase(); // the pillar's number, used elsewhere
+    let (st, r) = send(&app, "POST", &format!("/api/v1/wf/jobs/{id}/commit"), None, Some(typed(numbers.clone()))).await;
+    assert_eq!(st, StatusCode::CONFLICT, "a number already in the fabric elsewhere: {r}");
+    assert!(r["message"].as_str().unwrap().contains("already exists"), "{r}");
+    numbers[6] = format!("{tag}-7");
+
+    let (st, c) = send(&app, "POST", &format!("/api/v1/wf/jobs/{id}/commit"), None, Some(typed(numbers.clone()))).await;
     assert_eq!(st, StatusCode::OK, "{c}");
     assert_eq!(c["parcel_numbers"].as_array().unwrap().len(), 2);
+    assert_eq!(c["beacons_added"].as_array().unwrap().len(), 7, "{c}");
     assert_eq!(c["editing"]["drafts"], 0);
+    let linked: i64 = sqlx::query_scalar("SELECT count(*) FROM cadastre.parcel_corner pc JOIN cadastre.parcel p ON p.id = pc.parcel_id WHERE p.parcel_number = ANY($1)")
+        .bind(c["parcel_numbers"].as_array().unwrap().iter().map(|v| v.as_str().unwrap().to_string()).collect::<Vec<_>>())
+        .fetch_one(&pool).await.unwrap();
+    assert_eq!(linked, 8, "every corner of both parcels is linked to its beacon");
+    let rec: (i32, Option<String>, Option<String>, Option<String>, Option<i16>) = sqlx::query_as(
+        "SELECT object_id, property_number, plot, status, linkage_status FROM cadastre.parcel_attribute WHERE upin = ANY($1)")
+        .bind(c["parcel_numbers"].as_array().unwrap().iter().map(|v| v.as_str().unwrap().to_string()).collect::<Vec<_>>())
+        .fetch_one(&pool).await.unwrap();
+    assert!(rec.0 >= 1_000_000_000, "a new record's OBJECTID never clashes with Aumentum's: {}", rec.0);
+    assert_eq!((rec.1, rec.2, rec.3, rec.4), (Some(prop.clone()), Some("12".into()), Some("0".into()), Some(0)),
+        "captured attributes, Aumentum's status code 0 (Active), not linked until the Registry links it");
+    let (_, found) = send(&app, "GET", &format!("/api/v1/parcels/search?number={prop}"), None, None).await;
+    assert_eq!(found.as_array().unwrap().len(), 1, "found once by its property number: {found}");
+    let (_, found) = send(&app, "GET", &format!("/api/v1/beacons/search?q={tag}-3"), None, None).await;
+    assert_eq!(found[0]["number"], format!("{tag}-3"), "a committed beacon is found by its number");
 
     // A closed area takes no edits; discard; delete the area once it is empty.
     let (_, e) = send(&app, "POST", &format!("/api/v1/wf/jobs/{id}/area/close"), None, None).await;
@@ -1228,6 +1307,66 @@ async fn job_editing_follows_job_area_and_commit_rules() {
     let (_, _) = send(&app, "POST", &format!("/api/v1/wf/jobs/{id}/area/reopen"), None, None).await;
     let (st, _) = draft(x0 + 100.0, 20.0).await;
     assert_eq!(st, StatusCode::CREATED);
+    // Phase 3 under a workflow job. Create Parcel by FCI: an uploaded polygon shapefile becomes
+    // drafts (no .prj: taken as UTM 32N); one polygon outside the job area refuses the whole file.
+    let drafts_now = |app: Router| { let u = format!("/api/v1/parcels.geojson?status=draft&job={cjob}"); async move { send(&app, "GET", &u, None, None).await.1["features"].as_array().unwrap().clone() } };
+    let before = drafts_now(app.clone()).await.len();
+    let fci = format!("/api/v1/jobs/{cjob}/import/feature-class");
+    let sq = |x: f64, y: f64, s: f64| vec![(x, y), (x, y + s), (x + s, y + s), (x + s, y), (x, y)];
+    let shp = shapefile_polygons(&[sq(x0 + 20.0, y0 + 120.0, 20.0), sq(x0 + 60.0, y0 + 120.0, 20.0)]);
+    let (st, r) = send(&app, "POST", &fci, None, Some(json!({"shp_base64": STANDARD.encode(&shp), "name": "plots.shp"}))).await;
+    assert_eq!(st, StatusCode::CREATED, "{r}");
+    assert_eq!(r["created_parcels"], 2);
+    assert!(r["warnings"][0].as_str().unwrap().contains("32632"), "{r}");
+    let outside = shapefile_polygons(&[sq(x0 + 100.0, y0 + 160.0, 20.0), sq(x0 + 190.0, y0 + 160.0, 30.0)]);
+    let (st, r) = send(&app, "POST", &fci, None, Some(json!({"shp_base64": STANDARD.encode(&outside)}))).await;
+    assert_eq!(st, StatusCode::CONFLICT, "{r}");
+    assert!(r["message"].as_str().unwrap().contains("FID 1"), "{r}");
+    assert_eq!(drafts_now(app.clone()).await.len(), before + 2, "nothing imported from a refused file");
+    // The same polygon in WGS 84 (with its .prj) is converted to UTM 32N.
+    let ll: String = sqlx::query_scalar("SELECT ST_AsText(ST_Transform(ST_SetSRID(ST_MakePoint($1, $2), 32632), 4326))").bind(x0 + 130.0).bind(y0 + 60.0).fetch_one(&pool).await.unwrap();
+    let nums: Vec<f64> = ll.trim_start_matches("POINT(").trim_end_matches(')').split(' ').map(|v| v.parse().unwrap()).collect();
+    let d = 0.00015; // ~16 m
+    let wgs = shapefile_polygons(&[vec![(nums[0], nums[1]), (nums[0], nums[1] + d), (nums[0] + d, nums[1] + d), (nums[0] + d, nums[1]), (nums[0], nums[1])]]);
+    let prj = r#"GEOGCS["GCS_WGS_1984",DATUM["D_WGS_1984",SPHEROID["WGS_1984",6378137.0,298.257223563]],PRIMEM["Greenwich",0.0],UNIT["Degree",0.0174532925199433]]"#;
+    let (st, r) = send(&app, "POST", &fci, None, Some(json!({"shp_base64": STANDARD.encode(&wgs), "prj": prj}))).await;
+    assert_eq!(st, StatusCode::CREATED, "{r}");
+    assert_eq!(r["source_epsg"], 4326);
+
+    // Parcel Separation: a line across the first FCI parcel makes two drafts of 200 m² each; a
+    // line that does not cross is refused.
+    let draft_at = |x: f64, y: f64| {
+        let pool = pool.clone(); let cjob = cjob.clone();
+        async move {
+            sqlx::query_scalar::<_, Uuid>("SELECT id FROM cadastre.parcel WHERE job_id = $1::uuid AND status = 'draft' AND ST_Contains(geom, ST_SetSRID(ST_MakePoint($2, $3), 32632))")
+                .bind(cjob).bind(x).bind(y).fetch_one(&pool).await.unwrap()
+        }
+    };
+    let sep = format!("{draft_url}/{}/separate", draft_at(x0 + 30.0, y0 + 130.0).await);
+    let (st, r) = send(&app, "POST", &sep, None, Some(json!({"line": {"type": "LineString", "coordinates": [[x0 + 5.0, y0 + 5.0], [x0 + 6.0, y0 + 6.0]]}}))).await;
+    assert_eq!(st, StatusCode::BAD_REQUEST, "{r}");
+    let (st, parts) = send(&app, "POST", &sep, None, Some(json!({"line": {"type": "LineString", "coordinates": [[x0 + 30.0, y0 + 110.0], [x0 + 30.0, y0 + 150.0]]}}))).await;
+    assert_eq!(st, StatusCode::CREATED, "{parts}");
+    let areas: Vec<f64> = parts.as_array().unwrap().iter().map(|p| p["computed_area"].as_f64().unwrap().round()).collect();
+    assert_eq!(areas, vec![200.0, 200.0], "{parts}");
+    // Donut Parcel: a hole inside is accepted; a "hole" outside the parcel is not a valid shape.
+    let put = format!("{draft_url}/{}", draft_at(x0 + 70.0, y0 + 130.0).await);
+    let outer = json!([[x0 + 60.0, y0 + 120.0], [x0 + 80.0, y0 + 120.0], [x0 + 80.0, y0 + 140.0], [x0 + 60.0, y0 + 140.0], [x0 + 60.0, y0 + 120.0]]);
+    let hole = json!([[x0 + 65.0, y0 + 125.0], [x0 + 65.0, y0 + 130.0], [x0 + 70.0, y0 + 130.0], [x0 + 70.0, y0 + 125.0], [x0 + 65.0, y0 + 125.0]]);
+    let (st, r) = send(&app, "PUT", &put, None, Some(json!({"geometry": {"type": "Polygon", "coordinates": [outer, hole]}}))).await;
+    assert_eq!(st, StatusCode::OK, "{r}");
+    let bad = json!([[x0 + 90.0, y0 + 125.0], [x0 + 90.0, y0 + 130.0], [x0 + 95.0, y0 + 130.0], [x0 + 95.0, y0 + 125.0], [x0 + 90.0, y0 + 125.0]]);
+    let (st, r) = send(&app, "PUT", &put, None, Some(json!({"geometry": {"type": "Polygon", "coordinates": [outer, bad]}}))).await;
+    assert_eq!(st, StatusCode::BAD_REQUEST, "{r}");
+
+    // Survey import under a workflow job: point IDs come back for the commit, no beacons are made.
+    let csv = format!("id,easting,northing\nZQ{b}A,{},{}\nZQ{b}B,{},{}\n", x0 + 150.0, y0 + 20.0, x0 + 160.0, y0 + 20.0);
+    let (st, r) = send(&app, "POST", &format!("/api/v1/jobs/{cjob}/import"), None, Some(json!({"filename": "points.csv", "contents": csv}))).await;
+    assert_eq!(st, StatusCode::CREATED, "{r}");
+    assert_eq!(r["workflow_job"], true);
+    assert_eq!(r["created_beacons"], 0, "beacons are entered at commit, not at import");
+    assert_eq!(r["points_for_commit"].as_array().unwrap().len(), 2, "{r}");
+
     let (st, _) = send(&app, "DELETE", &format!("/api/v1/wf/jobs/{id}/area"), None, None).await;
     assert_eq!(st, StatusCode::CONFLICT, "drafts block deleting the area");
     let (_, e) = send(&app, "POST", &format!("/api/v1/wf/jobs/{id}/discard"), None, None).await;
@@ -1238,4 +1377,820 @@ async fn job_editing_follows_job_area_and_commit_rules() {
     let (st, d) = send(&app, "POST", &format!("/api/v1/wf/jobs/{id}/advance"), None, Some(json!({}))).await;
     assert_eq!(st, StatusCode::OK, "{d}");
     assert_eq!(d["job"]["current_task_id"], plan);
+}
+
+/// The Beacon box searches every beacon on the server: exact number first, then numbers starting
+/// with the text, nearest first; and the map loads survey beacons only for the area in view.
+#[tokio::test]
+async fn beacon_search_ranks_exact_then_prefix_then_nearest() {
+    let Some(db_url) = test_db_url() else {
+        eprintln!("skipping: CADASTRE_TEST_DATABASE_URL not set");
+        return;
+    };
+    let app = routes::router(state_with(AuthMode::Disabled, None, &db_url).await);
+    let tag = format!("T{}", rand_12() % 1_000_000);
+    let (x0, y0) = (300_000.0 + (rand_12() % 100_000) as f64, 1_000_000.0 + (rand_12() % 100_000) as f64);
+    for (name, dx, control) in [(tag.clone(), 900.0, true), (format!("{tag}1"), 500.0, false), (format!("{tag}2"), 10.0, false), (format!("X{tag}"), 1.0, false)] {
+        let (st, b) = send(&app, "POST", "/api/v1/beacons", None,
+            Some(json!({"number": name, "easting": x0 + dx, "northing": y0, "is_control": control}))).await;
+        assert_eq!(st, StatusCode::CREATED, "{b}");
+    }
+    let (st, found) = send(&app, "GET", &format!("/api/v1/beacons/search?q={}&e={x0}&n={y0}", tag.to_lowercase()), None, None).await;
+    assert_eq!(st, StatusCode::OK, "{found}");
+    let names: Vec<&str> = found.as_array().unwrap().iter().map(|b| b["number"].as_str().unwrap()).collect();
+    assert_eq!(names, [tag.clone(), format!("{tag}2"), format!("{tag}1"), format!("X{tag}")], "exact, then prefix by distance, then contains");
+
+    // A wildcard typed by the user is taken literally.
+    let (_, none) = send(&app, "GET", &format!("/api/v1/beacons/search?q={tag}_"), None, None).await;
+    assert_eq!(none, json!([]), "{none}");
+
+    // GeoJSON: survey beacons only, in a bbox around the test points (in WGS84).
+    let (_, all) = send(&app, "GET", "/api/v1/beacons.geojson?control=false&limit=20000", None, None).await;
+    let pick = all["features"].as_array().unwrap().iter().find(|f| f["properties"]["number"] == format!("{tag}2")).expect("survey beacon listed").clone();
+    let (lon, lat) = (pick["geometry"]["coordinates"][0].as_f64().unwrap(), pick["geometry"]["coordinates"][1].as_f64().unwrap());
+    let bbox = format!("{},{},{},{}", lon - 0.0003, lat - 0.0003, lon + 0.0003, lat + 0.0003);
+    let (_, near) = send(&app, "GET", &format!("/api/v1/beacons.geojson?control=false&bbox={bbox}"), None, None).await;
+    let near: Vec<String> = near["features"].as_array().unwrap().iter().map(|f| f["properties"]["number"].as_str().unwrap().to_string()).collect();
+    assert!(near.contains(&format!("{tag}2")) && near.contains(&format!("X{tag}")) && !near.contains(&format!("{tag}1")), "{near:?}");
+    let (_, ctrl) = send(&app, "GET", &format!("/api/v1/beacons.geojson?control=true&bbox={},{},{},{}", lon - 0.01, lat - 0.01, lon + 0.01, lat + 0.01), None, None).await;
+    assert!(ctrl["features"].as_array().unwrap().iter().all(|f| f["properties"]["is_control"] == true), "{ctrl}");
+}
+
+/// A minimal polygon shapefile (.shp) holding one ring per polygon, for the FCI import tests.
+fn shapefile_polygons(polys: &[Vec<(f64, f64)>]) -> Vec<u8> {
+    let all: Vec<(f64, f64)> = polys.iter().flatten().copied().collect();
+    let bbox = |pts: &[(f64, f64)]| {
+        let (mut a, mut b, mut c, mut d) = (f64::MAX, f64::MAX, f64::MIN, f64::MIN);
+        for &(x, y) in pts { a = a.min(x); b = b.min(y); c = c.max(x); d = d.max(y); }
+        [a, b, c, d]
+    };
+    let mut recs = Vec::new();
+    for (i, ring) in polys.iter().enumerate() {
+        let mut c = Vec::new();
+        c.extend(5i32.to_le_bytes());
+        for v in bbox(ring) { c.extend(v.to_le_bytes()); }
+        c.extend(1i32.to_le_bytes());
+        c.extend((ring.len() as i32).to_le_bytes());
+        c.extend(0i32.to_le_bytes());
+        for &(x, y) in ring { c.extend(x.to_le_bytes()); c.extend(y.to_le_bytes()); }
+        recs.extend(((i + 1) as i32).to_be_bytes());
+        recs.extend(((c.len() / 2) as i32).to_be_bytes());
+        recs.extend(c);
+    }
+    let mut out = vec![0u8; 100];
+    out[0..4].copy_from_slice(&9994i32.to_be_bytes());
+    out[24..28].copy_from_slice(&(((100 + recs.len()) / 2) as i32).to_be_bytes());
+    out[28..32].copy_from_slice(&1000i32.to_le_bytes());
+    out[32..36].copy_from_slice(&5i32.to_le_bytes());
+    for (k, v) in bbox(&all).iter().enumerate() { out[36 + k * 8..44 + k * 8].copy_from_slice(&v.to_le_bytes()); }
+    out.extend(recs);
+    out
+}
+
+/// Phase 4: mutations recorded in a workflow job and applied at commit, as Aumentum does (from
+/// its parcelLineage history): split (1 -> many), merge (many -> 1), retire (archived with a
+/// reason), cancel; parents become historic/archived, children get new UPINs, lineage is kept.
+#[tokio::test]
+async fn mutations_split_merge_retire_with_lineage() {
+    let Some(db_url) = test_db_url() else {
+        eprintln!("skipping: CADASTRE_TEST_DATABASE_URL not set");
+        return;
+    };
+    let app = routes::router(state_with(AuthMode::Disabled, None, &db_url).await);
+    let pool = sqlx::PgPool::connect(&db_url).await.unwrap();
+    let b = 300_000 + (rand_12() % 600_000) as i32 * 10;
+    let (construct, commit_t, plan) = (b, b + 1, b + 2);
+    for (id, name) in [(construct, "Split Parcel"), (commit_t, "Commit Parcel"), (plan, "Generate Title Deed Plan")] {
+        sqlx::query("INSERT INTO cadastre.wf_task (id, name) VALUES ($1, $2)").bind(id).bind(name).execute(&pool).await.unwrap();
+    }
+    sqlx::query("INSERT INTO cadastre.wf_step (id, name, commands) VALUES ($1, 'Commit Parcel', ARRAY[$2])")
+        .bind(b).bind(cadastre_server::routes::wf::COMMIT_TOOL).execute(&pool).await.unwrap();
+    sqlx::query("INSERT INTO cadastre.wf_task_step (task_id, step_id) VALUES ($1, $2)").bind(commit_t).bind(b).execute(&pool).await.unwrap();
+    sqlx::query("INSERT INTO cadastre.wf_job_type (id, name, start_task_id, end_task_id) VALUES ($1, 'Mutation (test)', $2, $3)")
+        .bind(b).bind(construct).bind(plan).execute(&pool).await.unwrap();
+    for (f, t) in [(construct, commit_t), (commit_t, plan)] {
+        sqlx::query("INSERT INTO cadastre.wf_task_flow (job_type_id, task_id, next_task_id) VALUES ($1, $2, $3)").bind(b).bind(f).bind(t).execute(&pool).await.unwrap();
+    }
+    let x0 = 150_000.0 + ((b / 10) % 60_000) as f64 * 10.0;
+    let y0 = 8_800_000.0;
+    // Four posted parcels: A alone; B and C sharing an edge; D alone.
+    let tag = format!("PLM{}", rand_12() % 1_000_000_000);
+    let upin = |k: &str| format!("{tag}{k}");
+    for (k, x, y) in [("A", 10.0, 10.0), ("B", 60.0, 10.0), ("C", 80.0, 10.0), ("D", 130.0, 10.0)] {
+        sqlx::query("INSERT INTO cadastre.parcel (parcel_number, geom, computed_area, status) VALUES ($1, ST_MakeEnvelope($2, $3, $2 + 20, $3 + 20, 32632), 400, 'posted')")
+            .bind(upin(k)).bind(x0 + x).bind(y0 + y).execute(&pool).await.unwrap();
+    }
+    let (_, d) = send(&app, "POST", "/api/v1/wf/jobs", None, Some(json!({"job_type_id": b, "name": "Job-MUT"}))).await;
+    let id = d["job"]["id"].as_i64().unwrap();
+    let murl = format!("/api/v1/wf/jobs/{id}/mutations");
+    let (st, r) = send(&app, "POST", &murl, None, Some(json!({"kind": "split", "upins": [upin("A")]}))).await;
+    assert_eq!(st, StatusCode::CONFLICT, "editing not started: {r}");
+    send(&app, "POST", &format!("/api/v1/wf/jobs/{id}/editing"), None, None).await;
+    let (st, _) = send(&app, "PUT", &format!("/api/v1/wf/jobs/{id}/area"), None, Some(json!({"geometry": square(x0, y0, 200.0)}))).await;
+    assert_eq!(st, StatusCode::OK);
+
+    // Split A along x = x0 + 25.
+    let line = json!({"type": "LineString", "coordinates": [[x0 + 25.0, y0 + 5.0], [x0 + 25.0, y0 + 35.0]]});
+    let (st, split) = send(&app, "POST", &murl, None, Some(json!({"kind": "split", "upins": [upin("A")], "line": line}))).await;
+    assert_eq!(st, StatusCode::CREATED, "{split}");
+    assert_eq!(split["drafts"].as_array().unwrap().len(), 2);
+    let (st, r) = send(&app, "POST", &murl, None, Some(json!({"kind": "resurvey", "upins": [upin("A")]}))).await;
+    assert_eq!(st, StatusCode::CONFLICT, "A is already being mutated: {r}");
+    // Merge B + C (adjacent); B + D do not touch.
+    let (st, r) = send(&app, "POST", &murl, None, Some(json!({"kind": "merge", "upins": [upin("B"), upin("D")]}))).await;
+    assert_eq!(st, StatusCode::BAD_REQUEST, "{r}");
+    let (st, merge) = send(&app, "POST", &murl, None, Some(json!({"kind": "merge", "upins": [upin("B"), upin("C")]}))).await;
+    assert_eq!(st, StatusCode::CREATED, "{merge}");
+    // Retire D: a reason is required.
+    let (st, _) = send(&app, "POST", &murl, None, Some(json!({"kind": "retire", "upins": [upin("D")]}))).await;
+    assert_eq!(st, StatusCode::BAD_REQUEST);
+    let (st, _) = send(&app, "POST", &murl, None, Some(json!({"kind": "retire", "upins": [upin("D")], "reason": "overlapping"}))).await;
+    assert_eq!(st, StatusCode::CREATED);
+    // A re-survey recorded then cancelled leaves nothing behind.
+    sqlx::query("INSERT INTO cadastre.parcel (parcel_number, geom, computed_area, status) VALUES ($1, ST_MakeEnvelope($2, $3, $2 + 20, $3 + 20, 32632), 400, 'posted')")
+        .bind(upin("E")).bind(x0 + 10.0).bind(y0 + 100.0).execute(&pool).await.unwrap();
+    let (_, rs) = send(&app, "POST", &murl, None, Some(json!({"kind": "resurvey", "upins": [upin("E")]}))).await;
+    let (st, _) = send(&app, "DELETE", &format!("{murl}/{}", rs["group"].as_str().unwrap()), None, None).await;
+    assert_eq!(st, StatusCode::NO_CONTENT);
+    let (_, pending) = send(&app, "GET", &murl, None, None).await;
+    assert_eq!(pending.as_array().unwrap().len(), 3, "split, merge, retire pending: {pending}");
+
+    // The parents' Aumentum attribute records (B before C, so B is a merge's source).
+    let oid = 800_000_000 + (rand_12() % 100_000_000) as i32;
+    for (k, o, block, pn) in [("A", oid, "B7", "PL999"), ("B", oid + 1, "B9", "PL111"), ("C", oid + 2, "C1", "PL222")] {
+        sqlx::query("INSERT INTO cadastre.parcel_attribute (object_id, upin, dataset_name, region_name, parcel_name, block, lga, location, property_type, area_unit, property_number, status, lrs_id, linkage_status, plan_number) \
+                     VALUES ($1, $2, 'DS', 'Plateau_State', 'PCL1', $3, '6', '1', '1', 2, $4, '0', $5, 1, 'PLAN-X')")
+            .bind(o).bind(upin(k)).bind(block).bind(pn).bind(format!("LRS-{k}")).execute(&pool).await.unwrap();
+    }
+
+    // Commit at the commit task (beacon numbers typed for every new corner).
+    send(&app, "POST", &format!("/api/v1/wf/jobs/{id}/advance"), None, Some(json!({}))).await;
+    let (_, pts) = send(&app, "GET", &format!("/api/v1/wf/jobs/{id}/editing/corners"), None, None).await;
+    let beacons: Vec<Value> = pts.as_array().unwrap().iter().filter(|p| p["beacon_id"].is_null()).enumerate()
+        .map(|(i, p)| json!({"easting": p["easting"], "northing": p["northing"], "number": format!("{tag}-{i}")})).collect();
+    let (st, c) = send(&app, "POST", &format!("/api/v1/wf/jobs/{id}/commit"), None, Some(json!({"beacons": beacons}))).await;
+    assert_eq!(st, StatusCode::OK, "children overlap their parents, which are being replaced: {c}");
+    let new_upins: Vec<String> = c["parcel_numbers"].as_array().unwrap().iter().map(|v| v.as_str().unwrap().to_string()).collect();
+    assert_eq!(new_upins.len(), 3, "two split parts and one merged parcel: {c}");
+    let mut retired: Vec<String> = c["retired"].as_array().unwrap().iter().map(|v| v.as_str().unwrap().to_string()).collect();
+    retired.sort();
+    assert_eq!(retired, vec![upin("A"), upin("B"), upin("C"), upin("D")]);
+    let status_of = |u: String| { let pool = pool.clone(); async move { sqlx::query_scalar::<_, String>("SELECT string_agg(status, ',' ORDER BY status) FROM cadastre.parcel WHERE parcel_number = $1").bind(u).fetch_one(&pool).await.unwrap() } };
+    assert_eq!(status_of(upin("A")).await, "historic");
+    assert_eq!(status_of(upin("D")).await, "archived");
+    assert_eq!(status_of(upin("E")).await, "posted", "the cancelled re-survey changed nothing");
+    for u in &new_upins { assert_eq!(status_of(u.clone()).await, "posted"); }
+
+    // Attribute inheritance (Aumentum IsMutationInherited): new records for the new parcels.
+    let attrs = sqlx::query_as::<_, (String, Option<String>, Option<String>, Option<String>, Option<String>, Option<String>, Option<f64>, Option<i16>, Option<String>, Option<String>, Option<String>)>(
+        "SELECT upin, parcel_name, block, lga, location, property_number, parcel_area, mutation_type, lrs_id, plan_number, dataset_name FROM cadastre.parcel_attribute WHERE upin = ANY($1) ORDER BY upin")
+        .bind(&new_upins).fetch_all(&pool).await.unwrap();
+    assert_eq!(attrs.len(), 3, "one attribute record per new parcel: {attrs:?}");
+    let split_rows: Vec<_> = attrs.iter().filter(|a| a.7 == Some(1)).collect();
+    let merge_row = attrs.iter().find(|a| a.7 == Some(2)).expect("merged parcel's record");
+    assert_eq!(split_rows.len(), 2);
+    let mut names: Vec<_> = split_rows.iter().map(|a| a.1.clone().unwrap()).collect();
+    names.sort();
+    assert_eq!(names, vec!["PCL1", "PCL2"], "children are named in order");
+    for a in &split_rows {
+        assert_eq!((a.2.as_deref(), a.3.as_deref(), a.4.as_deref(), a.8.as_deref(), a.10.as_deref()), (Some("B7"), Some("6"), Some("1"), Some("LRS-A"), Some("DS")), "inherited from A: {a:?}");
+        assert_eq!((a.5.as_deref(), a.9.as_deref()), (None, None), "Registry property number and plan number are not inherited: {a:?}");
+    }
+    let mut areas: Vec<f64> = split_rows.iter().map(|a| a.6.unwrap().round()).collect();
+    areas.sort_by(f64::total_cmp);
+    assert_eq!(areas, vec![100.0, 300.0], "each child's area from its own shape (the line cuts A 5 m / 15 m)");
+    assert_eq!((merge_row.1.as_deref(), merge_row.2.as_deref(), merge_row.8.as_deref()), (Some("PCL1"), Some("B9"), Some("LRS-B")), "a merge inherits from its first parent: {merge_row:?}");
+    assert!((merge_row.6.unwrap() - 800.0).abs() < 0.01, "{merge_row:?}");
+
+    // Lineage, as Aumentum records it.
+    let (_, la) = send(&app, "GET", &format!("/api/v1/parcels/lineage?upin={}", upin("A")), None, None).await;
+    let kids: Vec<&str> = la["edges"].as_array().unwrap().iter().filter(|e| e["parent_upin"] == upin("A")).map(|e| e["child_upin"].as_str().unwrap()).collect();
+    assert_eq!(kids.len(), 2, "{la}");
+    assert!(la["edges"].as_array().unwrap().iter().all(|e| e["mutation"] == "Split"), "{la}");
+    let merged = new_upins.iter().find(|u| !kids.contains(&u.as_str())).unwrap();
+    let (_, lm) = send(&app, "GET", &format!("/api/v1/parcels/lineage?upin={merged}"), None, None).await;
+    let mut parents: Vec<&str> = lm["edges"].as_array().unwrap().iter().map(|e| e["parent_upin"].as_str().unwrap()).collect();
+    parents.sort();
+    assert_eq!(parents, vec![upin("B").as_str(), upin("C").as_str()], "{lm}");
+    let (_, ld) = send(&app, "GET", &format!("/api/v1/parcels/lineage?upin={}", upin("D")), None, None).await;
+    assert_eq!(ld["retirements"][0]["reason"], "overlapping", "{ld}");
+    let reason: Option<String> = sqlx::query_scalar("SELECT archive_reason FROM cadastre.parcel_attribute WHERE upin = $1").bind(upin("D")).fetch_optional(&pool).await.unwrap().flatten();
+    assert!(reason.is_none(), "no attribute row exists for a test parcel; nothing invented");
+    // The retired shapes are on the history layer; a retired parcel cannot be mutated again.
+    let (_, hist) = send(&app, "GET", "/api/v1/parcels.geojson?status=retired&limit=20000", None, None).await;
+    assert!(hist["features"].as_array().unwrap().iter().any(|f| f["properties"]["parcel_number"] == upin("A")));
+    let (_, e2) = send(&app, "GET", &format!("/api/v1/wf/jobs/{id}/editing"), None, None).await;
+    assert_eq!(e2["drafts"], 0);
+    let (st, _) = send(&app, "POST", &murl, None, Some(json!({"kind": "resurvey", "upins": [upin("A")]}))).await;
+    assert_eq!(st, StatusCode::CONFLICT);
+}
+
+/// Phase 4: Aumentum's other two mutation types, as its parcelLineage history has them: a
+/// Separation (6, one parcel cut into parts along a line) and a Free Mutation (4, one parcel to
+/// one with a new UPIN). Lineage and attribute records carry the type.
+#[tokio::test]
+async fn mutations_separate_and_free_mutation() {
+    let Some(db_url) = test_db_url() else {
+        eprintln!("skipping: CADASTRE_TEST_DATABASE_URL not set");
+        return;
+    };
+    let app = routes::router(state_with(AuthMode::Disabled, None, &db_url).await);
+    let pool = sqlx::PgPool::connect(&db_url).await.unwrap();
+    let b = 300_001 + (rand_12() % 600_000) as i32 * 10;
+    let (construct, commit_t, plan) = (b, b + 1, b + 2);
+    for (id, name) in [(construct, "Split Parcel"), (commit_t, "Commit Parcel"), (plan, "Generate Title Deed Plan")] {
+        sqlx::query("INSERT INTO cadastre.wf_task (id, name) VALUES ($1, $2)").bind(id).bind(name).execute(&pool).await.unwrap();
+    }
+    sqlx::query("INSERT INTO cadastre.wf_step (id, name, commands) VALUES ($1, 'Commit Parcel', ARRAY[$2])")
+        .bind(b).bind(cadastre_server::routes::wf::COMMIT_TOOL).execute(&pool).await.unwrap();
+    sqlx::query("INSERT INTO cadastre.wf_task_step (task_id, step_id) VALUES ($1, $2)").bind(commit_t).bind(b).execute(&pool).await.unwrap();
+    sqlx::query("INSERT INTO cadastre.wf_job_type (id, name, start_task_id, end_task_id) VALUES ($1, 'Mutation 4/6 (test)', $2, $3)")
+        .bind(b).bind(construct).bind(plan).execute(&pool).await.unwrap();
+    for (f, t) in [(construct, commit_t), (commit_t, plan)] {
+        sqlx::query("INSERT INTO cadastre.wf_task_flow (job_type_id, task_id, next_task_id) VALUES ($1, $2, $3)").bind(b).bind(f).bind(t).execute(&pool).await.unwrap();
+    }
+    let x0 = 150_000.0 + ((b / 10) % 60_000) as f64 * 10.0;
+    let y0 = 8_900_000.0;
+    let tag = format!("PLN{}", rand_12() % 1_000_000_000);
+    let upin = |k: &str| format!("{tag}{k}");
+    // F, G alone; H and I share an edge (an adjustment of both); J alone.
+    for (k, x) in [("F", 10.0), ("G", 60.0), ("H", 100.0), ("I", 120.0), ("J", 160.0)] {
+        sqlx::query("INSERT INTO cadastre.parcel (parcel_number, geom, computed_area, status) VALUES ($1, ST_MakeEnvelope($2, $3, $2 + 20, $3 + 20, 32632), 400, 'posted')")
+            .bind(upin(k)).bind(x0 + x).bind(y0 + 10.0).execute(&pool).await.unwrap();
+    }
+    let oid = 700_000_000 + (rand_12() % 100_000_000) as i32;
+    for (k, o) in [("F", oid), ("G", oid + 1)] {
+        sqlx::query("INSERT INTO cadastre.parcel_attribute (object_id, upin, dataset_name, region_name, parcel_name, block, status) VALUES ($1, $2, 'DS', 'Plateau_State', 'PCL1', 'B1', '0')")
+            .bind(o).bind(upin(k)).execute(&pool).await.unwrap();
+    }
+    let (_, d) = send(&app, "POST", "/api/v1/wf/jobs", None, Some(json!({"job_type_id": b, "name": "Job-MUT46"}))).await;
+    let id = d["job"]["id"].as_i64().unwrap();
+    let murl = format!("/api/v1/wf/jobs/{id}/mutations");
+    send(&app, "POST", &format!("/api/v1/wf/jobs/{id}/editing"), None, None).await;
+    send(&app, "PUT", &format!("/api/v1/wf/jobs/{id}/area"), None, Some(json!({"geometry": square(x0, y0, 200.0)}))).await;
+
+    // A separation needs its line and one parcel; a free mutation one parcel.
+    let (st, r) = send(&app, "POST", &murl, None, Some(json!({"kind": "separate", "upins": [upin("F")]}))).await;
+    assert_eq!(st, StatusCode::BAD_REQUEST, "{r}");
+    let (st, r) = send(&app, "POST", &murl, None, Some(json!({"kind": "free", "upins": [upin("G"), upin("J")]}))).await;
+    assert_eq!(st, StatusCode::BAD_REQUEST, "parcels that do not touch: {r}");
+    let line = json!({"type": "LineString", "coordinates": [[x0 + 20.0, y0 + 5.0], [x0 + 20.0, y0 + 35.0]]});
+    let (st, sep) = send(&app, "POST", &murl, None, Some(json!({"kind": "separate", "upins": [upin("F")], "line": line}))).await;
+    assert_eq!(st, StatusCode::CREATED, "{sep}");
+    assert_eq!((sep["kind"].as_str(), sep["drafts"].as_array().unwrap().len()), (Some("separate"), 2));
+    let (st, free) = send(&app, "POST", &murl, None, Some(json!({"kind": "free", "upins": [upin("G")]}))).await;
+    assert_eq!(st, StatusCode::CREATED, "{free}");
+    assert_eq!((free["kind"].as_str(), free["drafts"].as_array().unwrap().len()), (Some("free"), 1));
+    // An adjustment of two adjacent parcels: two copies (n -> n).
+    let (st, adj) = send(&app, "POST", &murl, None, Some(json!({"kind": "resurvey", "upins": [upin("H"), upin("I")]}))).await;
+    assert_eq!(st, StatusCode::CREATED, "{adj}");
+    assert_eq!(adj["drafts"].as_array().unwrap().len(), 2);
+
+    // Separation Configuration: part 1 keeps F's UPIN (Mutation Manager setting on); only a
+    // separation can, and only with one of its own parts.
+    let sep_g = sep["group"].as_str().unwrap();
+    let part1 = sep["drafts"][0].as_str().unwrap().to_string();
+    let (st, r) = send(&app, "PUT", &format!("{murl}/{}/keep-upin", free["group"].as_str().unwrap()), None, Some(json!({"draft": free["drafts"][0]}))).await;
+    assert_eq!(st, StatusCode::BAD_REQUEST, "{r}");
+    let (st, r) = send(&app, "PUT", &format!("{murl}/{sep_g}/keep-upin"), None, Some(json!({"draft": adj["drafts"][0]}))).await;
+    assert_eq!(st, StatusCode::BAD_REQUEST, "{r}");
+    let (st, k) = send(&app, "PUT", &format!("{murl}/{sep_g}/keep-upin"), None, Some(json!({"draft": part1}))).await;
+    assert_eq!(st, StatusCode::OK, "{k}");
+    assert_eq!(k["keeps_upin"].as_str(), Some(part1.as_str()));
+    let f_attr_before: i32 = sqlx::query_scalar("SELECT object_id FROM cadastre.parcel_attribute WHERE upin = $1").bind(upin("F")).fetch_one(&pool).await.unwrap();
+
+    send(&app, "POST", &format!("/api/v1/wf/jobs/{id}/advance"), None, Some(json!({}))).await;
+    let (_, pts) = send(&app, "GET", &format!("/api/v1/wf/jobs/{id}/editing/corners"), None, None).await;
+    let beacons: Vec<Value> = pts.as_array().unwrap().iter().filter(|p| p["beacon_id"].is_null()).enumerate()
+        .map(|(i, p)| json!({"easting": p["easting"], "northing": p["northing"], "number": format!("{tag}-{i}")})).collect();
+    let (st, c) = send(&app, "POST", &format!("/api/v1/wf/jobs/{id}/commit"), None, Some(json!({"beacons": beacons}))).await;
+    assert_eq!(st, StatusCode::OK, "{c}");
+    let new_upins: Vec<String> = c["parcel_numbers"].as_array().unwrap().iter().map(|v| v.as_str().unwrap().to_string()).collect();
+    assert_eq!(new_upins.len(), 5, "two separated parts, one free-mutation parcel, two adjusted: {c}");
+    assert!(new_upins.contains(&upin("F")), "the kept part is posted under F's UPIN: {c}");
+
+    // Lineage and attribute records carry Aumentum's type codes and names.
+    let (_, lf) = send(&app, "GET", &format!("/api/v1/parcels/lineage?upin={}", upin("F")), None, None).await;
+    let f_edges: Vec<&Value> = lf["edges"].as_array().unwrap().iter().filter(|e| e["parent_upin"] == upin("F")).collect();
+    assert_eq!(f_edges.len(), 2, "{lf}");
+    assert!(f_edges.iter().any(|e| e["child_upin"] == upin("F")), "the kept part's lineage: F -> F: {lf}");
+    assert!(f_edges.iter().all(|e| e["mutation"] == "Separated"), "{lf}");
+    let (_, lg) = send(&app, "GET", &format!("/api/v1/parcels/lineage?upin={}", upin("G")), None, None).await;
+    let g_edges: Vec<&Value> = lg["edges"].as_array().unwrap().iter().filter(|e| e["parent_upin"] == upin("G")).collect();
+    assert_eq!(g_edges.len(), 1, "{lg}");
+    assert_eq!(g_edges[0]["mutation"], "Free Mutation", "{lg}");
+    // Each adjusted parcel has both H and I as parents.
+    let (_, lh) = send(&app, "GET", &format!("/api/v1/parcels/lineage?upin={}", upin("H")), None, None).await;
+    let adj_kids: std::collections::BTreeSet<String> = lh["edges"].as_array().unwrap().iter().filter(|e| e["parent_upin"] == upin("H")).map(|e| e["child_upin"].as_str().unwrap().to_string()).collect();
+    assert_eq!(adj_kids.len(), 2, "{lh}");
+    for kid in &adj_kids {
+        let (_, lk) = send(&app, "GET", &format!("/api/v1/parcels/lineage?upin={kid}"), None, None).await;
+        let ps: std::collections::BTreeSet<String> = lk["edges"].as_array().unwrap().iter().filter(|e| e["child_upin"] == kid.as_str()).map(|e| e["parent_upin"].as_str().unwrap().to_string()).collect();
+        assert_eq!(ps, [upin("H"), upin("I")].into_iter().collect::<std::collections::BTreeSet<_>>(), "{lk}");
+        assert!(lk["edges"].as_array().unwrap().iter().all(|e| e["mutation"] == "Adjusted (re-survey)"), "{lk}");
+    }
+    let mut types: Vec<i16> = sqlx::query_scalar("SELECT mutation_type FROM cadastre.parcel_attribute WHERE upin = ANY($1)")
+        .bind(&new_upins).fetch_all(&pool).await.unwrap();
+    types.sort();
+    assert_eq!(types, vec![3, 3, 4, 6, 6], "attribute records: Adjusted twice, Free Mutation once, Separated twice (one is F's own, kept)");
+    // The kept part kept F's attribute record (same OBJECTID, updated, not archived).
+    let f_attr: Vec<(i32, Option<i16>, Option<chrono::NaiveDateTime>)> = sqlx::query_as("SELECT object_id, mutation_type, archive_date FROM cadastre.parcel_attribute WHERE upin = $1")
+        .bind(upin("F")).fetch_all(&pool).await.unwrap();
+    assert_eq!(f_attr.len(), 1, "{f_attr:?}");
+    assert_eq!((f_attr[0].0, f_attr[0].1, f_attr[0].2), (f_attr_before, Some(6), None));
+    let f_status: String = sqlx::query_scalar("SELECT string_agg(status, ',' ORDER BY status) FROM cadastre.parcel WHERE parcel_number = $1").bind(upin("F")).fetch_one(&pool).await.unwrap();
+    assert_eq!(f_status, "historic,posted", "F's old shape is history, its kept part is active");
+    for k in ["G", "H", "I"] {
+        let st: String = sqlx::query_scalar("SELECT status FROM cadastre.parcel WHERE parcel_number = $1").bind(upin(k)).fetch_one(&pool).await.unwrap();
+        assert_eq!(st, "historic", "{k} was replaced by its mutation");
+    }
+}
+
+/// Phase 5: a link made in the Registry reaches the Cadastre: the parcel's attribute record takes
+/// the Registry's values (GISUpdatedFields), one event per link (re-reads change nothing), and the
+/// editor's list shows it with the parcel and, once created, the job serving its transaction.
+#[tokio::test]
+async fn registry_links_sync_into_the_cadastre() {
+    let Some(db_url) = test_db_url() else {
+        eprintln!("skipping: CADASTRE_TEST_DATABASE_URL not set");
+        return;
+    };
+    let app = routes::router(state_with(AuthMode::Disabled, None, &db_url).await);
+    let pool = sqlx::PgPool::connect(&db_url).await.unwrap();
+    let n = rand_12() % 1_000_000_000;
+    let upin = format!("PLR{n:09}");
+    let ghost = format!("PLG{n:09}");
+    let (su, txn) = (format!("PLT{n}"), format!("PLS{n}"));
+    sqlx::query("INSERT INTO cadastre.parcel (parcel_number, geom, computed_area, status) VALUES ($1, ST_MakeEnvelope(1000, 9000000, 1020, 9000020, 32632), 400, 'posted')")
+        .bind(&upin).execute(&pool).await.unwrap();
+    let oid = 600_000_000 + (n % 100_000_000) as i32;
+    sqlx::query("INSERT INTO cadastre.parcel_attribute (object_id, upin, status, linkage_status, property_number, plot) VALUES ($1, $2, '0', 0, NULL, 'plot 7')")
+        .bind(oid).bind(&upin).execute(&pool).await.unwrap();
+    let at = chrono::Utc::now().naive_utc() - chrono::Duration::minutes(5);
+    let at = chrono::NaiveDateTime::parse_from_str(&at.format("%Y-%m-%d %H:%M:%S").to_string(), "%Y-%m-%d %H:%M:%S").unwrap();
+    let link = |u: &str| cadastre_server::registry_sync::RegistryLink {
+        su_id: su.clone(), upin: u.to_string(), refnum: Some(format!("PL{n}")), linked_at: at,
+        transaction_number: txn.clone(), transaction_status_code: "transaction_lodged".into(), transaction_status: "Active".into(),
+        lot: Some("12".into()), block: Some("B".into()),
+    };
+    let links = vec![link(&upin), link(&ghost)];
+    let fields = cadastre_server::registry::parse_field_map(cadastre_server::registry_sync::DEFAULT_UPDATED_FIELDS);
+    let (new, updated, unmatched) = cadastre_server::registry_sync::apply(&pool, &links, &fields).await.unwrap();
+    assert_eq!((new, updated, unmatched), (2, 1, 1), "the ghost UPIN has no parcel");
+    let rec: (Option<String>, Option<i16>, Option<String>, Option<String>, Option<String>, Option<String>) = sqlx::query_as(
+        "SELECT lrs_id, linkage_status, linkage_date, property_number, plot, block FROM cadastre.parcel_attribute WHERE object_id = $1")
+        .bind(oid).fetch_one(&pool).await.unwrap();
+    assert_eq!(rec, (Some(su.clone()), Some(1), Some(at.format("%Y-%m-%d").to_string()), Some(format!("PL{n}")), Some("plotNumber".into()), Some("blockNumber".into())),
+        "GISUpdatedFields as Aumentum applied it: LRSID, LinkageStatus, LinkageDate, PropertyNumber, and Plot/Block as the literal names");
+    // The same links read again: nothing changes, no new events.
+    assert_eq!(cadastre_server::registry_sync::apply(&pool, &links, &fields).await.unwrap(), (0, 0, 0));
+
+    let (st, list) = send(&app, "GET", "/api/v1/registry/links?days=2", None, None).await;
+    assert_eq!(st, StatusCode::OK);
+    let mine: Vec<&Value> = list.as_array().unwrap().iter().filter(|l| l["su_id"] == su.as_str()).collect();
+    assert_eq!(mine.len(), 2, "{list}");
+    let real = mine.iter().find(|l| l["upin"] == upin.as_str()).unwrap();
+    assert!(real["parcel_id"].is_string(), "{real}");
+    assert_eq!((real["transaction_number"].as_str(), real["lot"].as_str()), (Some(txn.as_str()), Some("12")));
+    assert!(real["job_instance_id"].is_null());
+    assert!(mine.iter().find(|l| l["upin"] == ghost.as_str()).unwrap()["parcel_id"].is_null());
+
+    // A job for the transaction appears on the link.
+    let jt = 900_000 + (n % 90_000) as i32 * 10;
+    sqlx::query("INSERT INTO cadastre.wf_task (id, name) VALUES ($1, 'Deed Plan (test)')").bind(jt).execute(&pool).await.unwrap();
+    sqlx::query("INSERT INTO cadastre.wf_job_type (id, name, start_task_id, end_task_id) VALUES ($1, 'Deed Plan (test)', $1, $1)").bind(jt).execute(&pool).await.unwrap();
+    let (st, j) = send(&app, "POST", "/api/v1/wf/jobs", None, Some(json!({"job_type_id": jt, "name": format!("Job-PL{n}"), "lrs_transaction_number": txn}))).await;
+    assert_eq!(st, StatusCode::CREATED, "{j}");
+    let (_, list) = send(&app, "GET", "/api/v1/registry/links?days=2", None, None).await;
+    let real = list.as_array().unwrap().iter().find(|l| l["upin"] == upin.as_str()).unwrap().clone();
+    assert_eq!(real["job_instance_id"], j["job"]["id"], "{real}");
+    assert_eq!(real["job_name"].as_str(), Some(format!("Job-PL{n}").as_str()));
+
+    let (st, s) = send(&app, "GET", "/api/v1/registry/status", None, None).await;
+    assert_eq!(st, StatusCode::OK);
+    assert!(s.get("enabled").is_some(), "{s}");
+}
+
+
+/// Phase 5: unlinks made in the Registry. The first snapshot is a baseline; a property whose UPIN
+/// changes or goes unlinks the parcel it held (LinkageStatus 0, other fields kept); a property
+/// linked to several parcels (it holds only one UPIN) unlinks nothing; a short Registry answer is
+/// refused instead of unlinking everything.
+#[tokio::test]
+async fn registry_unlinks_by_snapshot() {
+    let Some(db_url) = test_db_url() else {
+        eprintln!("skipping: CADASTRE_TEST_DATABASE_URL not set");
+        return;
+    };
+    let pool = sqlx::PgPool::connect(&db_url).await.unwrap();
+    // The snapshot table is shared: this test runs alone on it.
+    let _guard = REGISTRY_SNAPSHOT.lock().await;
+    sqlx::query("DELETE FROM cadastre.registry_property").execute(&pool).await.unwrap();
+    let n = rand_12() % 1_000_000_000;
+    let (a, b, c) = (format!("PLA{n:09}"), format!("PLB{n:09}"), format!("PLC{n:09}"));
+    let (su1, su2) = (format!("PLT1{n}"), format!("PLT2{n}"));
+    let oid = 500_000_000 + (n % 100_000_000) as i32 * 3 % 99_000_000;
+    for (k, (u, su)) in [(&a, &su1), (&b, &su2), (&c, &su2)].iter().enumerate() {
+        sqlx::query("INSERT INTO cadastre.parcel_attribute (object_id, upin, status, linkage_status, lrs_id, property_number) VALUES ($1, $2, '0', 1, $3, 'PL5')")
+            .bind(oid + k as i32).bind(u.as_str()).bind(su.as_str()).execute(&pool).await.unwrap();
+    }
+    let snap = |rows: &[(&str, &str)]| rows.iter().map(|(su, u)| (su.to_string(), (Some(1i64), u.to_string(), None))).collect::<std::collections::HashMap<_, _>>();
+    // Baseline: su2 is linked to both b and c, the Registry holds c.
+    let r = cadastre_server::registry_sync::reconcile_with(&pool, &snap(&[(&su1, &a), (&su2, &c)])).await.unwrap();
+    assert!(r.baseline && r.unlinked == 0);
+    // Unchanged: nothing.
+    let r = cadastre_server::registry_sync::reconcile_with(&pool, &snap(&[(&su1, &a), (&su2, &c)])).await.unwrap();
+    assert_eq!((r.baseline, r.unlinked), (false, 0), "b (also linked to su2, which holds c) is not unlinked");
+    // su1's UPIN cleared in the Registry: a is unlinked, keeps LRSID / PropertyNumber.
+    let r = cadastre_server::registry_sync::reconcile_with(&pool, &snap(&[(&su2, &c)])).await.unwrap();
+    assert_eq!(r.unlinked, 1);
+    let (st, lrs, pn): (Option<i16>, Option<String>, Option<String>) = sqlx::query_as("SELECT linkage_status, lrs_id, property_number FROM cadastre.parcel_attribute WHERE upin = $1")
+        .bind(&a).fetch_one(&pool).await.unwrap();
+    assert_eq!((st, lrs.as_deref(), pn.as_deref()), (Some(0), Some(su1.as_str()), Some("PL5")));
+    let ev: i64 = sqlx::query_scalar("SELECT count(*) FROM cadastre.audit_log WHERE entity = 'registry_link' AND entity_id = $1 AND action = 'registry_unlink_synced'").bind(&a).fetch_one(&pool).await.unwrap();
+    assert_eq!(ev, 1);
+    // su2 now holds b: c (linked to su2, and the UPIN it held) is unlinked; b stays linked.
+    let r = cadastre_server::registry_sync::reconcile_with(&pool, &snap(&[(&su2, &b)])).await.unwrap();
+    assert_eq!(r.unlinked, 1);
+    let st: Vec<(String, Option<i16>)> = sqlx::query_as("SELECT upin, linkage_status FROM cadastre.parcel_attribute WHERE upin = ANY($1) ORDER BY upin").bind(vec![b.clone(), c.clone()]).fetch_all(&pool).await.unwrap();
+    assert_eq!(st, vec![(b.clone(), Some(1)), (c.clone(), Some(0))]);
+    // A Registry answer with far fewer properties than before is refused.
+    let mut big = snap(&[(&su2, &b)]);
+    for i in 0..10 { big.insert(format!("X{i}{n}"), (None, format!("PLX{i}"), None)); }
+    cadastre_server::registry_sync::reconcile_with(&pool, &big).await.unwrap();
+    assert!(cadastre_server::registry_sync::reconcile_with(&pool, &snap(&[(&su2, &b)])).await.is_err(), "a short answer must not unlink");
+    sqlx::query("DELETE FROM cadastre.registry_property").execute(&pool).await.unwrap();
+}
+
+static REGISTRY_SNAPSHOT: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+/// A fake Aumentum Registry for the write tests: answers the SOAP calls Aumentum made and the
+/// plan upload, and records every request.
+struct FakeRegistry {
+    url: String,
+    seen: std::sync::Arc<std::sync::Mutex<Vec<(String, String)>>>,
+}
+
+fn scalar_xml(rows: &[Vec<&str>]) -> String {
+    let recs: String = rows.iter().map(|r| format!("<ns1:value><ns1:items>{}</ns1:items></ns1:value>",
+        r.iter().map(|v| format!("<ns1:value><ns1:type>string</ns1:type><ns1:value>{v}</ns1:value></ns1:value>")).collect::<String>())).collect();
+    format!("<?xml version=\"1.0\"?><soapenv:Envelope xmlns:soapenv=\"http://schemas.xmlsoap.org/soap/envelope/\"><soapenv:Body><loadObjectsResponse xmlns=\"http://www.landsystems.com/domainmodel-service/1.0\"><Result><ns1:ResultScalar xmlns:ns1=\"http://www.landsystems.com/lrs/service\"><ns1:items>{recs}</ns1:items></ns1:ResultScalar></Result></loadObjectsResponse></soapenv:Body></soapenv:Envelope>")
+}
+
+impl FakeRegistry {
+    async fn start(su: String, prop_upin: Option<String>) -> Self {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::<(String, String)>::new()));
+        let seen2 = seen.clone();
+        let prop_upin = std::sync::Arc::new(std::sync::Mutex::new(prop_upin));
+        tokio::spawn(async move {
+            loop {
+                let Ok((mut sock, _)) = listener.accept().await else { break };
+                let seen = seen2.clone();
+                let su = su.clone();
+                let prop_upin = prop_upin.clone();
+                tokio::spawn(async move {
+                    let mut buf = Vec::new();
+                    let mut chunk = [0u8; 65536];
+                    // Read headers, then Content-Length bytes.
+                    loop {
+                        let n = sock.read(&mut chunk).await.unwrap_or(0);
+                        if n == 0 { break; }
+                        buf.extend_from_slice(&chunk[..n]);
+                        if let Some(i) = buf.windows(4).position(|w| w == b"\r\n\r\n") {
+                            let head = String::from_utf8_lossy(&buf[..i]).to_string();
+                            let len = head.lines().find_map(|l| l.to_ascii_lowercase().strip_prefix("content-length:").map(|v| v.trim().parse::<usize>().unwrap_or(0))).unwrap_or(0);
+                            if buf.len() >= i + 4 + len { break; }
+                        }
+                    }
+                    let text = String::from_utf8_lossy(&buf).to_string();
+                    let (head, body) = text.split_once("\r\n\r\n").unwrap_or((&text, ""));
+                    let line = head.lines().next().unwrap_or("").to_string();
+                    seen.lock().unwrap().push((line.clone(), body.to_string()));
+                    let ok = |b: String| format!("HTTP/1.1 200 OK\r\nDate: {}\r\nContent-Type: text/xml\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{b}", httpdate(), b.len());
+                    let resp = if line.starts_with("GET") {
+                        ok("<wsdl/>".into())
+                    } else if line.starts_with("PUT") && line.contains("/lrs/upload/") {
+                        ok("workspace://SpacesStore/fake-content".into())
+                    } else if line.contains("AuthenticationService") && body.contains("startSession") {
+                        ok("<r><startSessionReturn><ticket>TICKET-1</ticket></startSessionReturn></r>".into())
+                    } else if line.contains("AuthenticationService") && body.contains("isTicketValid") {
+                        ok(format!("<r><result>{}</result></r>", body.contains("<auth:ticket>GOOD-TICKET</auth:ticket>")))
+                    } else if line.contains("AuthenticationService") {
+                        ok("<r/>".into())
+                    } else if line.contains("IntegrationService") {
+                        if body.contains("<lrs:name>upin</lrs:name><lrs:value></lrs:value>") || body.contains("<lrs:name>upin</lrs:name><lrs:value/>") { *prop_upin.lock().unwrap() = None; }
+                        ok("<r><result><items><value><className>com.landsystems.lrs.model.Parcel</className></value></items></result></r>".into())
+                    } else if body.contains("Category = &apos;mcintegration&apos;") {
+                        ok(scalar_xml(&[vec!["LinkageFields", "upin:UPIN;LRSID:suid,PropertyNumber:refnum,Plot:plotNumber,Block:blockNumber"], vec!["GISUpdatedFields", "suID:LRSID"]]))
+                    } else if body.contains("join t.TransactionStatus s where t.TransactionNumber") {
+                        let closed = body.contains("TXNCLOSED");
+                        let num = if closed { "TXNCLOSED" } else { "PLS777" };
+                        ok(scalar_xml(&[vec!["10000000777", num, if closed { "transaction_completed" } else { "transaction_lodged" }, if closed { "Completed" } else { "Active" }]]))
+                    } else if body.contains("s.SpatialDate1 from com.landsystems.lrs.model.Transaction") {
+                        let u = prop_upin.lock().unwrap().clone().unwrap_or_default();
+                        ok(scalar_xml(&[vec!["10000000555", &su, &u, "PL777", "", "B7", ""]]))
+                    } else if body.contains("p.SuID =") {
+                        ok(scalar_xml(&[vec!["10000000777", "PLS777", "transaction_lodged", "Active", "10000000555", "x"]]))
+                    } else {
+                        ok(scalar_xml(&[]))
+                    };
+                    let _ = sock.write_all(resp.as_bytes()).await;
+                });
+            }
+        });
+        FakeRegistry { url: format!("http://{addr}/lrs/api/"), seen }
+    }
+    fn bodies(&self, needle: &str) -> Vec<String> {
+        self.seen.lock().unwrap().iter().filter(|(l, b)| l.contains(needle) || b.contains(needle)).map(|(_, b)| b.clone()).collect()
+    }
+}
+
+fn httpdate() -> String {
+    chrono::Utc::now().format("%a, %d %b %Y %H:%M:%S GMT").to_string()
+}
+
+/// Phase 5 write-back, against a fake Registry: link from the Cadastre (the Registry property
+/// takes the UPIN; the parcel the property's fields), sending the plan image to the job's
+/// transaction, and unlink, each refused as Aumentum refused (writing off, already linked,
+/// transaction not Active, not an image of the job).
+#[tokio::test]
+async fn registry_write_back_like_aumentum() {
+    let Some(db_url) = test_db_url() else {
+        eprintln!("skipping: CADASTRE_TEST_DATABASE_URL not set");
+        return;
+    };
+    let _guard = REGISTRY_SNAPSHOT.lock().await;
+    let n = rand_12() % 1_000_000_000;
+    let su = format!("PLTW{n}");
+    let fake = FakeRegistry::start(su.clone(), None).await;
+    std::env::set_var("CADASTRE_REGISTRY_URL", &fake.url);
+    std::env::set_var("CADASTRE_REGISTRY_USER", "tester");
+    std::env::set_var("CADASTRE_REGISTRY_PASSWORD", "secret");
+    std::env::remove_var("CADASTRE_REGISTRY_WRITE");
+    let app = routes::router(state_with(AuthMode::Disabled, None, &db_url).await);
+    let pool = sqlx::PgPool::connect(&db_url).await.unwrap();
+    let upin = format!("PLW{n:09}");
+    sqlx::query("INSERT INTO cadastre.parcel (parcel_number, geom, computed_area, status) VALUES ($1, ST_MakeEnvelope(3000, 9100000, 3020, 9100020, 32632), 400, 'posted')")
+        .bind(&upin).execute(&pool).await.unwrap();
+
+    // Reading works without writes.
+    let (st, t) = send(&app, "GET", "/api/v1/registry/transactions/PLS777", None, None).await;
+    assert_eq!(st, StatusCode::OK, "{t}");
+    assert_eq!((t["open"].as_bool(), t["properties"][0]["su_id"].as_str()), (Some(true), Some(su.as_str())));
+    let (st, t) = send(&app, "GET", "/api/v1/registry/transactions/TXNCLOSED", None, None).await;
+    assert_eq!((st, t["open"].as_bool()), (StatusCode::OK, Some(false)));
+    assert!(t["refused"].as_str().unwrap().contains("status 'Completed'"), "{t}");
+    let link = json!({"transaction_number": "PLS777", "su_id": su, "upin": upin});
+    let (st, r) = send(&app, "POST", "/api/v1/registry/link", None, Some(link.clone())).await;
+    assert_eq!(st, StatusCode::CONFLICT, "writing is off by default: {r}");
+    assert!(fake.bodies("SaveEntity").is_empty());
+
+    std::env::set_var("CADASTRE_REGISTRY_WRITE", "1");
+    let (st, r) = send(&app, "POST", "/api/v1/registry/link", None, Some(link.clone())).await;
+    assert_eq!(st, StatusCode::CONFLICT, "linking from the Cadastre is off unless switched on: {r}");
+    std::env::set_var("CADASTRE_REGISTRY_CADASTRE_LINKING", "1");
+    let (st, r) = send(&app, "POST", "/api/v1/registry/link", None, Some(json!({"transaction_number": "TXNCLOSED", "su_id": su, "upin": upin}))).await;
+    assert_eq!(st, StatusCode::CONFLICT, "a Completed transaction is closed: {r}");
+    let (st, r) = send(&app, "POST", "/api/v1/registry/link", None, Some(link.clone())).await;
+    assert_eq!(st, StatusCode::OK, "{r}");
+    let saves = fake.bodies("SaveEntity");
+    assert_eq!(saves.len(), 1);
+    assert!(saves[0].contains("<int:transactionId>10000000777</int:transactionId>"), "{}", saves[0]);
+    assert!(saves[0].contains("<lrs:className>com.landsystems.lrs.model.Parcel</lrs:className><lrs:status>modified</lrs:status>"));
+    assert!(saves[0].contains("<lrs:name>Id</lrs:name><lrs:value>10000000555</lrs:value>"));
+    assert!(saves[0].contains(&format!("<lrs:name>upin</lrs:name><lrs:value>{upin}</lrs:value>")));
+    assert!(saves[0].contains("wsse:UsernameToken") && saves[0].contains("TICKET-1"), "the ticket rides in the WS-Security header");
+    let rec: (Option<String>, Option<String>, Option<String>, Option<String>, Option<i16>, Option<String>) = sqlx::query_as(
+        "SELECT lrs_id, property_number, plot, block, linkage_status, linkage_date FROM cadastre.parcel_attribute WHERE upin = $1")
+        .bind(&upin).fetch_one(&pool).await.unwrap();
+    assert_eq!(rec, (Some(su.clone()), Some("PL777".into()), None, Some("B7".into()), Some(1), Some(chrono::Utc::now().format("%Y-%m-%d").to_string())),
+        "a new attribute record; LinkageFields: LRSID, PropertyNumber, Block (plotNumber is no property column: skipped)");
+    let (st, r) = send(&app, "POST", "/api/v1/registry/link", None, Some(link.clone())).await;
+    assert_eq!(st, StatusCode::CONFLICT, "already linked: {r}");
+    let (_, lst) = send(&app, "GET", "/api/v1/registry/links?days=2", None, None).await;
+    let mine = lst.as_array().unwrap().iter().find(|l| l["upin"] == upin.as_str()).expect("the link is listed").clone();
+    assert_eq!((mine["made_in"].as_str(), mine["linked_now"].as_bool()), (Some("cadastre"), Some(true)));
+
+    // Send the plan: the job's transaction, a JPG attached to the job.
+    let jt = 910_000 + (n % 90_000) as i32 * 10;
+    sqlx::query("INSERT INTO cadastre.wf_task (id, name) VALUES ($1, 'Save Title Deed Plan (test)')").bind(jt).execute(&pool).await.unwrap();
+    sqlx::query("INSERT INTO cadastre.wf_job_type (id, name, start_task_id, end_task_id) VALUES ($1, 'Deed Plan (test)', $1, $1)").bind(jt).execute(&pool).await.unwrap();
+    let (_, j) = send(&app, "POST", "/api/v1/wf/jobs", None, Some(json!({"job_type_id": jt, "name": "Job-PL777", "lrs_transaction_number": "PLS777"}))).await;
+    let job = j["job"]["id"].as_i64().unwrap();
+    let (_, j2) = send(&app, "POST", "/api/v1/wf/jobs", None, Some(json!({"job_type_id": jt, "name": "Job-closed", "lrs_transaction_number": "TXNCLOSED"}))).await;
+    let job2 = j2["job"]["id"].as_i64().unwrap();
+    let rel = format!("regtest/{n}.jpg");
+    std::fs::create_dir_all("files/regtest").unwrap();
+    std::fs::write(format!("files/{rel}"), b"\xFF\xD8\xFFfake-jpeg").unwrap();
+    let file: uuid::Uuid = sqlx::query_scalar("INSERT INTO cadastre.wf_job_file (job_instance_id, file_name, store, store_path, size_bytes) VALUES ($1, 'PL777.jpg', 'cadastre', $2, 12) RETURNING id")
+        .bind(job as i32).bind(&rel).fetch_one(&pool).await.unwrap();
+    let pdf: uuid::Uuid = sqlx::query_scalar("INSERT INTO cadastre.wf_job_file (job_instance_id, file_name, store, store_path, size_bytes) VALUES ($1, 'plan.pdf', 'cadastre', $2, 12) RETURNING id")
+        .bind(job as i32).bind(&rel).fetch_one(&pool).await.unwrap();
+    let (st, r) = send(&app, "POST", &format!("/api/v1/wf/jobs/{job}/registry/send-plan"), None, Some(json!({"file_id": pdf}))).await;
+    assert_eq!(st, StatusCode::BAD_REQUEST, "a PDF is not sent: {r}");
+    let (st, r) = send(&app, "POST", &format!("/api/v1/wf/jobs/{job2}/registry/send-plan"), None, Some(json!({"file_id": file}))).await;
+    assert_eq!(st, StatusCode::BAD_REQUEST, "another job's file: {r}");
+    let (st, r) = send(&app, "POST", &format!("/api/v1/wf/jobs/{job}/registry/send-plan"), None, Some(json!({"file_id": file}))).await;
+    assert_eq!(st, StatusCode::OK, "{r}");
+    let uploads: Vec<String> = fake.seen.lock().unwrap().iter().filter(|(l, _)| l.starts_with("PUT")).map(|(l, b)| format!("{l}|{b}")).collect();
+    assert_eq!(uploads.len(), 1);
+    assert!(uploads[0].contains("/lrs/upload/") && uploads[0].contains(".jpg?ticket=TICKET-1&encoding=UTF%2D8") && uploads[0].contains("fake-jpeg"), "{}", uploads[0]);
+    let doc = fake.bodies("IncomingDocument");
+    assert_eq!(doc.len(), 1);
+    assert!(doc[0].contains("<lrs:name>DocumentType</lrs:name><lrs:value>sd_titledeedPlan</lrs:value>"));
+    assert!(doc[0].contains("<cms:value>workspace://SpacesStore/fake-content</cms:value>"), "the uploaded content");
+    assert!(doc[0].contains("referenceid</cms:name><cms:isMultiValue xsi:nil=\"true\"/><cms:value>10000000777</cms:value>"));
+    let (_, sent) = send(&app, "GET", &format!("/api/v1/wf/jobs/{job}/registry/sent"), None, None).await;
+    assert_eq!(sent.as_array().unwrap().len(), 1);
+
+    // Unlink: the Registry property's UPIN cleared; the parcel's link fields cleared.
+    let (st, r) = send(&app, "POST", "/api/v1/registry/unlink", None, Some(json!({"upin": upin}))).await;
+    assert_eq!(st, StatusCode::OK, "{r}");
+    let last = fake.bodies("SaveEntity").pop().unwrap();
+    assert!(last.contains("<lrs:name>upin</lrs:name><lrs:value></lrs:value>"), "{last}");
+    let rec: (Option<String>, Option<String>, Option<i16>, Option<String>) = sqlx::query_as("SELECT lrs_id, property_number, linkage_status, linkage_date FROM cadastre.parcel_attribute WHERE upin = $1")
+        .bind(&upin).fetch_one(&pool).await.unwrap();
+    assert_eq!(rec, (None, None, Some(0), None));
+    let (st, _) = send(&app, "POST", "/api/v1/registry/unlink", None, Some(json!({"upin": upin}))).await;
+    assert_eq!(st, StatusCode::CONFLICT, "not linked any more");
+    let _ = std::fs::remove_file(format!("files/{rel}"));
+    for k in ["CADASTRE_REGISTRY_URL", "CADASTRE_REGISTRY_USER", "CADASTRE_REGISTRY_PASSWORD", "CADASTRE_REGISTRY_WRITE", "CADASTRE_REGISTRY_CADASTRE_LINKING"] { std::env::remove_var(k); }
+}
+
+/// The Registry's job service (Aumentum LRSWebServices.asmx at its path), called as the Registry's
+/// Java client calls it: Authenticate (session cookie), GetAllJobs → CreateJobInstance with the
+/// transaction parameter, GetJobInstance, ApproveJob, the parcel reads, LogOut.
+#[tokio::test]
+async fn registry_job_service_like_aumentum() {
+    let Some(db_url) = test_db_url() else {
+        eprintln!("skipping: CADASTRE_TEST_DATABASE_URL not set");
+        return;
+    };
+    std::env::set_var("CADASTRE_MC_SERVICE_USER", "administrator");
+    std::env::set_var("CADASTRE_MC_SERVICE_PASSWORD", "s3cret");
+    let app = routes::router(state_with(AuthMode::Disabled, None, &db_url).await);
+    let pool = sqlx::PgPool::connect(&db_url).await.unwrap();
+    let path = cadastre_server::routes::mcservice::PATH;
+    async fn soap(app: &Router, path: &str, op: &str, inner: &str, cookie: Option<&str>) -> (StatusCode, Option<String>, String) {
+        let body = format!("<?xml version=\"1.0\" encoding=\"UTF-8\"?><soapenv:Envelope xmlns:soapenv=\"http://schemas.xmlsoap.org/soap/envelope/\" xmlns:xsd=\"http://www.w3.org/2001/XMLSchema\"><soapenv:Body><{op} xmlns=\"http://tempuri.org/\">{inner}</{op}></soapenv:Body></soapenv:Envelope>");
+        let mut b = Request::builder().method("POST").uri(path).header(header::CONTENT_TYPE, "text/xml; charset=utf-8").header("SOAPAction", format!("\"http://tempuri.org/{op}\""));
+        if let Some(c) = cookie { b = b.header(header::COOKIE, c); }
+        let resp = app.clone().oneshot(b.body(Body::from(body)).unwrap()).await.unwrap();
+        let st = resp.status();
+        let set = resp.headers().get(header::SET_COOKIE).map(|v| v.to_str().unwrap().split(';').next().unwrap().to_string());
+        let text = String::from_utf8(to_bytes(resp.into_body(), usize::MAX).await.unwrap().to_vec()).unwrap();
+        (st, set, text)
+    }
+    let between = |s: &str, a: &str, b: &str| s.split_once(a).and_then(|(_, r)| r.split_once(b)).map(|(v, _)| v.to_string());
+
+    let (st, _, t) = soap(&app, path, "GetAllJobs", "", None).await;
+    assert_eq!(st, StatusCode::INTERNAL_SERVER_ERROR);
+    assert!(t.contains("Not authenticated"), "{t}");
+    let (_, set, t) = soap(&app, path, "Authenticate", "<user>administrator</user><password>wrong</password>", None).await;
+    assert!(t.contains("<AuthenticateResult>false</AuthenticateResult>") && set.is_none(), "{t}");
+    let (_, set, t) = soap(&app, path, "Authenticate", "<user>Administrator</user><password>s3cret</password>", None).await;
+    assert!(t.contains("<AuthenticateResponse xmlns=\"http://tempuri.org/\"><AuthenticateResult>true</AuthenticateResult>"), "{t}");
+    let cookie = set.expect("a session cookie");
+    assert!(cookie.starts_with("ASP.NET_SessionId="));
+
+    // A job type to find by name, as the Registry does (job_deedplan_creation → name).
+    let n = rand_12() % 1_000_000_000;
+    let jt = 920_000 + (n % 90_000) as i32 * 10;
+    let name = format!("Deed Plan Creation (test {n})");
+    sqlx::query("INSERT INTO cadastre.wf_task (id, name) VALUES ($1, 'Search Cadastre for Parcels (test)')").bind(jt).execute(&pool).await.unwrap();
+    sqlx::query("INSERT INTO cadastre.wf_job_type (id, name, start_task_id, end_task_id) VALUES ($1, $2, $1, $1)").bind(jt).bind(&name).execute(&pool).await.unwrap();
+    let (st, _, t) = soap(&app, path, "GetAllJobs", "", Some(&cookie)).await;
+    assert_eq!(st, StatusCode::OK);
+    assert!(t.contains(&format!("<WFJob><ID>{jt}</ID><Name>{name}</Name>")), "{}", &t[..t.len().min(400)]);
+
+    let txn = format!("PLS{:09}", n);
+    let (st, _, t) = soap(&app, path, "CreateJobInstance", &format!("<jobID>{jt}</jobID><instanceName>Job-PL{n}</instanceName><priority>1</priority><comments>Deed Plan Creationv2</comments><parameters>@LRS:[Transaction]:[TransactionNumber]={txn}</parameters>"), Some(&cookie)).await;
+    assert_eq!(st, StatusCode::OK, "{t}");
+    assert!(t.contains(&format!("<CreateJobInstanceResult><LrsTransactionNumber>{txn}</LrsTransactionNumber>")), "{t}");
+    let id: i32 = between(&t, "<ID>", "</ID>").unwrap().parse().unwrap();
+    assert!(t.contains(&format!("<JobID>{jt}</JobID><TaskID>{jt}</TaskID>")) && t.contains("<JobStatus>2</JobStatus>") && t.contains(&format!("<Name>Job-PL{n}</Name>")), "{t}");
+    let row: (Option<String>, Option<String>, i16) = sqlx::query_as("SELECT lrs_transaction_number, parameters, status FROM cadastre.wf_job_instance WHERE id = $1").bind(id).fetch_one(&pool).await.unwrap();
+    assert_eq!(row, (Some(txn.clone()), Some(format!("@LRS:[Transaction]:[TransactionNumber]={txn}")), 2), "the job carries the transaction, as Aumentum's did");
+
+    let (_, _, t) = soap(&app, path, "GetJobInstance", &format!("<jobInstanceId>{id}</jobInstanceId>"), Some(&cookie)).await;
+    assert!(t.contains(&format!("<ID>{id}</ID>")) && t.contains("<Ended xsi:nil=\"true\" />"), "{t}");
+    // Aumentum compares the stored number with the int it is passed: a PLS number never matches.
+    let digits: i64 = txn.trim_start_matches("PLS").parse().unwrap();
+    let (_, _, t) = soap(&app, path, "GetJobStatusByTransaction", &format!("<transactionNumber>{digits}</transactionNumber>"), Some(&cookie)).await;
+    assert!(t.contains("<GetJobStatusByTransactionResult></GetJobStatusByTransactionResult>"), "{t}");
+    let (_, _, t) = soap(&app, path, "GetJobStatusByJobInstanceID", &format!("<jobInstanceID>{id}</jobInstanceID>"), Some(&cookie)).await;
+    assert!(t.contains(&format!("<GetJobStatusByJobInstanceIDResult><ID>{jt}</ID><Name>{name}</Name>")), "the job's job type: {t}");
+    let unassigned: Option<i32> = sqlx::query_scalar("SELECT assigned_sid FROM cadastre.wf_job_instance WHERE id = $1").bind(id).fetch_one(&pool).await.unwrap();
+    assert_eq!(unassigned, None, "the Registry's jobs start unassigned (CreateNonAssignedTaskInstance)");
+    let (_, _, t) = soap(&app, path, "ApproveJob", &format!("<jobInstanceID>{id}</jobInstanceID>"), Some(&cookie)).await;
+    assert!(t.contains("<ApproveJobResult>true</ApproveJobResult>"), "{t}");
+    let (_, _, t) = soap(&app, path, "IsJobInstanceCompleted", &format!("<jobinstanceID>{id}</jobinstanceID>"), Some(&cookie)).await;
+    assert!(t.contains("<Completed>true</Completed><Status>Already been approved or rejected</Status>"), "Aumentum's wording: {t}");
+
+    // The Registry reads a parcel of this Cadastre: points (legs) and attributes.
+    let upin = format!("PLJ{n:09}");
+    let (x, y) = (5000.0 + (n % 1000) as f64 * 50.0, 9_200_000.0);
+    sqlx::query("INSERT INTO cadastre.parcel (parcel_number, geom, computed_area, status) VALUES ($1, ST_SetSRID(ST_GeomFromText(format('POLYGON((%s %s,%s %s,%s %s,%s %s,%s %s))', $2::float8, $3::float8, $2::float8 + 30, $3::float8, $2::float8 + 30, $3::float8 + 40, $2::float8, $3::float8 + 40, $2::float8, $3::float8)), 32632), 1200, 'posted')")
+        .bind(&upin).bind(x).bind(y).execute(&pool).await.unwrap();
+    sqlx::query("INSERT INTO cadastre.beacon (number, geom) VALUES ($1, ST_SetSRID(ST_MakePoint($2, $3), 32632))").bind(format!("BJ{n}")).bind(x).bind(y).execute(&pool).await.unwrap();
+    sqlx::query("INSERT INTO cadastre.parcel_attribute (object_id, upin, status, plot, property_number) VALUES ($1, $2, '0', '12', 'PL55')").bind(400_000_000 + (n % 100_000_000) as i32).bind(&upin).execute(&pool).await.unwrap();
+    let (_, _, t) = soap(&app, path, "GetParcelPointsData", &format!("<pUpin>{upin}</pUpin>"), Some(&cookie)).await;
+    assert_eq!(t.matches("<PointInformationDTO>").count(), 4, "four legs: {t}");
+    assert!(t.contains(&format!("<FromPointName>BJ{n}</FromPointName>")), "beacon names from the fabric: {t}");
+    assert!(t.contains("<Distance>30.000</Distance>") && t.contains("<Distance>40.000</Distance>"), "{t}");
+    assert!(t.contains("<Bearing>90°00'00\"</Bearing>"), "{t}");
+    let (_, _, t) = soap(&app, path, "GetParcelAttributesByUPIN", &format!("<regionName>Plateau_State</regionName><upin>{upin}</upin>"), Some(&cookie)).await;
+    assert!(t.contains("<DataField><FieldName>Plot</FieldName><FieldValue>12</FieldValue></DataField>") && t.contains("<FieldName>PropertyNumber</FieldName><FieldValue>PL55</FieldValue>"), "{t}");
+    let (_, _, t) = soap(&app, path, "GetDomainDetailsByName", "<domainName>d_mutation_type</domainName>", Some(&cookie)).await;
+    assert!(t.contains("<FieldValue>Free Mutation</FieldValue>"), "{t}");
+    let (_, _, t) = soap(&app, path, "BatchUpdateDataFromRegistry", &format!("<parameters>UPIN={upin}|LRSID=PLT9{n}|LinkageStatus=1</parameters>"), Some(&cookie)).await;
+    assert!(t.contains("<Completed>true</Completed><HasError>false</HasError>"), "{t}");
+    let l: (Option<String>, Option<i16>) = sqlx::query_as("SELECT lrs_id, linkage_status FROM cadastre.parcel_attribute WHERE upin = $1").bind(&upin).fetch_one(&pool).await.unwrap();
+    assert_eq!(l, (Some(format!("PLT9{n}")), Some(1)));
+
+    let (_, _, t) = soap(&app, path, "LogOut", "", Some(&cookie)).await;
+    assert!(t.contains("<LogOutResponse xmlns=\"http://tempuri.org/\">"), "{t}");
+    let (st, _, _) = soap(&app, path, "GetAllJobs", "", Some(&cookie)).await;
+    assert_eq!(st, StatusCode::INTERNAL_SERVER_ERROR, "signed out");
+    let req = Request::builder().uri(format!("{path}?WSDL")).header(header::HOST, "10.10.10.128:8080").body(Body::empty()).unwrap();
+    let w = String::from_utf8(to_bytes(app.clone().oneshot(req).await.unwrap().into_body(), usize::MAX).await.unwrap().to_vec()).unwrap();
+    assert!(w.contains("location=\"http://10.10.10.128:8080/ApplicationServerAdmin/WebServices/LRSWebServices.asmx\""), "the WSDL points at this server");
+}
+
+
+/// The Registry's map window (Aumentum GISViewer MapWorker.aspx) and its link service
+/// (CadastralWebService.asmx UpdateCadastralData), driven as the Registry desktop drives them.
+#[tokio::test]
+async fn registry_map_like_aumentum_gisviewer() {
+    let Some(db_url) = test_db_url() else {
+        eprintln!("skipping: CADASTRE_TEST_DATABASE_URL not set");
+        return;
+    };
+    let _guard = REGISTRY_SNAPSHOT.lock().await;
+    let n = rand_12() % 1_000_000_000;
+    let fake = FakeRegistry::start(format!("PLTM{n}"), None).await;
+    std::env::set_var("CADASTRE_REGISTRY_URL", &fake.url);
+    std::env::set_var("CADASTRE_REGISTRY_USER", "tester");
+    std::env::set_var("CADASTRE_REGISTRY_PASSWORD", "secret");
+    std::env::remove_var("CADASTRE_GISVIEWER_OPEN");
+    let app = routes::router(state_with(AuthMode::Disabled, None, &db_url).await);
+    let pool = sqlx::PgPool::connect(&db_url).await.unwrap();
+    let upin = format!("PLM{n:09}");
+    let oid = 800_000_000 + (n % 100_000_000) as i32;
+    sqlx::query("INSERT INTO cadastre.parcel (parcel_number, geom, computed_area, status) VALUES ($1, ST_MakeEnvelope(300000, 1100000, 300020, 1100020, 32632), 400, 'posted')")
+        .bind(&upin).execute(&pool).await.unwrap();
+    sqlx::query("INSERT INTO cadastre.parcel_attribute (object_id, upin, status, linkage_status) VALUES ($1, $2, '0', 0)").bind(oid).bind(&upin).execute(&pool).await.unwrap();
+
+    let post = |body: String, uri: &str| Request::builder().method("POST").uri(uri.to_string()).header(header::CONTENT_TYPE, "application/x-www-form-urlencoded").body(Body::from(body)).unwrap();
+    let html = |r: axum::response::Response| async move { String::from_utf8(to_bytes(r.into_body(), usize::MAX).await.unwrap().to_vec()).unwrap() };
+    // A bad ticket is refused.
+    let r = app.clone().oneshot(post("auth=1&lrsuser=ragoro&lrsticket=BAD".into(), "/GISViewer/MapWorker.aspx?ct=indexer&justmap=1&map=property-select&lang=en-US")).await.unwrap();
+    let page = html(r).await;
+    assert!(page.contains("not valid") && !page.contains("silverlightControl"), "{page}");
+    // The Registry's input objects, as its SerializerUtils encodes them.
+    let input = json!([{ "LayerName": "Plateau_State_Parcels", "IsReadOnly": false, "IsSelectionSet": true,
+        "Fields": [{ "Name": "UPIN", "Alias": "UPIN", "IsLayerField": true, "IsPrimary": true }],
+        "Entities": [{ "UUID": 0, "Attributes": [{ "Name": "UPIN", "Value": upin }] }] }]);
+    let enc = format!("<base64Binary xmlns:xsi=\"x\">{}[END]", base64::Engine::encode(&base64::engine::general_purpose::STANDARD, input.to_string()));
+    let form = format!("auth=1&lrsuser=ragoro&lrsticket=GOOD-TICKET&initparam_inputobjects={}", urlencoding(&enc));
+    let r = app.clone().oneshot(post(form, "/GISViewer/MapWorker.aspx?ct=indexer&justmap=1&map=property-select&lang=en-US")).await.unwrap();
+    assert_eq!(r.status(), StatusCode::OK);
+    let page = html(r).await;
+    for need in ["id=\"silverlightControl\"", "id=\"indexerEvents\"", "window.doAction", "IE=edge", &upin] { assert!(page.contains(need), "page lacks {need}"); }
+    let token = page.split("\"token\":\"").nth(1).unwrap().split('"').next().unwrap().to_string();
+    let (st, fc) = send(&app, "GET", &format!("/GISViewer/data/parcels?token={token}&field=UPIN&value={upin}"), None, None).await;
+    assert_eq!(st, StatusCode::OK);
+    assert_eq!(fc["features"][0]["properties"]["OBJECTID"], oid);
+    let (st, fc) = send(&app, "GET", &format!("/GISViewer/data/parcels?token={token}&bbox=5.1,9.9,5.2,10.0"), None, None).await;
+    assert_eq!(st, StatusCode::OK, "{fc}");
+    let (st, _) = send(&app, "GET", &format!("/GISViewer/data/parcels?token=nope&field=UPIN&value={upin}"), None, None).await;
+    assert_eq!(st, StatusCode::UNAUTHORIZED);
+
+    // The Registry links: UpdateCadastralData by OBJECTID, signed with the user's ticket.
+    let soap = |ticket: &str, records: &str| format!(r#"<?xml version="1.0" encoding="utf-8"?><soap:Envelope xmlns:soap="http://schemas.xmlsoap.org/soap/envelope/" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xmlns:xsd="http://www.w3.org/2001/XMLSchema"><soap:Header><SecurityHeader xmlns="http://www.landsystems.com/multicadastre/in4/service"><User>ragoro</User><Password>{ticket}</Password></SecurityHeader></soap:Header><soap:Body><UpdateCadastralData xmlns="http://www.landsystems.com/multicadastre/in4/service"><updateList><UpdateDataList><LayerNameOrAlias>sde.SDE.Plateau_State_Parcels</LayerNameOrAlias><Records>{records}</Records></UpdateDataList></updateList></UpdateCadastralData></soap:Body></soap:Envelope>"#);
+    let call = |b: String| Request::builder().method("POST").uri("/GISViewer/WebServices/CadastralWebService.asmx").header(header::CONTENT_TYPE, "text/xml; charset=utf-8").body(Body::from(b)).unwrap();
+    let by_oid = format!(r#"<UpdateRecord xsi:type="UpdateRecordByOID"><Values><UpdateValue><Field>LRSID</Field><Value xsi:type="xsd:string">PLTM{n}</Value></UpdateValue><UpdateValue><Field>LinkageStatus</Field><Value xsi:type="xsd:int">1</Value></UpdateValue><UpdateValue><Field>LinkageDate</Field><Value xsi:type="xsd:string">20261102</Value></UpdateValue><UpdateValue><Field>PropertyNumber</Field><Value xsi:type="xsd:string">PL{n}</Value></UpdateValue></Values><ObjectID>{oid}</ObjectID></UpdateRecord>"#);
+    let out = html(app.clone().oneshot(call(soap("BAD", &by_oid))).await.unwrap()).await;
+    assert!(out.contains("<Error>"), "{out}");
+    let out = html(app.clone().oneshot(call(soap("GOOD-TICKET", &by_oid))).await.unwrap()).await;
+    assert!(out.contains("UpdateCadastralDataResponse") && !out.contains("<Error>"), "{out}");
+    let rec: (Option<String>, Option<i16>, Option<String>, Option<String>) = sqlx::query_as("SELECT lrs_id, linkage_status, linkage_date, property_number FROM cadastre.parcel_attribute WHERE object_id = $1")
+        .bind(oid).fetch_one(&pool).await.unwrap();
+    assert_eq!(rec, (Some(format!("PLTM{n}")), Some(1), Some("20261102".into()), Some(format!("PL{n}"))));
+    let audits: i64 = sqlx::query_scalar("SELECT count(*) FROM cadastre.audit_log WHERE action = 'registry_map_update' AND entity_id = $1").bind(&upin).fetch_one(&pool).await.unwrap();
+    assert_eq!(audits, 1);
+    // Unlink by fields (the UPIN), values to nil.
+    let by_fields = format!(r#"<UpdateRecord xsi:type="UpdateRecordByFields"><Values><UpdateValue><Field>LRSID</Field><Value xsi:nil="true" /></UpdateValue><UpdateValue><Field>LinkageStatus</Field><Value xsi:type="xsd:int">0</Value></UpdateValue></Values><PrimaryFields><UpdateValue><Field>UPIN</Field><Value xsi:type="xsd:string">{upin}</Value></UpdateValue></PrimaryFields></UpdateRecord>"#);
+    let out = html(app.clone().oneshot(call(soap("GOOD-TICKET", &by_fields))).await.unwrap()).await;
+    assert!(!out.contains("<Error>"), "{out}");
+    let rec: (Option<String>, Option<i16>) = sqlx::query_as("SELECT lrs_id, linkage_status FROM cadastre.parcel_attribute WHERE object_id = $1").bind(oid).fetch_one(&pool).await.unwrap();
+    assert_eq!(rec, (None, Some(0)));
+    for k in ["CADASTRE_REGISTRY_URL", "CADASTRE_REGISTRY_USER", "CADASTRE_REGISTRY_PASSWORD"] { std::env::remove_var(k); }
+}
+
+fn urlencoding(s: &str) -> String {
+    s.bytes().map(|b| if b.is_ascii_alphanumeric() || b"-_.~".contains(&b) { (b as char).to_string() } else { format!("%{b:02X}") }).collect()
 }

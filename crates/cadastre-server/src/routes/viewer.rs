@@ -19,7 +19,7 @@ pub struct GeoJsonQuery {
     pub bbox: Option<String>,
     /// Max features (default 3000).
     pub limit: Option<i64>,
-    /// Status filter: `posted` (default), `draft`, `submitted`, or `all`.
+    /// Status filter: `posted` (default), `draft`, `submitted`, `historic`, `archived`, `retired` (both), or `all`.
     pub status: Option<String>,
     /// Restrict to one job's parcels (uuid).
     pub job: Option<String>,
@@ -36,7 +36,9 @@ pub async fn parcels_geojson(
     let status_clause = match q.status.as_deref() {
         None | Some("posted") => " AND p.status = 'posted'".to_string(),
         Some("all") => String::new(),
-        Some(s @ ("draft" | "submitted")) => format!(" AND p.status = '{s}'"),
+        Some(s @ ("draft" | "submitted" | "historic" | "archived")) => format!(" AND p.status = '{s}'"),
+        // Retired shapes (Phase 4 history): replaced by a mutation, or archived.
+        Some("retired") => " AND p.status IN ('historic', 'archived')".to_string(),
         Some(_) => return Err(crate::error::AppError::BadRequest("invalid status".into())),
     };
     // Job is parsed as a uuid (so the inlined value is safe).
@@ -77,22 +79,68 @@ pub async fn parcels_geojson(
     ))
 }
 
-/// Beacons as a WGS84 GeoJSON FeatureCollection (reprojected from 32632).
+/// Query params for the beacons GeoJSON endpoint.
+#[derive(Debug, Deserialize)]
+pub struct BeaconGeoJsonQuery {
+    /// Optional WGS84 bbox `minlon,minlat,maxlon,maxlat` to limit to the current view.
+    pub bbox: Option<String>,
+    /// `true`: control points only; `false`: survey beacons only; absent: both.
+    pub control: Option<bool>,
+    /// Max features (default and maximum 20000).
+    pub limit: Option<i64>,
+}
+
+/// Beacons as a WGS84 GeoJSON FeatureCollection (reprojected from 32632), ordered by number.
 pub async fn beacons_geojson(
     State(state): State<AppState>,
+    Query(q): Query<BeaconGeoJsonQuery>,
 ) -> ApiResult<([(axum::http::HeaderName, &'static str); 1], String)> {
-    let sql = "SELECT COALESCE(json_build_object('type','FeatureCollection','features', COALESCE(json_agg(f), '[]'::json))::text, \
-               '{\"type\":\"FeatureCollection\",\"features\":[]}') \
-         FROM (SELECT json_build_object('type','Feature', \
+    let limit = q.limit.unwrap_or(20000).clamp(1, 20000);
+    let control_clause = match q.control {
+        Some(true) => " AND is_control",
+        Some(false) => " AND NOT is_control",
+        None => "",
+    };
+    let bbox_clause = match q.bbox.as_deref().and_then(parse_bbox) {
+        Some((a, b, c, d)) => format!(" AND geom && ST_Transform(ST_MakeEnvelope({a},{b},{c},{d},4326),32632)"),
+        None => String::new(),
+    };
+    let sql = format!(
+        "SELECT COALESCE(json_build_object('type','FeatureCollection','features', COALESCE(json_agg(f ORDER BY n), '[]'::json))::text, \
+                '{{\"type\":\"FeatureCollection\",\"features\":[]}}') \
+         FROM (SELECT number AS n, json_build_object('type','Feature', \
                  'geometry', ST_AsGeoJSON(ST_Transform(geom,4326))::json, \
                  'properties', json_build_object('id', id, 'number', number, 'is_control', is_control, \
                      'easting', round(ST_X(geom)::numeric,3), 'northing', round(ST_Y(geom)::numeric,3))) AS f \
-               FROM cadastre.beacon WHERE geom IS NOT NULL LIMIT 20000) s";
-    let json: String = sqlx::query(sql).fetch_one(&state.pool).await?.get(0);
+               FROM cadastre.beacon WHERE geom IS NOT NULL{control_clause}{bbox_clause} \
+               ORDER BY is_control DESC, number LIMIT {limit}) s"
+    );
+    let json: String = sqlx::query(&sql).fetch_one(&state.pool).await?.get(0);
     Ok((
         [(axum::http::header::CONTENT_TYPE, "application/json")],
         json,
     ))
+}
+
+/// Query params for the compact beacon list.
+#[derive(Debug, Deserialize)]
+pub struct BeaconCompactQuery {
+    /// `true`: control points only; `false`: survey beacons only; absent: both.
+    pub control: Option<bool>,
+}
+
+/// Every beacon as a compact list `{"fields":["number","easting","northing","is_control"],
+/// "rows":[["C6782A",492951.814,1088827.672,false],...]}` (EPSG:32632), so the map can show all
+/// of them at every scale; the browser projects them. Far smaller than GeoJSON (and gzipped).
+pub async fn beacons_compact(
+    State(state): State<AppState>,
+    Query(q): Query<BeaconCompactQuery>,
+) -> ApiResult<([(axum::http::HeaderName, &'static str); 1], String)> {
+    let sql = "SELECT json_build_object('fields', json_build_array('number','easting','northing','is_control'), \
+                 'rows', COALESCE(json_agg(json_build_array(number, round(ST_X(geom)::numeric, 3), round(ST_Y(geom)::numeric, 3), is_control) ORDER BY number), '[]'::json))::text \
+               FROM cadastre.beacon WHERE geom IS NOT NULL AND ($1::boolean IS NULL OR is_control = $1)";
+    let json: String = sqlx::query(sql).bind(q.control).fetch_one(&state.pool).await?.get(0);
+    Ok(([(axum::http::header::CONTENT_TYPE, "application/json")], json))
 }
 
 fn parse_bbox(s: &str) -> Option<(f64, f64, f64, f64)> {

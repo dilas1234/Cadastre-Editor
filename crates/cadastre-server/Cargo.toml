@@ -18,7 +18,7 @@ cadastre-import = { path = "../cadastre-import" }
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "signal", "net", "io-util", "time", "fs"] }
 axum = "0.8"
 tower = { version = "0.5", features = ["util"] }
-tower-http = { version = "0.6", features = ["trace", "cors"] }
+tower-http = { version = "0.6", features = ["trace", "cors", "compression-gzip"] }
 
 # Persistence. runtime-tokio with NO TLS backend: dev connects to Postgres over
 # localhost without TLS, and keeping the rustls/ring C-ish crypto stack out of the
@@ -61,6 +61,8 @@ sha2 = { version = "0.10", features = ["oid"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 thiserror = "2"
+# Aumentum Registry (LRS) SOAP responses (Phase 5).
+quick-xml = "0.37"
 
 [dev-dependencies]
 # RSA keypair generation for JWT verification tests.

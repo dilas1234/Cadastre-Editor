@@ -1,0 +1,249 @@
+{
+ "source": "Aumentum ParcelAttributeTableDefinition.xml (PRODUCTIONMC Desktop), ArcGISDomainDefinition",
+ "domains": {
+  "d_area_unit": [
+   {
+    "code": "1",
+    "description": "Acres"
+   },
+   {
+    "code": "2",
+    "description": "Square Meters"
+   },
+   {
+    "code": "3",
+    "description": "Square Feet"
+   },
+   {
+    "code": "4",
+    "description": "Hectares"
+   }
+  ],
+  "d_property_type": [
+   {
+    "code": "1",
+    "description": "Fractional Part"
+   },
+   {
+    "code": "2",
+    "description": "Govt. Facility"
+   },
+   {
+    "code": "3",
+    "description": "Not Applicable"
+   },
+   {
+    "code": "4",
+    "description": "Other"
+   },
+   {
+    "code": "5",
+    "description": "Parcel"
+   },
+   {
+    "code": "6",
+    "description": "Park"
+   },
+   {
+    "code": "7",
+    "description": "Road"
+   },
+   {
+    "code": "8",
+    "description": "Strata"
+   },
+   {
+    "code": "9",
+    "description": "Trail"
+   },
+   {
+    "code": "10",
+    "description": "Water"
+   }
+  ],
+  "d_use_type": [
+   {
+    "code": "1",
+    "description": "Apartments"
+   },
+   {
+    "code": "2",
+    "description": "Burial"
+   },
+   {
+    "code": "3",
+    "description": "Commercial"
+   },
+   {
+    "code": "4",
+    "description": "Industry"
+   },
+   {
+    "code": "5",
+    "description": "Hotel"
+   },
+   {
+    "code": "6",
+    "description": "Institutional"
+   },
+   {
+    "code": "7",
+    "description": "Port"
+   },
+   {
+    "code": "8",
+    "description": "Forest"
+   },
+   {
+    "code": "9",
+    "description": "Protected Area"
+   },
+   {
+    "code": "10",
+    "description": "Residential"
+   },
+   {
+    "code": "11",
+    "description": "Tourism"
+   }
+  ],
+  "d_ownership_type": [
+   {
+    "code": "1",
+    "description": "City-Village-Town"
+   },
+   {
+    "code": "2",
+    "description": "County"
+   },
+   {
+    "code": "3",
+    "description": "Indian tribe"
+   },
+   {
+    "code": "4",
+    "description": "International"
+   },
+   {
+    "code": "5",
+    "description": "Other"
+   },
+   {
+    "code": "6",
+    "description": "Private"
+   },
+   {
+    "code": "7",
+    "description": "State"
+   }
+  ],
+  "d_surveytype": [
+   {
+    "code": "1",
+    "description": "GPS"
+   },
+   {
+    "code": "2",
+    "description": "Compass"
+   },
+   {
+    "code": "3",
+    "description": "Other"
+   },
+   {
+    "code": "4",
+    "description": "Theodolite"
+   }
+  ],
+  "d_mutation_rollback": [
+   {
+    "code": "1",
+    "description": "Yes"
+   },
+   {
+    "code": "2",
+    "description": "No"
+   }
+  ],
+  "d_isStrata_flag": [
+   {
+    "code": "1",
+    "description": "Yes"
+   },
+   {
+    "code": "0",
+    "description": "No"
+   }
+  ],
+  "d_mutation_type": [
+   {
+    "code": "0",
+    "description": "None"
+   },
+   {
+    "code": "1",
+    "description": "Split"
+   },
+   {
+    "code": "2",
+    "description": "Merged"
+   },
+   {
+    "code": "3",
+    "description": "Adjusted"
+   },
+   {
+    "code": "4",
+    "description": "Free Mutation"
+   },
+   {
+    "code": "5",
+    "description": "COGO"
+   },
+   {
+    "code": "6",
+    "description": "Separated"
+   },
+   {
+    "code": "7",
+    "description": "Conflation"
+   }
+  ],
+  "d_linkageStatus": [
+   {
+    "code": "0",
+    "description": "Unlinked"
+   },
+   {
+    "code": "1",
+    "description": "Linked"
+   }
+  ],
+  "d_parcel_modification_type": [
+   {
+    "code": "1",
+    "description": "COGO"
+   },
+   {
+    "code": "2",
+    "description": "FCI"
+   },
+   {
+    "code": "3",
+    "description": "CADImport"
+   },
+   {
+    "code": "4",
+    "description": "Mutation-Split"
+   },
+   {
+    "code": "5",
+    "description": "Mutation-Merge"
+   },
+   {
+    "code": "6",
+    "description": "Mutation-Adjustment"
+   }
+  ]
+ }
+}

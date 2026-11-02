@@ -1,0 +1,63 @@
+{
+  "name": "plagis-pl68955-leku-du-kwang",
+  "source": "Real PLAGIS survey plan (Timzeep Geomatics, Oct 2026), Leku Du Kwang, Jos South LGA; Registry PL68955, UPIN PL000000023895. Bearings to the minute and distances to the cm as written on the plan; beacons C6783A, C6782A, R1271X, G7772B; stated area 864.4665 sq.m. Expected values computed independently from the plan figures. The plan's legs misclose by 5 mm (1:22,000); the area is of the traversed figure (864.4672), 0.0007 sq.m from the plan's 864.4665.",
+  "crs": "EPSG:32632",
+  "start": {
+    "x": 492923.863,
+    "y": 1088839.924
+  },
+  "stated_area": 864.4665,
+  "legs": [
+    {
+      "type": "line",
+      "bearing_deg": 113.66666666666667,
+      "distance": 30.52
+    },
+    {
+      "type": "line",
+      "bearing_deg": 201.2,
+      "distance": 27.59
+    },
+    {
+      "type": "line",
+      "bearing_deg": 289.1166666666667,
+      "distance": 29.6
+    },
+    {
+      "type": "line",
+      "bearing_deg": 19.466666666666665,
+      "distance": 29.99
+    }
+  ],
+  "expected": {
+    "vertices": [
+      {
+        "x": 492923.863,
+        "y": 1088839.924
+      },
+      {
+        "x": 492951.816155,
+        "y": 1088827.672814
+      },
+      {
+        "x": 492941.838933,
+        "y": 1088801.950001
+      },
+      {
+        "x": 492913.871263,
+        "y": 1088811.643786
+      },
+      {
+        "x": 492923.865683,
+        "y": 1088839.919424
+      }
+    ],
+    "area": 864.4672,
+    "perimeter": 117.7,
+    "closure": {
+      "misclosure_east": 0.002683,
+      "misclosure_north": -0.004576,
+      "linear_misclosure": 0.005305
+    }
+  }
+}

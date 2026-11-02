@@ -4,13 +4,18 @@ pub mod audit;
 pub mod beacons;
 pub mod catalog;
 pub mod editor;
+pub mod fci;
 pub mod fabric;
+pub mod gisviewer;
 pub mod health;
 pub mod import;
 pub mod jobs;
+pub mod mcservice;
 pub mod me;
+pub mod mutations;
 pub mod parcels;
 pub mod promote;
+pub mod registry;
 pub mod reports;
 pub mod sessions;
 pub mod survey;
@@ -19,6 +24,7 @@ pub mod tolerances;
 pub mod viewer;
 pub mod wf;
 pub mod wfadmin;
+pub mod wfbeacons;
 pub mod workflow;
 
 use axum::routing::{delete, get, post, put};
@@ -47,6 +53,7 @@ pub fn router(state: AppState) -> Router {
         .route("/api/v1/wf/jobs/{id}/assign", post(wf::assign))
         .route("/api/v1/wf/jobs/{id}/hold", post(wf::hold))
         .route("/api/v1/wf/jobs/{id}/editing", get(wf::get_editing).post(wf::start_editing))
+        .route("/api/v1/wf/jobs/{id}/editing/corners", get(wfbeacons::corners))
         .route("/api/v1/wf/jobs/{id}/area", put(wf::put_area).delete(wf::delete_area))
         .route("/api/v1/wf/jobs/{id}/area/{action}", post(wf::area_action))
         .route("/api/v1/wf/jobs/{id}/discard", post(wf::discard))
@@ -71,6 +78,7 @@ pub fn router(state: AppState) -> Router {
         .route("/api/v1/catalog/shapefile", get(catalog::shapefile))
         .route("/api/v1/parcels.geojson", get(viewer::parcels_geojson))
         .route("/api/v1/beacons.geojson", get(viewer::beacons_geojson))
+        .route("/api/v1/beacons.compact", get(viewer::beacons_compact))
         .route(
             "/api/v1/tolerances",
             get(tolerances::get_tolerances).put(tolerances::put_tolerances),
@@ -79,9 +87,33 @@ pub fn router(state: AppState) -> Router {
             "/api/v1/beacons",
             get(beacons::list_beacons).post(beacons::create_beacon),
         )
+        .route("/api/v1/beacons/search", get(beacons::search_beacons))
         .route("/api/v1/beacons/{id}", get(beacons::get_beacon))
         .route("/api/v1/parcels", get(parcels::list_parcels))
         .route("/api/v1/parcels/search", get(parcels::search_parcels))
+        .route("/api/v1/parcels/lineage", get(mutations::lineage))
+        .route("/api/v1/wf/jobs/{id}/mutations", get(mutations::list).post(mutations::create))
+        .route("/api/v1/wf/jobs/{id}/mutations/{group}", delete(mutations::cancel))
+        .route("/api/v1/wf/jobs/{id}/mutations/{group}/keep-upin", put(mutations::keep_upin))
+        .route("/api/v1/registry/links", get(registry::links))
+        .route("/api/v1/registry/status", get(registry::status))
+        .route("/api/v1/registry/sync", post(registry::sync_now))
+        // The Registry's job service, at Aumentum's path (Registry setting mcServiceAddress).
+        .route(mcservice::PATH, get(mcservice::get).post(mcservice::post))
+        // The Registry's map (Registry settings GISServer / LWAMapURL) and its link service.
+        .route(gisviewer::PAGE, get(gisviewer::page).post(gisviewer::page))
+        .route("/GISViewer/data/parcels", get(gisviewer::data))
+        .route(gisviewer::SERVICE, get(gisviewer::service_get).post(gisviewer::service))
+        .route("/api/v1/registry/reconcile", post(registry::reconcile_now))
+        .route("/api/v1/registry/find", get(registry::find))
+        .route("/api/v1/registry/parcels/{upin}/work", get(registry::parcel_work))
+        .route("/api/v1/registry/start-digitising", post(registry::start_digitising))
+        .route("/api/v1/registry/transactions/{number}", get(registry::transaction))
+        .route("/api/v1/registry/link", post(registry::link))
+        .route("/api/v1/registry/unlink", post(registry::unlink))
+        .route("/api/v1/registry/parcels/{upin}/events", get(registry::parcel_events))
+        .route("/api/v1/wf/jobs/{id}/registry/send-plan", post(registry::send_plan))
+        .route("/api/v1/wf/jobs/{id}/registry/sent", get(registry::sent_plans))
         .route(
             "/api/v1/parcels/{id}/attributes",
             get(parcels::get_parcel_attributes).put(parcels::put_parcel_attributes),
@@ -111,6 +143,8 @@ pub fn router(state: AppState) -> Router {
         .route("/api/v1/jobs/{id}/events", get(jobs::list_job_events))
         .route("/api/v1/jobs/{id}/post", post(jobs::post_job))
         .route("/api/v1/jobs/{id}/parcels", post(parcels::create_job_parcel))
+        .route("/api/v1/jobs/{id}/parcels/{parcel_id}", put(parcels::update_job_parcel).delete(parcels::delete_job_parcel))
+        .route("/api/v1/jobs/{id}/parcels/{parcel_id}/separate", post(parcels::separate_job_parcel))
         .route("/api/v1/jobs/{id}/parcels/{pid}/cut", post(parcels::cut_job_parcel))
         .route("/api/v1/jobs/{id}/report.pdf", get(reports::job_report))
         .route("/api/v1/jobs/{id}/siteplan.pdf", get(reports::site_plan))
@@ -123,6 +157,7 @@ pub fn router(state: AppState) -> Router {
         .route("/api/v1/import/preview", post(import::preview))
         .route("/api/v1/import/attributes", post(import::attributes))
         .route("/api/v1/jobs/{id}/import", post(import::import_into_job))
+        .route("/api/v1/jobs/{id}/import/feature-class", post(fci::import_feature_class))
         // Edit sessions and locks
         .route("/api/v1/sessions", post(sessions::open_session))
         .route(
@@ -141,6 +176,8 @@ pub fn router(state: AppState) -> Router {
             "/api/v1/sessions/{id}/locks/{lock_id}",
             delete(sessions::release_lock),
         )
+        // gzip for clients that ask (the map's GeoJSON and beacon lists shrink several-fold).
+        .layer(tower_http::compression::CompressionLayer::new())
         .layer(TraceLayer::new_for_http())
         .with_state(state)
 }
