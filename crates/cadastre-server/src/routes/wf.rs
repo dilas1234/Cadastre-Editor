@@ -751,6 +751,22 @@ pub struct WfCommitDto {
     pub parcel_numbers: Vec<String>,
     pub editing: WfEditingDto,
 }
+#[derive(Default, Deserialize, ToSchema)]
+pub struct WfFinishBody {
+    /// Also carry the job to its end task and complete it (default true). False stops at commit.
+    pub complete: Option<bool>,
+    pub comment: Option<String>,
+}
+#[derive(Serialize, ToSchema)]
+pub struct WfFinishDto {
+    /// UPINs given to the posted parcels.
+    pub parcel_numbers: Vec<String>,
+    /// The tasks the job passed through to reach (and leave) its commit task.
+    pub tasks_passed: Vec<WfTaskRefDto>,
+    /// Whether the job was completed.
+    pub completed: bool,
+    pub job: WfJobDto,
+}
 
 async fn is_commit_task(conn: &mut sqlx::PgConnection, task_id: Option<i32>) -> ApiResult<bool> {
     let Some(task_id) = task_id else { return Ok(false) };
@@ -983,6 +999,16 @@ pub async fn commit(State(state): State<AppState>, user: AuthUser, Path(id): Pat
     if !is_commit_task(&mut tx, cur).await? {
         return Err(AppError::Conflict("parcels are committed at the job's commit task (e.g. Commit Parcel)".into()));
     }
+    let numbers = commit_drafts(&mut tx, id).await?;
+    audit::append(&mut tx, &actor.label, "wf_commit", "wf_job_instance", Some(&id.to_string()), json!({ "parcel_numbers": numbers })).await?;
+    tx.commit().await?;
+    Ok(Json(WfCommitDto { parcel_numbers: numbers, editing: editing_info(&state, id).await? }))
+}
+
+/// Post a job's draft parcels to the fabric and return their UPINs. Enforces Aumentum's
+/// no-overlap rule (unless `editor.allow_overlap` = 1). The caller has already confirmed the job is
+/// at its commit task.
+async fn commit_drafts(tx: &mut sqlx::PgConnection, id: i32) -> ApiResult<Vec<String>> {
     let job_id: Option<uuid::Uuid> = sqlx::query_scalar("SELECT cadastre_job_id FROM cadastre.wf_job_instance WHERE id = $1").bind(id).fetch_one(&mut *tx).await?;
     let job_id = job_id.ok_or_else(|| AppError::Conflict("the job has no parcels to commit".into()))?;
     let drafts: i64 = sqlx::query_scalar("SELECT count(*) FROM cadastre.parcel WHERE job_id = $1 AND status = 'draft'").bind(job_id).fetch_one(&mut *tx).await?;
@@ -1003,11 +1029,219 @@ pub async fn commit(State(state): State<AppState>, user: AuthUser, Path(id): Pat
             return Err(AppError::Conflict(format!("parcels may not overlap the fabric (Editor.AllowOverlap = 0); overlaps: {}", clashes.join(", "))));
         }
     }
-    let numbers = crate::routes::jobs::post_drafts(&mut tx, job_id).await?;
+    let numbers = crate::routes::jobs::post_drafts(&mut *tx, job_id).await?;
     sqlx::query("UPDATE cadastre.wf_job_instance SET updated = now()::timestamp WHERE id = $1").bind(id).execute(&mut *tx).await?;
-    audit::append(&mut tx, &actor.label, "wf_commit", "wf_job_instance", Some(&id.to_string()), json!({ "parcel_numbers": numbers })).await?;
+    Ok(numbers)
+}
+
+/// The job type's commit task: the task in its graph whose steps carry the Commit Parcel tool.
+async fn commit_task_of(conn: &mut sqlx::PgConnection, job_type_id: i32) -> ApiResult<Option<i32>> {
+    Ok(sqlx::query_scalar(
+        "SELECT f.task_id FROM cadastre.wf_task_flow f \
+         JOIN cadastre.wf_task_step ts ON ts.task_id = f.task_id \
+         JOIN cadastre.wf_step s ON s.id = ts.step_id \
+         WHERE f.job_type_id = $1 AND EXISTS (SELECT 1 FROM unnest(s.commands) c WHERE upper(c) = upper($2)) \
+         ORDER BY f.task_id LIMIT 1",
+    )
+    .bind(job_type_id)
+    .bind(COMMIT_TOOL)
+    .fetch_optional(conn)
+    .await?)
+}
+
+/// Close the job's open instance of `task` (Aumentum stamps the task's end time and comment).
+async fn close_open_task(conn: &mut sqlx::PgConnection, id: i32, task: i32, comment: Option<&str>) -> ApiResult<()> {
+    sqlx::query(
+        "UPDATE cadastre.wf_task_instance SET ended = now()::timestamp, started = COALESCE(started, now()::timestamp), \
+         comment = COALESCE($3, comment) WHERE job_instance_id = $1 AND task_id = $2 AND ended IS NULL",
+    )
+    .bind(id).bind(task).bind(comment)
+    .execute(conn)
+    .await?;
+    Ok(())
+}
+
+/// Move the job onto `next`, opening a task instance for it and assigning its default principal.
+async fn open_next_task(conn: &mut sqlx::PgConnection, id: i32, job_type_id: i32, next: i32, assignee: Option<i32>) -> ApiResult<()> {
+    sqlx::query("UPDATE cadastre.wf_job_instance SET current_task_id = $2, assigned_sid = $3, status = 2, updated = now()::timestamp WHERE id = $1")
+        .bind(id).bind(next).bind(assignee).execute(&mut *conn).await?;
+    sqlx::query("INSERT INTO cadastre.wf_task_instance (job_instance_id, job_type_id, task_id, sid, assigned) VALUES ($1, $2, $3, $4, now()::timestamp)")
+        .bind(id).bind(job_type_id).bind(next).bind(assignee).execute(&mut *conn).await?;
+    notify_assignment(conn, id, next, assignee).await?;
+    Ok(())
+}
+
+/// Fast-track a job from its current task straight to its commit task, post the drafts (allocating
+/// UPINs), and — unless `complete` is false — carry it on to its end task and complete it. This is
+/// the editor's one-click "post this parcel" for a seamless digitize-and-register flow; it applies
+/// the same rules as stepping through each task by hand (permissions, the no-overlap check, audit),
+/// all in one transaction.
+#[utoipa::path(post, path = "/api/v1/wf/jobs/{id}/finish", tag = "wf", request_body = WfFinishBody,
+    params(("id" = i32, Path, description = "Job instance id")),
+    responses((status = 200, body = WfFinishDto), (status = 409, description = "No draft, no commit task, or blocked")))]
+pub async fn finish(State(state): State<AppState>, user: AuthUser, Path(id): Path<i32>, Json(req): Json<WfFinishBody>) -> ApiResult<Json<WfFinishDto>> {
+    let actor = resolve_actor(&state, &user).await?;
+    let complete = req.complete.unwrap_or(true);
+    let mut tx = state.pool.begin().await?;
+    let row = sqlx::query(
+        "SELECT j.job_type_id, j.current_task_id, s.is_open FROM cadastre.wf_job_instance j \
+         JOIN cadastre.wf_job_status s ON s.code = j.status WHERE j.id = $1 FOR UPDATE OF j",
+    )
+    .bind(id)
+    .fetch_optional(&mut *tx)
+    .await?
+    .ok_or_else(|| AppError::NotFound(format!("job instance {id}")))?;
+    let (job_type_id, current, is_open): (i32, Option<i32>, bool) = (row.get(0), row.get(1), row.get(2));
+    if !is_open {
+        return Err(AppError::Conflict("the job is not open".into()));
+    }
+    let mut current = current.ok_or_else(|| AppError::Conflict("job has no current task".into()))?;
+
+    // There must be a parcel to post, and a commit task to post it at.
+    let drafts: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM cadastre.parcel p JOIN cadastre.wf_job_instance w ON w.cadastre_job_id = p.job_id WHERE w.id = $1 AND p.status = 'draft'",
+    )
+    .bind(id)
+    .fetch_one(&mut *tx)
+    .await?;
+    if drafts == 0 {
+        return Err(AppError::Conflict("draw a parcel before posting (no draft parcels to commit)".into()));
+    }
+    let commit_task = commit_task_of(&mut tx, job_type_id)
+        .await?
+        .ok_or_else(|| AppError::Conflict("this job type has no commit task configured".into()))?;
+
+    let (edges, end_task) = graph(&state.pool, job_type_id).await?;
+    let mut passed: Vec<i32> = Vec::new();
+
+    // Walk to the commit task, acting on each task the actor is permitted for. (Any refusal here
+    // rolls the whole transaction back, so nothing is posted until the walk succeeds.)
+    if current != commit_task {
+        let path = wfengine::path_to(&edges, current, commit_task)
+            .ok_or_else(|| AppError::Conflict("no path from the current task to the commit task".into()))?;
+        for next in path {
+            if !wfengine::may_act(&task_permitted(&mut tx, current).await?, &actor.sids, actor.admin) {
+                return Err(AppError::Forbidden(format!("{} may not act on a task on the way to commit", actor.label)));
+            }
+            close_open_task(&mut tx, id, current, req.comment.as_deref()).await?;
+            let assignee = default_assignee(&mut tx, next).await?;
+            open_next_task(&mut tx, id, job_type_id, next, assignee).await?;
+            audit::append(&mut tx, &actor.label, "wf_advance", "wf_job_instance", Some(&id.to_string()), json!({ "from_task": current, "to_task": next, "fast_track": true })).await?;
+            passed.push(next);
+            current = next;
+        }
+    }
+
+    // Post the drafts at the commit task.
+    if !wfengine::may_act(&task_permitted(&mut tx, current).await?, &actor.sids, actor.admin) {
+        return Err(AppError::Forbidden(format!("{} may not commit this job", actor.label)));
+    }
+    let numbers = commit_drafts(&mut tx, id).await?;
+    audit::append(&mut tx, &actor.label, "wf_commit", "wf_job_instance", Some(&id.to_string()), json!({ "parcel_numbers": numbers, "fast_track": true })).await?;
+
+    // Carry on to the end task and complete. Best-effort: the parcels are already posted, so a
+    // restricted downstream task simply leaves the job open there rather than failing the post.
+    let mut completed = false;
+    if complete {
+        if let Some(goal) = end_task.filter(|&g| !wfengine::can_complete(&edges, end_task, current) && g != current) {
+            if let Some(path) = wfengine::path_to(&edges, current, goal) {
+                for next in path {
+                    close_open_task(&mut tx, id, current, None).await?;
+                    let assignee = default_assignee(&mut tx, next).await?;
+                    open_next_task(&mut tx, id, job_type_id, next, assignee).await?;
+                    audit::append(&mut tx, &actor.label, "wf_advance", "wf_job_instance", Some(&id.to_string()), json!({ "from_task": current, "to_task": next, "fast_track": true })).await?;
+                    passed.push(next);
+                    current = next;
+                }
+            }
+        }
+        if wfengine::can_complete(&edges, end_task, current) {
+            close_open_task(&mut tx, id, current, req.comment.as_deref()).await?;
+            sqlx::query("UPDATE cadastre.wf_job_instance SET status = 3, ended = now()::timestamp, updated = now()::timestamp WHERE id = $1")
+                .bind(id)
+                .execute(&mut *tx)
+                .await?;
+            audit::append(&mut tx, &actor.label, "wf_complete", "wf_job_instance", Some(&id.to_string()), json!({ "from_task": current, "fast_track": true })).await?;
+            completed = true;
+        }
+    }
+
     tx.commit().await?;
-    Ok(Json(WfCommitDto { parcel_numbers: numbers, editing: editing_info(&state, id).await? }))
+    let detail = load_detail(&state, id).await?;
+    let tasks_passed = task_refs(&state.pool, &passed).await?;
+    Ok(Json(WfFinishDto { parcel_numbers: numbers, tasks_passed, completed, job: detail.job }))
+}
+
+/// A job's Registry linkage target (the property its LRS transaction serves). Parcels committed
+/// under the job inherit this (per-parcel capture overrides it field by field).
+#[derive(Default, Serialize, Deserialize, ToSchema)]
+pub struct WfLinkageDto {
+    /// The job's LRS transaction number (read-only, carried on the job).
+    pub lrs_transaction_number: Option<String>,
+    /// Registry property id (LRSID) committed parcels link to.
+    pub lrs_id: Option<String>,
+    pub property_number: Option<String>,
+    pub property_type: Option<String>,
+    pub plot: Option<String>,
+    pub block: Option<String>,
+    pub plan_number: Option<String>,
+    pub lga: Option<String>,
+    /// 1 = linked, 0 = pending.
+    pub linkage_status: Option<i16>,
+}
+
+/// Read the job's Registry linkage target.
+#[utoipa::path(get, path = "/api/v1/wf/jobs/{id}/linkage", tag = "wf", params(("id" = i32, Path, description = "Job instance id")),
+    responses((status = 200, body = WfLinkageDto)))]
+pub async fn get_linkage(State(state): State<AppState>, Path(id): Path<i32>) -> ApiResult<Json<WfLinkageDto>> {
+    let txn: Option<String> = sqlx::query_scalar("SELECT lrs_transaction_number FROM cadastre.wf_job_instance WHERE id = $1")
+        .bind(id).fetch_optional(&state.pool).await?.flatten();
+    let mut dto = WfLinkageDto { lrs_transaction_number: txn, ..Default::default() };
+    if let Some(r) = sqlx::query(
+        "SELECT lrs_id, property_number, property_type, plot, block, plan_number, lga, linkage_status \
+         FROM cadastre.wf_job_linkage WHERE wf_job_instance_id = $1",
+    )
+    .bind(id)
+    .fetch_optional(&state.pool)
+    .await?
+    {
+        dto.lrs_id = r.get("lrs_id");
+        dto.property_number = r.get("property_number");
+        dto.property_type = r.get("property_type");
+        dto.plot = r.get("plot");
+        dto.block = r.get("block");
+        dto.plan_number = r.get("plan_number");
+        dto.lga = r.get("lga");
+        dto.linkage_status = r.get("linkage_status");
+    }
+    Ok(Json(dto))
+}
+
+/// Set the job's Registry linkage target (requires `editor`).
+#[utoipa::path(put, path = "/api/v1/wf/jobs/{id}/linkage", tag = "wf", params(("id" = i32, Path, description = "Job instance id")),
+    request_body = WfLinkageDto, responses((status = 200, body = WfLinkageDto)))]
+pub async fn put_linkage(State(state): State<AppState>, user: AuthUser, Path(id): Path<i32>, Json(req): Json<WfLinkageDto>) -> ApiResult<Json<WfLinkageDto>> {
+    let actor = resolve_actor(&state, &user).await?;
+    let clean = |s: &Option<String>| s.as_ref().map(|x| x.trim().to_string()).filter(|x| !x.is_empty());
+    let mut tx = state.pool.begin().await?;
+    sqlx::query(
+        "INSERT INTO cadastre.wf_job_linkage \
+           (wf_job_instance_id, lrs_id, property_number, property_type, plot, block, plan_number, lga, linkage_status) \
+         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,COALESCE($9,1)) \
+         ON CONFLICT (wf_job_instance_id) DO UPDATE SET \
+           lrs_id = EXCLUDED.lrs_id, property_number = EXCLUDED.property_number, property_type = EXCLUDED.property_type, \
+           plot = EXCLUDED.plot, block = EXCLUDED.block, plan_number = EXCLUDED.plan_number, lga = EXCLUDED.lga, \
+           linkage_status = EXCLUDED.linkage_status, updated_at = now()",
+    )
+    .bind(id)
+    .bind(clean(&req.lrs_id)).bind(clean(&req.property_number)).bind(clean(&req.property_type))
+    .bind(clean(&req.plot)).bind(clean(&req.block)).bind(clean(&req.plan_number)).bind(clean(&req.lga))
+    .bind(req.linkage_status)
+    .execute(&mut *tx)
+    .await?;
+    audit::append(&mut tx, &actor.label, "wf_linkage_set", "wf_job_instance", Some(&id.to_string()), json!({ "lrs_id": clean(&req.lrs_id) })).await?;
+    tx.commit().await?;
+    get_linkage(State(state), Path(id)).await
 }
 
 #[derive(Deserialize, ToSchema)]
