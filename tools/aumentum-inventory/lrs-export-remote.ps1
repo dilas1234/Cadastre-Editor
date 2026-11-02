@@ -86,31 +86,52 @@ if (-not $SkipRegistry) {
     Write-Host ("Copying {0} files ({1:N1} MB) back to {2} ..." -f @($files).Count, ($total / 1MB), $root) -ForegroundColor Cyan
     # 4 MB per call: PowerShell 3/4 remoting refuses any object over 10 MB (an 8 MB chunk is
     # 10.7 MB as base64, which is what stopped the first run at the first jar).
-    $chunk = 4MB; $done = 0; $skipped = 0
+    $chunk = 4MB; $done = 0; $skipped = 0; $failed = New-Object Collections.Generic.List[string]
+    New-Item -ItemType Directory -Path (Join-Path $root 'registry') -Force | Out-Null
+    # The Registry's own list of the export's files, to check against what arrived.
+    [IO.File]::WriteAllLines((Join-Path $root 'registry\_remote-files.txt'), [string[]]@($files | % { "$($_.Len)|$($_.Rel)|$($_.Full)" }), $utf8)
     foreach ($f in $files) {
       $dest = Join-Path $root ('registry\' + $f.Rel)
       $done += $f.Len
-      if ((Test-Path $dest) -and (Get-Item $dest).Length -eq $f.Len) { $skipped++; continue }
-      New-Item -ItemType Directory -Path (Split-Path $dest -Parent) -Force | Out-Null
-      $out = [IO.File]::Create($dest)
       try {
-        for ($off = 0; $off -lt $f.Len; $off += $chunk) {
-          $b64 = Invoke-Command -Session $s -ArgumentList $f.Full, $off, $chunk -ScriptBlock {
-            param($p, $o, $n)
-            $fs = [IO.File]::OpenRead($p)
-            try { [void]$fs.Seek($o, 'Begin'); $buf = New-Object byte[] ([Math]::Min($n, $fs.Length - $o)); $read = $fs.Read($buf, 0, $buf.Length); [Convert]::ToBase64String($buf, 0, $read) }
-            finally { $fs.Close() }
+        if ((Test-Path -LiteralPath $dest) -and (Get-Item -LiteralPath $dest).Length -eq $f.Len) { $skipped++; continue }
+        New-Item -ItemType Directory -Path (Split-Path $dest -Parent) -Force | Out-Null
+        $out = [IO.File]::Create($dest)
+        try {
+          for ($off = 0; $off -lt [Math]::Max(1, $f.Len); $off += $chunk) {
+            $b64 = Invoke-Command -Session $s -ArgumentList $f.Full, $off, $chunk -ScriptBlock {
+              param($p, $o, $n)
+              $fs = [IO.File]::OpenRead($p)
+              try { [void]$fs.Seek($o, 'Begin'); $buf = New-Object byte[] ([Math]::Max(0, [Math]::Min($n, $fs.Length - $o))); $read = $fs.Read($buf, 0, $buf.Length); [Convert]::ToBase64String($buf, 0, $read) }
+              finally { $fs.Close() }
+            }
+            $bytes = [Convert]::FromBase64String($b64); $out.Write($bytes, 0, $bytes.Length)
           }
-          $bytes = [Convert]::FromBase64String($b64); $out.Write($bytes, 0, $bytes.Length)
-        }
-      } finally { $out.Close() }
-      if ((Get-Item $dest).Length -ne $f.Len) { throw "copy of $($f.Rel) is incomplete" }
-      Write-Host ("  {0,5:N1}%  {1}" -f (100.0 * $done / [Math]::Max(1, $total)), $f.Rel)
+        } finally { $out.Close() }
+        if ((Get-Item -LiteralPath $dest).Length -ne $f.Len) { throw "incomplete: $((Get-Item -LiteralPath $dest).Length) of $($f.Len) bytes" }
+        Write-Host ("  {0,5:N1}%  {1}" -f (100.0 * $done / [Math]::Max(1, $total)), $f.Rel)
+      } catch {
+        # One file that cannot be copied does not stop the rest; it is listed and reported.
+        $msg = "$($f.Rel) ($($f.Len) bytes): $($_.Exception.Message)"
+        $failed.Add($msg); Write-Host "  FAILED $msg" -ForegroundColor Red
+      }
     }
     if ($skipped) { Write-Host "  ($skipped files were already here complete)" -ForegroundColor DarkGray }
-    # Only after every file is here complete: remove the temp folder this export created there.
-    Invoke-Command -Session $s -ArgumentList $remoteDir -ScriptBlock { param($d) if ($d -like '*\lrs-export-*') { Remove-Item $d -Recurse -Force } }
-    Write-Host "Registry part done." -ForegroundColor Green
+    $errFile = Join-Path $root 'registry\copy-errors.txt'
+    if ($failed.Count) {
+      [IO.File]::WriteAllLines($errFile, [string[]]$failed, $utf8)
+      Write-Host "$($failed.Count) files could not be copied (listed in $errFile). The export stays on $Target in $remoteDir for another -Resume." -ForegroundColor Yellow
+    } else {
+      if (Test-Path $errFile) { Remove-Item $errFile }
+      # Only after every file is here complete: remove the temp folder this export created there.
+      Invoke-Command -Session $s -ArgumentList $remoteDir -ScriptBlock { param($d) if ($d -like '*\lrs-export-*') { Remove-Item $d -Recurse -Force } }
+      Write-Host "Registry part done." -ForegroundColor Green
+    }
+  }
+  catch {
+    # Whatever stops the Registry part, the PRODUCTIONMC part below still runs.
+    Write-Host "Registry part stopped: $($_.Exception.Message)" -ForegroundColor Red
+    [IO.File]::AppendAllText((Join-Path $root 'registry-part-error.txt'), "$(Get-Date -Format s) $($_.Exception.Message)`r`n$($_.ScriptStackTrace)`r`n", $utf8)
   }
   finally { if ($s) { Remove-PSSession $s } }
 }
@@ -122,7 +143,9 @@ if (-not $SkipLocal) {
   $report = New-Object Collections.Generic.List[string]
   $report.Add("Cadastre side of the Registry link on $env:COMPUTERNAME, $(Get-Date -Format s)")
 
+  # Each part on its own: one that fails is reported and the others still run.
   Write-Host "[a] AUMENTUM REGISTRY extension and the LRS client libraries ..." -ForegroundColor Cyan
+  try {
   $desk = @('C:\Program Files (x86)\AUMENTUM\CADASTRE\Desktop', 'C:\Program Files\AUMENTUM\CADASTRE\Desktop') | Where { Test-Path $_ } | Select -First 1
   if ($desk) {
     $ext = Join-Path $mc 'desktop'; New-Item -ItemType Directory -Path $ext -Force | Out-Null
@@ -131,9 +154,11 @@ if (-not $SkipLocal) {
     foreach ($f in (Get-ChildItem $desk -File | Where { $_.Extension -match '^\.(config|xml|settings)$' })) {
       [IO.File]::WriteAllText((Join-Path $ext $f.Name), (Mask ([IO.File]::ReadAllText($f.FullName))), $utf8); $report.Add("copied (masked) $($f.Name)")
     }
-  } else { $report.Add('Cadastre Desktop folder not found') }
+  } else { $report.Add('Cadastre Desktop folder not found (looked in C:\Program Files (x86)\AUMENTUM\CADASTRE\Desktop and C:\Program Files\AUMENTUM\CADASTRE\Desktop)'); Write-Host '  Cadastre Desktop folder not found' -ForegroundColor Yellow }
+  } catch { $m = "[a] stopped: $($_.Exception.Message)"; $report.Add($m); Write-Host "  $m" -ForegroundColor Red }
 
   Write-Host "[b] COM registrations of the desktop's commands (CLSID -> class) ..." -ForegroundColor Cyan
+  try {
   $rows = New-Object Collections.Generic.List[string]; $rows.Add('clsid|class|assembly|codebase|hive')
   foreach ($hive in 'Registry::HKEY_CLASSES_ROOT\CLSID', 'Registry::HKEY_CLASSES_ROOT\Wow6432Node\CLSID') {
     if (-not (Test-Path $hive)) { continue }
@@ -148,8 +173,10 @@ if (-not $SkipLocal) {
   }
   [IO.File]::WriteAllLines((Join-Path $mc 'com-commands.psv'), [string[]]$rows, $utf8)
   $report.Add("COM commands registered: $($rows.Count - 1)")
+  } catch { $m = "[b] stopped: $($_.Exception.Message)"; $report.Add($m); Write-Host "  $m" -ForegroundColor Red }
 
   Write-Host "[c] GISViewer (called back by the Registry) ..." -ForegroundColor Cyan
+  try {
   $gv = 'C:\inetpub\wwwroot\GISViewer'
   if (Test-Path $gv) {
     $gvOut = Join-Path $mc 'gisviewer'
@@ -170,7 +197,8 @@ if (-not $SkipLocal) {
     New-Item -ItemType Directory -Path $gvOut -Force | Out-Null
     [IO.File]::WriteAllLines((Join-Path $gvOut '_files.psv'), [string[]]$list, $utf8)
     $report.Add("GISViewer: $($files.Count) files listed")
-  } else { $report.Add('GISViewer folder not found') }
+  } else { $report.Add("GISViewer folder not found ($gv)"); Write-Host "  GISViewer folder not found ($gv)" -ForegroundColor Yellow }
+  } catch { $m = "[c] stopped: $($_.Exception.Message)"; $report.Add($m); Write-Host "  $m" -ForegroundColor Red }
   [IO.File]::WriteAllLines((Join-Path $mc 'productionmc-summary.txt'), [string[]]$report, $utf8)
   Write-Host "PRODUCTIONMC part done." -ForegroundColor Green
 }
