@@ -134,7 +134,7 @@ pub async fn page(RawQuery(q): RawQuery, headers: HeaderMap, body: Bytes) -> Res
                 "token": token, "user": u, "map": get("map"), "lang": get("lang"),                 "input": input, "extent": extent,
             });
             let init = init.to_string().replace("</", "<\\/");
-            Html(PAGE_HTML.replace("__INIT__", &init)).into_response()
+            ([("X-UA-Compatible", "IE=edge"), (header::CACHE_CONTROL.as_str(), "no-store")], Html(PAGE_HTML.replace("__INIT__", &init))).into_response()
         }
     }
 }
@@ -424,6 +424,13 @@ button { padding: 3px 8px; cursor: pointer; }
 </div>
 <div id="silverlightControl"></div>
 <input type="hidden" id="indexerEvents" value="">
+<input type="hidden" id="mapErrors" value="">
+<script>
+// Script errors, kept for the Registry simulator (and support) to read.
+window.onerror = function (msg, src, line) { try { var e = document.getElementById("mapErrors"); e.value += msg + " (" + String(src || "").split("/").pop() + ":" + line + "); "; } catch (x) {} };
+// IE11 lacks Number.isFinite, which proj4 uses.
+if (!Number.isFinite) { Number.isFinite = function (v) { return typeof v === "number" && isFinite(v); }; }
+</script>
 <script src="/editor/vendor/leaflet/leaflet.js"></script>
 <script src="/editor/vendor/proj4.js"></script>
 <script>
@@ -447,7 +454,12 @@ function text(s) { return String(s === null || s === undefined ? "" : s).replace
 $("who").innerHTML = text("Registry user: " + INIT.user + (INIT.map ? " · map: " + INIT.map : ""));
 
 var map = L.map("silverlightControl", { zoomControl: true }).setView([9.9, 8.9], 12);
-L.tileLayer("https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}", { maxZoom: 21, maxNativeZoom: 17, attribution: "Imagery &copy; Esri" }).addTo(map);
+// The background imagery comes from the internet. It is added once the page has loaded, so a PC
+// without internet (or a slow link) never holds up the page the Registry waits for.
+function addImagery() { L.tileLayer("https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}", { maxZoom: 21, maxNativeZoom: 17, attribution: "Imagery &copy; Esri" }).addTo(map); }
+if (document.readyState === "complete") addImagery();
+else if (window.addEventListener) window.addEventListener("load", addImagery, false);
+else window.attachEvent("onload", addImagery);
 function style(f) {
   var p = f.properties, s = sel[p.OBJECTID];
   return { color: s ? "#00d0ff" : (p.LinkageStatus === 1 ? "#3a86d6" : "#ff9f1a"), weight: s ? 3 : 1.5, fillOpacity: s ? 0.35 : 0.08 };

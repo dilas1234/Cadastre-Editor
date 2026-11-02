@@ -50,9 +50,9 @@ function Tag([string]$xml, [string]$name) {
   $m = [regex]::Match($xml, "<(?:\w+:)?$name(?:\s[^>]*)?>([^<]*)</(?:\w+:)?$name>")
   if ($m.Success) { [Net.WebUtility]::HtmlDecode($m.Groups[1].Value) } else { $null }
 }
-function Http([string]$Url, [string]$Method = 'GET', [string]$Body = $null, [string]$ContentType = 'text/xml; charset=utf-8', [hashtable]$Headers = @{}, $Cookies = $null) {
+function Http([string]$Url, [string]$Method = 'GET', [string]$Body = $null, [string]$ContentType = 'text/xml; charset=utf-8', [hashtable]$Headers = @{}, $Cookies = $null, [int]$TimeoutMs = 60000) {
   $req = [Net.HttpWebRequest]::Create($Url)
-  $req.Method = $Method; $req.Timeout = 60000; $req.Proxy = $null
+  $req.Method = $Method; $req.Timeout = $TimeoutMs; $req.Proxy = $null
   if ($Cookies) { $req.CookieContainer = $Cookies }
   foreach ($k in $Headers.Keys) { $req.Headers.Add($k, $Headers[$k]) }
   if ($Method -eq 'POST') {
@@ -182,13 +182,20 @@ if (-not $SkipMap -and $ticket) {
     $ready = $false; $t0 = Get-Date
     while (((Get-Date) - $t0).TotalSeconds -lt 90) {
       Start-Sleep -Milliseconds 500
-      if ($ie.Busy -or $ie.ReadyState -ne 4) { continue }
-      $ev = El 'indexerEvents'
+      $ev = $null; try { $ev = El 'indexerEvents' } catch {}
       if ($ev -and $ev.value -eq 'Map Ready') { $ready = $true; break }
     }
     $hasPage = [bool](El 'silverlightControl')
     Result 'Map page in IE' $hasPage $(if ($hasPage) { "silverlightControl present ($($ie.LocationURL))" } else { 'the page did not load: ' + $ie.LocationURL })
-    Result 'Map Ready' $ready $(if ($ready) { 'indexerEvents = "Map Ready"' } else { 'not within 90 s; if the page shows but stays empty, IE is blocking its scripts (IE Enhanced Security Configuration on this server); the Registry desktop PCs may differ' })
+    Result 'Map Ready' $ready $(if ($ready) { 'indexerEvents = "Map Ready"' } else { 'not within 90 s (details below)' })
+    # What IE made of the page: its document mode, the libraries, script errors, load state.
+    $diag = @()
+    try { $diag += 'document mode ' + (Doc).documentMode } catch {}
+    try { $diag += 'page state ' + (Doc).readyState } catch {}
+    foreach ($q in @('typeof L', 'typeof proj4', 'typeof doAction')) { try { $diag += $q + ' = ' + (Ask $q) } catch { $diag += "$q unreadable" } }
+    try { $errs = (El 'mapErrors').value; $diag += 'script errors: ' + $(if ($errs) { $errs } else { 'none' }) } catch {}
+    try { $r = Http 'https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer?f=json' 'GET' $null 'text/xml' @{} $null 10000; $diag += "internet imagery reachable from this server: HTTP $($r.Code)" } catch { $diag += 'internet imagery NOT reachable from this server (the map still works, without the photo background)' }
+    Say ('        ' + ($diag -join "`n        "))
     if ($ready) {
       Write-Host "`nThe map is open in Internet Explorer. Select the parcel(s) as the Registry admin would" -ForegroundColor Yellow
       Write-Host "(the UPIN's parcel is pre-selected; click to add or remove). Then come back here and press Enter." -ForegroundColor Yellow
