@@ -195,7 +195,7 @@ In the server's environment (`~/.config/cadastre/server.env` on the dev PC):
 | `CADASTRE_REGISTRY_USER` / `_PASSWORD` | The Registry account (Aumentum's MCServer used `admin`). |
 | `CADASTRE_REGISTRY_WRITE` | `1`: allow writing to the Registry on user action (send plan). |
 | `CADASTRE_REGISTRY_POLL_SECS` / `_RECONCILE_SECS` | Link check (60) and unlink check (900) intervals. |
-| `CADASTRE_MC_SERVICE_USER` / `_PASSWORD` | The account the Registry signs in with to the job service. It must equal the Registry's `multicadastre` `mcUserName` / `mcPassword`. **Set on 2026-11-02 from `.env` as `Administrator@plagis.com`, but the Registry sends `administrator`**: make the two names equal (here or in the Registry) before cut-over. Without that the Registry is refused. |
+| `CADASTRE_MC_SERVICE_USER` / `_PASSWORD` | The account the Registry signs in with to the job service. It must equal the Registry's `multicadastre` `mcUserName` / `mcPassword`. Set on 2026-11-02 from `.env`: `administrator`, the Registry's `mcUserName`. Checked: `Authenticate` accepts it and refuses a wrong password. The password must equal the Registry's `mcPassword`. |
 | `CADASTRE_GISVIEWER_OPEN` | `1` opens the Registry's map without a ticket. Development only. |
 | `CADASTRE_REGISTRY_CADASTRE_LINKING` | `1` re-enables linking from the Cadastre (off: PLAGIS links in the Registry). |
 
@@ -231,7 +231,7 @@ Aumentum's parcels only.
 | **The Registry's map** (where the admin links) | Built (§3.3a) from the decompiled `MapWorkerControl`. Tested as the Registry drives it, and the ticket check was tried live. The Registry desktop has not opened it yet. After §5 step 3, link one test file first and check the parcel and the Registry property. | Built; first Registry trial to do |
 | **Job service vs Aumentum** | Checked against `MCAdminWebSite.dll` and corrected (2026-11-02): unassigned start, priority, RejectJob discards the job's edits, status wording, job type answers, exact transaction match. BatchUpdate / points live in MCServer (not captured). | Done, except BatchUpdate's format |
 | **Title deed template parity**: Aumentum's `Plan_.mxd` / `PSG_Plan_.mxd` layout, print, and sending the plan straight from it. | Phase 6 (deed plans). Today the template is the site plan PDF; the plan image is attached and sent. | Planned |
-| `CADASTRE_MC_SERVICE_USER` / `_PASSWORD` | Administrator copies the Registry's `mcUserName` / `mcPassword`. | To do |
+| `CADASTRE_MC_SERVICE_USER` / `_PASSWORD` | Set to `administrator` (2026-11-02); the password must equal the Registry's `mcPassword`. | Done |
 | Registry server clock (+19 min) | IT. | To do |
 | RBAC: assigning linked jobs to staff; digitising / title deed dashboards | Later phase. | Planned |
 | Plot / Block literal values (`plotNumber` / `blockNumber`) | PLAGIS may change `GISUpdatedFields` in the Registry; this Cadastre follows. | Decision for PLAGIS |
