@@ -1,0 +1,8 @@
+lrs-export.ps1 against test/lrs-fixture.sql, then tools/import/load-lrs-copy.sh into LRS43_COPY:
+schema: 12 tables, PK/identity kept, ix_su_upin (INCLUDE suid), 1 FK (WITH NOCHECK), view tqb_transaction_type
+rows: lr_dictionary 6, lr_setting 2, lr_spatial_unit 2, lr_launit 1, lr_launit_spatial_unit 1, lr_transaction 2,
+      lr_transaction_launit 1, lr_mc_job 1, lr_tempcounter 1 (Id 5 kept), lr_payment 1, lr_address 1 of 2 (property only)
+      lr_person: structure only, 0 rows
+values identical byte for byte, incl. 'a|b' CRLF 'c', N'B1 Ọ̀gbọ́mọ̀ṣọ́ é', datetime .347, NULLs
+NULL in the copy (never exported): lr_spatial_unit.note/comments, lr_transaction.inscription/comments/reg_initials,
+      lr_payment.bank_name/account_number; every '... must not be exported' fixture value
