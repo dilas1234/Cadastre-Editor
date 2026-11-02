@@ -51,6 +51,8 @@ pub fn router(state: AppState) -> Router {
         .route("/api/v1/wf/jobs/{id}/area/{action}", post(wf::area_action))
         .route("/api/v1/wf/jobs/{id}/discard", post(wf::discard))
         .route("/api/v1/wf/jobs/{id}/commit", post(wf::commit))
+        .route("/api/v1/wf/jobs/{id}/finish", post(wf::finish))
+        .route("/api/v1/wf/jobs/{id}/linkage", get(wf::get_linkage).put(wf::put_linkage))
         .route("/api/v1/wf/jobs/{id}/end", post(wf::end_job))
         .route("/api/v1/wf/jobs/{id}/files", get(wfadmin::list_files)
             .post(wfadmin::upload_file).layer(axum::extract::DefaultBodyLimit::max(50 * 1024 * 1024)))
@@ -80,6 +82,10 @@ pub fn router(state: AppState) -> Router {
         .route("/api/v1/beacons/{id}", get(beacons::get_beacon))
         .route("/api/v1/parcels", get(parcels::list_parcels))
         .route("/api/v1/parcels/search", get(parcels::search_parcels))
+        .route(
+            "/api/v1/parcels/{id}/attributes",
+            get(parcels::get_parcel_attributes).put(parcels::put_parcel_attributes),
+        )
         // Live survey check (FR-COG-02/03)
         .route("/api/v1/survey/check", post(survey::check_survey))
         // The 35 computation tools (COGO, curves, area, transformations, geodetic)
@@ -105,6 +111,7 @@ pub fn router(state: AppState) -> Router {
         .route("/api/v1/jobs/{id}/events", get(jobs::list_job_events))
         .route("/api/v1/jobs/{id}/post", post(jobs::post_job))
         .route("/api/v1/jobs/{id}/parcels", post(parcels::create_job_parcel))
+        .route("/api/v1/jobs/{id}/parcels/{pid}/cut", post(parcels::cut_job_parcel))
         .route("/api/v1/jobs/{id}/report.pdf", get(reports::job_report))
         .route("/api/v1/jobs/{id}/siteplan.pdf", get(reports::site_plan))
         // Audit log (NFR-07/11)

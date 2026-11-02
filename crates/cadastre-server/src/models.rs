@@ -224,6 +224,72 @@ pub struct NewParcel {
     pub geometry: serde_json::Value,
     /// Area stated on the plan (m²), optional.
     pub stated_area: Option<f64>,
+    /// Property-document attributes to attach when this parcel is committed, optional.
+    #[serde(default)]
+    pub attributes: Option<ParcelAttributesInput>,
+}
+
+/// Property-document attributes captured for a draft parcel (Aumentum ParcelAttributeTable fields
+/// the surveyor fills in). Written into `cadastre.parcel_attribute`, keyed by UPIN, at commit.
+#[derive(Clone, Debug, Default, Deserialize, ToSchema)]
+pub struct ParcelAttributesInput {
+    /// Registry property number.
+    pub property_number: Option<String>,
+    /// Property type (e.g. residential/commercial), as the Registry records it.
+    pub property_type: Option<String>,
+    /// Plot number.
+    pub plot: Option<String>,
+    /// Block number.
+    pub block: Option<String>,
+    /// Location / address text.
+    pub location: Option<String>,
+    /// Survey plan number.
+    pub plan_number: Option<String>,
+    /// Local Government Area.
+    pub lga: Option<String>,
+    /// Parcel name/label.
+    pub parcel_name: Option<String>,
+    /// Area unit code (Aumentum), optional.
+    pub area_unit: Option<i16>,
+    /// Surveyor-General reference.
+    pub surveyor_general: Option<String>,
+    /// Parcel status (Aumentum: Active, etc.).
+    pub status: Option<String>,
+    /// Registry property id (LRSID) to link to; usually inherited from the job.
+    pub lrs_id: Option<String>,
+}
+
+impl ParcelAttributesInput {
+    /// Trim empty strings to `None` so blanks from the form are stored as NULL.
+    pub fn cleaned(mut self) -> Self {
+        fn clean(v: &mut Option<String>) {
+            if let Some(s) = v {
+                if s.trim().is_empty() {
+                    *v = None;
+                } else {
+                    *v = Some(s.trim().to_string());
+                }
+            }
+        }
+        for f in [
+            &mut self.property_number, &mut self.property_type, &mut self.plot, &mut self.block,
+            &mut self.location, &mut self.plan_number, &mut self.lga, &mut self.parcel_name,
+            &mut self.surveyor_general, &mut self.status, &mut self.lrs_id,
+        ] {
+            clean(f);
+        }
+        self
+    }
+    /// Whether anything was actually entered.
+    pub fn has_values(&self) -> bool {
+        self.area_unit.is_some()
+            || [
+                &self.property_number, &self.property_type, &self.plot, &self.block, &self.location,
+                &self.plan_number, &self.lga, &self.parcel_name, &self.surveyor_general, &self.status, &self.lrs_id,
+            ]
+            .iter()
+            .any(|v| v.is_some())
+    }
 }
 
 /// Query parameters for parcel search (FR-VIEW).

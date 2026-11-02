@@ -32,6 +32,42 @@ pub fn can_complete(edges: &[Edge], end_task_id: Option<i32>, current: i32) -> b
     end_task_id == Some(current) || edges.iter().any(|e| e.task_id == current && e.next_task_id.is_none())
 }
 
+/// The task hops of the shortest directed path from `start` (exclusive) to `goal` (inclusive), or
+/// `None` if `goal` is unreachable. `start == goal` yields an empty path. Used to fast-track a job
+/// straight to its commit task (or on to its end) without the user stepping through each task.
+pub fn path_to(edges: &[Edge], start: i32, goal: i32) -> Option<Vec<i32>> {
+    use std::collections::{BTreeMap, VecDeque};
+    if start == goal {
+        return Some(vec![]);
+    }
+    let mut prev: BTreeMap<i32, i32> = BTreeMap::new();
+    let mut seen: BTreeSet<i32> = BTreeSet::from([start]);
+    let mut queue: VecDeque<i32> = VecDeque::from([start]);
+    while let Some(cur) = queue.pop_front() {
+        for next in next_tasks(edges, cur) {
+            if !seen.insert(next) {
+                continue;
+            }
+            prev.insert(next, cur);
+            if next == goal {
+                let mut path = vec![goal];
+                let mut c = goal;
+                while let Some(&p) = prev.get(&c) {
+                    if p == start {
+                        break;
+                    }
+                    path.push(p);
+                    c = p;
+                }
+                path.reverse();
+                return Some(path);
+            }
+            queue.push_back(next);
+        }
+    }
+    None
+}
+
 /// What a request to advance a job resolves to.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Advance {
@@ -133,6 +169,17 @@ mod tests {
         assert_eq!(next_tasks(&g, 10), vec![12, 13]); // branch: plot first, or straight to the plan
         assert_eq!(next_tasks(&g, 14), vec![9, 13]); // review: commit, or back to plotting
         assert_eq!(next_tasks(&g, 12), Vec::<i32>::new());
+    }
+
+    #[test]
+    fn path_to_takes_the_shortest_route_to_the_commit_task_and_on_to_the_end() {
+        let g = deed_plan_v2();
+        // Plot(13) -> Review(14) -> Commit(9); the hops exclude the start, include the goal.
+        assert_eq!(path_to(&g, 13, 9), Some(vec![14, 9]));
+        assert_eq!(path_to(&g, 9, 9), Some(vec![])); // already there
+        assert_eq!(path_to(&g, 9, 12), Some(vec![12])); // commit -> end
+        assert_eq!(path_to(&g, 10, 9), Some(vec![13, 14, 9])); // from the start task
+        assert_eq!(path_to(&g, 12, 9), None); // the end task reaches nothing
     }
 
     #[test]

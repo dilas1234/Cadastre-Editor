@@ -67,6 +67,7 @@ const ICON_PATHS = {
   sketchTool: '<path d="M2 14l1-3.5L11 2.5l2.5 2.5-8 8z" fill="#f1c64c" stroke="#7a5d10"/><path d="M9.5 4l2.5 2.5" stroke="#7a5d10"/><rect x="1.2" y="12.4" width="2.4" height="2.4" fill="#2a2" stroke="#063"/>',
   editTool: '<path d="M3 2l9 4.6-4.1 1.2 2.6 4.3-1.9 1-2.6-4.3L3 12.3z" fill="#111" stroke="#111"/>',
   trace: '<path d="M2 11c3-5 9-5 12 0" stroke="#c22" stroke-width="1.5" fill="none" stroke-dasharray="2 1.5"/><circle cx="2" cy="11" r="1.6" fill="#2a2" stroke="#063"/><circle cx="14" cy="11" r="1.6" fill="#2a2" stroke="#063"/>',
+  cutPolygons: '<path d="M2 3l6 5 6-5" fill="none"/><path d="M3 10.5l10-6M3 5.5l10 6" stroke="#444" stroke-width="1" fill="none" stroke-dasharray="2 1.2"/><circle cx="3.2" cy="4.6" r="1.8" fill="none" stroke="#b02a1a" stroke-width="1.2"/><circle cx="3.2" cy="11.4" r="1.8" fill="none" stroke="#b02a1a" stroke-width="1.2"/><path d="M4.6 5.6l8 4.8M4.6 10.4l8-4.8" stroke="#b02a1a" stroke-width="1.3"/>',
   createFeatures: '<rect x="1.5" y="1.5" width="9" height="9" fill="#e8c86a" stroke="#806010"/><path d="M4 8l1-3.5 3.5-1 1 3.5z" fill="#fff" stroke="#806010"/><path d="M12.5 8v6M9.5 11h6" stroke="#1a8a2a" stroke-width="1.8"/>',
   sketchProps: '<rect x="1.5" y="1.5" width="13" height="13" fill="#fff" stroke="#555"/><path d="M1.5 6h13M1.5 10.5h13M6 1.5v13" stroke="#ccc"/><circle cx="3.7" cy="3.7" r="1.3" fill="#2a2"/>',
   finishSketch: '<path d="M2 10l3-6 5-1 3 5-2 5z" fill="#e8f5e9" stroke="#2e7d32"/><path d="M5 9l2 2 4-4.5" stroke="#2e7d32" stroke-width="1.8" fill="none"/>',
