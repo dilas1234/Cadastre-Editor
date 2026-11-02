@@ -169,3 +169,16 @@ non-GIS files (PDF, Office, `Thumbs.db`) hidden; shapefiles carry their geometry
 `.shp` header); TIFF/BigTIFF rasters expand into `Band_n` (band count read from the header only —
 rasters on the share exceed 100 GB). Paths are confined to the configured roots (`..`, absolute
 paths and drive letters are rejected). The server's service account needs read access to the share.
+
+## Registry integration (Phase 5)
+
+The Cadastre ↔ Aumentum Registry link is covered in [registry-integration.md](registry-integration.md):
+- the flow;
+- how Aumentum did it;
+- the link sync;
+- the Registry's job service (`LRSWebServices.asmx`);
+- sending plans back;
+- the Registry tab;
+- configuration and cut-over.
+
+Mutation rollback, deferred by PLAGIS, is covered in [rollback-report.md](rollback-report.md).
