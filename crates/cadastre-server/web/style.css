@@ -269,3 +269,7 @@ table.legs tr.selrow td { background: #fff6cf; }
 .regBadge { position: absolute; top: -3px; right: -4px; min-width: 14px; height: 14px; padding: 0 3px; border-radius: 7px;
   background: #d08000; color: #fff; font-size: 10px; line-height: 14px; text-align: center; font-weight: bold; }
 .regBadge.inline { position: static; display: inline-block; margin-left: 6px; }
+.regRow.gone { opacity: .6; border-left: 3px solid #999; }
+.regTbl { width: 100%; border-collapse: collapse; font-size: 11px; margin: 2px 0 4px; }
+.regTbl th, .regTbl td { text-align: left; padding: 1px 4px; border-bottom: 1px solid var(--border, #ddd); white-space: nowrap; }
+#regBody { overflow-y: auto; }

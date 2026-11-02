@@ -41,6 +41,7 @@ const ICON_PATHS = {
   options: '<rect x="2" y="2.5" width="12" height="11" fill="#fff" stroke="#555"/><path d="M4 5.5h8M4 8h8M4 10.5h5" stroke="#555"/>',
   tasks: '<rect x="2.5" y="1.5" width="11" height="13" fill="#fff" stroke="#555"/><path d="M4.5 5l1.2 1.2L8 4M4.5 9l1.2 1.2L8 8" stroke="#1a8a2a" stroke-width="1.3" fill="none"/><path d="M9.5 5.2h2.5M9.5 9.2h2.5" stroke="#555"/>',
   // Aumentum-style cadastre toolbar
+  registry: '<path d="M2 6.5 8 2.5l6 4z" fill="#9db7d8" stroke="#2c5b8f"/><path d="M3.5 7.5v5M6.5 7.5v5M9.5 7.5v5M12.5 7.5v5" stroke="#2c5b8f" stroke-width="1.5"/><path d="M2 13.5h12" stroke="#2c5b8f" stroke-width="1.5"/>',
   jobOpen: '<path d="M1.5 4.5h5l1.5 1.5h6.5v8.5h-13z" fill="#f2cf5b" stroke="#a07812"/><path d="M4 9h8M4 11.5h6" stroke="#a07812"/>',
   jobSubmit: '<path d="M2 8l4 4 8-8" stroke="#1a8a2a" stroke-width="2.4" fill="none"/>',
   jobReview: '<circle cx="6.5" cy="6.5" r="4" fill="#fff" stroke="#355" stroke-width="1.4"/><path d="M9.5 9.5l4.5 4.5" stroke="#355" stroke-width="2"/><path d="M4.5 6.5l1.4 1.4 2.5-2.5" stroke="#1a8a2a" stroke-width="1.2" fill="none"/>',

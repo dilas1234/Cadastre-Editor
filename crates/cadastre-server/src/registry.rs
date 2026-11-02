@@ -28,8 +28,9 @@
 //! * A property may be linked to several parcels (e.g. PLT00000136 -> 6 UPINs), so LRSID is not
 //!   unique.
 //!
-//! Link and unlink are refused while the property's transaction is Completed (Aumentum log,
-//! 2017-05-10: the message in [`LinkError::TransactionClosed`]) or Withdrawn.
+//! Link, unlink and sending a plan are refused unless the transaction is Active (lodged): Aumentum
+//! refuses Withdrawn, Postponed, Completed and Rejected (decompiled `IsTransactionStatusAllowed`;
+//! the message is the one in its log, [`LinkError::TransactionClosed`]).
 
 use chrono::NaiveDateTime;
 
@@ -154,6 +155,43 @@ pub fn registry_updates(
     retrieved_fields.iter().map(|m| (m.source.clone(), parcel_field(&m.target))).collect()
 }
 
+/// Aumentum's `LinkageFields` setting (`upin:UPIN;LRSID:suid,PropertyNumber:refnum,...`):
+/// before `;` the Registry property fields written from the parcel (`lrsField:gisField`), after it
+/// the parcel fields written from the property (`gisField:lrsField`). Both as (registry, parcel).
+pub fn parse_linkage_fields(setting: &str) -> (Vec<FieldMap>, Vec<FieldMap>) {
+    let mut parts = setting.splitn(2, ';');
+    let to_registry = parts.next().map(parse_field_map).unwrap_or_default();
+    let to_parcel = parts.next().map(|p| parse_field_map(p).into_iter().map(|m| FieldMap { source: m.target, target: m.source }).collect()).unwrap_or_default();
+    (to_registry, to_parcel)
+}
+
+/// A link made from the Cadastre (Aumentum `LinkageManager.LinkParcel`): the parcel fields it
+/// writes from the property. Each Registry name is looked up in the property's columns ignoring
+/// case (Aumentum reads a DataTable row); a name the row lacks (`plotNumber`) is skipped, as
+/// Aumentum skipped it ("Cannot retrieve the value of 'plotNumber' from Registry"). Empty values are
+/// skipped too. Then LinkageStatus 1 and LinkageDate (yyyy-MM-dd, as every stored date is).
+pub fn cadastre_link_updates(to_parcel: &[FieldMap], property: &[(&str, Option<String>)], today: chrono::NaiveDate) -> Vec<(String, Option<String>)> {
+    let mut out: Vec<(String, Option<String>)> = to_parcel
+        .iter()
+        .filter_map(|m| {
+            let v = property.iter().find(|(k, _)| k.eq_ignore_ascii_case(&m.source))?.1.clone()?;
+            (!v.trim().is_empty()).then(|| (m.target.clone(), Some(v)))
+        })
+        .collect();
+    out.push(("LinkageStatus".into(), Some("1".into())));
+    out.push(("LinkageDate".into(), Some(today.format("%Y-%m-%d").to_string())));
+    out
+}
+
+/// An unlink made from the Cadastre: every linked parcel field cleared, LinkageStatus 0,
+/// LinkageDate cleared (Aumentum writes empty values).
+pub fn cadastre_unlink_updates(to_parcel: &[FieldMap]) -> Vec<(String, Option<String>)> {
+    let mut out: Vec<(String, Option<String>)> = to_parcel.iter().map(|m| (m.target.clone(), None)).collect();
+    out.push(("LinkageStatus".into(), Some("0".into())));
+    out.push(("LinkageDate".into(), None));
+    out
+}
+
 /// A Registry transaction status (`LRSAdmin.lr_dictionary`, category of `transaction_status`).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct TransactionStatus {
@@ -161,10 +199,9 @@ pub struct TransactionStatus {
     pub label: String,
 }
 
-/// Statuses that close a transaction to link/unlink. `transaction_completed` is the code the
-/// Registry's own queries use (`LRSIntegrationQueryDefinition` E_TRANSDOCPROPEXCOMPLETED);
-/// the Withdrawn code is checked against `lr_dictionary` from the Registry export.
-pub const CLOSED_STATUS_CODES: &[&str] = &["transaction_completed", "transaction_withdrawn"];
+/// Statuses that close a transaction to link, unlink and sending a plan: Aumentum's
+/// `LinkageManager.IsTransactionStatusAllowed` list, verbatim (only Active / lodged passes).
+pub const CLOSED_STATUS_CODES: &[&str] = &["transaction_withdrawn", "transaction_postponed", "transaction_completed", "transaction_rejected"];
 
 #[derive(Clone, Debug, PartialEq, Eq, thiserror::Error)]
 pub enum LinkError {
@@ -245,6 +282,23 @@ mod tests {
     }
 
     #[test]
+    fn cadastre_side_link_and_unlink_follow_linkage_fields() {
+        let (to_reg, to_parcel) = parse_linkage_fields("upin:UPIN;LRSID:suid,PropertyNumber:refnum,Plot:plotNumber,Block:blockNumber");
+        assert_eq!(to_reg, vec![FieldMap { source: "upin".into(), target: "UPIN".into() }], "Registry upin <- parcel UPIN");
+        assert_eq!(to_parcel.iter().map(|m| (m.source.as_str(), m.target.as_str())).collect::<Vec<_>>(),
+            vec![("suid", "LRSID"), ("refnum", "PropertyNumber"), ("plotNumber", "Plot"), ("blockNumber", "Block")]);
+        let prop = [("SuID", Some("PLT1".to_string())), ("Refnum", Some("PL9".to_string())), ("LotNumber", Some("12".to_string())), ("BlockNumber", Some("B".to_string()))];
+        let u = cadastre_link_updates(&to_parcel, &prop, chrono::NaiveDate::from_ymd_opt(2026, 11, 2).unwrap());
+        let s = |v: &str| Some(v.to_string());
+        assert_eq!(u, vec![("LRSID".into(), s("PLT1")), ("PropertyNumber".into(), s("PL9")), ("Block".into(), s("B")),
+            ("LinkageStatus".into(), s("1")), ("LinkageDate".into(), s("2026-11-02"))], "plotNumber is not a property column: skipped");
+        let un = cadastre_unlink_updates(&to_parcel);
+        assert_eq!(un.len(), 6);
+        assert!(un.iter().any(|(k, v)| k == "LinkageStatus" && v.as_deref() == Some("0")));
+        assert!(un.iter().any(|(k, v)| k == "LRSID" && v.is_none()));
+    }
+
+    #[test]
     fn unlink_only_clears_the_status() {
         assert_eq!(unlink_updates(), vec![("LinkageStatus".to_string(), Some("0".to_string()))]);
     }
@@ -271,6 +325,8 @@ mod tests {
         let e = check_link_allowed("PLS000006909", Some(&st("transaction_completed", "Completed"))).unwrap_err();
         assert_eq!(e.to_string(), "Link/Unlink cannot be performed because the property belongs to a Transaction of status 'Completed'.");
         assert!(check_link_allowed("X", Some(&st("TRANSACTION_WITHDRAWN ", "Withdrawn"))).is_err());
+        assert!(check_link_allowed("X", Some(&st("transaction_postponed", "Postponed"))).is_err());
+        assert!(check_link_allowed("X", Some(&st("transaction_rejected", "Rejected"))).is_err());
         let e = check_link_allowed("PLS000006909", None).unwrap_err();
         assert_eq!(e.to_string(), "Cannot retrieve information of the Transaction. Transaction number:'PLS000006909'.");
     }

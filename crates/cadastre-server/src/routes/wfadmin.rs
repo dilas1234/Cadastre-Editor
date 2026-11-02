@@ -104,21 +104,27 @@ fn mime_for(name: &str, stored: Option<&str>) -> String {
     }
 }
 
-/// Open an attached file.
-#[utoipa::path(get, path = "/api/v1/wf/files/{file_id}", tag = "wf", params(("file_id" = uuid::Uuid, Path, description = "File id")),
-    responses((status = 200, description = "The file"), (status = 404, description = "Unknown, or its store is not reachable from this server")))]
-pub async fn get_file(State(state): State<AppState>, Path(file_id): Path<uuid::Uuid>) -> ApiResult<Response> {
-    let row = sqlx::query("SELECT file_name, store, store_path, mime_type FROM cadastre.wf_job_file WHERE id = $1")
+/// A job file's name, stored mime type, bytes and job instance (shared with the Registry send).
+pub async fn read_job_file(pool: &sqlx::PgPool, file_id: uuid::Uuid) -> ApiResult<(String, Option<String>, Vec<u8>, i32)> {
+    let row = sqlx::query("SELECT file_name, store, store_path, mime_type, job_instance_id FROM cadastre.wf_job_file WHERE id = $1")
         .bind(file_id)
-        .fetch_optional(&state.pool)
+        .fetch_optional(pool)
         .await?
         .ok_or_else(|| AppError::NotFound(format!("file {file_id}")))?;
-    let (name, store, rel, mime): (String, String, String, Option<String>) = (row.get(0), row.get(1), row.get(2), row.get(3));
+    let (name, store, rel, mime, job): (String, String, String, Option<String>, i32) = (row.get(0), row.get(1), row.get(2), row.get(3), row.get(4));
     let root = store_root(&store).ok_or_else(|| AppError::NotFound(format!(
         "{name}: Aumentum's document store is not reachable from this server (set CADASTRE_AUMENTUM_FILES_DIR to its Server\\data folder)"
     )))?;
     let path = resolve_store_path(&root, &store, &rel).ok_or_else(|| AppError::BadRequest("invalid stored path".into()))?;
     let bytes = tokio::fs::read(&path).await.map_err(|_| AppError::NotFound(format!("{name} is not in the document store at {}", root.display())))?;
+    Ok((name, mime, bytes, job))
+}
+
+/// Open an attached file.
+#[utoipa::path(get, path = "/api/v1/wf/files/{file_id}", tag = "wf", params(("file_id" = uuid::Uuid, Path, description = "File id")),
+    responses((status = 200, description = "The file"), (status = 404, description = "Unknown, or its store is not reachable from this server")))]
+pub async fn get_file(State(state): State<AppState>, Path(file_id): Path<uuid::Uuid>) -> ApiResult<Response> {
+    let (name, mime, bytes, _job) = read_job_file(&state.pool, file_id).await?;
     let disposition = format!("inline; filename=\"{}\"", name.replace('"', ""));
     Ok(([(header::CONTENT_TYPE, mime_for(&name, mime.as_deref())), (header::CONTENT_DISPOSITION, disposition)], Body::from(bytes)).into_response())
 }

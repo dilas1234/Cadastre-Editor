@@ -1715,15 +1715,16 @@ async fn registry_links_sync_into_the_cadastre() {
         lot: Some("12".into()), block: Some("B".into()),
     };
     let links = vec![link(&upin), link(&ghost)];
-    let (new, updated, unmatched) = cadastre_server::registry_sync::apply(&pool, &links).await.unwrap();
+    let fields = cadastre_server::registry::parse_field_map(cadastre_server::registry_sync::DEFAULT_UPDATED_FIELDS);
+    let (new, updated, unmatched) = cadastre_server::registry_sync::apply(&pool, &links, &fields).await.unwrap();
     assert_eq!((new, updated, unmatched), (2, 1, 1), "the ghost UPIN has no parcel");
-    let rec: (Option<String>, Option<i16>, Option<String>, Option<String>, Option<String>) = sqlx::query_as(
-        "SELECT lrs_id, linkage_status, linkage_date, property_number, plot FROM cadastre.parcel_attribute WHERE object_id = $1")
+    let rec: (Option<String>, Option<i16>, Option<String>, Option<String>, Option<String>, Option<String>) = sqlx::query_as(
+        "SELECT lrs_id, linkage_status, linkage_date, property_number, plot, block FROM cadastre.parcel_attribute WHERE object_id = $1")
         .bind(oid).fetch_one(&pool).await.unwrap();
-    assert_eq!(rec, (Some(su.clone()), Some(1), Some(at.format("%Y-%m-%d").to_string()), Some(format!("PL{n}")), Some("plot 7".into())),
-        "LRSID, LinkageStatus, LinkageDate, PropertyNumber from the Registry; Plot untouched");
+    assert_eq!(rec, (Some(su.clone()), Some(1), Some(at.format("%Y-%m-%d").to_string()), Some(format!("PL{n}")), Some("plotNumber".into()), Some("blockNumber".into())),
+        "GISUpdatedFields as Aumentum applied it: LRSID, LinkageStatus, LinkageDate, PropertyNumber, and Plot/Block as the literal names");
     // The same links read again: nothing changes, no new events.
-    assert_eq!(cadastre_server::registry_sync::apply(&pool, &links).await.unwrap(), (0, 0, 0));
+    assert_eq!(cadastre_server::registry_sync::apply(&pool, &links, &fields).await.unwrap(), (0, 0, 0));
 
     let (st, list) = send(&app, "GET", "/api/v1/registry/links?days=2", None, None).await;
     assert_eq!(st, StatusCode::OK);
@@ -1749,4 +1750,248 @@ async fn registry_links_sync_into_the_cadastre() {
     let (st, s) = send(&app, "GET", "/api/v1/registry/status", None, None).await;
     assert_eq!(st, StatusCode::OK);
     assert!(s.get("enabled").is_some(), "{s}");
+}
+
+
+/// Phase 5: unlinks made in the Registry. The first snapshot is a baseline; a property whose UPIN
+/// changes or goes unlinks the parcel it held (LinkageStatus 0, other fields kept); a property
+/// linked to several parcels (it holds only one UPIN) unlinks nothing; a short Registry answer is
+/// refused instead of unlinking everything.
+#[tokio::test]
+async fn registry_unlinks_by_snapshot() {
+    let Some(db_url) = test_db_url() else {
+        eprintln!("skipping: CADASTRE_TEST_DATABASE_URL not set");
+        return;
+    };
+    let pool = sqlx::PgPool::connect(&db_url).await.unwrap();
+    // The snapshot table is shared: this test runs alone on it.
+    let _guard = REGISTRY_SNAPSHOT.lock().await;
+    sqlx::query("DELETE FROM cadastre.registry_property").execute(&pool).await.unwrap();
+    let n = rand_12() % 1_000_000_000;
+    let (a, b, c) = (format!("PLA{n:09}"), format!("PLB{n:09}"), format!("PLC{n:09}"));
+    let (su1, su2) = (format!("PLT1{n}"), format!("PLT2{n}"));
+    let oid = 500_000_000 + (n % 100_000_000) as i32 * 3 % 99_000_000;
+    for (k, (u, su)) in [(&a, &su1), (&b, &su2), (&c, &su2)].iter().enumerate() {
+        sqlx::query("INSERT INTO cadastre.parcel_attribute (object_id, upin, status, linkage_status, lrs_id, property_number) VALUES ($1, $2, '0', 1, $3, 'PL5')")
+            .bind(oid + k as i32).bind(u.as_str()).bind(su.as_str()).execute(&pool).await.unwrap();
+    }
+    let snap = |rows: &[(&str, &str)]| rows.iter().map(|(su, u)| (su.to_string(), (Some(1i64), u.to_string(), None))).collect::<std::collections::HashMap<_, _>>();
+    // Baseline: su2 is linked to both b and c, the Registry holds c.
+    let r = cadastre_server::registry_sync::reconcile_with(&pool, &snap(&[(&su1, &a), (&su2, &c)])).await.unwrap();
+    assert!(r.baseline && r.unlinked == 0);
+    // Unchanged: nothing.
+    let r = cadastre_server::registry_sync::reconcile_with(&pool, &snap(&[(&su1, &a), (&su2, &c)])).await.unwrap();
+    assert_eq!((r.baseline, r.unlinked), (false, 0), "b (also linked to su2, which holds c) is not unlinked");
+    // su1's UPIN cleared in the Registry: a is unlinked, keeps LRSID / PropertyNumber.
+    let r = cadastre_server::registry_sync::reconcile_with(&pool, &snap(&[(&su2, &c)])).await.unwrap();
+    assert_eq!(r.unlinked, 1);
+    let (st, lrs, pn): (Option<i16>, Option<String>, Option<String>) = sqlx::query_as("SELECT linkage_status, lrs_id, property_number FROM cadastre.parcel_attribute WHERE upin = $1")
+        .bind(&a).fetch_one(&pool).await.unwrap();
+    assert_eq!((st, lrs.as_deref(), pn.as_deref()), (Some(0), Some(su1.as_str()), Some("PL5")));
+    let ev: i64 = sqlx::query_scalar("SELECT count(*) FROM cadastre.audit_log WHERE entity = 'registry_link' AND entity_id = $1 AND action = 'registry_unlink_synced'").bind(&a).fetch_one(&pool).await.unwrap();
+    assert_eq!(ev, 1);
+    // su2 now holds b: c (linked to su2, and the UPIN it held) is unlinked; b stays linked.
+    let r = cadastre_server::registry_sync::reconcile_with(&pool, &snap(&[(&su2, &b)])).await.unwrap();
+    assert_eq!(r.unlinked, 1);
+    let st: Vec<(String, Option<i16>)> = sqlx::query_as("SELECT upin, linkage_status FROM cadastre.parcel_attribute WHERE upin = ANY($1) ORDER BY upin").bind(vec![b.clone(), c.clone()]).fetch_all(&pool).await.unwrap();
+    assert_eq!(st, vec![(b.clone(), Some(1)), (c.clone(), Some(0))]);
+    // A Registry answer with far fewer properties than before is refused.
+    let mut big = snap(&[(&su2, &b)]);
+    for i in 0..10 { big.insert(format!("X{i}{n}"), (None, format!("PLX{i}"), None)); }
+    cadastre_server::registry_sync::reconcile_with(&pool, &big).await.unwrap();
+    assert!(cadastre_server::registry_sync::reconcile_with(&pool, &snap(&[(&su2, &b)])).await.is_err(), "a short answer must not unlink");
+    sqlx::query("DELETE FROM cadastre.registry_property").execute(&pool).await.unwrap();
+}
+
+static REGISTRY_SNAPSHOT: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+/// A fake Aumentum Registry for the write tests: answers the SOAP calls Aumentum made and the
+/// plan upload, and records every request.
+struct FakeRegistry {
+    url: String,
+    seen: std::sync::Arc<std::sync::Mutex<Vec<(String, String)>>>,
+}
+
+fn scalar_xml(rows: &[Vec<&str>]) -> String {
+    let recs: String = rows.iter().map(|r| format!("<ns1:value><ns1:items>{}</ns1:items></ns1:value>",
+        r.iter().map(|v| format!("<ns1:value><ns1:type>string</ns1:type><ns1:value>{v}</ns1:value></ns1:value>")).collect::<String>())).collect();
+    format!("<?xml version=\"1.0\"?><soapenv:Envelope xmlns:soapenv=\"http://schemas.xmlsoap.org/soap/envelope/\"><soapenv:Body><loadObjectsResponse xmlns=\"http://www.landsystems.com/domainmodel-service/1.0\"><Result><ns1:ResultScalar xmlns:ns1=\"http://www.landsystems.com/lrs/service\"><ns1:items>{recs}</ns1:items></ns1:ResultScalar></Result></loadObjectsResponse></soapenv:Body></soapenv:Envelope>")
+}
+
+impl FakeRegistry {
+    async fn start(su: String, prop_upin: Option<String>) -> Self {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::<(String, String)>::new()));
+        let seen2 = seen.clone();
+        let prop_upin = std::sync::Arc::new(std::sync::Mutex::new(prop_upin));
+        tokio::spawn(async move {
+            loop {
+                let Ok((mut sock, _)) = listener.accept().await else { break };
+                let seen = seen2.clone();
+                let su = su.clone();
+                let prop_upin = prop_upin.clone();
+                tokio::spawn(async move {
+                    let mut buf = Vec::new();
+                    let mut chunk = [0u8; 65536];
+                    // Read headers, then Content-Length bytes.
+                    loop {
+                        let n = sock.read(&mut chunk).await.unwrap_or(0);
+                        if n == 0 { break; }
+                        buf.extend_from_slice(&chunk[..n]);
+                        if let Some(i) = buf.windows(4).position(|w| w == b"\r\n\r\n") {
+                            let head = String::from_utf8_lossy(&buf[..i]).to_string();
+                            let len = head.lines().find_map(|l| l.to_ascii_lowercase().strip_prefix("content-length:").map(|v| v.trim().parse::<usize>().unwrap_or(0))).unwrap_or(0);
+                            if buf.len() >= i + 4 + len { break; }
+                        }
+                    }
+                    let text = String::from_utf8_lossy(&buf).to_string();
+                    let (head, body) = text.split_once("\r\n\r\n").unwrap_or((&text, ""));
+                    let line = head.lines().next().unwrap_or("").to_string();
+                    seen.lock().unwrap().push((line.clone(), body.to_string()));
+                    let ok = |b: String| format!("HTTP/1.1 200 OK\r\nDate: {}\r\nContent-Type: text/xml\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{b}", httpdate(), b.len());
+                    let resp = if line.starts_with("GET") {
+                        ok("<wsdl/>".into())
+                    } else if line.starts_with("PUT") && line.contains("/lrs/upload/") {
+                        ok("workspace://SpacesStore/fake-content".into())
+                    } else if line.contains("AuthenticationService") && body.contains("startSession") {
+                        ok("<r><startSessionReturn><ticket>TICKET-1</ticket></startSessionReturn></r>".into())
+                    } else if line.contains("AuthenticationService") {
+                        ok("<r/>".into())
+                    } else if line.contains("IntegrationService") {
+                        if body.contains("<lrs:name>upin</lrs:name><lrs:value></lrs:value>") || body.contains("<lrs:name>upin</lrs:name><lrs:value/>") { *prop_upin.lock().unwrap() = None; }
+                        ok("<r><result><items><value><className>com.landsystems.lrs.model.Parcel</className></value></items></result></r>".into())
+                    } else if body.contains("Category = &apos;mcintegration&apos;") {
+                        ok(scalar_xml(&[vec!["LinkageFields", "upin:UPIN;LRSID:suid,PropertyNumber:refnum,Plot:plotNumber,Block:blockNumber"], vec!["GISUpdatedFields", "suID:LRSID"]]))
+                    } else if body.contains("join t.TransactionStatus s where t.TransactionNumber") {
+                        let closed = body.contains("TXNCLOSED");
+                        let num = if closed { "TXNCLOSED" } else { "PLS777" };
+                        ok(scalar_xml(&[vec!["10000000777", num, if closed { "transaction_completed" } else { "transaction_lodged" }, if closed { "Completed" } else { "Active" }]]))
+                    } else if body.contains("s.SpatialDate1 from com.landsystems.lrs.model.Transaction") {
+                        let u = prop_upin.lock().unwrap().clone().unwrap_or_default();
+                        ok(scalar_xml(&[vec!["10000000555", &su, &u, "PL777", "", "B7", ""]]))
+                    } else if body.contains("p.SuID =") {
+                        ok(scalar_xml(&[vec!["10000000777", "PLS777", "transaction_lodged", "Active", "10000000555", "x"]]))
+                    } else {
+                        ok(scalar_xml(&[]))
+                    };
+                    let _ = sock.write_all(resp.as_bytes()).await;
+                });
+            }
+        });
+        FakeRegistry { url: format!("http://{addr}/lrs/api/"), seen }
+    }
+    fn bodies(&self, needle: &str) -> Vec<String> {
+        self.seen.lock().unwrap().iter().filter(|(l, b)| l.contains(needle) || b.contains(needle)).map(|(_, b)| b.clone()).collect()
+    }
+}
+
+fn httpdate() -> String {
+    chrono::Utc::now().format("%a, %d %b %Y %H:%M:%S GMT").to_string()
+}
+
+/// Phase 5 write-back, against a fake Registry: link from the Cadastre (the Registry property
+/// takes the UPIN; the parcel the property's fields), sending the plan image to the job's
+/// transaction, and unlink, each refused as Aumentum refused (writing off, already linked,
+/// transaction not Active, not an image of the job).
+#[tokio::test]
+async fn registry_write_back_like_aumentum() {
+    let Some(db_url) = test_db_url() else {
+        eprintln!("skipping: CADASTRE_TEST_DATABASE_URL not set");
+        return;
+    };
+    let _guard = REGISTRY_SNAPSHOT.lock().await;
+    let n = rand_12() % 1_000_000_000;
+    let su = format!("PLTW{n}");
+    let fake = FakeRegistry::start(su.clone(), None).await;
+    std::env::set_var("CADASTRE_REGISTRY_URL", &fake.url);
+    std::env::set_var("CADASTRE_REGISTRY_USER", "tester");
+    std::env::set_var("CADASTRE_REGISTRY_PASSWORD", "secret");
+    std::env::remove_var("CADASTRE_REGISTRY_WRITE");
+    let app = routes::router(state_with(AuthMode::Disabled, None, &db_url).await);
+    let pool = sqlx::PgPool::connect(&db_url).await.unwrap();
+    let upin = format!("PLW{n:09}");
+    sqlx::query("INSERT INTO cadastre.parcel (parcel_number, geom, computed_area, status) VALUES ($1, ST_MakeEnvelope(3000, 9100000, 3020, 9100020, 32632), 400, 'posted')")
+        .bind(&upin).execute(&pool).await.unwrap();
+
+    // Reading works without writes.
+    let (st, t) = send(&app, "GET", "/api/v1/registry/transactions/PLS777", None, None).await;
+    assert_eq!(st, StatusCode::OK, "{t}");
+    assert_eq!((t["open"].as_bool(), t["properties"][0]["su_id"].as_str()), (Some(true), Some(su.as_str())));
+    let (st, t) = send(&app, "GET", "/api/v1/registry/transactions/TXNCLOSED", None, None).await;
+    assert_eq!((st, t["open"].as_bool()), (StatusCode::OK, Some(false)));
+    assert!(t["refused"].as_str().unwrap().contains("status 'Completed'"), "{t}");
+    let link = json!({"transaction_number": "PLS777", "su_id": su, "upin": upin});
+    let (st, r) = send(&app, "POST", "/api/v1/registry/link", None, Some(link.clone())).await;
+    assert_eq!(st, StatusCode::CONFLICT, "writing is off by default: {r}");
+    assert!(fake.bodies("SaveEntity").is_empty());
+
+    std::env::set_var("CADASTRE_REGISTRY_WRITE", "1");
+    let (st, r) = send(&app, "POST", "/api/v1/registry/link", None, Some(json!({"transaction_number": "TXNCLOSED", "su_id": su, "upin": upin}))).await;
+    assert_eq!(st, StatusCode::CONFLICT, "a Completed transaction is closed: {r}");
+    let (st, r) = send(&app, "POST", "/api/v1/registry/link", None, Some(link.clone())).await;
+    assert_eq!(st, StatusCode::OK, "{r}");
+    let saves = fake.bodies("SaveEntity");
+    assert_eq!(saves.len(), 1);
+    assert!(saves[0].contains("<int:transactionId>10000000777</int:transactionId>"), "{}", saves[0]);
+    assert!(saves[0].contains("<lrs:className>com.landsystems.lrs.model.Parcel</lrs:className><lrs:status>modified</lrs:status>"));
+    assert!(saves[0].contains("<lrs:name>Id</lrs:name><lrs:value>10000000555</lrs:value>"));
+    assert!(saves[0].contains(&format!("<lrs:name>upin</lrs:name><lrs:value>{upin}</lrs:value>")));
+    assert!(saves[0].contains("wsse:UsernameToken") && saves[0].contains("TICKET-1"), "the ticket rides in the WS-Security header");
+    let rec: (Option<String>, Option<String>, Option<String>, Option<String>, Option<i16>, Option<String>) = sqlx::query_as(
+        "SELECT lrs_id, property_number, plot, block, linkage_status, linkage_date FROM cadastre.parcel_attribute WHERE upin = $1")
+        .bind(&upin).fetch_one(&pool).await.unwrap();
+    assert_eq!(rec, (Some(su.clone()), Some("PL777".into()), None, Some("B7".into()), Some(1), Some(chrono::Utc::now().format("%Y-%m-%d").to_string())),
+        "a new attribute record; LinkageFields: LRSID, PropertyNumber, Block (plotNumber is no property column: skipped)");
+    let (st, r) = send(&app, "POST", "/api/v1/registry/link", None, Some(link.clone())).await;
+    assert_eq!(st, StatusCode::CONFLICT, "already linked: {r}");
+    let (_, lst) = send(&app, "GET", "/api/v1/registry/links?days=2", None, None).await;
+    let mine = lst.as_array().unwrap().iter().find(|l| l["upin"] == upin.as_str()).expect("the link is listed").clone();
+    assert_eq!((mine["made_in"].as_str(), mine["linked_now"].as_bool()), (Some("cadastre"), Some(true)));
+
+    // Send the plan: the job's transaction, a JPG attached to the job.
+    let jt = 910_000 + (n % 90_000) as i32 * 10;
+    sqlx::query("INSERT INTO cadastre.wf_task (id, name) VALUES ($1, 'Save Title Deed Plan (test)')").bind(jt).execute(&pool).await.unwrap();
+    sqlx::query("INSERT INTO cadastre.wf_job_type (id, name, start_task_id, end_task_id) VALUES ($1, 'Deed Plan (test)', $1, $1)").bind(jt).execute(&pool).await.unwrap();
+    let (_, j) = send(&app, "POST", "/api/v1/wf/jobs", None, Some(json!({"job_type_id": jt, "name": "Job-PL777", "lrs_transaction_number": "PLS777"}))).await;
+    let job = j["job"]["id"].as_i64().unwrap();
+    let (_, j2) = send(&app, "POST", "/api/v1/wf/jobs", None, Some(json!({"job_type_id": jt, "name": "Job-closed", "lrs_transaction_number": "TXNCLOSED"}))).await;
+    let job2 = j2["job"]["id"].as_i64().unwrap();
+    let rel = format!("regtest/{n}.jpg");
+    std::fs::create_dir_all("files/regtest").unwrap();
+    std::fs::write(format!("files/{rel}"), b"\xFF\xD8\xFFfake-jpeg").unwrap();
+    let file: uuid::Uuid = sqlx::query_scalar("INSERT INTO cadastre.wf_job_file (job_instance_id, file_name, store, store_path, size_bytes) VALUES ($1, 'PL777.jpg', 'cadastre', $2, 12) RETURNING id")
+        .bind(job as i32).bind(&rel).fetch_one(&pool).await.unwrap();
+    let pdf: uuid::Uuid = sqlx::query_scalar("INSERT INTO cadastre.wf_job_file (job_instance_id, file_name, store, store_path, size_bytes) VALUES ($1, 'plan.pdf', 'cadastre', $2, 12) RETURNING id")
+        .bind(job as i32).bind(&rel).fetch_one(&pool).await.unwrap();
+    let (st, r) = send(&app, "POST", &format!("/api/v1/wf/jobs/{job}/registry/send-plan"), None, Some(json!({"file_id": pdf}))).await;
+    assert_eq!(st, StatusCode::BAD_REQUEST, "a PDF is not sent: {r}");
+    let (st, r) = send(&app, "POST", &format!("/api/v1/wf/jobs/{job2}/registry/send-plan"), None, Some(json!({"file_id": file}))).await;
+    assert_eq!(st, StatusCode::BAD_REQUEST, "another job's file: {r}");
+    let (st, r) = send(&app, "POST", &format!("/api/v1/wf/jobs/{job}/registry/send-plan"), None, Some(json!({"file_id": file}))).await;
+    assert_eq!(st, StatusCode::OK, "{r}");
+    let uploads: Vec<String> = fake.seen.lock().unwrap().iter().filter(|(l, _)| l.starts_with("PUT")).map(|(l, b)| format!("{l}|{b}")).collect();
+    assert_eq!(uploads.len(), 1);
+    assert!(uploads[0].contains("/lrs/upload/") && uploads[0].contains(".jpg?ticket=TICKET-1&encoding=UTF%2D8") && uploads[0].contains("fake-jpeg"), "{}", uploads[0]);
+    let doc = fake.bodies("IncomingDocument");
+    assert_eq!(doc.len(), 1);
+    assert!(doc[0].contains("<lrs:name>DocumentType</lrs:name><lrs:value>sd_titledeedPlan</lrs:value>"));
+    assert!(doc[0].contains("<cms:value>workspace://SpacesStore/fake-content</cms:value>"), "the uploaded content");
+    assert!(doc[0].contains("referenceid</cms:name><cms:isMultiValue xsi:nil=\"true\"/><cms:value>10000000777</cms:value>"));
+    let (_, sent) = send(&app, "GET", &format!("/api/v1/wf/jobs/{job}/registry/sent"), None, None).await;
+    assert_eq!(sent.as_array().unwrap().len(), 1);
+
+    // Unlink: the Registry property's UPIN cleared; the parcel's link fields cleared.
+    let (st, r) = send(&app, "POST", "/api/v1/registry/unlink", None, Some(json!({"upin": upin}))).await;
+    assert_eq!(st, StatusCode::OK, "{r}");
+    let last = fake.bodies("SaveEntity").pop().unwrap();
+    assert!(last.contains("<lrs:name>upin</lrs:name><lrs:value></lrs:value>"), "{last}");
+    let rec: (Option<String>, Option<String>, Option<i16>, Option<String>) = sqlx::query_as("SELECT lrs_id, property_number, linkage_status, linkage_date FROM cadastre.parcel_attribute WHERE upin = $1")
+        .bind(&upin).fetch_one(&pool).await.unwrap();
+    assert_eq!(rec, (None, None, Some(0), None));
+    let (st, _) = send(&app, "POST", "/api/v1/registry/unlink", None, Some(json!({"upin": upin}))).await;
+    assert_eq!(st, StatusCode::CONFLICT, "not linked any more");
+    let _ = std::fs::remove_file(format!("files/{rel}"));
+    for k in ["CADASTRE_REGISTRY_URL", "CADASTRE_REGISTRY_USER", "CADASTRE_REGISTRY_PASSWORD", "CADASTRE_REGISTRY_WRITE"] { std::env::remove_var(k); }
 }

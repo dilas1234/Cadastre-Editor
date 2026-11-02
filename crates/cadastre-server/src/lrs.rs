@@ -21,6 +21,10 @@ const DOM: &str = "http://www.landsystems.com/domainmodel-service/1.0";
 const LRS: &str = "http://www.landsystems.com/lrs/service";
 const WSSE: &str = "http://docs.oasis-open.org/wss/2004/01/oasis-200401-wss-wssecurity-secext-1.0.xsd";
 const WSU: &str = "http://docs.oasis-open.org/wss/2004/01/oasis-200401-wss-wssecurity-utility-1.0.xsd";
+const INT: &str = "http://www.landsystems.com/lrs-integration-service/1.0";
+const CMS: &str = "http://www.alfresco.org/ws/model/content/1.0";
+const LRS_CORE: &str = "http://www.landsystems.com/lrs/model/core/1.0";
+const XSI: &str = "http://www.w3.org/2001/XMLSchema-instance";
 const PWTEXT: &str = "http://docs.oasis-open.org/wss/2004/01/oasis-200401-wss-username-token-profile-1.0#PasswordText";
 
 /// Connection settings (Aumentum's `RegParam`: server, port, protocol, user, password).
@@ -30,11 +34,14 @@ pub struct LrsConfig {
     pub base_url: String,
     pub user: String,
     pub password: String,
+    /// Writes to the Registry (send a plan, link/unlink from the Cadastre) are allowed:
+    /// `CADASTRE_REGISTRY_WRITE=1`. Off by default; reads always work.
+    pub write_enabled: bool,
 }
 
 impl std::fmt::Debug for LrsConfig {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("LrsConfig").field("base_url", &self.base_url).field("user", &self.user).field("password", &"****").finish()
+        f.debug_struct("LrsConfig").field("base_url", &self.base_url).field("user", &self.user).field("password", &"****").field("write_enabled", &self.write_enabled).finish()
     }
 }
 
@@ -43,7 +50,12 @@ impl LrsConfig {
     /// when any is unset (the Registry sync is then off).
     pub fn from_env() -> Option<Self> {
         let get = |k: &str| std::env::var(k).ok().map(|v| v.trim().to_string()).filter(|v| !v.is_empty());
-        Some(Self { base_url: get("CADASTRE_REGISTRY_URL")?, user: get("CADASTRE_REGISTRY_USER")?, password: get("CADASTRE_REGISTRY_PASSWORD")? })
+        Some(Self {
+            base_url: get("CADASTRE_REGISTRY_URL")?,
+            user: get("CADASTRE_REGISTRY_USER")?,
+            password: get("CADASTRE_REGISTRY_PASSWORD")?,
+            write_enabled: get("CADASTRE_REGISTRY_WRITE").is_some_and(|v| v == "1" || v.eq_ignore_ascii_case("true")),
+        })
     }
 }
 
@@ -80,6 +92,10 @@ struct HttpResponse {
 /// Minimal HTTP/1.0 request over plain TCP (the Registry serves `http://` only). HTTP/1.0 and
 /// `Connection: close` keep the response unchunked and read to EOF.
 async fn http(url: &str, method: &str, headers: &[(&str, String)], body: &str) -> Result<HttpResponse, LrsError> {
+    http_bytes(url, method, headers, body.as_bytes()).await
+}
+
+async fn http_bytes(url: &str, method: &str, headers: &[(&str, String)], body: &[u8]) -> Result<HttpResponse, LrsError> {
     let rest = url.strip_prefix("http://").ok_or_else(|| LrsError::Http(format!("only http:// is supported: {url}")))?;
     let (authority, path) = match rest.find('/') {
         Some(i) => (&rest[..i], &rest[i..]),
@@ -96,8 +112,8 @@ async fn http(url: &str, method: &str, headers: &[(&str, String)], body: &str) -
             req.push_str(&format!("{k}: {v}\r\n"));
         }
         req.push_str("\r\n");
-        req.push_str(body);
         stream.write_all(req.as_bytes()).await.map_err(|e| LrsError::Http(format!("write: {e}")))?;
+        stream.write_all(body).await.map_err(|e| LrsError::Http(format!("write: {e}")))?;
         let mut raw = Vec::new();
         stream.read_to_end(&mut raw).await.map_err(|e| LrsError::Http(format!("read: {e}")))?;
         Ok::<_, LrsError>(raw)
@@ -180,6 +196,39 @@ impl Session {
         parse_scalar_rows(&xml)
     }
 
+    fn require_write(&self) -> Result<(), LrsError> {
+        if self.cfg.write_enabled { Ok(()) } else { Err(LrsError::Fault("writing to the Registry is turned off on this server (CADASTRE_REGISTRY_WRITE)".into())) }
+    }
+
+    /// `IntegrationService.SaveEntity(transactionId, entities)` (Aumentum's PersistDataInRegistry
+    /// / PersistDocumentInRegistry). `entities_xml`: one or more `<int:entities>` elements from
+    /// [`entity_xml`] / [`incoming_document_xml`]. Succeeds when the Registry returns items.
+    pub async fn save_entity(&self, transaction_id: i64, entities_xml: &str) -> Result<(), LrsError> {
+        self.require_write()?;
+        let body = format!(
+            "<int:SaveEntity xmlns:int=\"{INT}\" xmlns:lrs=\"{LRS}\" xmlns:cms=\"{CMS}\" xmlns:xsi=\"{XSI}\"><int:transactionId>{transaction_id}</int:transactionId>{entities_xml}</int:SaveEntity>"
+        );
+        let xml = soap(&self.cfg, "IntegrationService", &format!("{INT}/SaveEntity"), &self.security_header(), &body).await?;
+        if xml.contains("className") || xml.contains(":value>") || xml.contains("<value") {
+            Ok(())
+        } else {
+            Err(LrsError::Fault("the Registry saved nothing (no items returned)".into()))
+        }
+    }
+
+    /// Upload a file to the Registry's repository (`PUT /lrs/upload/{guid}.{ext}?ticket=…`), as
+    /// Aumentum's ConvertImageToString; returns the Registry's answer, which is the page content.
+    pub async fn upload(&self, extension: &str, bytes: &[u8]) -> Result<String, LrsError> {
+        self.require_write()?;
+        let root = self.cfg.base_url.trim_end_matches('/').trim_end_matches("/api").trim_end_matches('/');
+        let url = format!("{root}/upload/{}.{extension}?ticket={}&encoding=UTF%2D8", uuid::Uuid::new_v4(), self.ticket);
+        let r = http_bytes(&url, "PUT", &[("Content-Type", "application/octet-stream".into()), ("ContentType", "application/octet-stream".into())], bytes).await?;
+        if !(200..300).contains(&r.status) {
+            return Err(LrsError::Fault(format!("upload HTTP {}", r.status)));
+        }
+        Ok(r.body.trim().to_string())
+    }
+
     pub async fn end(self) {
         let body = format!("<auth:endSession xmlns:auth=\"{AUTH}\"><auth:ticket>{}</auth:ticket></auth:endSession>", escape(&self.ticket));
         if let Err(e) = soap(&self.cfg, "AuthenticationService", &format!("{AUTH}/endSession"), "", &body).await {
@@ -256,9 +305,67 @@ pub fn parse_datetime(s: &str) -> Option<NaiveDateTime> {
     NaiveDateTime::parse_from_str(s, "%d %b %Y %H:%M:%S").ok()
 }
 
+fn entity_value(name: &str, value: Option<&str>) -> String {
+    match value {
+        Some(v) => format!("<lrs:properties><lrs:name>{}</lrs:name><lrs:value>{}</lrs:value></lrs:properties>", escape(name), escape(v)),
+        None => format!("<lrs:properties><lrs:name>{}</lrs:name><lrs:value xsi:nil=\"true\"/></lrs:properties>", escape(name)),
+    }
+}
+
+fn named_value(name: &str, value: &str) -> String {
+    format!("<cms:properties><cms:name>{}</cms:name><cms:isMultiValue xsi:nil=\"true\"/><cms:value>{}</cms:value></cms:properties>", escape(name), escape(value))
+}
+
+/// A `com.landsystems.lrs.model.<class>` entity, status `modified`, with name/value pairs (a
+/// `None` value is sent as nil), as Aumentum's PersistDataInRegistry.
+pub fn entity_xml(class: &str, properties: &[(&str, Option<&str>)]) -> String {
+    let props: String = properties.iter().map(|(n, v)| entity_value(n, *v)).collect();
+    format!("<int:entities><lrs:className>com.landsystems.lrs.model.{}</lrs:className><lrs:status>modified</lrs:status>{props}</int:entities>", escape(class))
+}
+
+/// The survey plan as Aumentum's PersistDocumentInRegistry sent it: an `IncomingDocument`
+/// (status added) of type `doc_type` (MCServer dictionary SurveyPlanFromMC = sd_titledeedPlan),
+/// Comments "Survey Plan", Submission now, PageCount 1; one image page whose properties are the
+/// transaction reference, isattachment False, the page name, index 0 and the uploaded content.
+pub fn incoming_document_xml(doc_type: &str, transaction_id: i64, file_name: &str, uploaded: &str, submission: &str) -> String {
+    let content_props = [
+        named_value(&format!("{{{LRS_CORE}}}referenceid"), &transaction_id.to_string()),
+        named_value(&format!("{{{LRS_CORE}}}isattachment"), "False"),
+        named_value(&format!("{{{LRS_CORE}}}pagename"), file_name),
+        named_value(&format!("{{{LRS_CORE}}}pageindex"), "0"),
+        named_value(&format!("{{{CMS}}}content"), uploaded),
+    ]
+    .concat();
+    format!(
+        "<int:entities xsi:type=\"lrs:DocumentEntity\"><lrs:className>com.landsystems.lrs.model.IncomingDocument</lrs:className><lrs:status>added</lrs:status>{}{}{}{}\
+         <lrs:content><lrs:status>saved</lrs:status><lrs:reference xsi:nil=\"true\"/>{content_props}\
+         <lrs:pages><lrs:status>added</lrs:status><lrs:reference xsi:nil=\"true\"/>{content_props}<lrs:type>image</lrs:type></lrs:pages></lrs:content></int:entities>",
+        entity_value("DocumentType", Some(doc_type)),
+        entity_value("Comments", Some("Survey Plan")),
+        entity_value("Submission", Some(submission)),
+        entity_value("PageCount", Some("1")),
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn builds_aumentums_save_entity_payloads() {
+        let e = entity_xml("Parcel", &[("Id", Some("10000000000002")), ("upin", None)]);
+        assert_eq!(e, "<int:entities><lrs:className>com.landsystems.lrs.model.Parcel</lrs:className><lrs:status>modified</lrs:status>\
+<lrs:properties><lrs:name>Id</lrs:name><lrs:value>10000000000002</lrs:value></lrs:properties>\
+<lrs:properties><lrs:name>upin</lrs:name><lrs:value xsi:nil=\"true\"/></lrs:properties></int:entities>");
+        let d = incoming_document_xml("sd_titledeedPlan", 42, "PL68955 & co.jpg", "ref-1", "2026-11-02T05:10:00.000+01:00");
+        assert!(d.starts_with("<int:entities xsi:type=\"lrs:DocumentEntity\"><lrs:className>com.landsystems.lrs.model.IncomingDocument</lrs:className><lrs:status>added</lrs:status>"));
+        assert!(d.contains("<lrs:name>DocumentType</lrs:name><lrs:value>sd_titledeedPlan</lrs:value>"));
+        assert!(d.contains("<lrs:name>Comments</lrs:name><lrs:value>Survey Plan</lrs:value>"));
+        assert!(d.contains("<cms:name>{http://www.landsystems.com/lrs/model/core/1.0}referenceid</cms:name><cms:isMultiValue xsi:nil=\"true\"/><cms:value>42</cms:value>"));
+        assert!(d.contains("PL68955 &amp; co.jpg"), "names escaped");
+        assert!(d.contains("<cms:name>{http://www.alfresco.org/ws/model/content/1.0}content</cms:name><cms:isMultiValue xsi:nil=\"true\"/><cms:value>ref-1</cms:value>"));
+        assert!(d.ends_with("<lrs:type>image</lrs:type></lrs:pages></lrs:content></int:entities>"));
+    }
 
     #[test]
     fn parses_a_real_registry_response() {
