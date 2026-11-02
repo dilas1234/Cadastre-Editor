@@ -222,8 +222,9 @@ pub async fn post_job(
     }))
 }
 
-/// Post a job's draft parcels: give each its official UPIN (above every UPIN ever issued, via the
-/// ledger) and make it part of the live fabric. Shared by `POST /jobs/{id}/post` and the
+/// Post a job's draft parcels: give each its official UPIN (the next in the local series,
+/// `PL` + 12 digits counting up; structured UPINs of 1,000,000,000 and over are kept in the ledger
+/// but never drive the counter, migration 0018) and make it part of the live fabric. Shared by `POST /jobs/{id}/post` and the
 /// Aumentum workflow's commit. Returns the UPINs, in draft order.
 pub async fn post_drafts(conn: &mut sqlx::PgConnection, job_id: Uuid) -> ApiResult<Vec<String>> {
     Ok(post_drafts_with_ids(conn, job_id).await?.into_iter().map(|(_, n)| n).collect())
@@ -239,7 +240,8 @@ pub async fn post_drafts_with_ids(conn: &mut sqlx::PgConnection, job_id: Uuid) -
     .fetch_all(&mut *conn)
     .await?;
 
-    // Keep the allocator above every UPIN ever issued (imports included) before allocating.
+    // Keep the allocator above every local-series UPIN ever issued (imports included); the ledger
+    // still refuses any UPIN issued before, structured ones included.
     sqlx::query("SELECT cadastre.sync_upin_sequence()").execute(&mut *conn).await?;
 
     let mut parcel_numbers = Vec::with_capacity(rows.len());
