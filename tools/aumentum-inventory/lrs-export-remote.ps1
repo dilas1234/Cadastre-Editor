@@ -94,7 +94,7 @@ if (-not $SkipRegistry) {
       $dest = Join-Path $root ('registry\' + $f.Rel)
       $done += $f.Len
       try {
-        if ((Test-Path -LiteralPath $dest) -and (Get-Item -LiteralPath $dest).Length -eq $f.Len) { $skipped++; continue }
+        if ((Test-Path -LiteralPath $dest) -and (Get-Item -LiteralPath $dest -Force).Length -eq $f.Len) { $skipped++; continue }
         New-Item -ItemType Directory -Path (Split-Path $dest -Parent) -Force | Out-Null
         $out = [IO.File]::Create($dest)
         try {
@@ -108,7 +108,7 @@ if (-not $SkipRegistry) {
             $bytes = [Convert]::FromBase64String($b64); $out.Write($bytes, 0, $bytes.Length)
           }
         } finally { $out.Close() }
-        if ((Get-Item -LiteralPath $dest).Length -ne $f.Len) { throw "incomplete: $((Get-Item -LiteralPath $dest).Length) of $($f.Len) bytes" }
+        if ((Get-Item -LiteralPath $dest -Force).Length -ne $f.Len) { throw "incomplete: $((Get-Item -LiteralPath $dest -Force).Length) of $($f.Len) bytes" }
         Write-Host ("  {0,5:N1}%  {1}" -f (100.0 * $done / [Math]::Max(1, $total)), $f.Rel)
       } catch {
         # One file that cannot be copied does not stop the rest; it is listed and reported.

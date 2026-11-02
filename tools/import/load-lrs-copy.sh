@@ -45,7 +45,7 @@ for gz in "$SRC"/data/*.psv.gz; do
   docker exec -i "$C" bash -c "gzip -dc > $WORK/$t.dat" < "$gz"
   # bcp format file: one field per exported column (header row order), each bound to its column
   # in the table; the table's other columns are left NULL.
-  header=$(gzip -dc "$gz" | head -c 1000000 | awk -v RS='~#~\n' 'NR==1{print; exit}')
+  header=$( (gzip -dc "$gz" 2>/dev/null || true) | head -c 1000000 | awk -v RS='~#~\n' 'NR==1{print; exit}' || true)
   IFS=$'\n' read -r -d '' -a names < <(printf '%s' "$header" | awk -v RS='~\\|~' '{print}' && printf '\0') || true
   ords=$(val "SELECT name + '=' + CAST(column_id AS varchar(10)) FROM sys.columns WHERE object_id = OBJECT_ID('LRSAdmin.$t')")
   {
@@ -59,7 +59,37 @@ for gz in "$SRC"/data/*.psv.gz; do
       printf '%d SQLCHAR 0 0 "%s" %d %s ""\n' "$i" "$term" "$ord" "$n"
     done
   } | docker exec -i "$C" bash -c "cat > $WORK/$t.fmt"
+  # NOT NULL columns (outside the primary key) take NULL for the load: a column the export left
+  # out arrives empty, and so does an empty string ('' and NULL are both an empty field).
+  present=$(for n in "${names[@]}"; do printf "'%s'," "${n//\'/\'\'}"; done); present="${present%,}"
+  sq -d "$DB" -Q "SET NOCOUNT ON;
+    IF OBJECT_ID('dbo._lrs_notnull') IS NULL CREATE TABLE dbo._lrs_notnull (tbl sysname, col sysname, typ nvarchar(200), is_text bit, exported bit);
+    DECLARE @s nvarchar(max) = N'';
+    INSERT dbo._lrs_notnull
+    SELECT '$t', c.name,
+      CASE WHEN ty.name IN ('nvarchar','nchar') THEN ty.name + '(' + CASE WHEN c.max_length = -1 THEN 'max' ELSE CAST(c.max_length / 2 AS varchar(10)) END + ')'
+           WHEN ty.name IN ('varchar','char','varbinary','binary') THEN ty.name + '(' + CASE WHEN c.max_length = -1 THEN 'max' ELSE CAST(c.max_length AS varchar(10)) END + ')'
+           WHEN ty.name IN ('decimal','numeric') THEN ty.name + '(' + CAST(c.precision AS varchar(5)) + ',' + CAST(c.scale AS varchar(5)) + ')'
+           WHEN ty.name IN ('datetime2','time','datetimeoffset') THEN ty.name + '(' + CAST(c.scale AS varchar(5)) + ')'
+           ELSE ty.name END,
+      CASE WHEN ty.name IN ('nvarchar','nchar','varchar','char','text','ntext') THEN 1 ELSE 0 END,
+      CASE WHEN c.name IN ($present) THEN 1 ELSE 0 END
+    FROM sys.columns c JOIN sys.types ty ON ty.user_type_id = c.user_type_id
+    WHERE c.object_id = OBJECT_ID('LRSAdmin.$t') AND c.is_nullable = 0 AND c.is_identity = 0 AND c.is_computed = 0
+      AND NOT EXISTS (SELECT 1 FROM sys.index_columns ic JOIN sys.indexes i ON i.object_id = ic.object_id AND i.index_id = ic.index_id
+                      WHERE i.is_primary_key = 1 AND ic.object_id = c.object_id AND ic.column_id = c.column_id);
+    SELECT @s += N'ALTER TABLE LRSAdmin.' + QUOTENAME(tbl) + N' ALTER COLUMN ' + QUOTENAME(col) + N' ' + typ + N' NULL; ' FROM dbo._lrs_notnull WHERE tbl = '$t';
+    EXEC (@s);" < /dev/null >/dev/null
   out=$(docker exec -e P="$PW" "$C" bash -c "$T/bcp LRSAdmin.$t in $WORK/$t.dat -S localhost -U sa -P \"\$P\" -d $DB -u -f $WORK/$t.fmt -F 2 -k -E -C 65001 -b 20000 -e $WORK/$t.err 2>&1; echo; cat $WORK/$t.err 2>/dev/null | head -5") || true
+  # Back to NOT NULL: an exported text column that was NOT NULL can only have held '' where the
+  # field is empty; a column the export left out stays nullable (its values are not in the copy).
+  sq -d "$DB" -Q "SET NOCOUNT ON; DECLARE @s nvarchar(max) = N'';
+    SELECT @s += N'UPDATE LRSAdmin.' + QUOTENAME(tbl) + N' SET ' + QUOTENAME(col) + N' = '''' WHERE ' + QUOTENAME(col) + N' IS NULL; '
+      FROM dbo._lrs_notnull WHERE tbl = '$t' AND is_text = 1 AND exported = 1;
+    EXEC (@s); SET @s = N'';
+    SELECT @s += N'IF NOT EXISTS (SELECT 1 FROM LRSAdmin.' + QUOTENAME(tbl) + N' WHERE ' + QUOTENAME(col) + N' IS NULL) ALTER TABLE LRSAdmin.' + QUOTENAME(tbl) + N' ALTER COLUMN ' + QUOTENAME(col) + N' ' + typ + N' NOT NULL; '
+      FROM dbo._lrs_notnull WHERE tbl = '$t' AND exported = 1;
+    EXEC (@s);" < /dev/null >/dev/null
   printf '   %-28s %s\n' "$t" "$(printf '%s\n' "$out" | grep -Eo '[0-9]+ rows copied' || echo "FAILED: $(printf '%s' "$out" | tr '\n' ' ' | cut -c1-300)")"
   docker exec "$C" rm -f "$WORK/$t.dat"
 done
@@ -78,4 +108,5 @@ while IFS='|' read -r t exported _; do
   ok=OK; [ "$n" = "$exported" ] || { ok=MISMATCH; bad=1; }
   printf '   %-28s %9s -> %9s  %s\n' "$t" "$exported" "$n" "$ok"
 done < <(tr -d '\r' < "$SRC/lrs-export-summary.txt")
+sq -d "$DB" -Q "SET NOCOUNT ON; SELECT tbl + '.' + col AS left_nullable_not_exported FROM dbo._lrs_notnull WHERE exported = 0 ORDER BY 1" -W -h -1 < /dev/null | tr -d '\r' | sed '/^$/d; s/^/   nullable in the copy (not exported): /'
 [ "$bad" -eq 0 ] && echo "LRS copy ready: $C / $DB" || { echo "LRS copy has mismatches (see above)" >&2; exit 1; }
