@@ -7,6 +7,7 @@ pub mod editor;
 pub mod fci;
 pub mod fabric;
 pub mod gisviewer;
+pub mod gisviewer_passthrough;
 pub mod health;
 pub mod import;
 pub mod jobs;
@@ -104,6 +105,8 @@ pub fn router(state: AppState) -> Router {
         .route(gisviewer::PAGE, get(gisviewer::page).post(gisviewer::page))
         .route("/GISViewer/data/parcels", get(gisviewer::data))
         .route(gisviewer::SERVICE, get(gisviewer::service_get).post(gisviewer::service))
+        // Registry Web Access map tab: Aumentum's Silverlight viewer, passed through to Aumentum.
+        .route("/GISViewer/{*rest}", axum::routing::any(gisviewer_passthrough::forward))
         .route("/api/v1/registry/reconcile", post(registry::reconcile_now))
         .route("/api/v1/registry/find", get(registry::find))
         .route("/api/v1/registry/parcels/{upin}/work", get(registry::parcel_work))
