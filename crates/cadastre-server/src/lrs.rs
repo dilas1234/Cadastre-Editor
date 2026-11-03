@@ -337,14 +337,17 @@ pub fn entity_xml(class: &str, properties: &[(&str, Option<&str>)]) -> String {
     format!("<int:entities><lrs:className>com.landsystems.lrs.model.{}</lrs:className><lrs:status>modified</lrs:status>{props}</int:entities>", escape(class))
 }
 
-/// The survey plan as Aumentum's PersistDocumentInRegistry sent it: an `IncomingDocument`
+/// The plan document as Aumentum's PersistDocumentInRegistry sent it: an `IncomingDocument`
 /// (status added) of type `doc_type` (MCServer dictionary SurveyPlanFromMC = sd_titledeedPlan),
-/// Comments "Survey Plan", Submission now, PageCount 1; one image page whose properties are the
-/// transaction reference, isattachment False, the page name, index 0 and the uploaded content.
-pub fn incoming_document_xml(doc_type: &str, transaction_id: i64, file_name: &str, uploaded: &str, submission: &str) -> String {
+/// `comments` (Aumentum: "Survey Plan"), Submission now, PageCount 1; one page of `page_type`
+/// whose properties are the transaction reference, isattachment, the page name, index 0 and the
+/// uploaded content. The Registry's page types are `image` (Aumentum's JPG plan) and
+/// `attachment` (a file kept as it is: the PDF plan); isattachment follows the page type.
+pub fn incoming_document_xml(doc_type: &str, transaction_id: i64, file_name: &str, uploaded: &str, submission: &str, comments: &str, page_type: &str) -> String {
+    let page_type = if page_type == "image" { "image" } else { "attachment" };
     let content_props = [
         named_value(&format!("{{{LRS_CORE}}}referenceid"), &transaction_id.to_string()),
-        named_value(&format!("{{{LRS_CORE}}}isattachment"), "False"),
+        named_value(&format!("{{{LRS_CORE}}}isattachment"), if page_type == "attachment" { "True" } else { "False" }),
         named_value(&format!("{{{LRS_CORE}}}pagename"), file_name),
         named_value(&format!("{{{LRS_CORE}}}pageindex"), "0"),
         named_value(&format!("{{{CMS}}}content"), uploaded),
@@ -353,9 +356,9 @@ pub fn incoming_document_xml(doc_type: &str, transaction_id: i64, file_name: &st
     format!(
         "<int:entities xsi:type=\"lrs:DocumentEntity\"><lrs:className>com.landsystems.lrs.model.IncomingDocument</lrs:className><lrs:status>added</lrs:status>{}{}{}{}\
          <lrs:content><lrs:status>saved</lrs:status><lrs:reference xsi:nil=\"true\"/>{content_props}\
-         <lrs:pages><lrs:status>added</lrs:status><lrs:reference xsi:nil=\"true\"/>{content_props}<lrs:type>image</lrs:type></lrs:pages></lrs:content></int:entities>",
+         <lrs:pages><lrs:status>added</lrs:status><lrs:reference xsi:nil=\"true\"/>{content_props}<lrs:type>{page_type}</lrs:type></lrs:pages></lrs:content></int:entities>",
         entity_value("DocumentType", Some(doc_type)),
-        entity_value("Comments", Some("Survey Plan")),
+        entity_value("Comments", Some(comments)),
         entity_value("Submission", Some(submission)),
         entity_value("PageCount", Some("1")),
     )
@@ -371,7 +374,7 @@ mod tests {
         assert_eq!(e, "<int:entities><lrs:className>com.landsystems.lrs.model.Parcel</lrs:className><lrs:status>modified</lrs:status>\
 <lrs:properties><lrs:name>Id</lrs:name><lrs:value>10000000000002</lrs:value></lrs:properties>\
 <lrs:properties><lrs:name>upin</lrs:name><lrs:value xsi:nil=\"true\"/></lrs:properties></int:entities>");
-        let d = incoming_document_xml("sd_titledeedPlan", 42, "PL68955 & co.jpg", "ref-1", "2026-11-02T05:10:00.000+01:00");
+        let d = incoming_document_xml("sd_titledeedPlan", 42, "PL68955 & co.jpg", "ref-1", "2026-11-02T05:10:00.000+01:00", "Survey Plan", "image");
         assert!(d.starts_with("<int:entities xsi:type=\"lrs:DocumentEntity\"><lrs:className>com.landsystems.lrs.model.IncomingDocument</lrs:className><lrs:status>added</lrs:status>"));
         assert!(d.contains("<lrs:name>DocumentType</lrs:name><lrs:value>sd_titledeedPlan</lrs:value>"));
         assert!(d.contains("<lrs:name>Comments</lrs:name><lrs:value>Survey Plan</lrs:value>"));
@@ -379,6 +382,14 @@ mod tests {
         assert!(d.contains("PL68955 &amp; co.jpg"), "names escaped");
         assert!(d.contains("<cms:name>{http://www.alfresco.org/ws/model/content/1.0}content</cms:name><cms:isMultiValue xsi:nil=\"true\"/><cms:value>ref-1</cms:value>"));
         assert!(d.ends_with("<lrs:type>image</lrs:type></lrs:pages></lrs:content></int:entities>"));
+        assert!(d.contains("isattachment</cms:name><cms:isMultiValue xsi:nil=\"true\"/><cms:value>False</cms:value>"));
+        // The PDF plan: an attachment page, flagged as an attachment, with the officer's comment.
+        let p = incoming_document_xml("sd_titledeedPlan", 42, "Title Deed Plan PL67363.pdf", "ref-2", "2026-11-03T10:00:00.000+01:00", "Survey Plan (corrected)", "attachment");
+        assert!(p.ends_with("<lrs:type>attachment</lrs:type></lrs:pages></lrs:content></int:entities>"));
+        assert!(p.contains("isattachment</cms:name><cms:isMultiValue xsi:nil=\"true\"/><cms:value>True</cms:value>"));
+        assert!(p.contains("<lrs:name>Comments</lrs:name><lrs:value>Survey Plan (corrected)</lrs:value>"));
+        // Anything but "image" is sent as an attachment (the Registry knows only these two).
+        assert!(incoming_document_xml("t", 1, "a.pdf", "r", "s", "c", "pdf").contains("<lrs:type>attachment</lrs:type>"));
     }
 
     #[test]

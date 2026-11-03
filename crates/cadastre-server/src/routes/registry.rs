@@ -388,17 +388,58 @@ pub async fn unlink(State(state): State<AppState>, user: AuthUser, Json(req): Js
 
 #[derive(Debug, Deserialize, ToSchema)]
 pub struct SendPlanRequest {
-    /// The job file (a JPG or PNG of the plan) to send.
+    /// The job file to send: the title deed plan PDF (a JPG is turned into a PDF first).
     pub file_id: Uuid,
+    /// Resend a corrected plan: the job's plan was sent before. The new PDF is filed as
+    /// "Survey Plan (corrected)" and the plans sent before are marked as replaced. Without it, a
+    /// second send is refused so the transaction does not collect duplicates by accident.
+    #[serde(default)]
+    pub resend: bool,
 }
 
-/// Send the plan to the job's Registry transaction (Aumentum SendImageCommand → SendImageForm →
-/// PersistDocumentInRegistry): Active transactions only, not a P- transaction; the image is
-/// uploaded and filed in the transaction as a new incoming document of type SurveyPlanFromMC.
+/// The plan as the Registry receives it: always a PDF. A PDF is sent as it is; a JPG (the plan
+/// image of earlier versions, or one attached by hand) becomes a one-page A4 PDF. Returns the
+/// name to file it under (`.pdf`) and the bytes.
+pub fn plan_as_pdf(name: &str, bytes: &[u8]) -> ApiResult<(String, Vec<u8>)> {
+    let (stem, ext) = name.rsplit_once('.').map(|(s, e)| (s.to_string(), e.to_ascii_lowercase())).unwrap_or_else(|| (name.to_string(), String::new()));
+    match ext.as_str() {
+        "pdf" if bytes.starts_with(b"%PDF-") => Ok((name.to_string(), bytes.to_vec())),
+        "pdf" => Err(AppError::BadRequest(format!("{name} is not a PDF file"))),
+        "jpg" | "jpeg" => Ok((format!("{stem}.pdf"), crate::pdf::jpeg_a4_pdf(bytes).map_err(|e| AppError::BadRequest(format!("{name}: {e}")))?)),
+        _ => Err(AppError::BadRequest("send the title deed plan as a PDF (Title Deed Plan → Attach as PDF); a JPG is also accepted and sent as a PDF".into())),
+    }
+}
+
+/// The plan documents already filed in a transaction (ids, newest first), for a resend to mark as
+/// replaced. Read-only. The Registry's HQL names for the document–transaction relation are not
+/// documented, so the likely forms are tried in turn; `Err` says none answered.
+async fn plan_documents(session: &Session, transaction_id: i64, doc_type: &str) -> Result<Vec<String>, String> {
+    let doc_type = doc_type.replace('\'', "");
+    let forms = [
+        format!("select d.id from com.landsystems.lrs.model.IncomingDocument d where d.Transaction.id = {transaction_id} and d.DocumentType.Code = '{doc_type}' order by d.id desc"),
+        format!("select d.id from com.landsystems.lrs.model.Transaction t join t.IncomingDocuments d where t.id = {transaction_id} and d.DocumentType.Code = '{doc_type}' order by d.id desc"),
+        format!("select d.id from com.landsystems.lrs.model.Transaction t join t.Documents d where t.id = {transaction_id} and d.DocumentType.Code = '{doc_type}' order by d.id desc"),
+    ];
+    let mut last = String::new();
+    for hql in &forms {
+        match session.query(hql, 50).await {
+            Ok(rows) => return Ok(rows.iter().filter_map(|r| r.first().map(|v| v.trim().to_string())).filter(|v| !v.is_empty()).collect()),
+            Err(e) => last = e.to_string(),
+        }
+    }
+    Err(last)
+}
+
+/// Send the title deed plan to the job's Registry transaction (Aumentum SendImageCommand →
+/// SendImageForm → PersistDocumentInRegistry): Active transactions only, not a P- transaction.
+/// The plan always goes as a PDF, uploaded and filed in the transaction as a new incoming
+/// document of type SurveyPlanFromMC (sd_titledeedPlan) with an `attachment` page (setting
+/// `aumentum.Integration.PlanPageType`). With `resend`, the corrected plan is filed and the plans
+/// sent before are marked as replaced (their Comments); nothing in the Registry is deleted.
 #[utoipa::path(post, path = "/api/v1/wf/jobs/{id}/registry/send-plan", tag = "registry", request_body = SendPlanRequest,
     params(("id" = i32, Path, description = "Job instance id")),
-    responses((status = 200), (status = 400, description = "No transaction on the job, or not a JPG/PNG of this job"),
-              (status = 409, description = "Transaction not Active, or writing turned off"), (status = 422, description = "The Registry refused")))]
+    responses((status = 200), (status = 400, description = "No transaction on the job, or not a PDF/JPG of this job"),
+              (status = 409, description = "Transaction not Active, writing turned off, or already sent (use resend)"), (status = 422, description = "The Registry refused")))]
 pub async fn send_plan(State(state): State<AppState>, user: AuthUser, Path(id): Path<i32>, Json(req): Json<SendPlanRequest>) -> ApiResult<Json<serde_json::Value>> {
     let actor = crate::routes::wf::resolve_actor(&state, &user).await?;
     let cfg = write_config()?;
@@ -410,15 +451,22 @@ pub async fn send_plan(State(state): State<AppState>, user: AuthUser, Path(id): 
         return Err(AppError::BadRequest(format!("{txn} is not a transaction a plan is sent to (Aumentum leaves P- transactions out)")));
     }
     let txn = ident("transaction number", &txn)?;
+    let sent_before: Option<chrono::DateTime<chrono::Utc>> = sqlx::query_scalar(
+        "SELECT max(created_at) FROM cadastre.audit_log WHERE entity = 'wf_job_instance' AND entity_id = $1 AND action = 'registry_plan_sent' AND payload->>'transaction_number' = $2")
+        .bind(id.to_string()).bind(&txn).fetch_one(&state.pool).await?;
+    if let (Some(at), false) = (sent_before, req.resend) {
+        return Err(AppError::Conflict(format!("the plan was already sent to {txn} ({} UTC). To correct it, use Resend corrected plan.", at.format("%Y-%m-%d %H:%M"))));
+    }
     let (name, _mime, bytes, job) = crate::routes::wfadmin::read_job_file(&state.pool, req.file_id).await?;
     if job != id {
         return Err(AppError::BadRequest("that file is not attached to this job".into()));
     }
-    let ext = name.rsplit_once('.').map(|(_, e)| e.to_ascii_lowercase()).unwrap_or_default();
-    if ext != "jpg" && ext != "jpeg" && ext != "png" {
-        return Err(AppError::BadRequest("send a JPG or PNG image of the plan (as Aumentum did)".into()));
-    }
+    let (sent_name, pdf) = plan_as_pdf(&name, &bytes)?;
     let doc_type = registry_sync::setting(&state.pool, "aumentum.Integration.SurveyPlanFromMC").await?.unwrap_or_else(|| "sd_titledeedPlan".into());
+    let page_type = registry_sync::setting(&state.pool, "aumentum.Integration.PlanPageType").await?.unwrap_or_else(|| "attachment".into());
+    let resend = req.resend && sent_before.is_some();
+    let now = chrono::Local::now();
+    let comments = if resend { format!("Survey Plan (corrected, {})", now.format("%d-%m-%Y %H:%M")) } else { "Survey Plan".to_string() };
     let session = Session::start(&cfg).await.map_err(registry_err)?;
     let result = async {
         let t = load_transaction(&session, &txn).await?
@@ -426,20 +474,43 @@ pub async fn send_plan(State(state): State<AppState>, user: AuthUser, Path(id): 
         if let Some(why) = &t.refused {
             return Err(AppError::Conflict(why.clone()));
         }
-        let uploaded = session.upload(if ext == "png" { "png" } else { "jpg" }, &bytes).await.map_err(registry_err)?;
-        let submission = chrono::Local::now().format("%Y-%m-%dT%H:%M:%S%.3f%:z").to_string();
-        session.save_entity(t.id, &lrs::incoming_document_xml(&doc_type, t.id, &name, &uploaded, &submission)).await.map_err(registry_err)?;
-        Ok::<_, AppError>(t)
+        // The plans already filed, looked up before the corrected one is added.
+        let earlier = if resend { Some(plan_documents(&session, t.id, &doc_type).await) } else { None };
+        let uploaded = session.upload("pdf", &pdf).await.map_err(registry_err)?;
+        let submission = now.format("%Y-%m-%dT%H:%M:%S%.3f%:z").to_string();
+        session.save_entity(t.id, &lrs::incoming_document_xml(&doc_type, t.id, &sent_name, &uploaded, &submission, &comments, &page_type)).await.map_err(registry_err)?;
+        // Mark the earlier plans as replaced. The corrected plan is filed already, so a failure
+        // here is reported, not fatal.
+        let (mut replaced, mut replace_note) = (Vec::<String>::new(), None::<String>);
+        match earlier {
+            Some(Ok(ids)) => {
+                let note = format!("Survey Plan - REPLACED by the corrected plan of {}", now.format("%d-%m-%Y %H:%M"));
+                for d in ids {
+                    match session.save_entity(t.id, &lrs::entity_xml("IncomingDocument", &[("Id", Some(&d)), ("Comments", Some(&note))])).await {
+                        Ok(()) => replaced.push(d),
+                        Err(e) => { replace_note = Some(format!("document {d} could not be marked as replaced: {e}")); }
+                    }
+                }
+                if replaced.is_empty() && replace_note.is_none() {
+                    replace_note = Some("no earlier plan document was found in the transaction to mark".into());
+                }
+            }
+            Some(Err(e)) => replace_note = Some(format!("the earlier plan could not be looked up in the Registry ({e}); mark it as replaced in the Registry")),
+            None => {}
+        }
+        Ok::<_, AppError>((t, replaced, replace_note))
     }
     .await;
     session.end().await;
-    let t = result?;
+    let (t, replaced, replace_note) = result?;
     let mut tx = state.pool.begin().await?;
     audit::append(&mut tx, &actor.label, "registry_plan_sent", "wf_job_instance", Some(&id.to_string()), serde_json::json!({
-        "transaction_number": t.transaction_number, "file_id": req.file_id, "file_name": name, "bytes": bytes.len(), "document_type": doc_type,
+        "transaction_number": t.transaction_number, "file_id": req.file_id, "file_name": sent_name, "source_file": name, "bytes": pdf.len(),
+        "document_type": doc_type, "page_type": page_type, "resend": resend, "comments": comments, "replaced": replaced, "replace_note": replace_note,
     })).await?;
     tx.commit().await?;
-    Ok(Json(serde_json::json!({ "transaction_number": t.transaction_number, "file_name": name, "document_type": doc_type })))
+    Ok(Json(serde_json::json!({ "transaction_number": t.transaction_number, "file_name": sent_name, "document_type": doc_type,
+        "resend": resend, "replaced": replaced, "replace_note": replace_note })))
 }
 
 /// Plans this Cadastre has sent for a job (audit), newest first.
@@ -605,12 +676,34 @@ pub async fn parcel_work(State(state): State<AppState>, Path(upin): Path<String>
                                     WHERE p.parcel_number = $1 AND w.lrs_transaction_number IS NOT NULL ORDER BY w.id DESC LIMIT 1")
             .bind(&upin).fetch_optional(&state.pool).await?.flatten(),
     };
-    let job = match &txn {
+    let mut job = match &txn {
         Some(t) => sqlx::query("SELECT j.id, j.name, tk.name AS task FROM cadastre.wf_job_instance j JOIN cadastre.wf_job_status s ON s.code = j.status \
                                 LEFT JOIN cadastre.wf_task tk ON tk.id = j.current_task_id WHERE j.lrs_transaction_number = $1 AND s.is_open ORDER BY j.id DESC LIMIT 1")
             .bind(t).fetch_optional(&state.pool).await?,
         None => None,
     };
+    // Fallback: links that reached the attributes without a sync event (Aumentum-era links) carry
+    // no transaction. An open job for the parcel's file still serves it: found by its linkage
+    // (property number / LRSID) or by its name Job-<file number> / Job-<UPIN>, and its
+    // transaction is the parcel's.
+    let mut txn = txn;
+    if txn.is_none() {
+        job = sqlx::query(
+            "SELECT j.id, j.name, tk.name AS task, j.lrs_transaction_number FROM cadastre.wf_job_instance j \
+             JOIN cadastre.wf_job_status s ON s.code = j.status \
+             LEFT JOIN cadastre.wf_job_linkage l ON l.wf_job_instance_id = j.id \
+             LEFT JOIN cadastre.wf_task tk ON tk.id = j.current_task_id \
+             WHERE s.is_open AND j.lrs_transaction_number IS NOT NULL AND j.lrs_transaction_number <> '' \
+               AND ((NULLIF($2, '') IS NOT NULL AND upper(l.property_number) = upper($2)) \
+                 OR (NULLIF($3, '') IS NOT NULL AND upper(l.lrs_id) = upper($3)) \
+                 OR upper(j.name) = upper('Job-' || $1) \
+                 OR (NULLIF($2, '') IS NOT NULL AND upper(j.name) = upper('Job-' || $2))) \
+             ORDER BY j.id DESC LIMIT 1",
+        )
+        .bind(&upin).bind(&pn).bind(&su)
+        .fetch_optional(&state.pool).await?;
+        txn = job.as_ref().and_then(|j| j.get::<Option<String>, _>("lrs_transaction_number"));
+    }
     Ok(Json(ParcelWorkDto {
         upin, linked, su_id: su, property_number: pn, transaction_number: txn,
         job_instance_id: job.as_ref().map(|j| j.get("id")), job_name: job.as_ref().and_then(|j| j.get("name")), current_task: job.and_then(|j| j.get("task")),
@@ -624,5 +717,26 @@ fn cadastre_linking_allowed() -> ApiResult<()> {
         Ok(())
     } else {
         Err(AppError::Conflict("Linking is done by the Registry admin in the Registry, not in the Cadastre.".into()))
+    }
+}
+
+#[cfg(test)]
+mod send_plan_tests {
+    use super::plan_as_pdf;
+
+    #[test]
+    fn the_registry_always_gets_a_pdf() {
+        // A PDF goes as it is.
+        let (n, b) = plan_as_pdf("Title Deed Plan PL67363.pdf", b"%PDF-1.4 x %%EOF").unwrap();
+        assert_eq!((n.as_str(), b.as_slice()), ("Title Deed Plan PL67363.pdf", b"%PDF-1.4 x %%EOF".as_slice()));
+        // A JPG becomes a PDF under the same name.
+        let jpg = [0xFF, 0xD8, 0xFF, 0xC0, 0x00, 0x0B, 0x08, 0x00, 0x03, 0x00, 0x02, 0x01, 0x01, 0x11, 0x00, 0xFF, 0xD9];
+        let (n, b) = plan_as_pdf("Title Deed Plan PL67363.JPG", &jpg).unwrap();
+        assert_eq!(n, "Title Deed Plan PL67363.pdf");
+        assert!(b.starts_with(b"%PDF-") && b.ends_with(b"%%EOF"));
+        // Not a PDF in disguise, not a PNG, not a broken JPG.
+        assert!(plan_as_pdf("plan.pdf", b"\x89PNG").is_err());
+        assert!(plan_as_pdf("plan.png", b"\x89PNG").is_err());
+        assert!(plan_as_pdf("plan.jpg", b"not a jpeg").is_err());
     }
 }

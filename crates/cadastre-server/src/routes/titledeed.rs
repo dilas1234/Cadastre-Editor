@@ -269,3 +269,23 @@ pub async fn svg(State(state): State<AppState>, Path(id): Path<i32>, Query(q): Q
     let d = load(&state, id, q.upin, None).await?;
     Ok(([(header::CONTENT_TYPE, "image/svg+xml; charset=utf-8"), (header::CACHE_CONTROL, "no-store")], render_svg(&d.plan)))
 }
+
+#[derive(Debug, Deserialize, IntoParams)]
+#[into_params(parameter_in = Query)]
+pub struct AttachPdfQuery {
+    /// The PDF's file name, e.g. `Title Deed Plan PL67363.pdf`.
+    pub name: String,
+}
+
+/// Attach as PDF: the title deed sheet as the editor drew it (a JPEG of the A4 sheet, the request
+/// body) becomes a one-page A4 PDF filed on the job. Send plan sends that PDF to the Registry.
+#[utoipa::path(post, path = "/api/v1/wf/jobs/{id}/titledeed.pdf", tag = "wf", params(("id" = i32, Path, description = "Job instance id"), AttachPdfQuery),
+    request_body(content = Vec<u8>, content_type = "image/jpeg", description = "The sheet as a JPEG"),
+    responses((status = 201, body = crate::routes::wfadmin::WfFileDto), (status = 400, description = "Not a JPEG")))]
+pub async fn attach_pdf(State(state): State<AppState>, user: AuthUser, Path(id): Path<i32>, Query(q): Query<AttachPdfQuery>, body: axum::body::Bytes)
+    -> ApiResult<(axum::http::StatusCode, Json<crate::routes::wfadmin::WfFileDto>)> {
+    let pdf = crate::pdf::jpeg_a4_pdf(&body).map_err(|e| AppError::BadRequest(format!("the plan sheet: {e}")))?;
+    let stem = q.name.trim().trim_end_matches(".pdf").trim_end_matches(".PDF").to_string();
+    let name = format!("{}.pdf", if stem.is_empty() { format!("Title Deed Plan {id}") } else { stem });
+    crate::routes::wfadmin::upload_file(State(state), user, Path(id), Query(crate::routes::wfadmin::UploadQuery { name }), axum::body::Bytes::from(pdf)).await
+}
