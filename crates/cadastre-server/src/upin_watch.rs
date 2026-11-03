@@ -4,7 +4,10 @@
 //! number Aumentum has issued. The reverse cannot be prevented from here: Aumentum does not know
 //! this Cadastre's numbers and may later issue one already given here. This task notices that:
 //! every `CADASTRE_AUMENTUM_WATCH_SECS` (default 900) it asks Aumentum about each UPIN committed
-//! here (ledger source `posted`) and records any that Aumentum now has as well. The outcome is
+//! here (ledger source `posted`) that a parcel here still holds, and records any that Aumentum
+//! now has as well. A commit reverted here (e.g. `examples/revert_commit.rs`, because Aumentum had
+//! the number) leaves the number in the ledger, so it is never reissued, but no parcel holds it:
+//! that is not a duplicate any more, and a duplicate found earlier is cleared (audited once). The outcome is
 //! stored in `cadastre.app_setting` (`upin.watch.status`) and shown by `GET /api/v1/registry/status`;
 //! each newly found duplicate is written to the audit log once.
 //!
@@ -46,7 +49,11 @@ pub async fn check_once(pool: &PgPool) -> Value {
     let at = chrono::Utc::now().to_rfc3339();
     let result: Result<Value, String> = async {
         let upins: Vec<(String, chrono::DateTime<chrono::Utc>)> =
-            sqlx::query_as("SELECT upin, first_seen FROM cadastre.issued_upin WHERE source = 'posted' ORDER BY upin")
+            sqlx::query_as(
+                "SELECT l.upin, l.first_seen FROM cadastre.issued_upin l \
+                 WHERE l.source = 'posted' AND EXISTS (SELECT 1 FROM cadastre.parcel p WHERE p.parcel_number = l.upin) \
+                 ORDER BY l.upin",
+            )
                 .fetch_all(pool)
                 .await
                 .map_err(|e| e.to_string())?;
@@ -80,6 +87,16 @@ pub async fn check_once(pool: &PgPool) -> Value {
                 .iter()
                 .filter_map(|d| d.get("upin").and_then(Value::as_str).map(str::to_string))
                 .collect();
+            let now: Vec<String> = v["duplicates"].as_array().cloned().unwrap_or_default().iter()
+                .filter_map(|d| d.get("upin").and_then(Value::as_str).map(str::to_string)).collect();
+            for upin in before.iter().filter(|u| !now.contains(u)) {
+                tracing::info!("duplicate UPIN cleared: {upin} (no parcel here holds it any more, or Aumentum no longer has it)");
+                if let Ok(mut tx) = pool.begin().await {
+                    if audit::append(&mut tx, "upin-watch", "duplicate_upin_cleared", "upin", Some(upin), json!({ "upin": upin })).await.is_ok() {
+                        let _ = tx.commit().await;
+                    }
+                }
+            }
             for d in v["duplicates"].as_array().cloned().unwrap_or_default() {
                 let upin = d["upin"].as_str().unwrap_or_default().to_string();
                 if before.contains(&upin) {
