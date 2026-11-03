@@ -1896,6 +1896,9 @@ impl FakeRegistry {
                     } else if body.contains("s.SpatialDate1 from com.landsystems.lrs.model.Transaction") {
                         let u = prop_upin.lock().unwrap().clone().unwrap_or_default();
                         ok(scalar_xml(&[vec!["10000000555", &su, &u, "PL777", "", "B7", ""]]))
+                    } else if body.contains("model.IncomingDocument d where d.Transaction.id = 10000000777") {
+                        // The plans already filed in PLS777 (a resend marks them as replaced).
+                        ok(scalar_xml(&[vec!["10000000901"]]))
                     } else if body.contains("p.SuID =") {
                         ok(scalar_xml(&[vec!["10000000777", "PLS777", "transaction_lodged", "Active", "10000000555", "x"]]))
                     } else {
@@ -1978,7 +1981,7 @@ async fn registry_write_back_like_aumentum() {
     let mine = lst.as_array().unwrap().iter().find(|l| l["upin"] == upin.as_str()).expect("the link is listed").clone();
     assert_eq!((mine["made_in"].as_str(), mine["linked_now"].as_bool()), (Some("cadastre"), Some(true)));
 
-    // Send the plan: the job's transaction, a JPG attached to the job.
+    // Send the plan: the job's transaction, always as a PDF (a JPG attached to the job is sent as a PDF).
     let jt = 910_000 + (n % 90_000) as i32 * 10;
     sqlx::query("INSERT INTO cadastre.wf_task (id, name) VALUES ($1, 'Save Title Deed Plan (test)')").bind(jt).execute(&pool).await.unwrap();
     sqlx::query("INSERT INTO cadastre.wf_job_type (id, name, start_task_id, end_task_id) VALUES ($1, 'Deed Plan (test)', $1, $1)").bind(jt).execute(&pool).await.unwrap();
@@ -1988,27 +1991,49 @@ async fn registry_write_back_like_aumentum() {
     let job2 = j2["job"]["id"].as_i64().unwrap();
     let rel = format!("regtest/{n}.jpg");
     std::fs::create_dir_all("files/regtest").unwrap();
-    std::fs::write(format!("files/{rel}"), b"\xFF\xD8\xFFfake-jpeg").unwrap();
+    // A real (tiny) JPEG header: SOI, SOF0 2x3 grey, then "fake-jpeg" data and EOI.
+    std::fs::write(format!("files/{rel}"), b"\xFF\xD8\xFF\xC0\x00\x0B\x08\x00\x03\x00\x02\x01\x01\x11\x00fake-jpeg\xFF\xD9").unwrap();
     let file: uuid::Uuid = sqlx::query_scalar("INSERT INTO cadastre.wf_job_file (job_instance_id, file_name, store, store_path, size_bytes) VALUES ($1, 'PL777.jpg', 'cadastre', $2, 12) RETURNING id")
         .bind(job as i32).bind(&rel).fetch_one(&pool).await.unwrap();
     let pdf: uuid::Uuid = sqlx::query_scalar("INSERT INTO cadastre.wf_job_file (job_instance_id, file_name, store, store_path, size_bytes) VALUES ($1, 'plan.pdf', 'cadastre', $2, 12) RETURNING id")
         .bind(job as i32).bind(&rel).fetch_one(&pool).await.unwrap();
     let (st, r) = send(&app, "POST", &format!("/api/v1/wf/jobs/{job}/registry/send-plan"), None, Some(json!({"file_id": pdf}))).await;
-    assert_eq!(st, StatusCode::BAD_REQUEST, "a PDF is not sent: {r}");
+    assert_eq!(st, StatusCode::BAD_REQUEST, "plan.pdf is not really a PDF: {r}");
     let (st, r) = send(&app, "POST", &format!("/api/v1/wf/jobs/{job2}/registry/send-plan"), None, Some(json!({"file_id": file}))).await;
     assert_eq!(st, StatusCode::BAD_REQUEST, "another job's file: {r}");
     let (st, r) = send(&app, "POST", &format!("/api/v1/wf/jobs/{job}/registry/send-plan"), None, Some(json!({"file_id": file}))).await;
     assert_eq!(st, StatusCode::OK, "{r}");
+    assert_eq!((r["file_name"].as_str(), r["resend"].as_bool()), (Some("PL777.pdf"), Some(false)));
     let uploads: Vec<String> = fake.seen.lock().unwrap().iter().filter(|(l, _)| l.starts_with("PUT")).map(|(l, b)| format!("{l}|{b}")).collect();
     assert_eq!(uploads.len(), 1);
-    assert!(uploads[0].contains("/lrs/upload/") && uploads[0].contains(".jpg?ticket=TICKET-1&encoding=UTF%2D8") && uploads[0].contains("fake-jpeg"), "{}", uploads[0]);
-    let doc = fake.bodies("IncomingDocument");
+    assert!(uploads[0].contains("/lrs/upload/") && uploads[0].contains(".pdf?ticket=TICKET-1&encoding=UTF%2D8"), "{}", uploads[0]);
+    assert!(uploads[0].contains("|%PDF-1.4") && uploads[0].contains("/Filter/DCTDecode") && uploads[0].contains("fake-jpeg"), "the JPG inside a PDF");
+    let doc: Vec<String> = fake.bodies("IncomingDocument").into_iter().filter(|b| b.contains("SaveEntity")).collect();
     assert_eq!(doc.len(), 1);
     assert!(doc[0].contains("<lrs:name>DocumentType</lrs:name><lrs:value>sd_titledeedPlan</lrs:value>"));
+    assert!(doc[0].contains("<lrs:name>Comments</lrs:name><lrs:value>Survey Plan</lrs:value>"));
+    assert!(doc[0].contains("PL777.pdf") && doc[0].contains("<lrs:type>attachment</lrs:type>"), "a PDF attachment page");
     assert!(doc[0].contains("<cms:value>workspace://SpacesStore/fake-content</cms:value>"), "the uploaded content");
     assert!(doc[0].contains("referenceid</cms:name><cms:isMultiValue xsi:nil=\"true\"/><cms:value>10000000777</cms:value>"));
     let (_, sent) = send(&app, "GET", &format!("/api/v1/wf/jobs/{job}/registry/sent"), None, None).await;
     assert_eq!(sent.as_array().unwrap().len(), 1);
+
+    // Sent once: a second plain send is refused; Resend corrected plan files the new PDF as
+    // corrected and marks the earlier plan document as replaced (nothing deleted).
+    let (st, r) = send(&app, "POST", &format!("/api/v1/wf/jobs/{job}/registry/send-plan"), None, Some(json!({"file_id": file}))).await;
+    assert_eq!(st, StatusCode::CONFLICT, "already sent: {r}");
+    assert!(r["message"].as_str().unwrap_or("").contains("Resend corrected plan"), "{r}");
+    let (st, r) = send(&app, "POST", &format!("/api/v1/wf/jobs/{job}/registry/send-plan"), None, Some(json!({"file_id": file, "resend": true}))).await;
+    assert_eq!(st, StatusCode::OK, "{r}");
+    assert_eq!((r["resend"].as_bool(), r["replaced"].clone(), r["replace_note"].is_null()), (Some(true), json!(["10000000901"]), true), "{r}");
+    let saves = fake.bodies("SaveEntity");
+    let corrected = saves.iter().filter(|b| b.contains("model.IncomingDocument</lrs:className><lrs:status>added")).last().unwrap();
+    assert!(corrected.contains("<lrs:name>Comments</lrs:name><lrs:value>Survey Plan (corrected, "), "{corrected}");
+    let marked = saves.iter().find(|b| b.contains("model.IncomingDocument</lrs:className><lrs:status>modified")).expect("the earlier plan marked");
+    assert!(marked.contains("<lrs:name>Id</lrs:name><lrs:value>10000000901</lrs:value>") && marked.contains("Survey Plan - REPLACED by the corrected plan of "), "{marked}");
+    assert!(!saves.iter().any(|b| b.contains("<lrs:status>deleted")), "nothing deleted");
+    let (_, sent) = send(&app, "GET", &format!("/api/v1/wf/jobs/{job}/registry/sent"), None, None).await;
+    assert_eq!((sent.as_array().unwrap().len(), sent[0]["detail"]["resend"].as_bool()), (2, Some(true)));
 
     // Unlink: the Registry property's UPIN cleared; the parcel's link fields cleared.
     let (st, r) = send(&app, "POST", "/api/v1/registry/unlink", None, Some(json!({"upin": upin}))).await;
