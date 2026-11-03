@@ -107,7 +107,7 @@ async function initAuth() {
 }
 const authReady = initAuth().catch((e) => {
   const msg = "Sign-in could not start: " + e.message;
-  setTimeout(() => { try { status(msg); } catch { /* status bar not built yet */ } alert(msg); }, 0);
+  setTimeout(() => { try { status(msg); } catch { /* status bar not built yet */ } uiAlert(msg); }, 0);
   throw e;
 });
 const authHeaders = () => (auth.token ? { authorization: `Bearer ${auth.token}` } : {});
@@ -936,7 +936,7 @@ async function addRasterLayer(node) {
   status(`Adding ${name}…`);
   let info;
   try { info = await api(`/api/v1/catalog/raster/info?folder=${folder}&path=${encodeURIComponent(path)}`); }
-  catch (e) { status(`Could not read ${name}: ${e.message}`); alert(`Could not read ${name}:\n${e.message}`); return; }
+  catch (e) { status(`Could not read ${name}: ${e.message}`); uiAlert(`Could not read ${name}:\n${e.message}`); return; }
   const crs = resolveCrs(info.epsg);
   const code = crs.code;
   const toLLc = (x, y) => (code === "EPSG:4326" ? [x, y] : proj4(code, "EPSG:4326", [x, y]));
@@ -970,7 +970,7 @@ async function addShapefileLayer(node) {
   status(`Adding ${name}…`);
   let d;
   try { d = await api(`/api/v1/catalog/shapefile?folder=${folder}&path=${encodeURIComponent(path)}`); }
-  catch (e) { status(`Could not read ${name}: ${e.message}`); alert(`Could not read ${name}:\n${e.message}`); return; }
+  catch (e) { status(`Could not read ${name}: ${e.message}`); uiAlert(`Could not read ${name}:\n${e.message}`); return; }
   const feats = (d.geojson && d.geojson.features) || [];
   if (!feats.length) { status(`${name} has no features to draw.`); return; }
   const crs = resolveCrs(d.epsg);
@@ -1226,20 +1226,20 @@ function parcelMenu(e) {
 }
 async function startEditParcel(upin, fileOnly) {
   let w;
-  try { w = await api(`/api/v1/registry/parcels/${encodeURIComponent(upin)}/work`); } catch (e) { alert(e.message); return; }
-  if (fileOnly) { if (w.transaction_number) regFind(w.transaction_number); else alert(`${upin} has no Registry file (transaction) yet.`); return; }
+  try { w = await api(`/api/v1/registry/parcels/${encodeURIComponent(upin)}/work`); } catch (e) { uiAlert(e.message); return; }
+  if (fileOnly) { if (w.transaction_number) regFind(w.transaction_number); else uiAlert(`${upin} has no Registry file (transaction) yet.`); return; }
   // Not linked yet: the title deed work does not need the link. Find the parcel's file in the
   // Registry (read-only) and start its job there (Start digitising).
   if (!w.linked && !w.job_instance_id) {
     if (w.property_number) { regFind(w.property_number); notify(`${upin} is not linked in the Registry yet. Its file ${w.property_number} is shown under Registry → Find file: Start digitising opens the title deed job.`); return; }
-    alert(`${upin} is not linked in the Registry and has no file number on its attributes.\nFind its file under Registry → Find file (PL… or PLS…) and choose Start digitising.`); return;
+    uiAlert(`${upin} is not linked in the Registry and has no file number on its attributes.\nFind its file under Registry → Find file (PL… or PLS…) and choose Start digitising.`); return;
   }
   let job = w.job_instance_id;
   if (!job) {
-    if (!w.transaction_number) { alert(`${upin} is linked (${w.su_id}), but its Registry transaction is not known here. Find the file under Registry → Find file.`); return; }
-    if (!confirm(`No open job for ${w.transaction_number}. Start the title deed job (Job-${w.property_number || upin})?`)) return;
+    if (!w.transaction_number) { uiAlert(`${upin} is linked (${w.su_id}), but its Registry transaction is not known here. Find the file under Registry → Find file.`); return; }
+    if (!(await uiConfirm(`No open job for ${w.transaction_number}. Start the title deed job (Job-${w.property_number || upin})?`))) return;
     try { job = (await api("/api/v1/registry/start-digitising", { method: "POST", body: { transaction_number: w.transaction_number, property_number: w.property_number } })).job_instance_id; }
-    catch (e) { alert(e.message); return; }
+    catch (e) { uiAlert(e.message); return; }
   }
   await openWorkflow(); await wfSelect(job);
   try { await wfWorkOn(job); } catch (e) { notify(e.message, "err"); }
@@ -1443,8 +1443,8 @@ function copyCenterXY() {
 
 // bookmarks
 function saveBookmarks() { localStorage.setItem("cad.bookmarks", JSON.stringify(state.bookmarks)); }
-function createBookmark() {
-  const name = prompt("Bookmark Name:", `Bookmark ${state.bookmarks.length + 1}`); if (!name) return;
+async function createBookmark() {
+  const name = await uiPrompt("Bookmark Name:", `Bookmark ${state.bookmarks.length + 1}`); if (!name) return;
   state.bookmarks.push({ name, bounds: map.getBounds().toArray() }); saveBookmarks(); status(`Bookmark "${name}" created`);
 }
 function manageBookmarks() {
@@ -1456,10 +1456,87 @@ function manageBookmarks() {
     if (!state.bookmarks.length) list.append(h("tr", {}, h("td", { colspan: 2, class: "muted" }, "No bookmarks yet.")));
   };
   render();
-  floatWindow("Bookmarks Manager", h("div", {}, list, h("div", { class: "frow" }, h("button", { class: "btn", onclick: () => { createBookmark(); render(); } }, "New…"))), { width: 320 });
+  floatWindow("Bookmarks Manager", h("div", {}, list, h("div", { class: "frow" }, h("button", { class: "btn", onclick: async () => { await createBookmark(); render(); } }, "New…"))), { width: 320 });
 }
 
 // floating windows
+/* =====================================================================================
+ * In-page dialogs: one modal in the editor's own style instead of the browser's alert / confirm /
+ * prompt (which look foreign, cannot be styled, and on some browsers offer "prevent this page
+ * from creating more dialogs"). Each returns a promise:
+ *   await uiAlert("Saved.")                    -> undefined
+ *   if (!(await uiConfirm("Delete it?"))) ...  -> true / false
+ *   const v = await uiPrompt("Name:", "x")     -> the text, or null when cancelled
+ * Enter = the main button, Esc = cancel; focus stays inside the dialog; errors offer "Copy details".
+ * ===================================================================================== */
+const UI_ICON = { info: "i", warn: "!", error: "✕", question: "?" };
+function uiDialog({ title = APP, message = "", kind = "info", buttons = [{ label: "OK", value: true, primary: true, cancel: true }], input = null, details = null, width = 420 } = {}) {
+  return new Promise((resolve) => {
+    const before = document.activeElement;
+    const text = typeof message === "string" ? message : "";
+    const msg = typeof message === "string"
+      ? h("div", { class: "uiMsg" }, ...message.split("\n").map((line) => h("p", {}, line)))
+      : h("div", { class: "uiMsg" }, message);
+    const inp = input ? h(input.multiline ? "textarea" : "input", { class: "uiInput", value: input.value ?? "", placeholder: input.placeholder || null, rows: input.multiline ? 4 : null }) : null;
+    if (inp && input.multiline) inp.value = input.value ?? "";
+    const back = h("div", { class: "uiModalBack" });
+    let done = false;
+    const finish = (v) => {
+      if (done) return; done = true;
+      document.removeEventListener("keydown", onKey, true);
+      back.remove();
+      try { before?.focus?.(); } catch { /* element gone */ }
+      resolve(v === uiDialog.INPUT ? inp.value : v);
+    };
+    const btns = buttons.map((b) => h("button", { class: `btn${b.primary ? " btnPrimary" : ""}`, onclick: () => finish(b.value) }, b.label));
+    const copyText = [title, text, details || ""].filter(Boolean).join("\n");
+    const copy = (kind === "error" || details)
+      ? h("button", { class: "btn uiCopy", title: "Copy the message, to send to support", onclick: async (ev) => {
+          try { await navigator.clipboard.writeText(copyText); ev.target.textContent = "Copied"; } catch { ev.target.textContent = "Select and copy the text"; }
+        } }, "Copy details")
+      : null;
+    const box = h("div", { class: `uiModal ${kind}`, role: kind === "error" || kind === "warn" ? "alertdialog" : "dialog", "aria-modal": "true", "aria-label": title, style: `width:min(${width}px, calc(100vw - 32px))` },
+      h("div", { class: "uiHead" }, h("span", {}, title), h("span", { class: "fx", title: "Close", onclick: () => finish(cancelValue()) }, "✕")),
+      h("div", { class: "uiBody" }, h("span", { class: `uiIcon ${kind}`, "aria-hidden": "true" }, UI_ICON[kind] || "i"),
+        h("div", { class: "uiMain" }, msg, details ? h("pre", { class: "uiDetails" }, details) : null, inp)),
+      h("div", { class: "uiButtons" }, copy, ...btns));
+    back.append(box);
+    function cancelValue() { const c = buttons.find((b) => b.cancel); return c ? c.value : undefined; }
+    function onKey(ev) {
+      if (ev.key === "Escape") { ev.preventDefault(); ev.stopPropagation(); finish(cancelValue()); return; }
+      if (ev.key === "Enter" && !(ev.target && ev.target.tagName === "TEXTAREA") && !(ev.target && ev.target.tagName === "BUTTON")) {
+        ev.preventDefault(); ev.stopPropagation();
+        const p = buttons.find((b) => b.primary) || buttons[0]; finish(p.value); return;
+      }
+      if (ev.key === "Tab") { // keep focus inside the dialog
+        const f = [...box.querySelectorAll("input,textarea,button")].filter((x) => !x.disabled);
+        if (!f.length) return;
+        const i = f.indexOf(document.activeElement);
+        if (ev.shiftKey && i <= 0) { ev.preventDefault(); f[f.length - 1].focus(); }
+        else if (!ev.shiftKey && i === f.length - 1) { ev.preventDefault(); f[0].focus(); }
+      }
+      ev.stopPropagation(); // the map's shortcuts stay quiet while a dialog is open
+    }
+    document.addEventListener("keydown", onKey, true);
+    document.body.append(back);
+    setTimeout(() => { if (inp) { inp.focus(); inp.select?.(); } else (btns.find((_, i) => buttons[i].primary) || btns[0])?.focus(); }, 0);
+  });
+}
+uiDialog.INPUT = Symbol("input");
+// An alert's look follows its words: failures read as errors, the rest as information.
+const uiKind = (m) => (/\b(fail|failed|error|could not|cannot|can't|not saved|refused|invalid)\b/i.test(String(m)) ? "error" : "info");
+function uiAlert(message, opts = {}) {
+  return uiDialog({ title: opts.title || APP, message: String(message ?? ""), kind: opts.kind || uiKind(message), details: opts.details || null,
+    buttons: [{ label: "OK", value: undefined, primary: true, cancel: true }] });
+}
+function uiConfirm(message, opts = {}) {
+  return uiDialog({ title: opts.title || APP, message: String(message ?? ""), kind: opts.kind || "question",
+    buttons: [{ label: opts.ok || "OK", value: true, primary: true }, { label: opts.cancel || "Cancel", value: false, cancel: true }] });
+}
+function uiPrompt(message, value = "", opts = {}) {
+  return uiDialog({ title: opts.title || APP, message: String(message ?? ""), kind: "question", input: { value, placeholder: opts.placeholder, multiline: opts.multiline },
+    buttons: [{ label: opts.ok || "OK", value: uiDialog.INPUT, primary: true }, { label: "Cancel", value: null, cancel: true }] });
+}
 function floatWindow(title, body, { id, width = 300 } = {}) {
   if (id) $(id)?.remove();
   const w = h("div", { class: "float", id: id || null, style: `width:${width}px` });
@@ -1834,17 +1911,17 @@ async function doTransition(action) {
     const j = await api(`/api/v1/jobs/${state.job.id}/transition`, { method: "POST", body: { action } });
     Object.assign(state.job, j); const i = state.jobs.findIndex((x) => x.id === j.id); if (i >= 0) state.jobs[i] = j;
     renderJobBox(); renderTask(); buildCatalog(); status(`Job ${j.reference} is now ${j.status}`);
-  } catch (e) { alert(`${action} failed: ${e.message}`); }
+  } catch (e) { uiAlert(`${action} failed: ${e.message}`); }
 }
 async function postJob() {
   if (!state.job) return;
-  if (state.job.status !== POSTABLE_STAGE) { alert(`Only ${POSTABLE_STAGE} jobs can be posted (this job is ${state.job.status}).`); return; }
+  if (state.job.status !== POSTABLE_STAGE) { uiAlert(`Only ${POSTABLE_STAGE} jobs can be posted (this job is ${state.job.status}).`); return; }
   try {
     const res = await api(`/api/v1/jobs/${state.job.id}/post`, { method: "POST" });
     status(`Posted ${res.posted} parcel(s): ${res.parcel_numbers.join(", ")}`);
     await Promise.all([loadDrafts(), loadParcels(false)]); renderTask();
     floatWindow("Post Job", h("div", {}, h("p", {}, `Posted ${res.posted} parcel(s).`), h("div", {}, res.parcel_numbers.join(", ") || "—")), { width: 300 });
-  } catch (e) { alert("Post failed: " + e.message); }
+  } catch (e) { uiAlert("Post failed: " + e.message); }
 }
 function openPdf(kind) { if (state.job) window.open(`/api/v1/jobs/${state.job.id}/${kind === "siteplan" ? "siteplan" : "report"}.pdf`, "_blank"); }
 function newJobDialog() {
@@ -1858,12 +1935,12 @@ function newJobDialog() {
       try {
         const j = await api("/api/v1/jobs", { method: "POST", body: { reference: ref.value.trim(), job_type: type.value, title: title.value.trim() || null } });
         state.jobs.unshift(j); renderJobBox(); $("jobBox").value = j.id; await selectJob(j.id); w.remove();
-      } catch (e) { alert("Create job failed: " + e.message); }
+      } catch (e) { uiAlert("Create job failed: " + e.message); }
     } }, "OK"), h("button", { class: "btn", onclick: () => w.remove() }, "Cancel"))), { id: "newJobWin", width: 330 });
 }
 async function validateFabric() {
   const fs = (state.selection.size ? selectedFC() : state.drafts).features;
-  if (!fs.length) { alert("Select parcels, or choose a Job Area with draft parcels, to validate."); return; }
+  if (!fs.length) { uiAlert("Select parcels, or choose a Job Area with draft parcels, to validate."); return; }
   const rings = fs.map((f) => {
     const g = f.geometry; const ring = (g.type === "MultiPolygon" ? g.coordinates[0][0] : g.coordinates[0]);
     return ring.slice(0, -1).map(([x, y]) => { const [E, N] = toUTM(x, y); return { x: E, y: N }; });
@@ -1871,7 +1948,7 @@ async function validateFabric() {
   try {
     const r = await api("/api/v1/fabric/validate", { method: "POST", body: { parcels: rings } });
     floatWindow("Validate Fabric", h("pre", { style: "white-space:pre-wrap;margin:0" }, JSON.stringify(r, null, 2)), { width: 420 });
-  } catch (e) { alert("Validation failed: " + e.message); }
+  } catch (e) { uiAlert("Validation failed: " + e.message); }
 }
 
 // ---- Tasks wizard ----
@@ -1988,7 +2065,7 @@ async function finishTask() {
     status(`Saved draft parcel to ${state.job.reference} — ready for the next. ${draftNextStep()}`); wfRefreshEditing();
     await loadDrafts(); buildCatalog();
     resetTraverse(); renderTask(); // stay in survey mode for the next parcel
-  } catch (e) { alert("Save failed: " + e.message); }
+  } catch (e) { uiAlert("Save failed: " + e.message); }
 }
 function jobPicker() {
   const sel = h("select", { style: "flex:1;min-width:0", onchange: async (e) => { $("jobBox").value = e.target.value; await selectJob(e.target.value); } },
@@ -2092,8 +2169,8 @@ function startEditing(tool = "sketch") {
   updateEditorButtons();
   status("Editing started — pick a template in Create Features, then click the map to add vertices (double-click to finish).");
 }
-function stopEditing() {
-  if (edit.verts.length && !confirm("You have an unfinished sketch. Discard it and stop editing?")) return;
+async function stopEditing() {
+  if (edit.verts.length && !(await uiConfirm("You have an unfinished sketch. Discard it and stop editing?", { ok: "Discard", kind: "warn" }))) return;
   edit.active = false; clearSketch();
   $("createFeaturesWin")?.remove(); $("sketchPropsWin")?.remove();
   setTool("pan"); updateEditorButtons(); status("Editing stopped.");
@@ -2157,14 +2234,14 @@ async function finishSketch() {
   else saveSketchLine();
 }
 async function saveSketchJobArea() {
-  if (!wf.editing) { alert("Open a job in the Workflow tab and choose Work On This Job before drawing its job area."); return; }
+  if (!wf.editing) { uiAlert("Open a job in the Workflow tab and choose Work On This Job before drawing its job area."); return; }
   const utm = edit.verts.slice();
   try {
     wf.editing = await api(`/api/v1/wf/jobs/${wf.editing.job_instance_id}/area`, { method: "PUT", body: { geometry: { type: "Polygon", coordinates: [[...utm, utm[0]]] } } });
     showJobArea(); clearSketch(); refreshSketchProps(); updateEditorButtons(); zoomToUTMRing(utm);
     selectTemplate("parcel"); notify(`Job area saved (${Math.round(wf.editing.area_m2 || 0).toLocaleString()} m²). Parcels for this job must be drawn inside it.`);
     renderWorkflow();
-  } catch (e) { alert("Saving the job area failed: " + e.message); }
+  } catch (e) { uiAlert("Saving the job area failed: " + e.message); }
 }
 // The bounding box of a set of UTM vertices, expanded by `margin` metres, as a closed ring.
 function bboxRingUTM(verts, margin) {
@@ -2190,10 +2267,10 @@ async function ensureJobArea(utm) {
       status("Job area reopened for editing.");
     }
     return true;
-  } catch (e) { alert("Could not prepare the job area: " + e.message); return false; }
+  } catch (e) { uiAlert("Could not prepare the job area: " + e.message); return false; }
 }
 async function saveSketchParcel() {
-  if (!state.job) { alert("Choose a Job Area first — a digitized parcel is saved as a draft under a job."); return; }
+  if (!state.job) { uiAlert("Choose a Job Area first — a digitized parcel is saved as a draft under a job."); return; }
   const utm = edit.verts.slice();
   if (!(await ensureJobArea(utm))) return; // keep the sketch so nothing is lost
   // Finish Sketch saves the shape at once (nothing to confirm, nothing lost if the attribute form
@@ -2205,7 +2282,7 @@ async function saveSketchParcel() {
     saved = editingId
       ? await api(`/api/v1/jobs/${state.job.id}/parcels/${editingId}`, { method: "PUT", body: { geometry, stated_area: null } })
       : await api(`/api/v1/jobs/${state.job.id}/parcels`, { method: "POST", body: { geometry, stated_area: null } });
-  } catch (e) { alert("Save failed: " + e.message + "\nThe sketch is kept: correct it and Finish Sketch again."); return; }
+  } catch (e) { uiAlert("Save failed: " + e.message + "\nThe sketch is kept: correct it and Finish Sketch again."); return; }
   const id = saved && saved.id ? saved.id : editingId;
   if (!state.job.reference.startsWith("WF-")) notify(`Parcel saved to ${state.job.reference}, which is not a workflow job. To work as in Aumentum, open the job in the Workflow panel and choose Work On This Job.`, "warn");
   else notify(`${editingId ? "Draft parcel updated" : "Parcel saved as a draft"} in ${state.job.reference}. ${draftNextStep()}`);
@@ -2219,7 +2296,7 @@ async function saveSketchParcel() {
     title: "Update Parcel Attribute", saveLabel: "Save attributes" });
   if (!attrs || !Object.keys(attrs).length || !id) return; // closed: the shape stays saved
   try { await api(`/api/v1/parcels/${id}/attributes`, { method: "PUT", body: attrs }); status("Parcel attributes saved."); }
-  catch (e) { alert("The parcel is saved, but its attributes were not: " + e.message + "\nUse Update Parcel Attribute to enter them again."); }
+  catch (e) { uiAlert("The parcel is saved, but its attributes were not: " + e.message + "\nUse Update Parcel Attribute to enter them again."); }
 }
 // Property-document capture shown on Finish Sketch (parcel). Resolves to the attributes object
 // (possibly empty), or null if cancelled. Prefills the Registry link + property fields from the
@@ -2303,13 +2380,13 @@ async function parcelAttrDialog(opts = {}) {
 }
 async function saveSketchPoint() {
   const [E, N] = edit.verts[0];
-  const number = prompt("Control point number:", "");
+  const number = await uiPrompt("Control point number:", "");
   if (number == null || !number.trim()) return;
   try {
     await api("/api/v1/beacons", { method: "POST", body: { number: number.trim(), easting: E, northing: N, is_control: true } });
     status(`Control point ${number.trim()} created at ${E.toFixed(3)} ${N.toFixed(3)}.`);
     await loadBeacons(); clearSketch(); refreshSketchProps(); updateEditorButtons();
-  } catch (e) { alert("Create point failed: " + e.message); }
+  } catch (e) { uiAlert("Create point failed: " + e.message); }
 }
 function saveSketchLine() {
   const ll = edit.verts.map(([e, n]) => toLL(e, n));
@@ -2420,15 +2497,15 @@ function drawCut() {
 function clearCut() { edit.cut = []; if (edit.verts.length) drawSketch(); else map.getSource("sketch")?.setData(empty()); }
 async function finishCut() {
   if (edit.cut.length < 2) { status("Draw a line across the parcel (two or more points)."); return; }
-  if (!state.job) { alert("Open a job (Work On This Job) before cutting its draft parcels."); return; }
+  if (!state.job) { uiAlert("Open a job (Work On This Job) before cutting its draft parcels."); return; }
   const target = draftForCut(edit.cut);
-  if (!target) { alert("The cut line must cross one of the job's draft parcels."); clearCut(); return; }
+  if (!target) { uiAlert("The cut line must cross one of the job's draft parcels."); clearCut(); return; }
   const line = { type: "LineString", coordinates: edit.cut.slice() };
   try {
     const parts = await api(`/api/v1/jobs/${state.job.id}/parcels/${target}/cut`, { method: "POST", body: { line } });
     status(`Parcel cut into ${parts.length} parts.`);
     await loadDrafts(); buildCatalog(); wfRefreshEditing();
-  } catch (e) { alert("Cut failed: " + e.message); }
+  } catch (e) { uiAlert("Cut failed: " + e.message); }
   clearCut();
 }
 // The job draft the cut line crosses: the first whose polygon contains a point sampled along the line.
@@ -2478,7 +2555,7 @@ async function editDraftAttributes(id) {
   const attrs = await parcelAttrDialog({ prefill, parcelId: id, areaM2, title: "Update Parcel Attribute", saveLabel: "Save attributes" });
   if (attrs === null) return;
   try { await api(`/api/v1/parcels/${id}/attributes`, { method: "PUT", body: attrs }); status("Parcel attributes updated."); }
-  catch (e) { alert("Update failed: " + e.message); }
+  catch (e) { uiAlert("Update failed: " + e.message); }
 }
 // Area (m², UTM 32N) of a polygon feature (lng/lat), via the shoelace formula on its outer ring.
 function featureAreaM2(f) {
@@ -2616,11 +2693,11 @@ function openSketchProps() {
 }
 function refreshSketchProps() { if ($("sketchPropsWin")) openSketchProps(); }
 async function deleteDraftBeingEdited() {
-  if (!edit.editingId || !state.job || !confirm("Delete this draft parcel from the job?")) return;
+  if (!edit.editingId || !state.job || !(await uiConfirm("Delete this draft parcel from the job?", { ok: "Delete", kind: "warn" }))) return;
   try {
     await api(`/api/v1/jobs/${state.job.id}/parcels/${edit.editingId}`, { method: "DELETE" });
     clearSketch(); await loadDrafts(); wfRefreshEditing(); refreshSketchProps(); updateEditorButtons(); status("Draft parcel deleted.");
-  } catch (e) { alert("Delete failed: " + e.message); }
+  } catch (e) { uiAlert("Delete failed: " + e.message); }
 }
 
 /* =====================================================================================
@@ -2808,7 +2885,7 @@ function connectionLineDialog() {
 // Donut Parcel / Parcel Separation: the current sketch is applied to a draft parcel clicked next.
 let pickDraftMode = null;
 function startPickDraft(mode) {
-  if (!state.job) { alert("Choose the job first (Workflow → Work On This Job)."); return; }
+  if (!state.job) { uiAlert("Choose the job first (Workflow → Work On This Job)."); return; }
   pickDraftMode = mode; setTool("pickDraft");
   status(mode === "donut" ? "Create Donut Parcel: click the draft parcel the sketch is a hole in." : "Parcel Separation: click the draft parcel the sketched line separates.");
 }
@@ -2831,7 +2908,7 @@ async function pickDraftAt(pt) {
 }
 // Create Parcel by FCI: a polygon feature class (shapefile) becomes the job's draft parcels.
 function fciDialog() {
-  if (!state.job) { alert("Choose the job first (Workflow → Work On This Job)."); return; }
+  if (!state.job) { uiAlert("Choose the job first (Workflow → Work On This Job)."); return; }
   const node = cat.nodes.get(cat.selected);
   const catShp = node && node.folder != null && /\.shp$/i.test(node.path || "") ? node : null;
   const src = h("select", {}, catShp ? h("option", { value: "catalog" }, `Selected in the Catalog: ${catShp.name}`) : null, h("option", { value: "pc" }, "A shapefile on this PC"));
@@ -2874,7 +2951,7 @@ function fciDialog() {
 const selectedUpins = () => selectedFC().features.map((f) => f.properties.parcel_number).filter(Boolean);
 function needWorkflowJob() {
   if (wf.editing) return wf.editing.job_instance_id;
-  alert("Open the job in the Workflow panel and choose Work On This Job first."); return null;
+  uiAlert("Open the job in the Workflow panel and choose Work On This Job first."); return null;
 }
 async function afterMutation(msg) {
   clearSketch(); refreshSketchProps(); updateEditorButtons();
@@ -2895,7 +2972,7 @@ const MUTATION_LABEL = { split: "Split", merge: "Merge", resurvey: "Adjust (re-s
 function startSplitLine(kind = "split") {
   const verb = kind === "separate" ? "separate" : "split";
   const u = selectedUpins();
-  if (u.length !== 1) { alert(`Select the one parcel to ${verb} first (Select tool).`); return; }
+  if (u.length !== 1) { uiAlert(`Select the one parcel to ${verb} first (Select tool).`); return; }
   if (!needWorkflowJob()) return;
   if (!edit.active) startEditing("sketch");
   clearSketch(); selectTemplate("line"); edit.splitMode = kind; setTool("sketch"); openSketchProps();
@@ -2904,28 +2981,28 @@ function startSplitLine(kind = "split") {
 async function mutationSplit() {
   const kind = edit.splitMode === "separate" ? "separate" : "split";
   const u = selectedUpins();
-  if (u.length !== 1) { alert(`Select the one parcel to ${kind} (Select tool).`); return; }
-  if (edit.verts.length < 2) { alert("Sketch the line across the parcel first."); return; }
+  if (u.length !== 1) { uiAlert(`Select the one parcel to ${kind} (Select tool).`); return; }
+  if (edit.verts.length < 2) { uiAlert("Sketch the line across the parcel first."); return; }
   const line = { type: "LineString", coordinates: edit.verts.map((v) => [...v]) };
   edit.splitMode = false;
   await recordMutation({ kind, upins: u, line }, (r) => `${MUTATION_LABEL[kind]} of ${u[0]} recorded: ${r.drafts.length} new parcels (drafts). They replace it when the job's parcels are committed.`);
 }
 async function mutationMerge() {
   const u = selectedUpins();
-  if (u.length < 2) { alert("Select two or more neighbouring parcels to merge (Select tool, Shift-click to add)."); return; }
-  if (!confirm(`Merge ${u.join(" + ")} into one parcel?`)) return;
+  if (u.length < 2) { uiAlert("Select two or more neighbouring parcels to merge (Select tool, Shift-click to add)."); return; }
+  if (!(await uiConfirm(`Merge ${u.join(" + ")} into one parcel?`))) return;
   await recordMutation({ kind: "merge", upins: u }, `Merge of ${u.join(" + ")} recorded (a draft). It replaces them when the job's parcels are committed.`);
 }
 // Aumentum: an adjustment takes n adjacent parcels to n (each new parcel's parents: all n); a
 // free mutation X parcels to Y (reshape, separate or delete the copies). New UPINs for all.
 async function mutationResurvey() {
   const u = selectedUpins();
-  if (!u.length) { alert("Select the parcel(s) to adjust (Select tool; Shift-click to add adjacent parcels)."); return; }
+  if (!u.length) { uiAlert("Select the parcel(s) to adjust (Select tool; Shift-click to add adjacent parcels)."); return; }
   await recordMutation({ kind: "resurvey", upins: u }, `Adjustment of ${u.join(" + ")} recorded: edit the ${u.length > 1 ? "copies" : "copy"} with the Edit tool; ${u.length > 1 ? "they replace them" : `it replaces ${u[0]}`} (new UPINs) at commit.`);
 }
 async function mutationFree() {
   const u = selectedUpins();
-  if (!u.length) { alert("Select the parcel(s) for the free mutation (Select tool; Shift-click to add adjacent parcels)."); return; }
+  if (!u.length) { uiAlert("Select the parcel(s) for the free mutation (Select tool; Shift-click to add adjacent parcels)."); return; }
   await recordMutation({ kind: "free", upins: u }, `Free mutation of ${u.join(" + ")} recorded: reshape, separate or delete the copies; they replace ${u.join(" + ")} (new UPINs) at commit.`);
 }
 // Aumentum's Separation Configuration: which part keeps the parent's UPIN and attributes.
@@ -2935,7 +3012,7 @@ async function mutationKeepUpin(jobId, m, draft) {
 }
 function mutationRetire() {
   const u = selectedUpins();
-  if (!u.length) { alert("Select the parcel(s) to retire (Select tool)."); return; }
+  if (!u.length) { uiAlert("Select the parcel(s) to retire (Select tool)."); return; }
   if (!needWorkflowJob()) return;
   const reason = h("input", { placeholder: "e.g. RE-SURVEYED, overlapping, WRONGLY DONE", style: "flex:1" });
   const go = async () => { if (!reason.value.trim()) { reason.focus(); return; } w.remove(); await recordMutation({ kind: "retire", upins: u, reason: reason.value.trim() }, `Retirement of ${u.join(", ")} recorded; applied when the job is committed.`); };
@@ -2944,15 +3021,15 @@ function mutationRetire() {
     h("div", { class: "frow" }, h("label", {}, "Reason:"), reason), h("div", { class: "frow", style: "justify-content:flex-end" }, h("button", { class: "btn", onclick: go }, "Retire"))), { id: "retireWin", width: 400 });
   setTimeout(() => reason.focus(), 0);
 }
-function lineageOfSelection() {
+async function lineageOfSelection() {
   const u = selectedUpins();
   if (u.length) { lineageWindow(u[0]); return; }
-  const v = prompt("Parcel UPIN:", ""); if (v && v.trim()) lineageWindow(v.trim());
+  const v = await uiPrompt("Parcel UPIN:", ""); if (v && v.trim()) lineageWindow(v.trim());
 }
 // Lineage: where a parcel came from and what it became (Aumentum's history and mutations made here).
 async function lineageWindow(upin) {
   let d;
-  try { d = await api(`/api/v1/parcels/lineage?upin=${encodeURIComponent(upin)}`); } catch (e) { alert(e.message); return; }
+  try { d = await api(`/api/v1/parcels/lineage?upin=${encodeURIComponent(upin)}`); } catch (e) { uiAlert(e.message); return; }
   const body = h("div", {});
   const link = (u) => u ? h("a", { href: "#", onclick: (ev) => { ev.preventDefault(); lineageWindow(u); } }, u) : "?";
   const groups = new Map();
@@ -3197,7 +3274,7 @@ function drawStyle() {
     bold: $("fmtB")?.classList.contains("active"), italic: $("fmtI")?.classList.contains("active"), underline: $("fmtU")?.classList.contains("active") };
 }
 function addGraphic(g) { const id = crypto.randomUUID?.() || String(Date.now()); state.graphics.push({ id, ...drawStyle(), ...g }); renderGraphics(); return id; }
-function addTextGraphic(ll) { const text = prompt("Text:", "Text"); if (text) addGraphic({ type: "text", at: [ll.lng, ll.lat], text }); }
+async function addTextGraphic(ll) { const text = await uiPrompt("Text:", "Text"); if (text) addGraphic({ type: "text", at: [ll.lng, ll.lat], text }); }
 const gfxMarkers = [];
 function renderGraphics() {
   saveGraphics();
@@ -3310,15 +3387,15 @@ async function registryZoom(upin) {
 async function registryStartJob(l) {
   const types = (wf.defs?.job_types || []).filter((t) => t.active && t.start_task_id);
   const type = types.find((t) => t.id === 9) || types[0];
-  if (!type) { alert("No active job type to start."); return; }
+  if (!type) { uiAlert("No active job type to start."); return; }
   const name = `Job-${l.property_number || l.upin}`;
-  if (!confirm(`Start a "${type.name}" job ${name} for Registry transaction ${l.transaction_number} (parcel ${l.upin})?`)) return;
+  if (!(await uiConfirm(`Start a "${type.name}" job ${name} for Registry transaction ${l.transaction_number} (parcel ${l.upin})?`, { ok: "Start job" }))) return;
   try {
     const d = await api("/api/v1/wf/jobs", { method: "POST", body: { job_type_id: type.id, name, lrs_transaction_number: l.transaction_number, comment: `Registry property ${l.su_id} linked to ${l.upin} on ${regTime(l.linked_at)}` } });
     await registryLoad(); renderRegistry(); await registryZoom(l.upin);
     status(`Job ${d.job.id} (${name}) started on "${d.job.current_task}". Open it in Workflow, choose Work On This Job, then input the survey points.`);
-    if (confirm(`Job ${name} started. Open it in the Workflow now to input the points?`)) registryOpenJob(d.job.id);
-  } catch (e) { alert(e.message); }
+    if (await uiConfirm(`Job ${name} started. Open it in the Workflow now to input the points?`, { ok: "Open job", cancel: "Not now" })) registryOpenJob(d.job.id);
+  } catch (e) { uiAlert(e.message); }
 }
 async function registryOpenJob(id) { await openWorkflow(); await wfSelect(id); }
 // --- transaction lookup, link / unlink (Aumentum LinkageManager.LinkParcel) ---
@@ -3344,7 +3421,7 @@ async function regSetJob(id) {
 }
 async function regSendPlan(fileId, fileName) {
   const t = reg.job.lrs_transaction_number;
-  if (!confirm(`Send the plan image ${fileName} to Registry transaction ${t}?\nIt is filed in the transaction as a Title Deed Plan.`)) return;
+  if (!(await uiConfirm(`Send the plan image ${fileName} to Registry transaction ${t}?\nIt is filed in the transaction as a Title Deed Plan.`, { ok: "Send" }))) return;
   await regRun("Send plan", async () => { const r = await api(`/api/v1/wf/jobs/${reg.job.id}/registry/send-plan`, { method: "POST", body: { file_id: fileId } }); notify(`${r.file_name} sent to ${r.transaction_number}.`); await regSetJob(reg.job.id); });
 }
 // ---- view ---------------------------------------------------------------------------------
@@ -3477,7 +3554,7 @@ async function regFind(q) {
   reg.finding = false; renderRegistry();
 }
 async function regStartDigitising(f) {
-  if (!confirm(`Start digitising ${f.property_number || f.transaction_number}?\nA "Deed Plan Creationv2" job is created for Registry transaction ${f.transaction_number}, as the Registry created them.`)) return;
+  if (!(await uiConfirm(`Start digitising ${f.property_number || f.transaction_number}?\nA "Deed Plan Creationv2" job is created for Registry transaction ${f.transaction_number}, as the Registry created them.`, { ok: "Start digitising" }))) return;
   await regRun("Start digitising", async () => {
     const r = await api("/api/v1/registry/start-digitising", { method: "POST", body: { transaction_number: f.transaction_number, property_number: f.property_number } });
     notify(r.created ? `${r.name} created.` : `${r.name || "The job"} was already open for ${f.transaction_number}.`);
@@ -3707,7 +3784,7 @@ async function wfAction(url, body, done) {
     wf.selEditing = await api(`/api/v1/wf/jobs/${wf.detail.job.id}/editing`).catch(() => wf.selEditing);
     if (wf.editing && wf.editing.job_instance_id === wf.detail.job.id) wf.editing = wf.selEditing;
     status(done);
-  } catch (e) { status(e.message); alert(e.message); }
+  } catch (e) { status(e.message); uiAlert(e.message); }
   finally { wf.busy = false; renderWorkflow(); }
 }
 function wfEndDialog(j) {
@@ -3734,7 +3811,7 @@ function wfNewJobDialog() {
       try {
         const d = await api("/api/v1/wf/jobs", { method: "POST", body: { job_type_id: Number(type.value), name: name.value || null, lrs_transaction_number: lrs.value || null, comment: comment.value || null } });
         w.remove(); wf.filter = "open"; wf.q = ""; await wfLoadJobs(true); wf.selected = d.job.id; wf.detail = d; renderWorkflow(); status(`Job ${d.job.id} created on "${d.job.current_task}".`);
-      } catch (e) { alert(e.message); }
+      } catch (e) { uiAlert(e.message); }
     } }, "Create"))), { id: "wfNewWin", width: 380 });
 }
 
@@ -3768,7 +3845,7 @@ async function wfWorkOn(jobId) {
     showJobArea();
     if (wf.editing.area) zoomToFC({ type: "FeatureCollection", features: [{ type: "Feature", geometry: wf.editing.area, properties: {} }] });
     status(wf.editing.area ? `Working on ${wf.detail?.job?.name || "job " + jobId}: draw parcels inside its job area, then Post Parcel & Finish.` : `Working on ${wf.detail?.job?.name || "job " + jobId}: sketch the parcel — its job area is created automatically — then Post Parcel & Finish.`);
-  } catch (e) { alert(e.message); }
+  } catch (e) { uiAlert(e.message); }
   renderWorkflow();
 }
 async function wfEditAction(method, path, done, body) {
@@ -3780,7 +3857,7 @@ async function wfEditAction(method, path, done, body) {
     else status(done);
     await loadDrafts(); showJobArea();
     wf.detail = await api("/api/v1/wf/jobs/" + id);
-  } catch (e) { alert(e.message); }
+  } catch (e) { uiAlert(e.message); }
   renderWorkflow();
 }
 // Commit Parcels: the officer types the beacon number of every corner, from the surveyor's point
@@ -3791,12 +3868,12 @@ async function wfEditAction(method, path, done, body) {
 async function wfCommitDialog(opts = {}) {
   const id = wf.editing?.job_instance_id; if (!id) { status("Choose Work On This Job first."); return; }
   let pts;
-  try { pts = await api(`/api/v1/wf/jobs/${id}/editing/corners`); } catch (e) { alert(e.message); return; }
-  if (!pts.length && opts.submit) { try { await opts.submit([]); } catch (e) { alert(e.message); } return; }
+  try { pts = await api(`/api/v1/wf/jobs/${id}/editing/corners`); } catch (e) { uiAlert(e.message); return; }
+  if (!pts.length && opts.submit) { try { await opts.submit([]); } catch (e) { uiAlert(e.message); } return; }
   if (!pts.length) {
     const ret = (wf.mutations || []).filter((m) => m.kind === "retire");
-    if (!ret.length) { alert("The job has no draft parcels to commit."); return; }
-    if (!confirm(`Commit the retirement of ${ret.flatMap((m) => m.parents).join(", ")}?`)) return;
+    if (!ret.length) { uiAlert("The job has no draft parcels to commit."); return; }
+    if (!(await uiConfirm(`Commit the retirement of ${ret.flatMap((m) => m.parents).join(", ")}?`, { ok: "Commit" }))) return;
     try {
       const r = await api(`/api/v1/wf/jobs/${id}/commit`, { method: "POST", body: { beacons: [] } });
       wf.editing = r.editing; wf.selEditing = wf.editing; await Promise.all([loadParcels(false), loadDrafts()]); loadHistory();
@@ -3908,8 +3985,8 @@ function wfEditingView(j, e) {
   sec.append(h("div", { class: "frow", style: "flex-wrap:wrap" },
     h("button", { class: "btn", onclick: wfDrawJobArea }, ed.area ? "Edit Job Area" : "Create Job Area"),
     ed.area ? h("button", { class: "btn", onclick: () => wfEditAction("POST", `/area/${ed.area_status === "closed" ? "reopen" : "close"}`, ed.area_status === "closed" ? "Job area reopened." : "Job area closed.") }, ed.area_status === "closed" ? "Reopen Job Area" : "Close Job Area") : null,
-    ed.area ? h("button", { class: "btn", onclick: () => { if (confirm("Delete the job area?")) wfEditAction("DELETE", "/area", "Job area deleted."); } }, "Delete Job Area") : null,
-    h("button", { class: "btn", disabled: !ed.drafts, onclick: () => { if (confirm(`Discard the job's ${ed.drafts} uncommitted parcel(s)?`)) wfEditAction("POST", "/discard", "Draft parcels discarded."); } }, "Discard Changes"),
+    ed.area ? h("button", { class: "btn", onclick: async () => { if (await uiConfirm("Delete the job area?", { ok: "Delete", kind: "warn" })) wfEditAction("DELETE", "/area", "Job area deleted."); } }, "Delete Job Area") : null,
+    h("button", { class: "btn", disabled: !ed.drafts, onclick: async () => { if (await uiConfirm(`Discard the job's ${ed.drafts} uncommitted parcel(s)?`, { ok: "Discard", kind: "warn" })) wfEditAction("POST", "/discard", "Draft parcels discarded."); } }, "Discard Changes"),
     h("button", { class: "btn", onclick: async () => { await loadDrafts(); await wfSelect(j.id); status("Reloaded from the fabric."); } }, "Reload"),
     ed.is_commit_task ? h("button", { class: "btn", disabled: !ed.drafts && !(wf.mutations || []).length, title: "Give the job's draft parcels their UPINs and add them to the fabric", onclick: () => wfCommitDialog() }, "Commit Parcels…") : null));
   // Mutations recorded in the job (Phase 4), applied when the parcels are committed.
@@ -3922,8 +3999,8 @@ function wfEditingView(j, e) {
         ...m.drafts.map((d, i) => { const f = state.drafts.features.find((x) => String(x.properties.id) === String(d));
           return h("option", { value: d, selected: m.keeps_upin === d }, `part ${i + 1} keeps ${m.parents[0]}${f && f.properties.computed_area ? ` (${area2(f.properties.computed_area)} m²)` : ""}`); })) : null;
       ul.append(h("li", {}, what, " ", keep, " ", h("button", { class: "btn", style: "min-width:0;padding:0 6px", title: "Cancel this mutation (its draft parcels are removed)", onclick: async () => {
-        if (!confirm(`Cancel: ${what}?`)) return;
-        try { await api(`/api/v1/wf/jobs/${ed.job_instance_id}/mutations/${m.group}`, { method: "DELETE" }); await afterMutation("Mutation cancelled."); } catch (e) { alert(e.message); }
+        if (!(await uiConfirm(`Cancel: ${what}?`, { ok: "Cancel it", cancel: "Keep", kind: "warn" }))) return;
+        try { await api(`/api/v1/wf/jobs/${ed.job_instance_id}/mutations/${m.group}`, { method: "DELETE" }); await afterMutation("Mutation cancelled."); } catch (e) { uiAlert(e.message); }
       } }, "Cancel")));
     }
     sec.append(h("div", { class: "wfSub", style: "margin-top:6px" }, "Mutations (applied at commit)"), ul);
@@ -3942,13 +4019,13 @@ async function wfFinishCurrent() {
   const id = wf.editing?.job_instance_id;
   if (!id) { status("Work on a job (Workflow pane) before posting."); return; }
   let job = wf.detail && wf.detail.job && wf.detail.job.id === id ? wf.detail.job : null;
-  if (!job) { try { job = (await api("/api/v1/wf/jobs/" + id)).job; } catch (e) { alert(e.message); return; } }
+  if (!job) { try { job = (await api("/api/v1/wf/jobs/" + id)).job; } catch (e) { uiAlert(e.message); return; } }
   await wfFinishJob(job);
 }
 async function wfFinishJob(j) {
   const ed = wf.editing;
   if (!ed || !ed.drafts) { status("Draw a parcel first."); return; }
-  if (!confirm(`Post ${ed.drafts} parcel(s) and finish job ${j.name || "#" + j.id}?\nThis allocates the official UPIN(s) and completes the workflow.`)) return;
+  if (!(await uiConfirm(`Post ${ed.drafts} parcel(s) and finish job ${j.name || "#" + j.id}?\nThis allocates the official UPIN(s) and completes the workflow.`, { ok: "Post & Finish" }))) return;
   // The new corners' beacon numbers first, as for Commit Parcels.
   await wfCommitDialog({ title: "Post Parcel & Finish Job — Beacon Numbers", label: "Post & Finish", submit: (beacons) => wfFinishPost(j, beacons) });
 }
@@ -3958,7 +4035,7 @@ async function wfFinishPost(j, beacons) {
     const r = await api(`/api/v1/wf/jobs/${j.id}/finish`, { method: "POST", body: { complete: true, beacons } });
     const nums = (r.parcel_numbers || []).join(", ") || "(none)";
     status(r.completed ? `Done — ${nums} posted; job completed.` : `${nums} posted.`);
-    alert(`Parcel posted.\nUPIN: ${nums}\n${r.completed ? "Job completed." : "Job now at: " + (r.job?.current_task || "—")}`);
+    uiAlert(`Parcel posted.\nUPIN: ${nums}\n${r.completed ? "Job completed." : "Job now at: " + (r.job?.current_task || "—")}`);
     await loadParcels(false); await loadDrafts(); showJobArea();
     wf.detail = await api("/api/v1/wf/jobs/" + j.id);
     wf.selEditing = await api(`/api/v1/wf/jobs/${j.id}/editing`).catch(() => wf.selEditing);
@@ -3977,7 +4054,7 @@ const TD_SCALES = [250, 500, 750, 1000, 1250, 1500, 2000, 2500, 3000, 4000, 5000
 async function titleDeedDialog(jobId, upin) {
   let d;
   try { d = await api(`/api/v1/wf/jobs/${jobId}/titledeed` + (upin ? `?upin=${encodeURIComponent(upin)}` : "")); }
-  catch (e) { alert("Title deed plan: " + e.message); return; }
+  catch (e) { uiAlert("Title deed plan: " + e.message); return; }
   const p = d.plan, f = p.fields;
   const inp = (key, ph) => h("input", { value: f[key] || "", placeholder: ph || "", style: "width:100%;box-sizing:border-box", "data-k": key });
   const row = (label, el) => h("div", { class: "frow" }, h("label", { style: "min-width:120px" }, label), el);
@@ -4020,7 +4097,7 @@ async function titleDeedDialog(jobId, upin) {
     try {
       const svg = await sheet();
       const w = window.open("", "_blank");
-      if (!w) { alert("Allow pop-ups for this site to preview the plan."); return; }
+      if (!w) { uiAlert("Allow pop-ups for this site to preview the plan."); return; }
       w.document.write(`<!doctype html><html><head><title>Title Deed Plan ${p.upin}</title><style>@page{size:A4;margin:0}body{margin:0;background:#888}
         .page{width:210mm;height:297mm;margin:10px auto;background:#fff;box-shadow:0 0 6px #000}.bar{text-align:center;padding:8px;font:14px sans-serif}
         @media print{body{background:#fff}.page{margin:0;box-shadow:none}.bar{display:none}}</style></head><body>
@@ -4132,7 +4209,7 @@ function wfFilesView(j) {
       const r = await fetch(`/api/v1/wf/jobs/${j.id}/files?name=${encodeURIComponent(file.name)}`, { method: "POST", body: file, headers: { "content-type": "application/octet-stream", ...authHeaders() } });
       if (!r.ok) throw new Error((await r.json().catch(() => ({}))).message || r.statusText);
       status(`${file.name} attached.`); await wfSelect(j.id);
-    } catch (e) { alert("Attaching failed: " + e.message); }
+    } catch (e) { uiAlert("Attaching failed: " + e.message); }
   };
   sec.append(h("div", { class: "frow" }, h("label", {}, "Attach file:"), input));
   return sec;
@@ -4173,12 +4250,12 @@ async function notificationsWindow() {
 const adm = { tab: "users", data: null, settings: [], sel: null };
 async function adminWindow() {
   try { [adm.data, adm.settings] = await Promise.all([api("/api/v1/admin/security"), api("/api/v1/admin/settings")]); if (!wf.defs) wf.defs = await api("/api/v1/wf/definitions"); }
-  catch (e) { alert(e.message); return; }
+  catch (e) { uiAlert(e.message); return; }
   floatWindow("Administration", h("div", { id: "admBody" }), { id: "admWin", width: 700 });
   renderAdmin();
 }
 async function admChange(body) {
-  try { adm.data = await api("/api/v1/admin/change", { method: "POST", body }); renderAdmin(); status("Saved."); } catch (e) { alert(e.message); }
+  try { adm.data = await api("/api/v1/admin/change", { method: "POST", body }); renderAdmin(); status("Saved."); } catch (e) { uiAlert(e.message); }
 }
 function renderAdmin() {
   const root = $("admBody"); if (!root) return; root.innerHTML = "";
@@ -4212,7 +4289,7 @@ function renderAdmin() {
       const add = h("select", {}, h("option", { value: "" }, "+ add…"), ...P.filter((p) => !perms.some(([, s]) => s === p.sid)).map((p) => h("option", { value: p.sid }, p.name || p.code)));
       add.onchange = () => add.value && admChange({ kind: "task_permission", task_id: t.id, sid: Number(add.value), add: true });
       tb.append(h("tr", {}, h("td", {}, t.name), h("td", {}, ...perms.map(([, sid, def]) => h("span", { class: "wfPill " + (def ? "done" : "ended"), style: "display:inline-block;margin:1px", title: "Click to remove; double-click to make default" ,
-        onclick: () => confirm(`Remove ${name(sid)} from "${t.name}"?`) && admChange({ kind: "task_permission", task_id: t.id, sid, add: false }),
+        onclick: async () => (await uiConfirm(`Remove ${name(sid)} from "${t.name}"?`, { ok: "Remove", kind: "warn" })) && admChange({ kind: "task_permission", task_id: t.id, sid, add: false }),
         ondblclick: (e) => { e.stopPropagation(); admChange({ kind: "task_permission", task_id: t.id, sid, add: true, is_default: !def }); } }, (def ? "★ " : "") + name(sid)))), h("td", {}, add)));
     }
     body.append(tb);
@@ -4227,7 +4304,7 @@ function renderAdmin() {
     const tb = h("table", { class: "wfHist" }, h("tr", {}, h("th", {}, "Setting"), h("th", {}, "Value"), h("th", {}, "Source")));
     for (const st of adm.settings) {
       const inp = h("input", { value: st.value ?? "", style: "width:260px", type: /pass|secret/i.test(st.key) ? "password" : "text" });
-      inp.onchange = async () => { try { adm.settings = await api("/api/v1/admin/settings", { method: "PUT", body: { key: st.key, value: inp.value } }); status(`${st.key} saved.`); renderAdmin(); } catch (e) { alert(e.message); } };
+      inp.onchange = async () => { try { adm.settings = await api("/api/v1/admin/settings", { method: "PUT", body: { key: st.key, value: inp.value } }); status(`${st.key} saved.`); renderAdmin(); } catch (e) { uiAlert(e.message); } };
       tb.append(h("tr", {}, h("td", {}, st.key), h("td", {}, inp), h("td", {}, st.source || "")));
     }
     const k = h("input", { placeholder: "e.g. mail.smtp_password", style: "width:220px" }), v = h("input", { style: "width:220px" });
