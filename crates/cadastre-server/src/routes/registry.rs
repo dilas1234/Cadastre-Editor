@@ -196,6 +196,12 @@ pub struct RegistryPropertyDto {
     pub lot: Option<String>,
     pub block: Option<String>,
     pub linked_at: Option<String>,
+    /// The property's location (Registry dictionary `location`, e.g. "Jos - Bukuru Metropolis").
+    #[serde(default)]
+    pub location: Option<String>,
+    /// The property's layout (Registry dictionary `layout_type`).
+    #[serde(default)]
+    pub layout: Option<String>,
 }
 
 #[derive(Debug, Serialize, ToSchema)]
@@ -219,8 +225,9 @@ pub(crate) async fn load_transaction(session: &Session, number: &str) -> ApiResu
     let Some(t) = t.into_iter().find(|r| r.len() >= 4) else { return Ok(None) };
     let props = session
         .query(&format!(
-            "select s.Id, s.SuID, s.Upin, s.Refnum, s.LotNumber, s.BlockNumber, s.SpatialDate1 from com.landsystems.lrs.model.Transaction t \
-             join t.Properties l join l.SpatialUnits s where t.TransactionNumber = '{number}' and l.EndLifespanVersion is null and s.EndLifespanVersion is null"
+            "select s.Id, s.SuID, s.Upin, s.Refnum, s.LotNumber, s.BlockNumber, s.SpatialDate1, z.Label, y.Label from com.landsystems.lrs.model.Transaction t \
+             join t.Properties l join l.SpatialUnits s left join s.Zone z left join s.Layout y \
+             where t.TransactionNumber = '{number}' and l.EndLifespanVersion is null and s.EndLifespanVersion is null"
         ), 500)
         .await
         .map_err(registry_err)?;
@@ -237,11 +244,62 @@ pub(crate) async fn load_transaction(session: &Session, number: &str) -> ApiResu
         properties: props.iter().filter(|r| r.len() >= 7).map(|r| RegistryPropertyDto {
             id: r[0].trim().to_string(), su_id: r[1].trim().to_string(), upin: o(&r[2]), refnum: o(&r[3]),
             lot: o(&r[4]), block: o(&r[5]), linked_at: lrs::parse_datetime(&r[6]).map(|d| d.format("%Y-%m-%dT%H:%M:%S").to_string()),
+            location: r.get(7).and_then(o), layout: r.get(8).and_then(o),
         }).collect(),
     }))
 }
 
 /// A Registry transaction: its status and properties (read live from the Registry).
+/// The Registry's place lists for the parcel form: `location` (e.g. "Jos - Bukuru Metropolis"),
+/// `layout_type` and `property_area`, read from the Registry's dictionary (read-only). A copy is kept
+/// (`registry.lookups`) and refreshed when older than a day, so the form still works when the
+/// Registry cannot be reached (`stale` is then true and `error` says why).
+#[utoipa::path(get, path = "/api/v1/registry/lookups", tag = "registry", responses((status = 200)))]
+pub async fn lookups(State(state): State<AppState>) -> ApiResult<Json<serde_json::Value>> {
+    const KEY: &str = "registry.lookups";
+    let cached: Option<serde_json::Value> = sqlx::query_scalar::<_, String>("SELECT value FROM cadastre.app_setting WHERE key = $1")
+        .bind(KEY).fetch_optional(&state.pool).await?.and_then(|v| serde_json::from_str(&v).ok());
+    let fresh = cached.as_ref()
+        .and_then(|c| c.get("fetched_at")).and_then(|v| v.as_str())
+        .and_then(|t| chrono::DateTime::parse_from_rfc3339(t).ok())
+        .is_some_and(|t| chrono::Utc::now().signed_duration_since(t) < chrono::Duration::hours(24));
+    if fresh {
+        return Ok(Json(cached.unwrap_or_default()));
+    }
+    let read = async {
+        let cfg = config()?;
+        let session = Session::start(&cfg).await.map_err(registry_err)?;
+        let rows = session.query(
+            "select d.Id, d.Code, d.Label, d.Category from com.landsystems.lrs.model.Dictionary d \
+             where d.Category in ('location', 'layout_type', 'property_area') and d.EndLifespanVersion is null \
+             order by d.Category, d.SortOrder, d.Label", 5000).await;
+        session.end().await;
+        rows.map_err(registry_err)
+    }.await;
+    match read {
+        Ok(rows) => {
+            let mut lists: std::collections::BTreeMap<String, Vec<serde_json::Value>> = ["location", "layout_type", "property_area"].iter().map(|k| (k.to_string(), Vec::new())).collect();
+            for r in rows.iter().filter(|r| r.len() >= 4) {
+                let label = r[2].trim();
+                if label.is_empty() { continue; }
+                if let Some(l) = lists.get_mut(r[3].trim()) {
+                    l.push(serde_json::json!({ "id": r[0].trim(), "code": r[1].trim(), "label": label }));
+                }
+            }
+            let mut out = serde_json::json!({ "fetched_at": chrono::Utc::now().to_rfc3339(), "stale": false });
+            for (k, v) in lists { out[k] = serde_json::Value::Array(v); }
+            sqlx::query("INSERT INTO cadastre.app_setting (key, value, source, updated_by) VALUES ($1, $2, 'registry', 'registry-lookups') \
+                         ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value, updated_by = EXCLUDED.updated_by, updated_at = now()")
+                .bind(KEY).bind(out.to_string()).execute(&state.pool).await?;
+            Ok(Json(out))
+        }
+        Err(e) => match cached {
+            Some(mut c) => { c["stale"] = true.into(); c["error"] = e.to_string().into(); Ok(Json(c)) }
+            None => Err(AppError::Conflict(format!("The Registry's place lists could not be read ({e}) and no copy is kept yet."))),
+        },
+    }
+}
+
 #[utoipa::path(get, path = "/api/v1/registry/transactions/{number}", tag = "registry",
     params(("number" = String, Path, description = "Transaction number, e.g. PLS000138648")),
     responses((status = 200, body = RegistryTransactionDto), (status = 404, description = "No such transaction"), (status = 422, description = "The Registry could not be read")))]

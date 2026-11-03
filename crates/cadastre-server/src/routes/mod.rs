@@ -116,6 +116,7 @@ pub fn router(state: AppState) -> Router {
         .route("/api/v1/registry/reconcile", post(registry::reconcile_now))
         .route("/api/v1/registry/upin-watch", post(registry::upin_watch_now))
         .route("/api/v1/registry/find", get(registry::find))
+        .route("/api/v1/registry/lookups", get(registry::lookups))
         .route("/api/v1/registry/parcels/{upin}/work", get(registry::parcel_work))
         .route("/api/v1/registry/start-digitising", post(registry::start_digitising))
         .route("/api/v1/registry/transactions/{number}", get(registry::transaction))

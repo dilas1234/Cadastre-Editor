@@ -2319,26 +2319,59 @@ function sketchAreaM2() {
 // The ArcMap/Aumentum "Update Parcel Attribute" form (General + Survey tabs), shown on Finish
 // Sketch. Resolves to the attributes object (possibly empty), or null if cancelled. Prefills the
 // Registry link + property fields from the job's linkage. The UPIN is assigned at commit.
+// The Registry's place lists (Location, Layout, Area), kept by the server; loaded once per page.
+let placeLists = null;
+async function loadPlaceLists() {
+  if (placeLists && !placeLists.error) return placeLists;
+  try { placeLists = await api("/api/v1/registry/lookups"); }
+  catch (e) { placeLists = { location: [], layout_type: [], property_area: [], error: e.message }; }
+  return placeLists;
+}
+// The job's Registry property (its location / layout), when the job belongs to a transaction.
+async function jobRegistryProperty(txn, propertyNumber) {
+  if (!txn) return null;
+  try {
+    const t = await api("/api/v1/registry/transactions/" + encodeURIComponent(txn));
+    const ps = t.properties || [];
+    return ps.find((p) => propertyNumber && (p.refnum || "").toUpperCase() === propertyNumber.toUpperCase()) || ps[0] || null;
+  } catch { return null; }
+}
 async function parcelAttrDialog(opts = {}) {
   let link = {};
   if (wf.editing && wf.editing.job_instance_id) {
     try { link = await api(`/api/v1/wf/jobs/${wf.editing.job_instance_id}/linkage`); } catch { link = {}; }
   }
+  const [places, regProp] = await Promise.all([loadPlaceLists(), jobRegistryProperty(link.lrs_transaction_number, link.property_number)]);
   const jobNo = link.property_number || link.lrs_transaction_number || (state.job && state.job.reference) || "";
   const areaM2 = opts.areaM2 !== undefined ? opts.areaM2 : sketchAreaM2();
   // Values already captured on the draft (editing) take precedence over the job's linkage defaults.
   const pf = opts.prefill || {};
   const pv = (k, d) => (pf[k] != null && pf[k] !== "" ? pf[k] : d);
-  // Aumentum names a job's parcels PCL1, PCL2, … (93% of its records): suggest the next one.
+  // Parcel Name: the property number (PLAGIS), e.g. PL67363; with several parcels in the job,
+  // PL67363-1, PL67363-2, … Without a property number, Aumentum's PCL1, PCL2, …
   const drafts = (state.drafts && state.drafts.features) || [];
   const at = opts.parcelId ? drafts.findIndex((x) => x.properties.id === opts.parcelId) : -1;
-  const pclDefault = "PCL" + (at >= 0 ? at + 1 : drafts.length + 1);
+  const nth = at >= 0 ? at + 1 : drafts.length + 1;
+  const many = drafts.length > 1 || (at < 0 && drafts.length >= 1);
+  const propNo = (link.property_number || regProp?.refnum || "").trim();
+  const pclDefault = propNo ? (many ? `${propNo}-${nth}` : propNo) : "PCL" + nth;
   return new Promise((resolve) => {
     const f = {};
     const row = (label, ctrl) => h("div", { class: "frow" }, h("label", {}, label), ctrl);
     const ro = (label, val) => row(label, h("span", { class: "roval" }, val));
     const txt = (key, val) => { const i = h("input", { value: val || "", style: "flex:1;min-width:0" }); f[key] = i; return i; };
     const sel = (key, opts, val) => { const s = h("select", { style: "flex:1;min-width:0" }, ...opts.map((o) => h("option", { selected: o === (val || "") }, o))); f[key] = s; return s; };
+    // A Registry list as a dropdown. A value already on the parcel that is not in the list (the
+    // codes 1 to 4 Aumentum stored) is kept and shown as it is; with no list, a text box.
+    const placeSelect = (key, list, val) => {
+      if (!list || !list.length) return txt(key, val);
+      const labels = list.map((x) => x.label);
+      const s = h("select", { style: "flex:1;min-width:0", title: places.stale ? `Registry list from ${String(places.fetched_at || "").slice(0, 10)} (the Registry could not be reached)` : "From the Registry" },
+        h("option", { value: "" }, ""),
+        val && !labels.includes(val) ? h("option", { value: val, selected: true }, /^\d+$/.test(val) ? `${val} (Aumentum code)` : val) : null,
+        ...labels.map((l) => h("option", { value: l, selected: l === val }, l)));
+      f[key] = s; return s;
+    };
 
     const general = h("div", {},
       ro("UPIN:", "— assigned on commit —"),
@@ -2349,7 +2382,7 @@ async function parcelAttrDialog(opts = {}) {
       row("Property Type:", sel("property_type", PROPERTY_TYPES, pv("property_type", link.property_type || "Land Parcel"))),
       row("Property Number:", txt("property_number", pv("property_number", link.property_number || jobNo))),
       row("Plot:", txt("plot", pv("plot", link.plot || ""))),
-      row("Location:", txt("location", pv("location", ""))),
+      row("Location:", placeSelect("location", places.location, pv("location", regProp?.location || ""))),
       row("Plan Number:", txt("plan_number", pv("plan_number", link.plan_number || ""))),
       row("LGA:", sel("lga", ["", ...PLATEAU_LGAS], pv("lga", link.lga || ""))),
       row("Status:", sel("status", PARCEL_STATUSES, pv("status", "Active"))),
