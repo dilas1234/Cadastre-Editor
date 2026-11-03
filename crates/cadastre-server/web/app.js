@@ -85,7 +85,7 @@ async function authLogin() {
 }
 function authLogout() {
   const id = auth.cfg?.enabled ? auth.cfg : null;
-  try { sessionStorage.removeItem("cad.tokens"); } catch { /* ignore */ }
+  try { sessionStorage.removeItem("cad.tokens"); sessionStorage.removeItem("cad.session"); } catch { /* ignore */ }
   if (id) location.assign(`${id.issuer}/protocol/openid-connect/logout?` + new URLSearchParams({ client_id: id.client_id, post_logout_redirect_uri: authRedirectUri() }));
 }
 async function initAuth() {
@@ -333,6 +333,7 @@ map.once("style.load", async () => {
   await Promise.all([loadParcels(true), loadBeacons(), loadJobs()]);
   renderGraphics();
   buildTOC(); buildCatalog();
+  await restoreSession();
   pushHistory();
 });
 
@@ -4257,7 +4258,92 @@ const CAT_DRAG_TYPE = "text/cad-item";
   });
 });
 
+/* =====================================================================================
+ * Page refresh keeps the work: the map view, the open panel, the workflow job being worked on, the
+ * selected job and filters, the Registry lookup, the tool and an unfinished sketch are kept for this
+ * browser tab (sessionStorage, so two tabs on different jobs do not overwrite each other) and put
+ * back after sign-in and the first data load. Signing out forgets them. Nothing is saved until the
+ * restore has finished, so a refresh during start-up cannot overwrite the saved work with a blank page.
+ * ===================================================================================== */
+const SESSION_KEY = "cad.session";
+const SESSION_TOOLS = ["pan", "zoomIn", "zoomOut", "select", "selectEl", "identify", "measure"];
+const savedSession = (() => { try { const s = JSON.parse(sessionStorage.getItem(SESSION_KEY) || "null"); return s && s.v === 1 ? s : null; } catch { return null; } })();
+let sessionRestored = false;
+function snapshotSession() {
+  const c = map.getCenter();
+  return {
+    v: 1, at: Date.now(),
+    view: { center: [c.lng, c.lat], zoom: map.getZoom(), bearing: map.getBearing(), pitch: map.getPitch() },
+    panel: regOpen() ? "registry" : wfOpen() ? "workflow" : tasksOpen() ? "tasks" : "toc",
+    tocVisible: !$("tocPane").classList.contains("hidden"),
+    tocView: state.tocView,
+    wf: { selected: wf.selected, filter: wf.filter, jobType: wf.jobType, q: wf.q, working: wf.editing?.job_instance_id || null },
+    reg: { view: reg.view, txnNo: reg.txn ? reg.txnNo : "" },
+    job: state.job?.id || null,
+    tool: state.tool,
+    edit: edit.active ? { template: edit.template, construction: edit.construction, verts: edit.verts, editingId: edit.editingId } : null,
+  };
+}
+function saveSession() {
+  if (!sessionRestored) return;
+  try { sessionStorage.setItem(SESSION_KEY, JSON.stringify(snapshotSession())); } catch { /* storage unavailable */ }
+}
+window.addEventListener("pagehide", saveSession);
+window.addEventListener("beforeunload", saveSession);
+document.addEventListener("visibilitychange", () => { if (document.visibilityState === "hidden") saveSession(); });
+setInterval(saveSession, 5000); // also survives a crash or a closed laptop lid
+function jumpToSavedView(v) {
+  if (!v || !Array.isArray(v.center) || !v.center.every(Number.isFinite) || !Number.isFinite(v.zoom)) return false;
+  map.jumpTo({ center: v.center, zoom: v.zoom, bearing: v.bearing || 0, pitch: v.pitch || 0 });
+  return true;
+}
+// Pick the worked-on job back up without creating anything (GET, unlike Work On's POST) and
+// without moving the map (the saved view is put back afterwards).
+async function wfResume(jobId) {
+  const ed = await api(`/api/v1/wf/jobs/${jobId}/editing`);
+  if (!ed?.cadastre_job_id) return false;
+  wf.editing = ed; wf.selEditing = ed;
+  const job = await api(`/api/v1/jobs/${ed.cadastre_job_id}`);
+  if (!state.jobs.some((x) => x.id === job.id)) state.jobs.unshift(job);
+  renderJobBox(); $("jobBox").value = job.id; await selectJob(job.id);
+  showJobArea();
+  return true;
+}
+async function restoreSession() {
+  const s = savedSession;
+  const step = async (what, fn) => { try { await fn(); } catch (e) { console.warn(`Restore ${what}:`, e); } };
+  try {
+    if (!s) return;
+    const notes = [];
+    if (s.tocVisible === false && !$("tocPane").classList.contains("hidden")) togglePane("tocPane");
+    if (s.tocView && s.tocView !== state.tocView) { state.tocView = s.tocView; buildTocTools(); buildTOC(); }
+    if (s.wf) { wf.filter = s.wf.filter ?? wf.filter; wf.jobType = s.wf.jobType ?? wf.jobType; wf.q = s.wf.q ?? wf.q; }
+    if (s.wf?.working) await step("job", async () => { if (await wfResume(s.wf.working)) notes.push(`working on job ${s.wf.working}`); });
+    else if (s.job && state.jobs.some((j) => j.id === s.job)) await step("job", async () => { renderJobBox(); $("jobBox").value = s.job; await selectJob(s.job); });
+    if (s.panel === "workflow") await step("workflow", async () => { await openWorkflow(); if (s.wf?.selected) await wfSelect(s.wf.selected); });
+    else if (s.panel === "registry") await step("registry", () => openRegistry({ view: s.reg?.view, txn: s.reg?.txnNo || undefined }));
+    else if (s.panel === "tasks") { showTasks(true); buildTocTools(); }
+    if (s.edit) await step("sketch", () => {
+      selectTemplate(s.edit.template || edit.template);
+      startEditing("sketch");
+      if (s.edit.construction) edit.construction = s.edit.construction;
+      const verts = (s.edit.verts || []).filter((v) => Array.isArray(v) && v.length >= 2 && v.every(Number.isFinite));
+      if (verts.length) {
+        edit.verts = verts.map((v) => [v[0], v[1]]); edit.sel = edit.verts.length - 1; edit.editingId = s.edit.editingId || null;
+        afterVertexChange();
+        notes.push(`unfinished sketch (${verts.length} vertices)`);
+      }
+    });
+    else if (SESSION_TOOLS.includes(s.tool)) setTool(s.tool);
+    jumpToSavedView(s.view); // last: the steps above may have zoomed elsewhere
+    if (notes.length) notify("Restored after refresh: " + notes.join(", ") + ".");
+  } finally {
+    sessionRestored = true;
+  }
+}
+
 initialDeepLink = initialViewFromURL(); // apply /editor?center=E,N&scale=N before any data arrives
+if (!initialDeepLink && savedSession && jumpToSavedView(savedSession.view)) initialDeepLink = true; // refresh: no fit to all parcels
 buildMenus(); buildToolbars(); buildTocTools(); buildTOC(); renderTask(); buildCatalog(); updateNavButtons(); updateScaleBox(); updateEditorButtons();
 loadCatalogRoots();
 loadCatalogDatabases();
