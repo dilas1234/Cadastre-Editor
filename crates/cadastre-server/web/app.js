@@ -1052,17 +1052,20 @@ function buildTocTools() {
   const views = [["drawing", "listDrawing", "List By Drawing Order"], ["source", "listSource", "List By Source"],
     ["visibility", "listVisibility", "List By Visibility"], ["selection", "listSelection", "List By Selection"]];
   for (const [v, ic, tip] of views) {
-    const b = h("span", { class: `tb${state.tocView === v && !tasksOpen() && !wfOpen() && !regOpen() ? " active" : ""}`, title: tip, html: icon(ic) });
-    b.onclick = () => { state.tocView = v; showRegistry(false); showWorkflow(false); showTasks(false); buildTocTools(); buildTOC(); };
+    const b = h("span", { class: `tb${state.tocView === v && !tasksOpen() && !wfOpen() && !regOpen() && !doneOpen() ? " active" : ""}`, title: tip, html: icon(ic) });
+    b.onclick = () => { state.tocView = v; showCompleted(false); showRegistry(false); showWorkflow(false); showTasks(false); buildTocTools(); buildTOC(); };
     t.append(b);
   }
   t.append(h("span", { class: "tsep" }));
-  const tasksBtn = h("span", { class: `tb${tasksOpen() && !wfOpen() && !regOpen() ? " active" : ""}`, title: "Tasks", html: icon("tasks") });
-  tasksBtn.onclick = () => { showRegistry(false); showWorkflow(false); showTasks(true); buildTocTools(); };
+  const tasksBtn = h("span", { class: `tb${tasksOpen() && !wfOpen() && !regOpen() && !doneOpen() ? " active" : ""}`, title: "Tasks", html: icon("tasks") });
+  tasksBtn.onclick = () => { showCompleted(false); showRegistry(false); showWorkflow(false); showTasks(true); buildTocTools(); };
   t.append(tasksBtn);
   const wfBtn = h("span", { class: `tb${wfOpen() ? " active" : ""}`, title: "Workflow (job instances)", html: icon("jobOpen") });
   wfBtn.onclick = () => openWorkflow();
   t.append(wfBtn);
+  const doneBtn = h("span", { class: `tb${doneOpen() ? " active" : ""}`, title: "Completed jobs (digitised; plan, Registry, Correct)", html: icon("jobApprove") });
+  doneBtn.onclick = () => openCompleted();
+  t.append(doneBtn);
   // Registry links: their own tab, apart from the workflow.
   const waiting = registryWaiting();
   const regBtn = h("span", { class: `tb${regOpen() ? " active" : ""}`, title: "Registry — links from the Aumentum Registry" + (waiting ? ` (${waiting} waiting for a job)` : ""), html: icon("registry"), style: "position:relative" });
@@ -1073,6 +1076,7 @@ function buildTocTools() {
 }
 const tasksOpen = () => !$("tasksBody").classList.contains("hidden");
 function showTasks(on) {
+  if (on) $("doneBody")?.classList.add("hidden");
   $("tasksBody").classList.toggle("hidden", !on); $("tocBody").classList.toggle("hidden", on);
   document.querySelector("#tocPane .hscroll").classList.toggle("hidden", on);
 }
@@ -3540,7 +3544,7 @@ const wf = { defs: null, filter: "open", jobType: "", q: "", jobs: [], total: 0,
 };
 const wfOpen = () => !$("wfBody").classList.contains("hidden");
 function showWorkflow(on) {
-  if (on) showRegistry(false);
+  if (on) { showRegistry(false); showCompleted(false); }
   $("wfBody").classList.toggle("hidden", !on);
   if (on) { $("tasksBody").classList.add("hidden"); $("tocBody").classList.add("hidden"); document.querySelector("#tocPane .hscroll").classList.add("hidden"); }
   else if (!tasksOpen()) { $("tocBody").classList.remove("hidden"); document.querySelector("#tocPane .hscroll").classList.remove("hidden"); }
@@ -3554,6 +3558,128 @@ async function openWorkflow() {
   }
   await wfLoadJobs(true);
 }
+/* =====================================================================================
+ * Completed tab: every completed job (this editor's and Aumentum's), newest first, with its
+ * metadata — Registry transaction and property, UPIN(s), committed / linked date and time, the
+ * plan sent — and what the Registry (10.10.10.5) holds for it, read live for the page shown.
+ * A committed job is completed (the end of digitising). From here: Title deed plan, Registry
+ * confirmation, Withdraw plan (the parcel stays), and Correct (reopen with the parcel back as a
+ * draft keeping its UPIN; commit again, then resend the corrected plan).
+ * ===================================================================================== */
+const done = { q: "", source: "", jobs: [], total: 0, offset: 0, busy: false, err: "", regErr: "", loaded: false };
+const doneOpen = () => !!$("doneBody") && !$("doneBody").classList.contains("hidden");
+function showCompleted(on) {
+  const body = $("doneBody"); if (!body) return;
+  const pane = $("tocPane");
+  if (on && !done.widened && pane.getBoundingClientRect().width < 380) { done.widened = pane.style.width || "auto"; pane.style.width = "380px"; setTimeout(() => map.resize(), 0); }
+  if (!on && done.widened) { pane.style.width = done.widened === "auto" ? "" : done.widened; done.widened = null; setTimeout(() => map.resize(), 0); }
+  body.classList.toggle("hidden", !on);
+  const title = document.querySelector("#tocPane .paneHead > span");
+  if (on) {
+    if (title) title.textContent = "Completed Jobs";
+    ["wfBody", "tasksBody", "regBody", "tocBody"].forEach((id) => $(id).classList.add("hidden"));
+    document.querySelector("#tocPane .hscroll").classList.add("hidden");
+  } else if (!tasksOpen() && !wfOpen() && !regOpen()) {
+    if (title) title.textContent = "Table Of Contents";
+    $("tocBody").classList.remove("hidden"); document.querySelector("#tocPane .hscroll").classList.remove("hidden");
+  }
+}
+async function openCompleted() {
+  if ($("tocPane").classList.contains("hidden")) togglePane("tocPane");
+  showWorkflow(false); showRegistry(false); showTasks(false);
+  showCompleted(true); buildTocTools();
+  if (!done.loaded) await doneLoad(true); else renderCompleted();
+}
+async function doneLoad(reset) {
+  if (reset) { done.offset = 0; done.jobs = []; }
+  done.busy = true; done.err = ""; renderCompleted();
+  try {
+    const q = new URLSearchParams({ q: done.q, source: done.source, offset: String(done.offset), limit: "50", registry: "1" });
+    const r = await api("/api/v1/wf/completed?" + q);
+    done.jobs = done.jobs.concat(r.jobs); done.total = r.total; done.offset = done.jobs.length; done.regErr = r.registry_error || ""; done.loaded = true;
+  } catch (e) { done.err = e.message; }
+  done.busy = false; renderCompleted();
+}
+const doneParcels = (j) => (j.parcels || []).filter((p) => p && p.upin);
+function doneCard(j) {
+  const parcels = doneParcels(j);
+  const reg = j.registry;
+  const upins = parcels.map((p) => p.upin);
+  const firstUpin = upins[0] || reg?.upin || null;
+  const committedAt = parcels[0]?.committed_at || j.completed;
+  const linked = parcels.filter((p) => p.linked);
+  const plan = j.plan;
+  const planText = !plan ? "Not sent from this editor"
+    : plan.action === "registry_plan_withdrawn" ? `Withdrawn ${fmtDT(plan.at)}${plan.by ? " by " + plan.by : ""}${plan.reason ? " — " + plan.reason : ""}`
+    : `${plan.resend ? "Corrected plan resent" : "Sent"} ${fmtDT(plan.at)}${plan.by ? " by " + plan.by : ""}${plan.file ? " (" + plan.file + ")" : ""}`;
+  const regText = !reg ? (done.regErr ? "Registry not reached" : "—")
+    : !reg.found ? "Not found in the Registry"
+    : `${reg.status}; property ${reg.property || "—"}${reg.refnum ? " (" + reg.refnum + ")" : ""}${reg.upin ? `, holds ${reg.upin}` : ", no UPIN yet"}${reg.linked_at ? `, linked ${fmtDT(reg.linked_at)}` : ""}`;
+  const mine = j.source === "cadastre";
+  const actions = [];
+  if (firstUpin) actions.push(regLink("Zoom", "Zoom to the parcel", () => registryZoom(firstUpin)));
+  actions.push(regLink("Open job", "Open the job in the Workflow", async () => { await openWorkflow(); await wfSelect(j.id); }));
+  if (mine) actions.push(regLink("Registry check", "Ask the Registry whether the committed parcels are visible there", () => registryConfirmDialog(j.id)));
+  if (mine && upins.length) actions.push(regLink("Title deed plan", "Open the title deed plan (form, sheet, PDF, send)", () => titleDeedDialog(j.id, upins[0])));
+  if (mine && plan && plan.action === "registry_plan_sent") actions.push(regLink("Withdraw plan", "Mark the plan sent to the Registry as withdrawn (the parcel and UPIN stay)", () => doneWithdraw(j)));
+  if (j.can_correct && upins.length) actions.push(regLink("Correct", "Reopen the job to fix the parcel (same UPIN), then commit again and resend the plan", () => doneCorrect(j, parcels)));
+  const conf = j.confirmation;
+  return h("div", { class: "regCard " + (mine ? "job" : "gone"), title: "Double-click to zoom", ondblclick: () => firstUpin && registryZoom(firstUpin) },
+    h("div", { class: "regCardTop" }, h("span", { class: "regUpin" }, j.property_number || j.name || "#" + j.id),
+      h("span", { class: "regPill " + (mine ? "ok" : "gone") }, mine ? "New editor" : "Aumentum")),
+    regStatus(linked.length ? "job" : "wait", linked.length ? `Linked: ${linked.map((p) => p.upin).join(", ")}` : upins.length ? `Committed ${upins.join(", ")} · not linked yet` : "Completed (no parcel found)"),
+    h("div", { class: "regKv" },
+      h("div", {}, h("i", {}, "Job"), `${j.name || ""} (#${j.id}) · ${j.job_type}`),
+      h("div", {}, h("i", {}, "Transaction"), j.transaction_number || "—"),
+      h("div", {}, h("i", {}, "Committed"), committedAt ? `${fmtDT(committedAt)}${j.completed_by && mine ? " by " + j.completed_by : ""}` : "—"),
+      linked.length ? h("div", {}, h("i", {}, "Linked"), linked.map((p) => `${p.upin} ${p.linked_at ? fmtD(p.linked_at) : ""}${p.lrs_id ? " → " + p.lrs_id : ""}`).join("; ")) : null,
+      h("div", {}, h("i", {}, "Plan"), planText),
+      h("div", {}, h("i", {}, "Registry"), regText),
+      conf ? h("div", {}, h("i", {}, "Confirmed"), `${conf.ok ? "✔" : "✕"} ${fmtDT(conf.at)}`) : null),
+    h("div", { class: "regCardFoot" }, h("span", { class: "regLinks" }, ...actions)));
+}
+function renderCompleted() {
+  const box = $("doneBody"); if (!box) return;
+  box.innerHTML = "";
+  const q = h("input", { class: "tinput", value: done.q, placeholder: "File, transaction or UPIN (e.g. PL68928)", style: "flex:1;min-width:0" });
+  const run = () => { done.q = q.value.trim(); doneLoad(true); };
+  q.addEventListener("keydown", (e) => e.key === "Enter" && run());
+  const src = h("select", { onchange: (e) => { done.source = e.target.value; doneLoad(true); } },
+    ...[["", "All"], ["cadastre", "New editor"], ["aumentum", "Aumentum"]].map(([v, l]) => h("option", { value: v, selected: done.source === v }, l)));
+  box.append(h("div", { class: "frow", style: "margin:6px 8px 2px" }, q, h("button", { class: "btn", style: "min-width:0", onclick: run }, "Find"), src),
+    h("div", { class: "muted", style: "margin:0 8px 4px" }, done.busy && !done.jobs.length ? "Loading…" : `${done.total.toLocaleString()} completed job(s)${done.q ? ` matching “${done.q}”` : ""}, newest first`),
+    done.regErr ? h("div", { class: "muted", style: "margin:0 8px 4px;color:#a35a00" }, `Registry details not shown: ${done.regErr}`) : null,
+    done.err ? h("div", { style: "margin:0 8px 4px;color:#b00" }, done.err) : null);
+  for (const j of done.jobs) box.append(doneCard(j));
+  if (done.jobs.length < done.total) box.append(h("div", { class: "frow", style: "margin:6px 8px 10px" },
+    h("button", { class: "btn", disabled: done.busy, onclick: () => doneLoad(false) }, done.busy ? "Loading…" : `More (${(done.total - done.jobs.length).toLocaleString()} left)`)));
+}
+async function doneWithdraw(j) {
+  const reason = await uiPrompt(`Withdraw the title deed plan of ${j.property_number || j.name} from Registry transaction ${j.transaction_number}?\n\nThe plan documents in the transaction are marked WITHDRAWN (nothing is deleted in the Registry) and the saved title deed form is cleared. The parcel and its UPIN stay. Reason:`, "", { title: "Withdraw Plan", ok: "Withdraw" });
+  if (!reason || !reason.trim()) return;
+  try {
+    const r = await api(`/api/v1/wf/jobs/${j.id}/registry/withdraw-plan`, { method: "POST", body: { reason: reason.trim() } });
+    notify(`Plan withdrawn in ${r.transaction_number} (${r.withdrawn.length} document(s) marked).` + (r.failed.length ? ` Not marked: ${r.failed.join("; ")}.` : ""), r.failed.length ? "warn" : "ok");
+    await doneLoad(true);
+  } catch (e) { uiAlert("Withdraw failed: " + e.message); }
+}
+async function doneCorrect(j, parcels) {
+  let upin = parcels[0].upin;
+  if (parcels.length > 1) {
+    const pick = await uiPrompt(`Which parcel of ${j.name} to correct? (${parcels.map((p) => p.upin).join(", ")})`, upin, { title: "Correct" });
+    if (!pick) return; upin = pick.trim().toUpperCase();
+  }
+  const reason = await uiPrompt(`Correct ${upin}?\n\nThe job is reopened at its commit step with ${upin} back as a draft (it keeps this UPIN). Fix the shape, beacons or attributes, commit again, then resend the corrected plan. Refused if the parcel is linked in the Registry (unlink it there first). Reason:`, "", { title: "Correct", ok: "Reopen to correct" });
+  if (!reason || !reason.trim()) return;
+  try {
+    const r = await api(`/api/v1/wf/jobs/${j.id}/correct`, { method: "POST", body: { upin, reason: reason.trim() } });
+    for (const b of r.beacons || []) rememberPointId(b.easting, b.northing, b.number);
+    done.loaded = false;
+    await openWorkflow(); await wfSelect(j.id); await wfWorkOn(j.id);
+    notify(`${upin} is a draft of ${j.name} again (it keeps its UPIN). Fix it, then Commit; resend the corrected plan after.`);
+  } catch (e) { uiAlert("Correct refused: " + e.message); }
+}
+
 /* =====================================================================================
  * Phase 5 — Registry tab (apart from the Workflow). The server reads the Aumentum Registry every
  * minute and records each property the Registry admin links to a parcel (the parcel's link
@@ -3574,8 +3700,8 @@ function showRegistry(on) {
   $("regBody").classList.toggle("hidden", !on);
   const title = document.querySelector("#tocPane .paneHead > span");
   if (title) title.textContent = on ? "Registry" : "Table Of Contents";
-  if (on) { $("wfBody").classList.add("hidden"); $("tasksBody").classList.add("hidden"); $("tocBody").classList.add("hidden"); document.querySelector("#tocPane .hscroll").classList.add("hidden"); }
-  else if (!tasksOpen() && !wfOpen()) { $("tocBody").classList.remove("hidden"); document.querySelector("#tocPane .hscroll").classList.remove("hidden"); }
+  if (on) { showCompleted(false); $("wfBody").classList.add("hidden"); $("tasksBody").classList.add("hidden"); $("tocBody").classList.add("hidden"); document.querySelector("#tocPane .hscroll").classList.add("hidden"); }
+  else if (!tasksOpen() && !wfOpen() && !doneOpen()) { $("tocBody").classList.remove("hidden"); document.querySelector("#tocPane .hscroll").classList.remove("hidden"); }
 }
 async function openRegistry(opts = {}) {
   if ($("tocPane").classList.contains("hidden")) togglePane("tocPane");
@@ -4616,7 +4742,8 @@ function snapshotSession() {
   return {
     v: 1, at: Date.now(),
     view: { center: [c.lng, c.lat], zoom: map.getZoom(), bearing: map.getBearing(), pitch: map.getPitch() },
-    panel: regOpen() ? "registry" : wfOpen() ? "workflow" : tasksOpen() ? "tasks" : "toc",
+    panel: regOpen() ? "registry" : wfOpen() ? "workflow" : doneOpen() ? "completed" : tasksOpen() ? "tasks" : "toc",
+    done: { q: done.q, source: done.source },
     tocVisible: !$("tocPane").classList.contains("hidden"),
     tocView: state.tocView,
     wf: { selected: wf.selected, filter: wf.filter, jobType: wf.jobType, q: wf.q, working: wf.editing?.job_instance_id || null },
@@ -4665,6 +4792,7 @@ async function restoreSession() {
     if (s.panel === "workflow") await step("workflow", async () => { await openWorkflow(); if (s.wf?.selected) await wfSelect(s.wf.selected); });
     else if (s.panel === "registry") await step("registry", () => openRegistry({ view: s.reg?.view, txn: s.reg?.txnNo || undefined }));
     else if (s.panel === "tasks") { showTasks(true); buildTocTools(); }
+    else if (s.panel === "completed") await step("completed", () => { if (s.done) { done.q = s.done.q || ""; done.source = s.done.source || ""; } return openCompleted(); });
     if (s.edit) await step("sketch", () => {
       selectTemplate(s.edit.template || edit.template);
       startEditing("sketch");

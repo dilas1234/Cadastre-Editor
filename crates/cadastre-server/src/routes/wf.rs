@@ -1049,6 +1049,12 @@ pub async fn commit(State(state): State<AppState>, user: AuthUser, Path(id): Pat
     }
     let c = commit_drafts(&mut tx, id, &req).await?;
     audit::append(&mut tx, &actor.label, "wf_commit", "wf_job_instance", Some(&id.to_string()), json!({ "parcel_numbers": c.numbers, "beacons_added": c.beacons_added, "retired": c.retired })).await?;
+    // A commit is the end of digitising: the job is completed (Correct reopens it).
+    let job_type_id: i32 = sqlx::query_scalar("SELECT job_type_id FROM cadastre.wf_job_instance WHERE id = $1").bind(id).fetch_one(&mut *tx).await?;
+    let (edges, end_task) = graph(&state.pool, job_type_id).await?;
+    if let Some(cur) = cur {
+        complete_after_commit(&mut tx, id, job_type_id, cur, &edges, end_task, &actor.label, None).await?;
+    }
     tx.commit().await?;
     Ok(Json(WfCommitDto { parcel_numbers: c.numbers, beacons_added: c.beacons_added, retired: c.retired, editing: editing_info(&state, id).await? }))
 }
@@ -1100,6 +1106,38 @@ struct Committed {
 
 
 /// The job type's commit task: the task in its graph whose steps carry the Commit Parcel tool.
+/// After a commit: walk the job on to its end task and complete it. A committed job is the end of
+/// digitising (PLAGIS); the title deed plan is made on the completed job, and Correct reopens it.
+/// Returns whether the job was completed and the tasks passed on the way.
+#[allow(clippy::too_many_arguments)]
+async fn complete_after_commit(
+    tx: &mut sqlx::PgConnection, id: i32, job_type_id: i32, mut current: i32, edges: &[Edge], end_task: Option<i32>, actor: &str, comment: Option<&str>,
+) -> ApiResult<(bool, Vec<i32>)> {
+    let mut passed = Vec::new();
+    if let Some(goal) = end_task.filter(|&g| !wfengine::can_complete(edges, end_task, current) && g != current) {
+        if let Some(path) = wfengine::path_to(edges, current, goal) {
+            for next in path {
+                close_open_task(&mut *tx, id, current, None).await?;
+                let assignee = default_assignee(&mut *tx, next).await?;
+                open_next_task(&mut *tx, id, job_type_id, next, assignee).await?;
+                audit::append(&mut *tx, actor, "wf_advance", "wf_job_instance", Some(&id.to_string()), json!({ "from_task": current, "to_task": next, "fast_track": true })).await?;
+                passed.push(next);
+                current = next;
+            }
+        }
+    }
+    if wfengine::can_complete(edges, end_task, current) {
+        close_open_task(&mut *tx, id, current, comment).await?;
+        sqlx::query("UPDATE cadastre.wf_job_instance SET status = 3, ended = now()::timestamp, updated = now()::timestamp WHERE id = $1")
+            .bind(id)
+            .execute(&mut *tx)
+            .await?;
+        audit::append(&mut *tx, actor, "wf_complete", "wf_job_instance", Some(&id.to_string()), json!({ "from_task": current, "fast_track": true })).await?;
+        return Ok((true, passed));
+    }
+    Ok((false, passed))
+}
+
 async fn commit_task_of(conn: &mut sqlx::PgConnection, job_type_id: i32) -> ApiResult<Option<i32>> {
     Ok(sqlx::query_scalar(
         "SELECT f.task_id FROM cadastre.wf_task_flow f \
@@ -1214,27 +1252,9 @@ pub async fn finish(State(state): State<AppState>, user: AuthUser, Path(id): Pat
     // restricted downstream task simply leaves the job open there rather than failing the post.
     let mut completed = false;
     if complete {
-        if let Some(goal) = end_task.filter(|&g| !wfengine::can_complete(&edges, end_task, current) && g != current) {
-            if let Some(path) = wfengine::path_to(&edges, current, goal) {
-                for next in path {
-                    close_open_task(&mut tx, id, current, None).await?;
-                    let assignee = default_assignee(&mut tx, next).await?;
-                    open_next_task(&mut tx, id, job_type_id, next, assignee).await?;
-                    audit::append(&mut tx, &actor.label, "wf_advance", "wf_job_instance", Some(&id.to_string()), json!({ "from_task": current, "to_task": next, "fast_track": true })).await?;
-                    passed.push(next);
-                    current = next;
-                }
-            }
-        }
-        if wfengine::can_complete(&edges, end_task, current) {
-            close_open_task(&mut tx, id, current, req.comment.as_deref()).await?;
-            sqlx::query("UPDATE cadastre.wf_job_instance SET status = 3, ended = now()::timestamp, updated = now()::timestamp WHERE id = $1")
-                .bind(id)
-                .execute(&mut *tx)
-                .await?;
-            audit::append(&mut tx, &actor.label, "wf_complete", "wf_job_instance", Some(&id.to_string()), json!({ "from_task": current, "fast_track": true })).await?;
-            completed = true;
-        }
+        let (done, more) = complete_after_commit(&mut tx, id, job_type_id, current, &edges, end_task, &actor.label, req.comment.as_deref()).await?;
+        completed = done;
+        passed.extend(more);
     }
 
     tx.commit().await?;
