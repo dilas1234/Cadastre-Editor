@@ -53,10 +53,42 @@ pub struct PlanFields {
     pub scale: Option<u32>,
     /// Corner names typed over the fabric's, by corner index in the plan's order.
     pub corner_names: Vec<Option<String>>,
-    /// Side (index in the plan's order: side k runs from corner k to corner k+1) the access road
-    /// runs along, if any, and its label.
+    /// Legacy single access road side (forms saved before `road_sides`); read when `road_sides` is
+    /// empty.
     pub road_side: Option<usize>,
+    /// Sides (index in the plan's order: side k runs from corner k to corner k+1) access roads run
+    /// along. Two roads on neighbouring sides meet in a junction at their shared beacon.
+    pub road_sides: Vec<usize>,
     pub road_label: Option<String>,
+    /// The co-ordinate cross: lines through one beacon labelled with its Easting and Northing.
+    /// `None` = on.
+    pub grid: Option<bool>,
+    /// The beacon (corner index in the plan's order) the cross goes through; `None` = the first.
+    pub grid_corner: Option<usize>,
+}
+
+impl PlanFields {
+    /// The access road sides: `road_sides`, else the legacy `road_side`.
+    pub fn roads(&self) -> Vec<usize> {
+        let mut v = if self.road_sides.is_empty() { self.road_side.into_iter().collect() } else { self.road_sides.clone() };
+        v.sort_unstable();
+        v.dedup();
+        v
+    }
+}
+
+/// Capitalise the first letter of each word ("wiss resources" → "Wiss Resources",
+/// "blessing j.wophill" → "Blessing J.Wophill"). Letters already in capitals stay; a letter after
+/// an apostrophe is a word's continuation ("Sa'ad").
+pub fn cap_words(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut prev: Option<char> = None;
+    for c in s.chars() {
+        let start = prev.is_none_or(|p| !(p.is_alphanumeric() || p == '\'' || p == '’'));
+        if start && c.is_alphabetic() { out.extend(c.to_uppercase()) } else { out.push(c) }
+        prev = Some(c);
+    }
+    out
 }
 
 /// Everything the sheet shows.
@@ -114,9 +146,26 @@ pub fn fit_scale(corners: &[Corner]) -> u32 {
     *SCALES.iter().find(|&&s| w * 1000.0 / s as f64 <= fw && h * 1000.0 / s as f64 <= fh).unwrap_or(SCALES.last().unwrap())
 }
 
-/// Sheet number: the thousands of the Easting and Northing of a point (484903 E, 1082927 N → `484-1082`).
+/// Sheet number: the thousands of the Easting and Northing of a point (484903 E, 1082927 N →
+/// `484-1082`), each stepped down to even at its third digit (495142 E, 1092430 N → `494-1082`).
 pub fn sheet_no(e: f64, n: f64) -> String {
-    format!("{}-{}", (e / 1000.0).floor() as i64, (n / 1000.0).floor() as i64)
+    format!("{}-{}", sheet_part((e / 1000.0).floor() as i64), sheet_part((n / 1000.0).floor() as i64))
+}
+
+/// A sheet number part with an odd third digit stepped down to the even one below (495 → 494,
+/// 1092 → 1082).
+fn sheet_part(v: i64) -> i64 {
+    let digits = v.abs().to_string();
+    match digits.as_bytes().get(2) {
+        Some(d) if (d - b'0') % 2 == 1 => v - v.signum() * 10_i64.pow(digits.len() as u32 - 3),
+        _ => v,
+    }
+}
+
+/// Where line `p + t·u` meets line `q + s·v`: `t`, or `None` if they are (nearly) parallel.
+fn meet(p: (f64, f64), u: (f64, f64), q: (f64, f64), v: (f64, f64)) -> Option<f64> {
+    let den = u.0 * v.1 - u.1 * v.0;
+    (den.abs() > 0.1).then(|| ((q.0 - p.0) * v.1 - (q.1 - p.1) * v.0) / den)
 }
 
 /// Whole-circle bearing of a leg, rounded to the minute: (degrees, minutes).
@@ -215,15 +264,24 @@ pub fn render_svg(d: &PlanData) -> String {
     // Frame and grid values (the ground co-ordinates of its lower-left corner).
     let (x0, y0, x1, y1) = FRAME;
     let _ = writeln!(s, r##"<rect x="{x0}" y="{y0}" width="{}" height="{}" fill="none" stroke="#1f3f8f" stroke-width="0.5"/>"##, x1 - x0, y1 - y0);
-    let e_left = ce + (x0 - fx) / k;
-    let n_bottom = cn - (y1 - fy) / k;
-    text(&mut s, x0, y1 + 3.0, 2.0, "start", "", &format!("{:.0}", e_left));
-    let _ = writeln!(s, r#"<text x="{:.2}" y="{:.2}" font-size="2" text-anchor="start" transform="rotate(-90 {:.2} {:.2})">{:.0}</text>"#, x1 + 3.0, y1, x1 + 3.0, y1, n_bottom);
+    let grid_on = f.grid.unwrap_or(true) && !corners.is_empty();
+    if !grid_on {
+        let e_left = ce + (x0 - fx) / k;
+        let n_bottom = cn - (y1 - fy) / k;
+        text(&mut s, x0, y1 + 3.0, 2.0, "start", "", &format!("{:.0}", e_left));
+        let _ = writeln!(s, r#"<text x="{:.2}" y="{:.2}" font-size="2" text-anchor="start" transform="rotate(-90 {:.2} {:.2})">{:.0}</text>"#, x1 + 3.0, y1, x1 + 3.0, y1, n_bottom);
+    }
 
     // Access road: two dashed lines parallel to the chosen side, outside the parcel.
     let p: Vec<(f64, f64)> = corners.iter().map(|c| paper(c.e, c.n)).collect();
     let (pcx, pcy) = (p.iter().map(|q| q.0).sum::<f64>() / p.len().max(1) as f64, p.iter().map(|q| q.1).sum::<f64>() / p.len().max(1) as f64);
-    if let Some(side) = f.road_side.filter(|&i| i < p.len() && p.len() >= 3) {
+    // Access roads: two dashed lines parallel to each chosen side, outside the parcel. Roads on
+    // neighbouring sides meet in a junction: the longer runs through, the other ends at it.
+    let roads: Vec<usize> = f.roads().into_iter().filter(|&i| i < p.len() && p.len() >= 3).collect();
+    const ROAD_IN: f64 = 5.0;
+    const ROAD_OUT: f64 = 13.0;
+    struct Road { a: (f64, f64), u: (f64, f64), nrm: (f64, f64), len: f64, t0: f64, t1: f64, t0_out: f64, t1_out: f64, gaps: Vec<(f64, f64)> }
+    let mut rd: Vec<Road> = roads.iter().map(|&side| {
         let (a, b) = (p[side], p[(side + 1) % p.len()]);
         let (dx, dy) = (b.0 - a.0, b.1 - a.1);
         let len = (dx * dx + dy * dy).sqrt().max(1e-9);
@@ -234,14 +292,73 @@ pub fn render_svg(d: &PlanData) -> String {
             nx = -nx; ny = -ny; // point away from the parcel
         }
         let ext = len * 0.35;
-        for off in [5.0, 13.0] {
-            let (sx, sy) = (a.0 - ux * ext + nx * off, a.1 - uy * ext + ny * off);
-            let (ex, ey) = (b.0 + ux * ext + nx * off, b.1 + uy * ext + ny * off);
-            let _ = writeln!(s, r##"<line x1="{sx:.2}" y1="{sy:.2}" x2="{ex:.2}" y2="{ey:.2}" stroke="#000" stroke-width="0.3" stroke-dasharray="2.5 1.5"/>"##);
+        Road { a, u: (ux, uy), nrm: (nx, ny), len, t0: -ext, t1: len + ext, t0_out: -ext, t1_out: len + ext, gaps: Vec::new() }
+    }).collect();
+    let off_pt = |r: &Road, off: f64| (r.a.0 + r.nrm.0 * off, r.a.1 + r.nrm.1 * off);
+    for i in 0..rd.len() {
+        for j in i + 1..rd.len() {
+            // Two roads whose inner lines would cross (neighbouring sides, or sides a short side
+            // apart) meet in a junction where they cross.
+            let (pi, pj) = (off_pt(&rd[i], ROAD_IN), off_pt(&rd[j], ROAD_IN));
+            let (Some(ti), Some(tj)) = (meet(pi, rd[i].u, pj, rd[j].u), meet(pj, rd[j].u, pi, rd[i].u)) else { continue };
+            let reach = |r: &Road, t: f64| t > r.t0 - ROAD_OUT && t < r.t1 + ROAD_OUT;
+            if !(reach(&rd[i], ti) && reach(&rd[j], tj)) {
+                continue;
+            }
+            let (thr, join, t_thr, t_join) = if rd[i].len >= rd[j].len { (i, j, ti, tj) } else { (j, i, tj, ti) };
+            let tin = (off_pt(&rd[thr], ROAD_IN), rd[thr].u);
+            let jout = off_pt(&rd[join], ROAD_OUT);
+            let (Some(cut_out), Some(g_out)) = (meet(jout, rd[join].u, tin.0, tin.1), meet(tin.0, tin.1, jout, rd[join].u)) else { continue };
+            // The joining road ends at the through road's inner line, at its end nearer the crossing.
+            let r = &mut rd[join];
+            if t_join < r.len / 2.0 { r.t0 = t_join; r.t0_out = cut_out; } else { r.t1 = t_join; r.t1_out = cut_out; }
+            // The through road runs on past the junction, open where the other road comes in.
+            let r = &mut rd[thr];
+            let (g0, g1) = (t_thr.min(g_out), t_thr.max(g_out));
+            if g1 + 6.0 > r.t1 { r.t1 = g1 + 6.0; r.t1_out = r.t1_out.max(r.t1); }
+            if g0 - 6.0 < r.t0 { r.t0 = g0 - 6.0; r.t0_out = r.t0_out.min(r.t0); }
+            r.gaps.push((g0, g1));
         }
-        let label = f.road_label.clone().filter(|l| !l.trim().is_empty()).unwrap_or_else(|| "Access Road".into());
-        let (la, lb) = ((a.0 + nx * 9.0, a.1 + ny * 9.0), (b.0 + nx * 9.0, b.1 + ny * 9.0));
-        along(&mut s, la, lb, 0.5, 0.0, 2.8, &label);
+    }
+    let dashed = |s: &mut String, o: (f64, f64), u: (f64, f64), t0: f64, t1: f64| {
+        if t1 - t0 > 0.2 {
+            let _ = writeln!(s, r##"<line x1="{:.2}" y1="{:.2}" x2="{:.2}" y2="{:.2}" stroke="#000" stroke-width="0.3" stroke-dasharray="2.5 1.5"/>"##,
+                o.0 + u.0 * t0, o.1 + u.1 * t0, o.0 + u.0 * t1, o.1 + u.1 * t1);
+        }
+    };
+    let label = f.road_label.clone().filter(|l| !l.trim().is_empty()).unwrap_or_else(|| "Access Road".into());
+    for r in &rd {
+        // Inner line, broken where a joining road comes in.
+        let mut gaps = r.gaps.clone();
+        gaps.sort_by(|x, y| x.0.total_cmp(&y.0));
+        let mut t = r.t0;
+        for (g0, g1) in gaps {
+            dashed(&mut s, off_pt(r, ROAD_IN), r.u, t, g0.min(r.t1));
+            t = t.max(g1);
+        }
+        dashed(&mut s, off_pt(r, ROAD_IN), r.u, t, r.t1);
+        dashed(&mut s, off_pt(r, ROAD_OUT), r.u, r.t0_out, r.t1_out);
+        let m = off_pt(r, (ROAD_IN + ROAD_OUT) / 2.0);
+        along(&mut s, m, (m.0 + r.u.0 * r.len, m.1 + r.u.1 * r.len), 0.5, 0.0, 2.8, &label);
+    }
+
+    // Co-ordinate cross: blue lines through the chosen beacon, out to the frame on the sides away
+    // from the parcel, labelled with the beacon's Easting and Northing.
+    if grid_on {
+        let gi = f.grid_corner.filter(|&i| i < corners.len()).unwrap_or(0);
+        let (q, c) = (p[gi], &corners[gi]);
+        let down = q.1 >= pcy; // the vertical line runs away from the parcel
+        let right = q.0 >= pcx;
+        let (vy_end, hx_end) = (if down { y1 - 2.0 } else { y0 + 2.0 }, if right { x1 - 2.0 } else { x0 + 2.0 });
+        let (vy_back, hx_back) = (if down { q.1 - 6.0 } else { q.1 + 6.0 }, if right { q.0 - 6.0 } else { q.0 + 6.0 });
+        let _ = writeln!(s, r##"<g stroke="#1f3f8f" stroke-width="0.3"><line x1="{:.2}" y1="{vy_back:.2}" x2="{:.2}" y2="{vy_end:.2}"/><line x1="{hx_back:.2}" y1="{:.2}" x2="{hx_end:.2}" y2="{:.2}"/></g>"##, q.0, q.0, q.1, q.1);
+        // Easting along the vertical line (reading upward), Northing along the horizontal one.
+        let (ex, ey) = (q.0 - 1.2, vy_end + if down { -1.0 } else { 1.0 });
+        let e_anchor = if down { "start" } else { "end" };
+        let _ = writeln!(s, r##"<text x="{ex:.2}" y="{ey:.2}" font-size="2.6" text-anchor="{e_anchor}" fill="#1f3f8f" {HALO} transform="rotate(-90 {ex:.2} {ey:.2})">{:.3}mE</text>"##, c.e);
+        let (nx_, ny_) = (hx_end + if right { -1.0 } else { 1.0 }, q.1 - 1.2);
+        let n_anchor = if right { "end" } else { "start" };
+        let _ = writeln!(s, r##"<text x="{nx_:.2}" y="{ny_:.2}" font-size="2.6" text-anchor="{n_anchor}" fill="#1f3f8f" {HALO}>{:.3}mN</text>"##, c.n);
     }
 
     // Parcel, beacons, bearings and distances.
@@ -289,7 +406,7 @@ pub fn render_svg(d: &PlanData) -> String {
         text(&mut s, fx0, 240.5, 2.8, "start", &format!(r#"font-weight="bold" fill="{LINE}""#), &format!("N: {:.3}m", o.n));
         text(&mut s, fx0, 245.0, 2.8, "start", &format!(r#"font-weight="bold" fill="{LINE}""#), &format!("E: {:.3}m", o.e));
     }
-    text(&mut s, fx0, 251.0, 2.8, "start", r#"font-weight="bold""#, &format!("SURVEYED BY: {}", esc(f.surveyed_by.as_deref().unwrap_or(""))));
+    text(&mut s, fx0, 251.0, 2.8, "start", r#"font-weight="bold""#, &format!("SURVEYED BY: {}", esc(&cap_words(f.surveyed_by.as_deref().unwrap_or("")))));
     text(&mut s, fx0, 256.0, 2.8, "start", r#"font-weight="bold""#, &format!("SURVEY DATE: {}", esc(f.survey_date.as_deref().unwrap_or(""))));
     if let Some(o) = corners.first() {
         text(&mut s, fx0, 261.0, 2.8, "start", r#"font-weight="bold""#, &format!("SHEET NO. {}", sheet_no(o.e, o.n).replace('-', " - ")));
@@ -374,6 +491,62 @@ mod tests {
         fields.scale = Some(750);
         let svg = render_svg(&PlanData { upin: "PL000000023268".into(), area_m2: 249.489, corners: c, fields });
         assert!(svg.contains("Scale = 1:750"));
+    }
+
+    #[test]
+    fn sheet_number_steps_an_odd_third_digit_down() {
+        assert_eq!(sheet_no(495142.578, 1092430.989), "494-1082", "PL68374: 495 → 494, 1092 → 1082");
+        assert_eq!(sheet_no(484903.293, 1082927.804), "484-1082", "even third digits stay");
+        assert_eq!(sheet_no(497000.0, 1093999.0), "496-1083", "the third digit, not the last: 1093 → 1083");
+    }
+
+    #[test]
+    fn surveyed_by_words_start_with_a_capital() {
+        assert_eq!(cap_words("wiss resources"), "Wiss Resources");
+        assert_eq!(cap_words("dakyil survey/mapping consultants"), "Dakyil Survey/Mapping Consultants");
+        assert_eq!(cap_words("blessing j.wophill"), "Blessing J.Wophill");
+        assert_eq!(cap_words("sa'ad ABUBAKAR"), "Sa'ad ABUBAKAR");
+    }
+
+    /// PL68374 (PLAGIS), clockwise from N9994V, as on its printed plan.
+    fn pl68374() -> Vec<Corner> {
+        plan_order(&[
+            (495142.578, 1092430.989, "N9994V".into()),
+            (495171.460, 1092438.493, "N9995V".into()),
+            (495182.474, 1092408.984, "N9996V".into()),
+            (495157.613, 1092403.167, "N9997V".into()),
+            (495153.926, 1092403.981, "N9998V".into()),
+        ])
+    }
+
+    #[test]
+    fn roads_on_two_sides_and_the_coordinate_cross() {
+        let c = pl68374();
+        assert_eq!(c[0].name, "N9994V");
+        // West side (N9998V → N9994V, side 4) and south side (N9996V → N9997V, side 2), as the photo.
+        let fields = PlanFields { road_sides: vec![4, 2], road_label: Some("ACCESS ROAD".into()), grid_corner: Some(2), ..Default::default() };
+        let svg = render_svg(&PlanData { upin: "PL000000023480".into(), area_m2: 902.203, corners: c.clone(), fields: fields.clone() });
+        assert_eq!(svg.matches(">ACCESS ROAD<").count(), 2, "one label per road");
+        assert!(svg.matches("stroke-dasharray=\"2.5 1.5\"").count() >= 4, "two lines per road");
+        assert!(svg.contains(">495182.474mE<") && svg.contains(">1092408.984mN<"), "the cross is at N9996V");
+        assert!(svg.contains("SHEET NO. 494 - 1082"));
+        // Grid off: no cross; the frame values come back.
+        let svg = render_svg(&PlanData { upin: "PL000000023480".into(), area_m2: 902.203, corners: c.clone(), fields: PlanFields { grid: Some(false), ..fields } });
+        assert!(!svg.contains("mE<"));
+        // A form saved before road_sides keeps its one road.
+        let legacy = PlanFields { road_side: Some(3), ..Default::default() };
+        assert_eq!(legacy.roads(), vec![3]);
+        let svg = render_svg(&PlanData { upin: "X".into(), area_m2: 1.0, corners: c, fields: legacy });
+        assert_eq!(svg.matches(">Access Road<").count(), 1);
+    }
+
+    #[test]
+    fn neighbouring_roads_meet_in_a_junction() {
+        let c = pl68374();
+        // Sides 1 (N9995V → N9996V) and 2 (N9996V → N9997V) share N9996V.
+        let svg = render_svg(&PlanData { upin: "X".into(), area_m2: 1.0, corners: c, fields: PlanFields { road_sides: vec![1, 2], grid: Some(false), ..Default::default() } });
+        // Through road: inner line broken in two + outer; joining road: inner + outer.
+        assert_eq!(svg.matches("stroke-dasharray=\"2.5 1.5\"").count(), 5);
     }
 
     #[test]

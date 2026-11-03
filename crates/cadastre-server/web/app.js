@@ -4015,8 +4015,17 @@ async function titleDeedDialog(jobId, upin) {
   const ct = h("table", { class: "legs" }, h("tr", {}, h("th", {}, "#"), h("th", {}, "Beacon"), h("th", {}, "Easting"), h("th", {}, "Northing")),
     ...p.corners.map((c, i) => h("tr", {}, h("td", { class: "n" }, String(i + 1)), h("td", {}, names[i]), h("td", {}, fmt3(c.e)), h("td", {}, fmt3(c.n)))));
   const nameOf = (i) => names[i].value.trim() || p.corners[i].name;
-  const road = h("select", { style: "width:100%" }, h("option", { value: "" }, "No road"),
-    ...p.corners.map((c, i) => h("option", { value: i, selected: f.road_side === i }, `Side ${i + 1}: ${nameOf(i)} → ${nameOf((i + 1) % n)}`)));
+  // Access roads: any number of sides (two neighbouring sides meet in a junction on the sheet).
+  const roadSet = new Set((f.road_sides && f.road_sides.length) ? f.road_sides : (f.road_side != null ? [f.road_side] : []));
+  const sideText = (i) => `Side ${i + 1}: ${nameOf(i)} → ${nameOf((i + 1) % n)}`;
+  const roadBoxes = p.corners.map((c, i) => h("input", { type: "checkbox", checked: roadSet.has(i) }));
+  const roadLabels = p.corners.map((c, i) => h("span", {}, sideText(i)));
+  const road = h("div", { style: "width:100%;max-height:90px;overflow:auto" },
+    ...p.corners.map((c, i) => h("label", { style: "display:block;white-space:nowrap" }, roadBoxes[i], " ", roadLabels[i])));
+  // Co-ordinate cross: lines through one beacon with its Easting / Northing, on or off.
+  const gridOn = h("input", { type: "checkbox", checked: f.grid !== false });
+  const gridAt = h("select", { style: "flex:1" }, ...p.corners.map((c, i) => h("option", { value: i, selected: (f.grid_corner ?? 0) === i }, `at ${nameOf(i)}`)));
+  const grid = h("div", { style: "display:flex;gap:6px;align-items:center;width:100%" }, h("label", { style: "white-space:nowrap" }, gridOn, " Show"), gridAt);
   const roadLabel = inp("road_label", "Access Road");
   const reg = d.registry === "ok" ? h("span", { style: "color:#060" }, "Prefilled from the Registry (read only) and the parcel record.")
     : d.registry === "off" ? h("span", { class: "muted" }, "Registry not configured on this server: type the holder and survey details.")
@@ -4024,13 +4033,22 @@ async function titleDeedDialog(jobId, upin) {
   const missing = p.corners.filter((c, i) => !((f.corner_names || [])[i]) && /^P\d+$/.test(c.name)).length;
   const keys = ["title_no", "plan_no", "tracing_no", "region", "location", "address", "holder", "surveyed_by", "survey_date", "plotted_by", "checked_by", "surveyor_general", "prepared_by"];
   const fields = Object.fromEntries(keys.map((k) => [k, inp(k)]));
+  // Surveyed by: each word starts with a capital (the server enforces it too).
+  const capWords = (v) => v.replace(/(^|[^\p{L}\p{N}'’])(\p{L})/gu, (m, a, b) => a + b.toUpperCase());
+  fields.surveyed_by.addEventListener("input", () => {
+    const el = fields.surveyed_by, pos = el.selectionStart, v = capWords(el.value);
+    if (v !== el.value) { el.value = v; el.setSelectionRange(pos, pos); }
+  });
   const collect = () => {
     const out = {};
     for (const k of keys) out[k] = fields[k].value.trim() || null;
     out.lga = lga.value || null;
     out.scale = scale.value ? Number(scale.value) : null;
     out.corner_names = names.map((x) => x.value.trim() || null);
-    out.road_side = road.value === "" ? null : Number(road.value);
+    out.road_side = null;
+    out.road_sides = roadBoxes.flatMap((b, i) => (b.checked ? [i] : []));
+    out.grid = gridOn.checked;
+    out.grid_corner = Number(gridAt.value);
     out.road_label = roadLabel.value.trim() || null;
     return out;
   };
@@ -4084,7 +4102,7 @@ async function titleDeedDialog(jobId, upin) {
     row("Region:", fields.region), row("Location:", fields.location), row("Address:", fields.address), row("L.G. area:", lga),
     row("Holder:", fields.holder), row("Surveyed by:", fields.surveyed_by), row("Survey date:", fields.survey_date),
     row("Plotted by:", fields.plotted_by), row("Checked by:", fields.checked_by), row("Surveyor-General:", fields.surveyor_general),
-    row("Prepared by:", fields.prepared_by), row("Scale:", scale), row("Access road:", road), row("Road label:", roadLabel),
+    row("Prepared by:", fields.prepared_by), row("Scale:", scale), row("Access roads:", road), row("Road label:", roadLabel), row("Co-ordinate grid:", grid),
     h("div", { class: "cfHdr", style: "margin-top:6px" }, "Beacon numbers" + (missing ? ` — ${missing} to type (not in the fabric)` : "")),
     h("div", { style: "max-height:180px;overflow:auto" }, ct),
     msg,
@@ -4094,7 +4112,10 @@ async function titleDeedDialog(jobId, upin) {
       h("button", { class: "btn", onclick: attach, title: "File the plan on the job as a PDF, for Send plan" }, "Attach as PDF"),
       h("button", { class: "btn", onclick: () => openRegistry({ job: jobId, view: "send" }) }, "Send plan…"))),
     { id: "titleDeedWin", width: 470 });
-  for (const x of names) x.addEventListener("input", () => [...road.options].slice(1).forEach((o, i) => { o.textContent = `Side ${i + 1}: ${nameOf(i)} → ${nameOf((i + 1) % n)}`; }));
+  for (const x of names) x.addEventListener("input", () => {
+    roadLabels.forEach((l, i) => { l.textContent = sideText(i); });
+    [...gridAt.options].forEach((o, i) => { o.textContent = `at ${nameOf(i)}`; });
+  });
 }
 
 function wfStepAction(s) {
