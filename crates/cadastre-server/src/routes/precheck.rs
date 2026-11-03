@@ -298,3 +298,132 @@ pub async fn precheck(State(state): State<AppState>, user: AuthUser, Path(id): P
     }
     Ok(Json(report))
 }
+
+// ---------------------------------------------------------------------------------------------
+// Confirmation from the Registry (10.10.10.5) after a commit: read back, read-only, what the
+// Registry holds and will ask for, so the officer knows the commit is visible on the Registry side.
+// ---------------------------------------------------------------------------------------------
+
+#[derive(Debug, Clone, Serialize, ToSchema)]
+pub struct RegistryConfirmation {
+    /// Nothing failed.
+    pub ok: bool,
+    pub items: Vec<PrecheckItem>,
+    /// The UPINs this job committed.
+    pub upins: Vec<String>,
+    pub checked_at: String,
+    pub checked_by: Option<String>,
+}
+
+async fn confirm_run(state: &AppState, id: i32) -> ApiResult<RegistryConfirmation> {
+    let mut items = Vec::new();
+    let row: Option<(Option<uuid::Uuid>, Option<String>, Option<String>)> = sqlx::query_as(
+        "SELECT j.cadastre_job_id, j.lrs_transaction_number, l.property_number FROM cadastre.wf_job_instance j \
+         LEFT JOIN cadastre.wf_job_linkage l ON l.wf_job_instance_id = j.id WHERE j.id = $1")
+        .bind(id).fetch_optional(&state.pool).await?;
+    let (cadastre_job, txn, property_number) = row.ok_or_else(|| AppError::NotFound(format!("job instance {id}")))?;
+    // What this Cadastre committed for the job, and whether the Registry can read it back.
+    let committed: Vec<(String, Option<chrono::DateTime<chrono::Utc>>, bool)> = match cadastre_job {
+        Some(j) => sqlx::query_as(
+            "SELECT p.parcel_number, p.posted_at, EXISTS (SELECT 1 FROM cadastre.parcel_attribute a WHERE a.upin = p.parcel_number AND (a.status = '0' OR a.status IS NULL)) \
+             FROM cadastre.parcel p WHERE p.job_id = $1 AND p.status = 'posted' AND p.parcel_number IS NOT NULL ORDER BY p.posted_at, p.parcel_number")
+            .bind(j).fetch_all(&state.pool).await?,
+        None => Vec::new(),
+    };
+    let upins: Vec<String> = committed.iter().map(|c| c.0.clone()).collect();
+    items.push(if committed.is_empty() {
+        item("committed", "Committed parcels", "fail", "The job has no committed parcel.", vec![])
+    } else {
+        let d = committed.iter().map(|(u, at, attr)| format!("{u}{}{}",
+            at.map(|t| format!(" at {}", t.with_timezone(&chrono::FixedOffset::east_opt(3600).unwrap()).format("%d/%m/%Y %H:%M"))).unwrap_or_default(),
+            if *attr { "" } else { " (no attribute record)" })).collect::<Vec<_>>().join(", ");
+        let all = committed.iter().all(|c| c.2);
+        item("committed", "Committed parcels", if all { "pass" } else { "warn" },
+            format!("{d}{}", if all { ": readable by the Registry (GetParcelAttributesByUPIN)." } else { ". A parcel without an attribute record cannot be linked: enter its attributes." }), upins.clone())
+    });
+    // The job the Registry will find for the transaction (GetJobStatusByTransaction).
+    let Some(number) = txn.as_deref().map(str::trim).filter(|t| !t.is_empty()).map(str::to_string) else {
+        items.push(item("transaction", "Registry transaction", "skipped", "The job has no Registry transaction: nothing to confirm with the Registry.", vec![]));
+        return Ok(RegistryConfirmation { ok: !items.iter().any(|i| i.result == "fail"), items, upins, checked_at: chrono::Utc::now().to_rfc3339(), checked_by: None });
+    };
+    let seen: Vec<(i32, String, String)> = sqlx::query_as(
+        "SELECT j.id, COALESCE(j.name, ''), s.label FROM cadastre.wf_job_instance j JOIN cadastre.wf_job_status s ON s.code = j.status \
+         WHERE j.parameters ILIKE '%@LRS:[Transaction]:[TransactionNumber]=' || $1 || '%' ORDER BY j.id")
+        .bind(&number).fetch_all(&state.pool).await?;
+    items.push(match seen.iter().find(|s| s.0 == id) {
+        Some((_, name, label)) => item("job_service", "Job the Registry reads", "pass",
+            format!("Asked for {number}, this Cadastre answers with job {id} {name} ({label})."), vec![]),
+        None => item("job_service", "Job the Registry reads", "fail",
+            format!("Asked for {number}, this Cadastre would not return job {id}: its parameters do not name the transaction."), vec![]),
+    });
+    // Read back from the Registry itself.
+    let read = async {
+        let cfg = crate::routes::registry::config()?;
+        let session = crate::lrs::Session::start(&cfg).await.map_err(|e| AppError::Conflict(e.to_string()))?;
+        let t = crate::routes::registry::load_transaction(&session, &number).await;
+        let mc = match &t {
+            Ok(Some(t)) => session.query(&format!(
+                "select j.JobInstanceId, j.JobName, j.JobStatus from com.landsystems.lrs.model.McJob j where j.TransactionId = {}", t.id), 50).await.ok(),
+            _ => None,
+        };
+        session.end().await;
+        Ok::<_, AppError>((t?, mc))
+    }.await;
+    match read {
+        Err(e) => {
+            let why = match e { AppError::Conflict(m) | AppError::BadRequest(m) | AppError::NotFound(m) => m, other => other.to_string() };
+            items.push(item("registry", "Registry (10.10.10.5)", "fail", format!("The Registry could not be reached: {why}. Re-check when it is back."), vec![]));
+        }
+        Ok((None, _)) => items.push(item("registry", "Registry (10.10.10.5)", "fail", format!("The Registry has no transaction {number}."), vec![])),
+        Ok((Some(t), mc)) => {
+            items.push(item("registry", "Registry (10.10.10.5)", "pass", format!("Reached; transaction {} is {}.", t.transaction_number, t.status), vec![]));
+            let prop = t.properties.iter()
+                .find(|p| property_number.as_deref().is_some_and(|n| p.refnum.as_deref().is_some_and(|r| r.eq_ignore_ascii_case(n))))
+                .or(t.properties.first());
+            items.push(match prop {
+                None => item("property", "Registry property", "fail", "The transaction has no property to link the parcel to.", vec![]),
+                Some(p) => {
+                    let name = format!("{} ({})", p.su_id, p.refnum.as_deref().unwrap_or("no property number"));
+                    match p.upin.as_deref() {
+                        Some(u) if upins.iter().any(|x| x.eq_ignore_ascii_case(u)) => item("property", "Registry property", "pass",
+                            format!("{name} is linked to {u}{}.", p.linked_at.as_deref().map(|d| format!(" since {}", d.replace('T', " "))).unwrap_or_default()), vec![u.to_string()]),
+                        Some(u) => item("property", "Registry property", "warn", format!("{name} holds another UPIN, {u}, not this job's parcel."), vec![u.to_string()]),
+                        None => item("property", "Registry property", "pass", format!("{name} is ready for the Registry admin to link (Map → Connect)."), vec![]),
+                    }
+                }
+            });
+            items.push(match mc {
+                Some(rows) if !rows.is_empty() => item("registry_job", "Registry's job record", "pass",
+                    format!("The Registry records job(s) {} for this transaction.", rows.iter().filter(|r| r.len() >= 2).map(|r| format!("{} {}", r[0].trim(), r[1].trim())).collect::<Vec<_>>().join(", ")), vec![]),
+                Some(_) => item("registry_job", "Registry's job record", "pass",
+                    "The Registry keeps no job record for this transaction (the job was started in the Cadastre); it finds the job by transaction number, as above.", vec![]),
+                None => item("registry_job", "Registry's job record", "skipped", "The Registry's job records could not be read.", vec![]),
+            });
+        }
+    }
+    let ok = !items.iter().any(|i| i.result == "fail");
+    Ok(RegistryConfirmation { ok, items, upins, checked_at: chrono::Utc::now().to_rfc3339(), checked_by: None })
+}
+
+/// Confirm a commit with the Registry (10.10.10.5), read-only, and keep the result on the job.
+#[utoipa::path(post, path = "/api/v1/wf/jobs/{id}/registry-confirmation", tag = "wf", params(("id" = i32, Path, description = "Job instance id")),
+    responses((status = 200, body = RegistryConfirmation)))]
+pub async fn confirm(State(state): State<AppState>, user: AuthUser, Path(id): Path<i32>) -> ApiResult<Json<RegistryConfirmation>> {
+    let actor = crate::routes::wf::resolve_actor(&state, &user).await?;
+    let mut c = confirm_run(&state, id).await?;
+    c.checked_by = Some(actor.label.clone());
+    let mut tx = state.pool.begin().await?;
+    audit::append(&mut tx, &actor.label, "registry_confirmation", "wf_job_instance", Some(&id.to_string()), serde_json::to_value(&c).unwrap_or_default()).await?;
+    tx.commit().await?;
+    Ok(Json(c))
+}
+
+/// The last Registry confirmation kept for the job (404 when there is none yet).
+#[utoipa::path(get, path = "/api/v1/wf/jobs/{id}/registry-confirmation", tag = "wf", params(("id" = i32, Path, description = "Job instance id")),
+    responses((status = 200, body = RegistryConfirmation), (status = 404)))]
+pub async fn last_confirmation(State(state): State<AppState>, Path(id): Path<i32>) -> ApiResult<Json<Value>> {
+    let v: Option<Value> = sqlx::query_scalar(
+        "SELECT payload FROM cadastre.audit_log WHERE entity = 'wf_job_instance' AND entity_id = $1 AND action = 'registry_confirmation' ORDER BY id DESC LIMIT 1")
+        .bind(id.to_string()).fetch_optional(&state.pool).await?;
+    v.map(Json).ok_or_else(|| AppError::NotFound(format!("no Registry confirmation for job {id} yet")))
+}

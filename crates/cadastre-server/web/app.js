@@ -126,6 +126,26 @@ async function api(path, opts = {}) {
   return data;
 }
 const fmt3 = (v) => Number(v).toFixed(3);
+// Date and time as PLAGIS reads them: 03/11/2026 16:47 (day first, 24-hour, this PC's time zone).
+function fmtDT(iso) {
+  if (!iso) return "";
+  const d = new Date(String(iso).includes("T") || /[zZ+]/.test(iso) ? iso : String(iso).replace(" ", "T"));
+  if (isNaN(d)) return String(iso);
+  const p = (n) => String(n).padStart(2, "0");
+  return `${p(d.getDate())}/${p(d.getMonth() + 1)}/${d.getFullYear()} ${p(d.getHours())}:${p(d.getMinutes())}`;
+}
+// A date-only value (yyyy-mm-dd, as the Registry's link date is kept) shown day first.
+const fmtD = (s) => (/^\d{4}-\d{2}-\d{2}$/.test(String(s || "")) ? String(s).split("-").reverse().join("/") : fmtDT(s));
+// Parcel metadata (committed when / by whom / in which job; linked when / to what), by UPIN.
+async function parcelMeta({ upins = [], jobs = [] } = {}) {
+  const q = new URLSearchParams(); if (upins.length) q.set("upins", upins.join(",")); if (jobs.length) q.set("jobs", jobs.join(","));
+  if (!upins.length && !jobs.length) return [];
+  try { return await api("/api/v1/parcels/metadata?" + q); } catch { return []; }
+}
+const metaCommitted = (m) => !m || !m.committed_at ? "—"
+  : m.committed_in === "aumentum" ? `${fmtDT(m.committed_at)} (Aumentum)`
+  : `${fmtDT(m.committed_at)}${m.committed_by ? " by " + m.committed_by : ""}`;
+const metaLinked = (m) => !m ? "—" : m.linked ? `${m.linked_at ? fmtD(m.linked_at) : "yes"}${m.lrs_id ? " → " + m.lrs_id : ""}` : "Not linked";
 const status = (msg) => { $("statusMsg").textContent = msg || ""; };
 // A message that cannot be missed (the status bar is easy to overlook): shown over the map for a
 // few seconds, and also written to the status bar.
@@ -1293,7 +1313,15 @@ function identifyAt(e) {
   for (const f of feats) {
     const p = f.properties;
     const rows = Object.entries(p).filter(([k]) => k !== "id").map(([k, v]) => h("tr", {}, h("th", {}, k), h("td", {}, v == null || v === "null" ? "<Null>" : String(v))));
-    body.append(h("h4", { style: "margin:8px 0 3px" }, names[f.layer.id]), h("table", {}, ...rows));
+    const tbl = h("table", {}, ...rows);
+    body.append(h("h4", { style: "margin:8px 0 3px" }, names[f.layer.id]), tbl);
+    if ((f.layer.id === "parcels-fill" || f.layer.id === "history-fill") && p.parcel_number) {
+      parcelMeta({ upins: [p.parcel_number] }).then(([m]) => {
+        if (!m) return;
+        tbl.append(h("tr", {}, h("th", {}, "Committed"), h("td", {}, metaCommitted(m) + (m.job_name ? ` (${m.job_name})` : ""))),
+          h("tr", {}, h("th", {}, "Linked"), h("td", {}, metaLinked(m))));
+      });
+    }
     if ((f.layer.id === "parcels-fill" || f.layer.id === "history-fill") && p.parcel_number)
       body.append(h("div", { class: "frow" }, h("button", { class: "btn", onclick: () => lineageWindow(p.parcel_number) }, "Lineage…")));
   }
@@ -1401,13 +1429,20 @@ function findDialog() {
       } else map.getSource("found")?.setData(empty());
       if (missing.length && terms.length > 1) results.append(h("div", { style: "margin-top:6px;color:#b00" }, `Not found: ${missing.join(", ")}`));
       if (parcels.length) {
-        const t = h("table", {}, h("tr", {}, h("th", {}, "Parcel"), h("th", {}, "Status"), h("th", {}, "Area (m²)")));
+        const t = h("table", {}, h("tr", {}, h("th", {}, "Parcel"), h("th", {}, "Status"), h("th", {}, "Area (m²)"), h("th", {}, "Committed"), h("th", {}, "Linked")));
+        const metaCells = new Map();
         for (const p of parcels.slice(0, 200)) {
           const area = p.computed_area ?? p.stated_area;
-          const tr = h("tr", { style: "cursor:pointer", title: "Zoom to parcel" }, h("td", {}, p.parcel_number || "(unposted)"), h("td", {}, p.status), h("td", {}, area2(area)));
+          const cc = h("td", { class: "muted" }, "…"), lc = h("td", { class: "muted" }, "…");
+          if (p.parcel_number) metaCells.set(p.parcel_number, [cc, lc]); else { cc.textContent = "—"; lc.textContent = "—"; }
+          const tr = h("tr", { style: "cursor:pointer", title: "Zoom to parcel" }, h("td", {}, p.parcel_number || "(unposted)"), h("td", {}, p.status), h("td", {}, area2(area)), cc, lc);
           tr.onclick = () => goToResult(p);
           t.append(tr);
         }
+        parcelMeta({ upins: [...metaCells.keys()] }).then((list) => {
+          for (const m of list) { const c = metaCells.get(m.upin); if (!c) continue; c[0].textContent = metaCommitted(m); c[1].textContent = metaLinked(m); c[0].classList.remove("muted"); c[1].classList.remove("muted"); }
+          for (const [, c] of metaCells) for (const td of c) if (td.textContent === "…") td.textContent = "—";
+        });
         results.append(h("div", { class: "muted", style: "margin-top:6px" }, `${parcels.length} parcel(s)${parcels.length > 200 ? " (first 200 shown)" : ""} — click a row to zoom`), t);
         if (!beacons.length) { if (parcels.length === 1) goToResult(parcels[0]); else selectFeatures(parcels.map((p) => p.id)); }
       }
@@ -2772,6 +2807,29 @@ async function runPrecheck(utm) {
   return true;
 }
 
+// --- Confirmation from the Registry (10.10.10.5) after a commit ---
+// Read back, read-only: the committed parcels readable by the Registry, the job the Registry finds
+// for its transaction, the transaction, the property and the Registry's job record. Kept on the job;
+// Re-check asks again (e.g. when the Registry was down, or after the admin linked).
+async function registryConfirmDialog(jobId, opts = {}) {
+  for (;;) {
+    const wait = h("div", { class: "toast" }, "Asking the Registry (10.10.10.5)…"); document.body.append(wait);
+    let c;
+    try { c = await api(`/api/v1/wf/jobs/${jobId}/registry-confirmation`, { method: "POST" }); }
+    catch (e) { wait.remove(); await uiAlert("The Registry confirmation could not run: " + e.message); return; }
+    wait.remove();
+    const when = fmtDT(c.checked_at);
+    const body = h("div", {},
+      opts.headline ? h("p", {}, h("b", {}, opts.headline)) : null,
+      h("p", {}, c.ok ? h("b", { style: "color:#138a2a" }, "Confirmed by the Registry.") : h("b", { style: "color:#c62020" }, "Not confirmed: see the crosses below."),
+        ` Checked ${when}${c.checked_by ? " by " + c.checked_by : ""}.`),
+      h("div", { class: "verifyWrap" }, precheckTable(c)));
+    const again = await uiDialog({ title: "Registry Confirmation", message: body, kind: c.ok ? "info" : "error", width: 720,
+      buttons: [{ label: "Re-check", value: true }, { label: "Close", value: false, primary: true, cancel: true }] });
+    if (!again) return c;
+  }
+}
+
 // --- Edit Sketch Properties window (live X/Y vertex table) ---
 function openSketchProps() {
   const tbl = h("table", { class: "legs" }, h("tr", {}, h("th", {}, "#"), h("th", {}, "Beacon"), h("th", {}, "X (Easting)"), h("th", {}, "Y (Northing)"), h("th", {}, "")));
@@ -3758,11 +3816,23 @@ function regFindView(box) {
       h("div", { class: "regKv" },
         h("div", {}, h("i", {}, "Transaction"), f.transaction_number),
         h("div", {}, h("i", {}, "Property"), f.su_id || "—"),
-        h("div", {}, h("i", {}, "UPIN"), f.upin || "— (given at commit; the Registry links it)")),
+        h("div", {}, h("i", {}, "UPIN"), f.upin || "— (given at commit; the Registry links it)"),
+        regMetaRow(f)),
       h("div", { class: "regCardFoot" }, h("span", { class: "regLinks" }, regLink("Zoom", "Zoom to the parcel", () => registryZoom(f.upin), !linked)), main)));
   }
 }
 
+// Committed / linked date and time on a Registry file card (filled in when the metadata arrives).
+function regMetaRow(f) {
+  if (!f.upin && !f.job_instance_id) return null;
+  const v = h("span", { class: "muted" }, "…");
+  parcelMeta({ upins: f.upin ? [f.upin] : [], jobs: f.job_instance_id ? [f.job_instance_id] : [] }).then((list) => {
+    const m = list.find((x) => x.upin === f.upin) || list.find((x) => x.committed_at) || null;
+    v.classList.remove("muted");
+    v.textContent = !m || !m.committed_at ? "Not committed yet" : `${m.upin}: committed ${metaCommitted(m)}; linked: ${metaLinked(m)}`;
+  });
+  return h("div", {}, h("i", {}, "Committed"), v);
+}
 function regSendView(box, writes) {
   const jobId = reg.job ? reg.job.id : (wf.editing ? wf.editing.job_instance_id : wf.selected);
   if (!reg.job && jobId) { box.append(h("p", { class: "regEmpty" }, "Loading the job…")); regSetJob(jobId).then(renderRegistry); return; }
@@ -3934,6 +4004,8 @@ function wfDetailView(d) {
     box.append(ol);
   }
   if (j.is_open) box.append(wfEditingView(j, wf.selEditing));
+  else box.append(h("div", { class: "frow", style: "margin:6px 0" },
+    h("button", { class: "btn", title: "Ask the Registry (10.10.10.5) whether this job's committed parcels are visible there", onclick: () => registryConfirmDialog(j.id) }, "Registry Confirmation")));
   if (j.is_open) {
     const comment = h("textarea", { rows: 2, placeholder: "Comment for this task (optional)", style: "width:100%;box-sizing:border-box" });
     const assign = h("select", { style: "flex:1;min-width:0" }, h("option", { value: "" }, "Default assignee"),
@@ -4124,6 +4196,7 @@ async function wfCommitDialog(opts = {}) {
       notify(`Committed ${r.parcel_numbers.length} parcel(s): ${r.parcel_numbers.join(", ")}; ${r.beacons_added.length} beacon(s) added.` + (r.retired?.length ? ` Replaced / retired: ${r.retired.join(", ")}.` : ""));
       loadHistory(); await wfRefreshEditing();
       wf.detail = await api("/api/v1/wf/jobs/" + id); renderWorkflow();
+      if (r.parcel_numbers.length) registryConfirmDialog(id, { headline: `Committed: ${r.parcel_numbers.join(", ")}.` });
     } catch (e) { commitBtn.disabled = false; msg.style.color = "#b00"; msg.textContent = e.message; }
   } }, opts.label || "Commit");
   // The UPIN(s) this commit will give, and whether Aumentum was asked (parallel run). Advisory.
@@ -4166,6 +4239,7 @@ function wfEditingView(j, e) {
   const working = wf.editing && wf.editing.job_instance_id === j.id;
   if (!working) {
     sec.append(h("div", { class: "frow" }, h("button", { class: "btn", onclick: () => wfWorkOn(j.id) }, "Work On This Job"),
+      h("button", { class: "btn", title: "Ask the Registry (10.10.10.5) whether this job's committed parcels are visible there", onclick: () => registryConfirmDialog(j.id) }, "Registry Confirmation"),
       h("span", { class: "muted" }, e?.drafts ? `${e.drafts} draft parcel(s)` : e?.area ? "Job area defined" : "")));
     return sec;
   }
@@ -4177,6 +4251,7 @@ function wfEditingView(j, e) {
     ed.area ? h("button", { class: "btn", onclick: async () => { if (await uiConfirm("Delete the job area?", { ok: "Delete", kind: "warn" })) wfEditAction("DELETE", "/area", "Job area deleted."); } }, "Delete Job Area") : null,
     h("button", { class: "btn", disabled: !ed.drafts, onclick: async () => { if (await uiConfirm(`Discard the job's ${ed.drafts} uncommitted parcel(s)?`, { ok: "Discard", kind: "warn" })) wfEditAction("POST", "/discard", "Draft parcels discarded."); } }, "Discard Changes"),
     h("button", { class: "btn", onclick: async () => { await loadDrafts(); await wfSelect(j.id); status("Reloaded from the fabric."); } }, "Reload"),
+    h("button", { class: "btn", title: "Ask the Registry (10.10.10.5) whether this job's committed parcels are visible there", onclick: () => registryConfirmDialog(j.id) }, "Registry Confirmation"),
     ed.is_commit_task ? h("button", { class: "btn", disabled: !ed.drafts && !(wf.mutations || []).length, title: "Give the job's draft parcels their UPINs and add them to the fabric", onclick: () => wfCommitDialog() }, "Commit Parcels…") : null));
   // Mutations recorded in the job (Phase 4), applied when the parcels are committed.
   if ((wf.mutations || []).length) {
@@ -4224,8 +4299,8 @@ async function wfFinishPost(j, beacons) {
     const r = await api(`/api/v1/wf/jobs/${j.id}/finish`, { method: "POST", body: { complete: true, beacons } });
     const nums = (r.parcel_numbers || []).join(", ") || "(none)";
     status(r.completed ? `Done — ${nums} posted; job completed.` : `${nums} posted.`);
-    uiAlert(`Parcel posted.\nUPIN: ${nums}\n${r.completed ? "Job completed." : "Job now at: " + (r.job?.current_task || "—")}`);
     await loadParcels(false); await loadDrafts(); showJobArea();
+    registryConfirmDialog(j.id, { headline: `Parcel posted. UPIN: ${nums}. ${r.completed ? "Job completed." : "Job now at: " + (r.job?.current_task || "—")}` });
     wf.detail = await api("/api/v1/wf/jobs/" + j.id);
     wf.selEditing = await api(`/api/v1/wf/jobs/${j.id}/editing`).catch(() => wf.selEditing);
     if (wf.editing && wf.editing.job_instance_id === j.id) wf.editing = wf.selEditing;

@@ -299,8 +299,8 @@ async fn add_own_parcels(pool: &sqlx::PgPool, params: &[(String, String)], body:
     let op = if like { "ILIKE" } else { "=" };
     let sql = format!(
         "SELECT a.object_id, a.parcel_id::text AS parcel_id, a.parcel_name, p.parcel_number AS upin, a.parent, \
-                (EXTRACT(EPOCH FROM COALESCE(a.creation_date, p.created_at)) * 1000)::bigint AS created, \
-                (EXTRACT(EPOCH FROM a.last_edit_date) * 1000)::bigint AS edited, a.mutation_type::text AS mutation_type, \
+                (EXTRACT(EPOCH FROM COALESCE(p.posted_at, a.creation_date AT TIME ZONE 'Africa/Lagos', p.created_at)) * 1000)::bigint AS created, \
+                (EXTRACT(EPOCH FROM GREATEST(p.posted_at, a.last_edit_date AT TIME ZONE 'Africa/Lagos', p.updated_at)) * 1000)::bigint AS edited, a.mutation_type::text AS mutation_type, \
                 a.plan_number, a.plot, a.block, a.property_number, ST_Area(p.geom) AS area, ST_Perimeter(p.geom) AS len, \
                 ST_AsGeoJSON(ST_Transform(p.geom, 32632))::text AS gj \
          FROM cadastre.parcel p \

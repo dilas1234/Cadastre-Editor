@@ -553,3 +553,69 @@ fn parse_bbox(s: &str) -> ApiResult<(f64, f64, f64, f64)> {
         )),
     }
 }
+
+#[derive(Debug, Deserialize, utoipa::IntoParams)]
+pub struct ParcelMetadataQuery {
+    /// UPINs, comma-separated (at most 200).
+    #[serde(default)]
+    pub upins: String,
+    /// Workflow job instances, comma-separated: their committed parcels are added.
+    #[serde(default)]
+    pub jobs: String,
+}
+
+/// When and by whom each parcel was committed, its job, and when and to which Registry property it
+/// was linked: the metadata Find, Identify and the Registry file search show with a parcel.
+/// Parcels brought over from Aumentum carry Aumentum's creation date (`committed_in` = "aumentum").
+#[utoipa::path(get, path = "/api/v1/parcels/metadata", tag = "parcels", params(ParcelMetadataQuery), responses((status = 200)))]
+pub async fn parcel_metadata(State(state): State<AppState>, Query(q): Query<ParcelMetadataQuery>) -> ApiResult<Json<Vec<serde_json::Value>>> {
+    let mut upins: Vec<String> = q.upins.split(',').map(|u| u.trim().to_uppercase()).filter(|u| !u.is_empty()).take(200).collect();
+    let jobs: Vec<i32> = q.jobs.split(',').filter_map(|j| j.trim().parse().ok()).take(50).collect();
+    if !jobs.is_empty() {
+        let more: Vec<String> = sqlx::query_scalar(
+            "SELECT p.parcel_number FROM cadastre.wf_job_instance w JOIN cadastre.parcel p ON p.job_id = w.cadastre_job_id \
+             WHERE w.id = ANY($1) AND p.status = 'posted' AND p.parcel_number IS NOT NULL ORDER BY p.posted_at")
+            .bind(&jobs).fetch_all(&state.pool).await?;
+        for u in more { if !upins.contains(&u) && upins.len() < 200 { upins.push(u); } }
+    }
+    if upins.is_empty() {
+        return Ok(Json(Vec::new()));
+    }
+    let rows = sqlx::query(
+        "SELECT u.upin, p.status, p.posted_at, pa.creation_date, \
+                (SELECT a.actor FROM cadastre.audit_log a WHERE a.action = 'wf_commit' AND a.payload->'parcel_numbers' ? u.upin ORDER BY a.id DESC LIMIT 1) AS committed_by, \
+                w.id AS job_instance_id, w.name AS job_name, \
+                pa.linkage_status, pa.linkage_date, pa.lrs_id, pa.property_number, \
+                (SELECT COALESCE(l.payload->>'linked_at', to_char(l.created_at AT TIME ZONE 'UTC', 'YYYY-MM-DD\"T\"HH24:MI:SS\"Z\"')) FROM cadastre.audit_log l \
+                  WHERE l.entity = 'registry_link' AND l.entity_id = u.upin AND l.action IN ('registry_link_synced', 'registry_link_made', 'registry_map_update') \
+                  ORDER BY l.id DESC LIMIT 1) AS link_event \
+         FROM unnest($1::text[]) AS u(upin) \
+         LEFT JOIN LATERAL (SELECT * FROM cadastre.parcel x WHERE x.parcel_number = u.upin ORDER BY (x.status = 'posted') DESC, x.updated_at DESC LIMIT 1) p ON true \
+         LEFT JOIN LATERAL (SELECT id, name FROM cadastre.wf_job_instance wj WHERE p.job_id IS NOT NULL AND wj.cadastre_job_id = p.job_id ORDER BY wj.id DESC LIMIT 1) w ON true \
+         LEFT JOIN LATERAL (SELECT * FROM cadastre.parcel_attribute y WHERE y.upin = u.upin ORDER BY (y.status = '0') DESC NULLS LAST, y.object_id DESC LIMIT 1) pa ON true",
+    )
+    .bind(&upins)
+    .fetch_all(&state.pool)
+    .await?;
+    let iso = |t: Option<chrono::DateTime<chrono::Utc>>| t.map(|t| t.to_rfc3339_opts(chrono::SecondsFormat::Secs, true));
+    Ok(Json(rows.iter().map(|r| {
+        let posted: Option<chrono::DateTime<chrono::Utc>> = r.get("posted_at");
+        let created: Option<chrono::NaiveDateTime> = r.get("creation_date");
+        let linked = r.get::<Option<i16>, _>("linkage_status").map(i32::from) == Some(1);
+        let link_event: Option<String> = r.get("link_event");
+        let linkage_date: Option<String> = r.get("linkage_date");
+        serde_json::json!({
+            "upin": r.get::<String, _>("upin"),
+            "status": r.get::<Option<String>, _>("status"),
+            "committed_at": iso(posted).or_else(|| created.map(|c| c.format("%Y-%m-%dT%H:%M:%S").to_string())),
+            "committed_in": if posted.is_some() && r.get::<Option<String>, _>("committed_by").is_some() { "cadastre" } else if posted.is_some() || created.is_some() { "aumentum" } else { "" },
+            "committed_by": r.get::<Option<String>, _>("committed_by"),
+            "job_instance_id": r.get::<Option<i32>, _>("job_instance_id"),
+            "job_name": r.get::<Option<String>, _>("job_name"),
+            "linked": linked,
+            "linked_at": if linked { link_event.or(linkage_date) } else { None },
+            "lrs_id": r.get::<Option<String>, _>("lrs_id"),
+            "property_number": r.get::<Option<String>, _>("property_number"),
+        })
+    }).collect()))
+}
