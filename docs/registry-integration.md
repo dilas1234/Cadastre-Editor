@@ -140,10 +140,21 @@ nothing, because values are written only where they differ.
 Only on a user's action, and only with `CADASTRE_REGISTRY_WRITE=1`:
 
 * **Send plan** (`POST /api/v1/wf/jobs/{id}/registry/send-plan`), Aumentum's `SendImageCommand`:
-  a JPG or PNG attached to the job goes to the job's transaction. Only Active transactions are
-  accepted, never `P-`. The image is uploaded with `PUT /lrs/upload/{guid}.jpg?ticket=…`, then
-  `SaveEntity` adds an `IncomingDocument` of type `SurveyPlanFromMC` (`sd_titledeedPlan`), Comments
-  "Survey Plan", one image page.
+  the title deed plan goes to the job's transaction **as a PDF** (Title Deed Plan → *Attach as PDF*
+  files it on the job; a JPG attached by hand is turned into a one-page A4 PDF first; PNG is
+  refused). Only Active transactions are accepted, never `P-`. The PDF is uploaded with
+  `PUT /lrs/upload/{guid}.pdf?ticket=…`, then `SaveEntity` adds an `IncomingDocument` of type
+  `SurveyPlanFromMC` (`sd_titledeedPlan`), Comments "Survey Plan", one page of type `attachment`
+  (isattachment True). The Registry's page types are `image` and `attachment` (its data model);
+  setting `aumentum.Integration.PlanPageType` switches back to `image` if the Registry wants it.
+* **Resend corrected plan** (same call, `"resend": true`): once a plan has been sent to the
+  transaction, a plain send is refused (409) so it does not collect duplicates by accident. A resend
+  files the corrected PDF as "Survey Plan (corrected, <date>)", then marks the plans filed before
+  (looked up read-only by transaction and document type) with Comments "Survey Plan - REPLACED by
+  the corrected plan of <date>". Nothing is deleted in the Registry. If the earlier plan cannot be
+  found or marked, the resend still succeeds and says so; the officer marks it in the Registry.
+  **First test on a test transaction:** the PDF page type and the lookup of earlier documents have
+  not been tried against the live Registry yet.
 * **Linking from the Cadastre** (Aumentum's desktop `LinkParcel`) exists, tested, but is **off**:
   PLAGIS links in the Registry only. It answers 409 unless `CADASTRE_REGISTRY_CADASTRE_LINKING=1`.
 
@@ -155,7 +166,8 @@ Only on a user's action, and only with `CADASTRE_REGISTRY_WRITE=1`:
     transaction's parameters). If a job for the transaction is already open, **Open job** is shown instead.
   * **Linked**: links from the Registry by day, with Waiting / With job / Unlinked filters.
     Each link has Zoom, File, and Start job / Open job.
-  * **Send plan**: a checklist (transaction, Active, plan image with Attach image…) → Send. History below.
+  * **Send plan**: a checklist (transaction, Active, plan PDF with Attach PDF…) → Send, or
+    **Resend corrected plan** once a plan was sent. History below (Sent / Corrected).
   * Header: connection light, last check, one refresh (links + unlinks).
 * **Map**: right-click or double-click a parcel → **Start edit — title deed**, Zoom To Parcel,
   Registry File…, Parcel Lineage…. Start edit opens the parcel's job (the transaction of its

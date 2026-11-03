@@ -1243,7 +1243,7 @@ async function startEditParcel(upin, fileOnly) {
   await openWorkflow(); await wfSelect(job);
   try { await wfWorkOn(job); } catch (e) { notify(e.message, "err"); }
   stepTools(`Title Deed Plan — ${upin}`, [
-    ["Title Deed Plan… (form, print, plan image)", () => titleDeedDialog(job, upin)],
+    ["Title Deed Plan… (form, print, PDF)", () => titleDeedDialog(job, upin)],
     ["Send the plan to the Registry…", () => openRegistry({ job, view: "send" })],
   ]);
   status(`Working on ${w.job_name || "job " + job} for ${upin}${w.current_task ? " — task: " + w.current_task : ""}.`);
@@ -3335,16 +3335,28 @@ async function regSetJob(id) {
   try {
     const d = await api("/api/v1/wf/jobs/" + id);
     reg.job = d.job;
-    reg.files = (await api(`/api/v1/wf/jobs/${id}/files`)).filter((f) => /\.(jpe?g|png)$/i.test(f.file_name));
-    if (!reg.files.some((f) => f.id === reg.pick)) reg.pick = reg.files.length ? reg.files[reg.files.length - 1].id : null;
+    // The plan goes to the Registry as a PDF; a JPG (earlier plan images) is sent as a PDF too.
+    reg.files = (await api(`/api/v1/wf/jobs/${id}/files`)).filter((f) => /\.(pdf|jpe?g)$/i.test(f.file_name));
+    const pdfs = reg.files.filter((f) => /\.pdf$/i.test(f.file_name));
+    if (!reg.files.some((f) => f.id === reg.pick)) reg.pick = (pdfs.length ? pdfs[pdfs.length - 1] : reg.files[reg.files.length - 1] || {}).id || null;
     reg.sent = await api(`/api/v1/wf/jobs/${id}/registry/sent`);
     if (reg.job.lrs_transaction_number && !reg.txnNo) await regLookup(reg.job.lrs_transaction_number);
   } catch (e) { notify(e.message, "err"); }
 }
-async function regSendPlan(fileId, fileName) {
+async function regSendPlan(fileId, fileName, resend) {
   const t = reg.job.lrs_transaction_number;
-  if (!confirm(`Send the plan image ${fileName} to Registry transaction ${t}?\nIt is filed in the transaction as a Title Deed Plan.`)) return;
-  await regRun("Send plan", async () => { const r = await api(`/api/v1/wf/jobs/${reg.job.id}/registry/send-plan`, { method: "POST", body: { file_id: fileId } }); notify(`${r.file_name} sent to ${r.transaction_number}.`); await regSetJob(reg.job.id); });
+  const asPdf = /\.pdf$/i.test(fileName) ? fileName : fileName.replace(/\.[^.]+$/, "") + ".pdf";
+  const ask = resend
+    ? `Resend the corrected plan ${asPdf} to Registry transaction ${t}?\n\nIt is filed as "Survey Plan (corrected)", and the plan sent before is marked as replaced. Nothing is deleted in the Registry.`
+    : `Send the plan ${asPdf} to Registry transaction ${t}?\nIt is filed in the transaction as a Title Deed Plan (PDF).`;
+  if (!confirm(ask)) return;
+  await regRun(resend ? "Resend plan" : "Send plan", async () => {
+    const r = await api(`/api/v1/wf/jobs/${reg.job.id}/registry/send-plan`, { method: "POST", body: { file_id: fileId, resend: !!resend } });
+    const done = `${r.file_name} ${r.resend ? "resent (corrected)" : "sent"} to ${r.transaction_number}.`;
+    if (r.replace_note) notify(`${done} Note: ${r.replace_note}.`, "warn");
+    else notify(r.resend ? `${done} ${r.replaced.length} earlier plan(s) marked as replaced.` : done);
+    await regSetJob(reg.job.id);
+  });
 }
 // ---- view ---------------------------------------------------------------------------------
 const regDay = (iso) => {
@@ -3532,11 +3544,14 @@ function regSendView(box, writes) {
   for (const f of reg.files) {
     files.append(h("label", { class: "regFile" + (reg.pick === f.id ? " sel" : "") },
       h("input", { type: "radio", name: "regPick", checked: reg.pick === f.id, onchange: () => { reg.pick = f.id; renderRegistry(); } }),
-      h("img", { src: `/api/v1/wf/files/${f.id}`, alt: "", loading: "lazy" }),
+      /\.pdf$/i.test(f.file_name)
+        ? h("a", { class: "regPdf", href: `/api/v1/wf/files/${f.id}`, target: "_blank", title: "Open the PDF", onclick: (e) => e.stopPropagation() }, "PDF")
+        : h("img", { src: `/api/v1/wf/files/${f.id}`, alt: "", loading: "lazy" }),
       h("span", {}, f.file_name)));
   }
-  // Attach the plan image here (the same job attachment as Workflow → Attachments).
-  const pickFile = h("input", { type: "file", accept: ".jpg,.jpeg,.png,image/jpeg,image/png", style: "display:none" });
+  // Attach the plan here (the same job attachment as Workflow → Attachments). The usual way is
+  // Title Deed Plan → Attach as PDF; a PDF or JPG made elsewhere can be attached too.
+  const pickFile = h("input", { type: "file", accept: ".pdf,.jpg,.jpeg,application/pdf,image/jpeg", style: "display:none" });
   pickFile.onchange = async () => {
     const file = pickFile.files[0]; if (!file) return;
     await regRun("Attach", async () => {
@@ -3547,20 +3562,31 @@ function regSendView(box, writes) {
       reg.pick = (reg.files.find((x) => x.file_name === file.name) || {}).id || reg.pick;
     });
   };
-  const attach = regIconBtn(reg.files.length ? "Attach another…" : "Attach image…", "Attach the plan image (JPG or PNG) to the job", () => pickFile.click(), { disabled: reg.busy });
-  box.append(step(reg.files.length ? true : false, "Plan image (JPG or PNG)",
-    reg.files.length ? "Choose the image to send." : "Attach the plan image to the job."));
+  const attach = regIconBtn(reg.files.length ? "Attach another…" : "Attach PDF…", "Attach a plan PDF (or JPG, sent as a PDF) to the job", () => pickFile.click(), { disabled: reg.busy });
+  box.append(step(reg.files.length ? true : false, "Title deed plan (PDF)",
+    reg.files.length ? "Choose the plan to send. It goes to the Registry as a PDF." : "Title Deed Plan → Attach as PDF, or attach a PDF here."));
   box.append(h("div", { style: "margin:-2px 8px 6px 34px" }, attach, pickFile));
   if (reg.files.length) box.append(files);
   const f = reg.files.find((x) => x.id === reg.pick);
   const ready = writes && t && t.open && f && !reg.busy;
+  // Sent before to this transaction: the button becomes Resend corrected plan.
+  const sentHere = reg.sent.some((x) => x.detail && x.detail.transaction_number === j.lrs_transaction_number);
+  const pdfName = f ? (/\.pdf$/i.test(f.file_name) ? f.file_name : f.file_name.replace(/\.[^.]+$/, "") + ".pdf") : "";
   box.append(h("div", { class: "regSendBar" },
     h("button", { class: "regAct primary big", disabled: !ready, title: !writes ? "Writing to the Registry is off on this server" : "",
-      onclick: () => regSendPlan(f.id, f.file_name) }, reg.busy ? "Sending…" : f ? `Send ${f.file_name} to ${j.lrs_transaction_number}` : "Send plan"),
-    h("div", { class: "muted" }, "Filed in the transaction as a Title Deed Plan (\"Survey Plan\"), as Aumentum did.")));
+      onclick: () => regSendPlan(f.id, f.file_name, sentHere) },
+      reg.busy ? "Sending…" : !f ? "Send plan" : sentHere ? `Resend corrected plan: ${pdfName}` : `Send ${pdfName} to ${j.lrs_transaction_number}`),
+    h("div", { class: "muted" }, sentHere
+      ? "A plan was sent before. The corrected PDF is filed as \"Survey Plan (corrected)\" and the earlier plan is marked as replaced; nothing is deleted."
+      : "Filed in the transaction as a Title Deed Plan (\"Survey Plan\"), as a PDF.")));
   if (reg.sent.length) {
     box.append(h("div", { class: "regDayHead" }, "Sent"));
-    for (const x of reg.sent) box.append(h("div", { class: "regSent" }, h("span", { class: "regPill ok" }, "Sent"), ` ${x.detail.file_name} → ${x.detail.transaction_number}`, h("span", { class: "muted" }, ` · ${regDay(x.at)} ${regClock(x.at)} · ${x.by}`)));
+    for (const x of reg.sent) {
+      const d = x.detail || {};
+      box.append(h("div", { class: "regSent" }, h("span", { class: "regPill ok" }, d.resend ? "Corrected" : "Sent"), ` ${d.file_name} → ${d.transaction_number}`,
+        h("span", { class: "muted" }, ` · ${regDay(x.at)} ${regClock(x.at)} · ${x.by}`),
+        d.replace_note ? h("div", { class: "muted", style: "color:#a60" }, d.replace_note) : null));
+    }
   }
 }
 // A step command as a readable tool name: "Ils.MultiCadastre.Desktop.CreateJobAreaCommand" -> "Create Job Area".
@@ -3968,10 +3994,10 @@ async function wfFinishPost(j, beacons) {
   finally { wf.busy = false; renderWorkflow(); }
 }
 // What a workflow step's "Open" does in this editor. Steps whose tools belong to later phases say so.
-// --- Title deed plan (Generate Title Deed Plan): the form, the sheet, the plan image -------------
+// --- Title deed plan (Generate Title Deed Plan): the form, the sheet, the plan PDF ---------------
 // The server prefills the form from the Registry (Aumentum's R_PROPINFO / R_HOLDERS) and the parcel
 // record; the officer confirms or types the rest, saves it with the job, prints the A4 sheet, and
-// turns it into the JPEG that Send plan files with the Registry transaction.
+// turns it into the PDF that Send plan files with the Registry transaction.
 const TD_SCALES = [250, 500, 750, 1000, 1250, 1500, 2000, 2500, 3000, 4000, 5000, 7500, 10000, 25000];
 async function titleDeedDialog(jobId, upin) {
   let d;
@@ -4027,10 +4053,11 @@ async function titleDeedDialog(jobId, upin) {
       w.document.close();
     } catch (e) { msg.style.color = "#900"; msg.textContent = e.message; }
   };
-  // The plan image Send plan files with the Registry transaction: the sheet as a JPEG (A4, 200 dpi).
+  // The plan Send plan files with the Registry transaction: the sheet (drawn at A4, 200 dpi) as a
+  // one-page A4 PDF, made on the server.
   const attach = async () => {
     try {
-      msg.style.color = ""; msg.textContent = "Making the plan image…";
+      msg.style.color = ""; msg.textContent = "Making the plan PDF…";
       const svg = await sheet();
       const url = URL.createObjectURL(new Blob([svg], { type: "image/svg+xml" }));
       const img = new Image();
@@ -4039,13 +4066,13 @@ async function titleDeedDialog(jobId, upin) {
       const g = c.getContext("2d"); g.fillStyle = "#fff"; g.fillRect(0, 0, c.width, c.height); g.drawImage(img, 0, 0, c.width, c.height);
       URL.revokeObjectURL(url);
       const blob = await new Promise((ok) => c.toBlob(ok, "image/jpeg", 0.92));
-      const name = `Title Deed Plan ${(fields.title_no.value || p.upin).trim()}.jpg`;
+      const name = `Title Deed Plan ${(fields.title_no.value || p.upin).trim()}.pdf`;
       await authReady;
-      const r = await fetch(`/api/v1/wf/jobs/${jobId}/files?name=${encodeURIComponent(name)}`, { method: "POST", body: blob, headers: { "content-type": "application/octet-stream", ...authHeaders() } });
+      const r = await fetch(`/api/v1/wf/jobs/${jobId}/titledeed.pdf?name=${encodeURIComponent(name)}`, { method: "POST", body: blob, headers: { "content-type": "image/jpeg", ...authHeaders() } });
       if (!r.ok) throw new Error((await r.json().catch(() => ({}))).message || r.statusText);
-      msg.style.color = "#060"; msg.textContent = `${name} attached to the job. Send plan files it with the Registry transaction.`;
+      msg.style.color = "#060"; msg.textContent = `${name} attached to the job. Send plan files it with the Registry transaction (or Resend corrected plan, if a plan was sent before).`;
       if (wf.detail?.job?.id === jobId) await wfSelect(jobId);
-    } catch (e) { msg.style.color = "#900"; msg.textContent = "Plan image: " + e.message; }
+    } catch (e) { msg.style.color = "#900"; msg.textContent = "Plan PDF: " + e.message; }
   };
   const pick = d.upins.length > 1 ? row("Parcel:", h("select", { onchange: (e) => { w.remove(); titleDeedDialog(jobId, e.target.value); } },
     ...d.upins.map((u) => h("option", { value: u, selected: u === p.upin }, u)))) : null;
@@ -4064,7 +4091,7 @@ async function titleDeedDialog(jobId, upin) {
     h("div", { class: "frow", style: "flex-wrap:wrap;justify-content:flex-end" },
       h("button", { class: "btn", onclick: () => save().catch((e) => { msg.style.color = "#900"; msg.textContent = e.message; }) }, "Save"),
       h("button", { class: "btn", onclick: preview }, "Preview / Print"),
-      h("button", { class: "btn", onclick: attach }, "Attach as plan image"),
+      h("button", { class: "btn", onclick: attach, title: "File the plan on the job as a PDF, for Send plan" }, "Attach as PDF"),
       h("button", { class: "btn", onclick: () => openRegistry({ job: jobId, view: "send" }) }, "Send plan…"))),
     { id: "titleDeedWin", width: 470 });
   for (const x of names) x.addEventListener("input", () => [...road.options].slice(1).forEach((o, i) => { o.textContent = `Side ${i + 1}: ${nameOf(i)} → ${nameOf((i + 1) % n)}`; }));
@@ -4094,11 +4121,11 @@ function wfStepAction(s) {
     case 1002: case 1012: return { run: needJob(() => wfCommitDialog()), label: "Commit", tip: "Commit the job's parcels to the fabric" };
     case 1014: return { run: () => findDialog(), tip: "Search the cadastre for parcels" };
     case 1017: return { run: needJob(() => window.open(`/api/v1/jobs/${wf.editing.cadastre_job_id}/siteplan.pdf`, "_blank")), label: "Plan", tip: "Open the job's site plan (Title Deed Plan layout parity is Phase 6)" };
-    // TDP, Generate / Save Title Deed Plan carry Aumentum's SendImageCommand: the plan image to the Registry.
+    // TDP, Generate / Save Title Deed Plan carry Aumentum's SendImageCommand: here the plan goes to the Registry as a PDF.
     case 1003: case 1016: case 1018: return { run: needJob(() => stepTools("Title Deed Plan", [
-      ["Title Deed Plan… (form, print, plan image)", () => titleDeedDialog(jobId)],
+      ["Title Deed Plan… (form, print, PDF)", () => titleDeedDialog(jobId)],
       ["Open the job's site plan", () => window.open(`/api/v1/jobs/${wf.editing.cadastre_job_id}/siteplan.pdf`, "_blank")],
-      ["Send the plan image to the Registry…", () => openRegistry({ job: jobId, view: "send" })]])), label: "Plan", tip: "Title deed plan, and sending the plan image to the job's Registry transaction" };
+      ["Send the plan (PDF) to the Registry…", () => openRegistry({ job: jobId, view: "send" })]])), label: "Plan", tip: "Title deed plan, and sending the plan (PDF) to the job's Registry transaction" };
     case 1009: return { run: needJob(() => fciDialog()), label: "Import", tip: "Create parcels from a polygon feature class (shapefile)" };
     case 1013: return { run: async () => { const d = wf.detail && wf.detail.job.id === jobId ? wf.detail.job : null; await regFind(d && d.lrs_transaction_number); }, label: "Link", tip: "Link the parcel to the job's Registry transaction (Registry tab)" };
     case 1020: return { run: needJob(() => stepTools("Merge Parcel", [
