@@ -376,3 +376,18 @@ table.legs tr.selrow td { background: #fff6cf; }
 .uiModal .uiButtons { display: flex; justify-content: flex-end; gap: 8px; padding: 10px 16px 12px; background: #fff; border-top: 1px solid #eee; flex-wrap: wrap; }
 .uiModal .uiButtons .uiCopy { margin-right: auto; }
 .uiModal .uiButtons .btn { min-width: 80px; height: 26px; }
+
+/* Verify Points + the sketch corner list */
+.verifyWrap { max-height: 46vh; overflow: auto; border: 1px solid #ddd; }
+.verifyTbl { border-collapse: collapse; width: 100%; background: #fff; font-size: 12px; }
+.verifyTbl th { position: sticky; top: 0; background: #f3f3f3; font-weight: normal; color: #444; text-align: left; padding: 4px 6px; border-bottom: 1px solid #ddd; }
+.verifyTbl td { padding: 3px 6px; border-bottom: 1px solid #eee; white-space: nowrap; }
+.verifyTbl td.n { text-align: right; }
+.verifyTbl tr { cursor: pointer; }
+.verifyTbl tr:hover td { background: var(--hover); }
+.verifyTbl tr.selrow td { background: #ffe9a8; }
+.src-beacon { color: #13612a; }
+.src-shared { color: #1f5f8b; }
+.src-new { color: #8a5a00; }
+.linkish { color: #1a5fb4; text-decoration: none; }
+.linkish:hover { text-decoration: underline; }

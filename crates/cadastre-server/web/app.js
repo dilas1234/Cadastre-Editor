@@ -2272,6 +2272,8 @@ async function ensureJobArea(utm) {
 async function saveSketchParcel() {
   if (!state.job) { uiAlert("Choose a Job Area first — a digitized parcel is saved as a draft under a job."); return; }
   const utm = edit.verts.slice();
+  // Verify Points: the digitiser checks every corner (beacon, coordinates) before anything is saved.
+  if (!(await verifyPoints(utm))) { status("Back to the sketch: adjust the corners, then Finish Sketch again."); return; }
   if (!(await ensureJobArea(utm))) return; // keep the sketch so nothing is lost
   // Finish Sketch saves the shape at once (nothing to confirm, nothing lost if the attribute form
   // is closed); the Update Parcel Attribute form then opens on the saved draft.
@@ -2624,20 +2626,101 @@ function openCreateFeatures() {
   floatWindow("Create Features", h("div", {}, h("div", { class: "cfHdr" }, "Create Features"), search, tlist, ctools, jobLine), { id: "createFeaturesWin", width: 240 });
 }
 
+// --- Corner identification: what each sketched corner is (fabric beacon, shared corner, new) ---
+// Asked of the server after each change (debounced), so the corner list shows beacon numbers as
+// the digitiser clicks; Verify Points asks again before saving.
+const sketchIdent = { key: "", list: [], timer: null };
+const vertsKey = (verts) => verts.map(([e, n]) => `${e.toFixed(3)},${n.toFixed(3)}`).join(";");
+async function identifyVertices(verts) {
+  if (!verts.length) return [];
+  return api("/api/v1/beacons/identify", { method: "POST", body: { vertices: verts.map(([e, n]) => [e, n]) } });
+}
+function scheduleIdentify() {
+  const key = vertsKey(edit.verts);
+  if (key === sketchIdent.key) return;
+  clearTimeout(sketchIdent.timer);
+  sketchIdent.timer = setTimeout(async () => {
+    const verts = edit.verts.map((v) => v.slice());
+    try {
+      const list = await identifyVertices(verts);
+      if (vertsKey(edit.verts) !== vertsKey(verts)) return; // the sketch moved on meanwhile
+      sketchIdent.key = vertsKey(verts); sketchIdent.list = list; refreshSketchProps();
+    } catch { /* the list stays without beacon names; Verify Points asks again */ }
+  }, 350);
+}
+// How a corner is shown: its beacon number, the committed parcel it shares, or a number typed
+// for it (kept by coordinates), else a temporary P-number.
+function cornerLabel(id, newIndex) {
+  if (!id) return "";
+  if (id.source === "beacon") return id.beacon_number;
+  const typed = pointIds.get(ptKey(id.easting, id.northing));
+  if (typed) return typed;
+  if (id.source === "shared") return `corner of ${id.shared_with[0]}`;
+  return `P${newIndex}`;
+}
+const CORNER_SOURCE = { beacon: "Existing beacon", shared: "Shared corner", new: "New point" };
+// Verify Points (before attributes): every corner, its beacon, coordinates, where it came from and
+// the distance to the next corner. New points can be numbered here (from the surveyor's plan);
+// those numbers fill the Beacon Numbers window at commit. Resolves true to go on, false to go back.
+async function verifyPoints(utm) {
+  let ids;
+  try { ids = await identifyVertices(utm); }
+  catch (e) { await uiAlert("The corners could not be checked: " + e.message + "\nThe sketch is kept; try Finish Sketch again."); return false; }
+  let k = 0;
+  const inputs = [];
+  const tbl = h("table", { class: "verifyTbl" },
+    h("tr", {}, h("th", {}, "#"), h("th", {}, "Beacon"), h("th", {}, "Easting"), h("th", {}, "Northing"), h("th", {}, "Source"), h("th", {}, "To next (m)")));
+  ids.forEach((id, i) => {
+    const isNew = id.source !== "beacon";
+    const label = cornerLabel(id, isNew ? ++k : 0);
+    const cell = isNew
+      ? h("input", { class: "uiInput", style: "margin:0;width:118px", value: pointIds.get(ptKey(id.easting, id.northing)) || "", placeholder: label })
+      : h("b", {}, label);
+    if (isNew) inputs.push([id, cell]);
+    const src = id.source === "shared" ? `Shared corner (${id.shared_with.join(", ")})` : CORNER_SOURCE[id.source];
+    const tr = h("tr", { class: `src-${id.source}`, title: "Show this corner on the map" },
+      h("td", { class: "n" }, String(i + 1)), h("td", {}, cell), h("td", {}, fmt3(id.easting)), h("td", {}, fmt3(id.northing)),
+      h("td", {}, src, id.offset_m ? h("span", { class: "muted" }, ` ${(id.offset_m * 100).toFixed(1)} cm`) : null), h("td", { class: "n" }, id.next_distance_m.toFixed(2)));
+    tr.addEventListener("click", (ev) => {
+      if (ev.target.tagName === "INPUT") return;
+      edit.sel = i; drawSketch(); map.easeTo({ center: toLL(id.easting, id.northing), zoom: Math.max(map.getZoom(), 19) });
+      tbl.querySelectorAll("tr.selrow").forEach((r) => r.classList.remove("selrow")); tr.classList.add("selrow");
+    });
+    tbl.append(tr);
+  });
+  const counts = ["beacon", "shared", "new"].map((s) => [s, ids.filter((x) => x.source === s).length]).filter(([, n]) => n)
+    .map(([s, n]) => `${n} ${CORNER_SOURCE[s].toLowerCase()}${n > 1 ? "s" : ""}`).join(", ");
+  const body = h("div", {},
+    h("p", {}, h("b", {}, `${ids.length} corners`), `: ${counts}. Area ${area2(sketchAreaM2())} m².`),
+    h("p", { class: "muted" }, "Check each corner against the survey plan. Click a row to see it on the map. Type the plan's beacon number for a new point if you have it (it can also be entered at commit)."),
+    h("div", { class: "verifyWrap" }, tbl));
+  const ok = await uiDialog({ title: "Verify Points", message: body, kind: "info", width: 720,
+    buttons: [{ label: "Back to sketch", value: false, cancel: true }, { label: "Confirm points", value: true, primary: true }] });
+  if (!ok) return false;
+  for (const [id, inp] of inputs) { const v = inp.value.trim().toUpperCase(); if (v) rememberPointId(id.easting, id.northing, v); }
+  return true;
+}
+
 // --- Edit Sketch Properties window (live X/Y vertex table) ---
 function openSketchProps() {
-  const tbl = h("table", { class: "legs" }, h("tr", {}, h("th", {}, "#"), h("th", {}, "X (Easting)"), h("th", {}, "Y (Northing)"), h("th", {}, "")));
+  const tbl = h("table", { class: "legs" }, h("tr", {}, h("th", {}, "#"), h("th", {}, "Beacon"), h("th", {}, "X (Easting)"), h("th", {}, "Y (Northing)"), h("th", {}, "")));
+  const known = sketchIdent.key === vertsKey(edit.verts) ? sketchIdent.list : null;
+  let newNo = 0;
   edit.verts.forEach(([E, N], i) => {
+    const id = known && known[i];
+    const bcell = h("td", { class: id ? `src-${id.source}` : "muted", title: id ? (id.source === "shared" ? `Shared corner (${id.shared_with.join(", ")})` : CORNER_SOURCE[id.source]) : "Checking…" },
+      id ? cornerLabel(id, id.source !== "beacon" ? ++newNo : 0) : "…");
     const x = h("input", { type: "number", step: "0.001", value: E.toFixed(3), style: "width:92px" });
     const y = h("input", { type: "number", step: "0.001", value: N.toFixed(3), style: "width:92px" });
     x.oninput = () => { const v = parseFloat(x.value); if (isFinite(v)) { edit.verts[i][0] = v; drawSketch(); } };
     y.oninput = () => { const v = parseFloat(y.value); if (isFinite(v)) { edit.verts[i][1] = v; drawSketch(); } };
-    const tr = h("tr", { class: i === edit.sel ? "selrow" : "" }, h("td", { class: "n" }, String(i + 1)), h("td", {}, x), h("td", {}, y),
+    const tr = h("tr", { class: i === edit.sel ? "selrow" : "" }, h("td", { class: "n" }, String(i + 1)), bcell, h("td", {}, x), h("td", {}, y),
       h("td", {}, h("button", { title: "Delete vertex", onclick: () => { edit.verts.splice(i, 1); edit.sel = Math.min(edit.sel, edit.verts.length - 1); drawSketch(); openSketchProps(); updateEditorButtons(); } }, "✕")));
     tr.addEventListener("click", (ev) => { if (!/INPUT|BUTTON/.test(ev.target.tagName)) { edit.sel = i; drawSketch(); openSketchProps(); } });
     tbl.append(tr);
   });
-  if (!edit.verts.length) tbl.append(h("tr", {}, h("td", { colspan: 4, class: "muted" }, "No points yet: click the map, or type / paste coordinates below.")));
+  if (!edit.verts.length) tbl.append(h("tr", {}, h("td", { colspan: 5, class: "muted" }, "No points yet: click the corners on the map. Beacons and shared corners are recognised as you click.")));
+  scheduleIdentify();
   // Typing points: Easting/Northing, a beacon number (its coordinates), or a pasted point list.
   const addPts = (pts) => {
     if (!edit.active) startEditing("sketch"); // typing can start the edit session (Che)
@@ -2678,18 +2761,27 @@ function openSketchProps() {
     if (!pts.length) { status("No coordinates found in the pasted text."); return; }
     addPts(pts); status(`Added ${pts.length} point(s).`);
   };
+  // Digitising needs no point list: corners come from the map clicks. Typing or pasting
+  // coordinates (COGO, a surveyor's list) stays one click away; the choice is remembered.
+  let showEntry = false; try { showEntry = localStorage.getItem("cad.sketchEntry") === "1"; } catch { /* storage unavailable */ }
+  const entry = h("div", { class: showEntry ? "" : "hidden" },
+    h("div", { class: "frow" }, xIn, yIn, h("button", { class: "btn", style: "min-width:0", onclick: addXY }, "Add")),
+    h("div", { class: "frow" }, bIn, h("button", { class: "btn", style: "min-width:0", onclick: addBeacon }, "Add beacon")),
+    paste, h("div", { class: "frow" }, h("button", { class: "btn", onclick: addPasted }, "Add pasted points")));
+  const entryToggle = h("a", { href: "#", class: "linkish", style: "display:inline-block;margin:6px 0 2px", onclick: (ev) => {
+    ev.preventDefault(); const on = entry.classList.toggle("hidden") === false;
+    try { localStorage.setItem("cad.sketchEntry", on ? "1" : "0"); } catch { /* storage unavailable */ }
+    ev.target.textContent = on ? "Hide coordinate entry" : "Type / paste coordinates…";
+  } }, showEntry ? "Hide coordinate entry" : "Type / paste coordinates…");
   const body = h("div", {},
     h("div", { class: "muted" }, `${edit.editingId ? "Editing draft parcel — " : ""}${edit.template === "jobArea" ? "job area" : edit.geomType} sketch — ${edit.verts.length} vertex(es), WGS 84 / UTM 32N metres`),
     h("div", { style: "max-height:260px;overflow:auto" }, tbl),
-    h("div", { class: "cfHdr", style: "margin-top:6px" }, "Add points"),
-    h("div", { class: "frow" }, xIn, yIn, h("button", { class: "btn", style: "min-width:0", onclick: addXY }, "Add")),
-    h("div", { class: "frow" }, bIn, h("button", { class: "btn", style: "min-width:0", onclick: addBeacon }, "Add beacon")),
-    paste, h("div", { class: "frow" }, h("button", { class: "btn", onclick: addPasted }, "Add pasted points")),
+    entryToggle, entry,
     h("div", { class: "taskNav" },
       h("button", { class: "btn", disabled: !canFinishSketch(), onclick: finishSketch }, edit.editingId ? "Save Changes" : "Finish Sketch"),
       h("button", { class: "btn", disabled: !edit.verts.length, onclick: deleteSketch }, edit.editingId ? "Cancel Edit" : "Delete Sketch"),
       edit.editingId ? h("button", { class: "btn", onclick: deleteDraftBeingEdited }, "Delete Parcel") : null));
-  floatWindow("Edit Sketch Properties", body, { id: "sketchPropsWin", width: 340 });
+  floatWindow("Edit Sketch Properties", body, { id: "sketchPropsWin", width: 430 });
 }
 function refreshSketchProps() { if ($("sketchPropsWin")) openSketchProps(); }
 async function deleteDraftBeingEdited() {

@@ -136,6 +136,94 @@ pub async fn corners(State(state): State<AppState>, Path(id): Path<i32>) -> ApiR
     Ok(Json(to_dto(&corner_points(&mut conn, job_id, tol).await?)))
 }
 
+/// The sketch's corners to identify (UTM 32N metres, ring order, no closing repeat).
+#[derive(Debug, Deserialize, ToSchema)]
+pub struct IdentifyVerticesRequest {
+    pub vertices: Vec<[f64; 2]>,
+}
+
+/// What a sketched corner is: a fabric beacon, a corner shared with a committed parcel, or new.
+#[derive(Debug, Clone, Serialize, ToSchema)]
+pub struct IdentifiedVertexDto {
+    /// 1-based corner number.
+    pub point: i32,
+    pub easting: f64,
+    pub northing: f64,
+    /// `beacon` (on a fabric beacon), `shared` (on a corner of a committed parcel), or `new`.
+    pub source: String,
+    /// The fabric beacon's number, when `source` is `beacon`.
+    pub beacon_number: Option<String>,
+    /// How far the corner is from that beacon or shared corner (m).
+    pub offset_m: Option<f64>,
+    /// The committed parcel(s) whose corner this is.
+    pub shared_with: Vec<String>,
+    /// Distance to the next corner (m), closing back to the first.
+    pub next_distance_m: f64,
+}
+
+/// Identify every corner of a sketch before it is saved (Verify Points): the digitiser clicks on
+/// the map, and each corner is matched, within the commit's beacon tolerance
+/// (`commit.beacon_tolerance_m`, 5 cm), to a fabric beacon (its number) or to a corner of a
+/// committed parcel. Nothing is created; a new corner's number is entered by the officer, as in
+/// Aumentum (the system never makes up a beacon number).
+#[utoipa::path(post, path = "/api/v1/beacons/identify", tag = "beacons", request_body = IdentifyVerticesRequest,
+    responses((status = 200, body = [IdentifiedVertexDto])))]
+pub async fn identify(State(state): State<AppState>, Json(req): Json<IdentifyVerticesRequest>) -> ApiResult<Json<Vec<IdentifiedVertexDto>>> {
+    if req.vertices.len() > 2000 {
+        return Err(AppError::BadRequest("too many vertices".into()));
+    }
+    if req.vertices.iter().flatten().any(|v| !v.is_finite()) {
+        return Err(AppError::BadRequest("vertices must be numbers (UTM 32N metres)".into()));
+    }
+    let mut conn = state.pool.acquire().await?;
+    let tol = tolerance(&mut conn).await?;
+    let es: Vec<f64> = req.vertices.iter().map(|v| v[0]).collect();
+    let ns: Vec<f64> = req.vertices.iter().map(|v| v[1]).collect();
+    let rows = sqlx::query(
+        "WITH v AS (SELECT i::int AS i, ST_SetSRID(ST_MakePoint(e, n), 32632) AS g \
+                    FROM unnest($1::float8[], $2::float8[]) WITH ORDINALITY AS t(e, n, i)) \
+         SELECT v.i, b.number AS beacon_number, b.d AS beacon_d, s.upins, s.d AS shared_d \
+         FROM v \
+         LEFT JOIN LATERAL (SELECT bb.number, ST_Distance(bb.geom, v.g) AS d FROM cadastre.beacon bb \
+                            WHERE ST_DWithin(bb.geom, v.g, $3) ORDER BY bb.geom <-> v.g LIMIT 1) b ON true \
+         LEFT JOIN LATERAL (SELECT array_agg(DISTINCT p.parcel_number ORDER BY p.parcel_number) AS upins, min(ST_Distance(dp.geom, v.g)) AS d \
+                            FROM cadastre.parcel p, ST_DumpPoints(p.geom) dp \
+                            WHERE p.status = 'posted' AND p.geom && ST_Expand(v.g, $3) AND ST_DWithin(dp.geom, v.g, $3)) s ON true \
+         ORDER BY v.i",
+    )
+    .bind(&es)
+    .bind(&ns)
+    .bind(tol)
+    .fetch_all(&mut *conn)
+    .await?;
+    let n = req.vertices.len();
+    let mut out = Vec::with_capacity(n);
+    for (k, r) in rows.iter().enumerate() {
+        let [e, nn] = req.vertices[k];
+        let [e2, n2] = req.vertices[(k + 1) % n];
+        let beacon: Option<String> = r.get("beacon_number");
+        let shared: Vec<String> = r.get::<Option<Vec<String>>, _>("upins").unwrap_or_default();
+        let (source, offset) = if beacon.is_some() {
+            ("beacon", r.get::<Option<f64>, _>("beacon_d"))
+        } else if !shared.is_empty() {
+            ("shared", r.get::<Option<f64>, _>("shared_d"))
+        } else {
+            ("new", None)
+        };
+        out.push(IdentifiedVertexDto {
+            point: k as i32 + 1,
+            easting: (e * 1000.0).round() / 1000.0,
+            northing: (nn * 1000.0).round() / 1000.0,
+            source: source.into(),
+            beacon_number: beacon,
+            offset_m: offset.map(|d| (d * 1000.0).round() / 1000.0),
+            shared_with: shared,
+            next_distance_m: if n > 1 { ((e2 - e).hypot(n2 - nn) * 1000.0).round() / 1000.0 } else { 0.0 },
+        });
+    }
+    Ok(Json(out))
+}
+
 /// Within the commit transaction: check the typed beacon numbers, add the new beacons and link
 /// every corner to its beacon. Returns the numbers of the beacons added.
 pub async fn apply(conn: &mut sqlx::PgConnection, job_id: Uuid, req: &WfCommitRequest) -> ApiResult<Vec<String>> {
