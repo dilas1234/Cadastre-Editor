@@ -222,6 +222,78 @@ pub async fn post_job(
     }))
 }
 
+/// What a commit would give right now (shown in the Commit window before committing).
+#[derive(Debug, serde::Serialize, utoipa::ToSchema)]
+pub struct UpinPreview {
+    /// Draft parcels that still need a UPIN.
+    pub drafts: i64,
+    /// The UPINs a commit would give them, in draft order (advisory: the commit allocates again,
+    /// atomically, so a commit made elsewhere in between moves them on).
+    pub upins: Vec<String>,
+    /// `checked` (Aumentum was asked about each), `not_configured` (no parallel-run check on this
+    /// server) or `unavailable` (configured but Aumentum could not be asked: a commit is refused).
+    pub aumentum: String,
+    /// Numbers skipped because Aumentum has already issued them.
+    pub aumentum_skipped: Vec<String>,
+    pub message: Option<String>,
+}
+
+/// Preview the UPINs `post_drafts_with_ids` would allocate for `drafts` new parcels, without
+/// using any: the next number in the local series past every issued UPIN, skipping numbers in the
+/// ledger and (parallel run) numbers Aumentum has issued. Writes nothing.
+pub async fn preview_upins(conn: &mut sqlx::PgConnection, drafts: i64) -> ApiResult<UpinPreview> {
+    // The allocator's next value, read-only (sync_upin_sequence() would also move the sequence).
+    let mut next: i64 = sqlx::query_scalar(
+        "SELECT GREATEST( \
+            (SELECT CASE WHEN is_called THEN last_value ELSE last_value - 1 END FROM cadastre.parcel_number_seq), \
+            COALESCE((SELECT max(substring(upin FROM 3)::bigint) FROM cadastre.issued_upin \
+                      WHERE upin ~ '^PL[0-9]{12}$' AND substring(upin FROM 3)::bigint < 1000000000), 0)) + 1",
+    )
+    .fetch_one(&mut *conn)
+    .await?;
+    let mut out = UpinPreview { drafts, upins: Vec::new(), aumentum: "not_configured".into(), aumentum_skipped: Vec::new(), message: None };
+    if drafts <= 0 {
+        return Ok(out);
+    }
+    let check = if crate::aumentum::UpinCheck::configured() {
+        match crate::aumentum::UpinCheck::connect().await {
+            Ok(c) => { out.aumentum = "checked".into(); c }
+            Err(e) => { out.aumentum = "unavailable".into(); out.message = Some(e.replace("; nothing was committed", "")); None }
+        }
+    } else {
+        None
+    };
+    let mut tries = 0;
+    while (out.upins.len() as i64) < drafts {
+        tries += 1;
+        if tries > 50 + drafts {
+            out.message = Some("no free UPIN found in 50 numbers".into());
+            break;
+        }
+        let upin = numbering::format_upin(next);
+        next += 1;
+        let taken: bool = sqlx::query_scalar("SELECT EXISTS (SELECT 1 FROM cadastre.issued_upin WHERE upin = $1)")
+            .bind(&upin)
+            .fetch_one(&mut *conn)
+            .await?;
+        if taken {
+            continue;
+        }
+        if let Some(c) = &check {
+            match c.issued(&upin).await {
+                Ok(true) => { out.aumentum_skipped.push(upin); continue; }
+                Ok(false) => {}
+                Err(e) => { out.aumentum = "unavailable".into(); out.message = Some(e.replace("; nothing was committed", "")); break; }
+            }
+        }
+        out.upins.push(upin);
+    }
+    if let Some(c) = check {
+        c.close().await;
+    }
+    Ok(out)
+}
+
 /// Post a job's draft parcels: give each its official UPIN (the next in the local series,
 /// `PL` + 12 digits counting up; structured UPINs of 1,000,000,000 and over are kept in the ledger
 /// but never drive the counter, migration 0018) and make it part of the live fabric. Shared by `POST /jobs/{id}/post` and the

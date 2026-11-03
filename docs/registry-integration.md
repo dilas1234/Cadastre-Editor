@@ -197,6 +197,7 @@ In the server's environment (`~/.config/cadastre/server.env` on the dev PC):
 | `CADASTRE_REGISTRY_POLL_SECS` / `_RECONCILE_SECS` | Link check (60) and unlink check (900) intervals. |
 | `CADASTRE_MC_SERVICE_USER` / `_PASSWORD` | The account the Registry signs in with to the job service. It must equal the Registry's `multicadastre` `mcUserName` / `mcPassword`. Set on 2026-11-02 from `.env`: `administrator`, the Registry's `mcUserName`. Checked: `Authenticate` accepts it and refuses a wrong password. The password must equal the Registry's `mcPassword`. |
 | `CADASTRE_AUMENTUM_JOBSERVICE_URL` | Parallel run with Aumentum: before giving a new UPIN the Cadastre asks Aumentum's job service (`http://10.10.10.6/ApplicationServerAdmin/WebServices/LRSWebServices.asmx`, signed in with `CADASTRE_MC_SERVICE_USER` / `_PASSWORD`) whether Aumentum already issued it; such numbers are recorded (`aumentum:live`) and skipped. If Aumentum cannot be asked the commit is refused. Remove after cut-over. |
+| `CADASTRE_AUMENTUM_WATCH_SECS` | Parallel run: how often the duplicate-UPIN watch asks Aumentum about the UPINs committed here (default 900, minimum 60). Runs only while `CADASTRE_AUMENTUM_JOBSERVICE_URL` is set. |
 | `CADASTRE_GISVIEWER_OPEN` | `1` opens the Registry's map without a ticket. Development only. |
 | `CADASTRE_REGISTRY_CADASTRE_LINKING` | `1` re-enables linking from the Cadastre (off: PLAGIS links in the Registry). |
 
@@ -239,6 +240,24 @@ to continue after Aumentum (2026-11-03), so:
 * A commit made by mistake can be undone before it is linked:
   `cargo run -p cadastre-server --example revert_commit -- <job> <UPIN> [property no.] [--apply]`
   (2026-11-03: job 17511, PL000000023896, which Aumentum had already given to PL68346).
+* **The Commit window shows the UPIN(s) a commit will give** before committing
+  (`GET /api/v1/wf/jobs/{id}/next-upin`): checked with Aumentum just now, the numbers skipped
+  because Aumentum has them, or a red line when Aumentum cannot be asked (the commit will be
+  refused). Advisory: the commit allocates again, atomically.
+* **Duplicate watch** (`src/upin_watch.rs`): every `CADASTRE_AUMENTUM_WATCH_SECS` the Cadastre asks
+  Aumentum about each UPIN committed here (ledger source `posted`). One Aumentum has issued since
+  is a duplicate: it is shown in `GET /api/v1/registry/status` (`upin_watch`) and as a red line in
+  the Registry tab, and audited once (`duplicate_upin_found`). Check now:
+  `POST /api/v1/registry/upin-watch`. Do not link a duplicate until it is resolved.
+
+### Job numbers in the parallel run
+
+Jobs and task instances created here are numbered **from 1,000,001** (migration 0019); Aumentum's
+ids stay below 1,000,000 and never move these counters, so reloading Aumentum's workflow
+(`tools/import/load-aumentum-workflow.sh`) cannot meet a number used here. Jobs created here
+before the migration were renumbered into the range (`cadastre.wf_renumbered` keeps old → new).
+The loader refuses an export with ids of 1,000,000 or more, refreshes a task row only when it is
+Aumentum's own row of the same job, and reports any number clash in its reconciliation.
 
 Areas are recorded and shown to 2 decimals, cut not rounded (903.1976 m² is 903.19 m²); the
 geometry keeps its exact area.
@@ -250,7 +269,7 @@ geometry keeps its exact area.
 | **The Registry's map** (where the admin links) | Built (§3.3a) from the decompiled `MapWorkerControl`. Tested as the Registry drives it, and the ticket check was tried live. The Registry desktop has not opened it yet. After §5 step 3, link one test file first and check the parcel and the Registry property. | Built; first Registry trial to do |
 | **Registry Web Access map tab** (`lrswa` `map.do`) | It is Aumentum's Silverlight viewer, not MapWorker: it probes `{GISViewer}/Assets/s.gif` ("No connection to Cadastre Server" on failure), then loads `Client/Client.xap`, `Client/Conf/web-access.xml` and draws via `gis.gate/*` from Aumentum's database. Bridge (2026-11-03): every `/GISViewer/*` path this server does not answer is forwarded to `CADASTRE_GISVIEWER_UPSTREAM` (`http://10.10.10.6`) and logged. Searches Aumentum answers empty (`gis.gate/0/0/query`, `UPIN`/`propertyNo`/`PlotNo`/`BlockNo`/`PlanNo`/`ParcelName`) are answered from this Cadastre's posted parcels in Aumentum's JSON, so new parcels are found and outlined; the drawn image still shows only Aumentum's parcels. Replacing it (answer `gis.gate` from PostGIS, from the logged requests) is needed before Aumentum is switched off. | Bridged; replacement to do |
 | **Job service vs Aumentum** | Checked against `MCAdminWebSite.dll` and corrected (2026-11-02): unassigned start, priority, RejectJob discards the job's edits, status wording, job type answers, exact transaction match. BatchUpdate / points live in MCServer (not captured). | Done, except BatchUpdate's format |
-| **Title deed template parity**: Aumentum's `Plan_.mxd` / `PSG_Plan_.mxd` layout, print, and sending the plan straight from it. | Phase 6 (deed plans). Today the template is the site plan PDF; the plan image is attached and sent. | Planned |
+| **Title deed template parity**: Aumentum's `Plan_.mxd` layout, print, and sending the plan straight from it. | Built 2026-11-03 (`src/titledeed.rs`, `routes/titledeed.rs`), laid out on a printed PLAGIS plan (PL68061): A4, clockwise legs from the westernmost beacon, auto-fit standard scale, Registry prefill with Aumentum's own `R_PROPINFO` / `R_HOLDERS` queries, a form saved per job (beacon numbers, road side, plotted/checked by), Print/PDF and the plan JPEG that Send plan files. `PSG_Plan_.mxd` (the PSG variant) not yet seen. | Built; review by the title deed unit |
 | `CADASTRE_MC_SERVICE_USER` / `_PASSWORD` | Set to `administrator` (2026-11-02); the password must equal the Registry's `mcPassword`. | Done |
 | Registry server clock (+19 min) | IT. | To do |
 | RBAC: assigning linked jobs to staff; digitising / title deed dashboards | Later phase. | Planned |

@@ -110,6 +110,11 @@ pub struct RegistryStatusDto {
     /// The last unlink reconcile: `{ ok, at, report | error }`.
     #[schema(value_type = Object)]
     pub last_reconcile: Option<serde_json::Value>,
+    /// Parallel run: whether new UPINs are checked with Aumentum (`CADASTRE_AUMENTUM_JOBSERVICE_URL`).
+    pub aumentum_check: bool,
+    /// Parallel run: the last duplicate-UPIN watch (`at`, `ok`, `checked`, `duplicates`, `error`).
+    #[schema(value_type = Object)]
+    pub upin_watch: Option<serde_json::Value>,
 }
 
 /// Whether the Registry sync runs, and how its last check went.
@@ -122,7 +127,20 @@ pub async fn status(State(state): State<AppState>) -> ApiResult<Json<RegistrySta
         url: cfg.map(|c| c.base_url),
         last: registry_sync::last_status(&state.pool).await,
         last_reconcile: registry_sync::last_reconcile(&state.pool).await,
+        aumentum_check: crate::aumentum::UpinCheck::configured(),
+        upin_watch: crate::upin_watch::last_status(&state.pool).await,
     }))
+}
+
+/// Parallel run: ask Aumentum about this Cadastre's UPINs now (the duplicate watch, instead of
+/// waiting for its next pass). Read-only towards Aumentum.
+#[utoipa::path(post, path = "/api/v1/registry/upin-watch", tag = "registry",
+    responses((status = 200, description = "The watch outcome", body = Object), (status = 409, description = "The parallel-run check is not configured")))]
+pub async fn upin_watch_now(State(state): State<AppState>, _user: AuthUser) -> ApiResult<Json<serde_json::Value>> {
+    if !crate::aumentum::UpinCheck::configured() {
+        return Err(AppError::Conflict("the parallel-run check is not configured on this server (CADASTRE_AUMENTUM_JOBSERVICE_URL)".into()));
+    }
+    Ok(Json(crate::upin_watch::check_once(&state.pool).await))
 }
 
 /// Check the Registry for new links now (instead of waiting for the next minute).
@@ -193,7 +211,7 @@ pub struct RegistryTransactionDto {
     pub properties: Vec<RegistryPropertyDto>,
 }
 
-async fn load_transaction(session: &Session, number: &str) -> ApiResult<Option<RegistryTransactionDto>> {
+pub(crate) async fn load_transaction(session: &Session, number: &str) -> ApiResult<Option<RegistryTransactionDto>> {
     let t = session
         .query(&format!("select t.Id, t.TransactionNumber, s.Code, s.Label from com.landsystems.lrs.model.Transaction t join t.TransactionStatus s where t.TransactionNumber = '{number}'"), 5)
         .await
@@ -468,7 +486,7 @@ pub struct RegistryFileDto {
 #[utoipa::path(get, path = "/api/v1/registry/find", tag = "registry", params(FindQuery),
     responses((status = 200, body = [RegistryFileDto]), (status = 422, description = "The Registry could not be read")))]
 pub async fn find(State(state): State<AppState>, Query(q): Query<FindQuery>) -> ApiResult<Json<Vec<RegistryFileDto>>> {
-    let term = ident("number", &q.q)?.to_uppercase();
+    let term = ident("number", &registry::normalise_file_query(&q.q))?;
     let cfg = config()?;
     let by_txn = term.starts_with("PLS") || term.starts_with("P-");
     let hql = format!(

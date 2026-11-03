@@ -27,7 +27,16 @@ single reference for them.
 - Builds run **on Windows** (a Windows box or Windows CI runner). Cross-compiling MSVC from macOS
   is not the supported path.
 
-## The win7 build command (server and editor logic)
+## The server build in use: cross-compiled from Linux (GNU target)
+
+`scripts/build-windows.sh` builds **`x86_64-win7-windows-gnu`** on Linux with nightly +
+`-Z build-std` and the distro MinGW-w64 linker (`gcc-mingw-w64-x86-64`). First built 2026-11-02:
+a single ~25 MB exe importing only `kernel32`, `advapi32`, `ntdll`, `ws2_32`, `bcrypt`, `shell32`,
+`combase` (Windows 8+, so fine on 2012 R2) and `msvcrt.dll`. No VC++ redistributable or UCRT
+update is needed on the box. The script rejects a build that imports a post-8.1 API. Deployment:
+`windows-deployment.md`.
+
+## The MSVC alternative (on Windows)
 
 Requires the **nightly** toolchain with the `rust-src` component, on Windows:
 

@@ -849,6 +849,26 @@ pub async fn get_editing(State(state): State<AppState>, Path(id): Path<i32>) -> 
     Ok(Json(editing_info(&state, id).await?))
 }
 
+/// The UPINs a commit of this job would give now, and whether Aumentum was asked (parallel run).
+/// Advisory: shown in the Commit window; nothing is allocated or recorded.
+#[utoipa::path(get, path = "/api/v1/wf/jobs/{id}/next-upin", tag = "wf", params(("id" = i32, Path, description = "Job instance id")),
+    responses((status = 200, body = crate::routes::jobs::UpinPreview), (status = 404, description = "Job not found")))]
+pub async fn next_upin(State(state): State<AppState>, Path(id): Path<i32>) -> ApiResult<Json<crate::routes::jobs::UpinPreview>> {
+    let mut conn = state.pool.acquire().await?;
+    let exists: bool = sqlx::query_scalar("SELECT EXISTS (SELECT 1 FROM cadastre.wf_job_instance WHERE id = $1)").bind(id).fetch_one(&mut *conn).await?;
+    if !exists {
+        return Err(AppError::NotFound(format!("job instance {id}")));
+    }
+    let drafts: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM cadastre.parcel p JOIN cadastre.wf_job_instance w ON w.cadastre_job_id = p.job_id \
+         WHERE w.id = $1 AND p.status = 'draft' AND p.parcel_number IS NULL",
+    )
+    .bind(id)
+    .fetch_one(&mut *conn)
+    .await?;
+    Ok(Json(crate::routes::jobs::preview_upins(&mut conn, drafts).await?))
+}
+
 /// Start editing under the job: creates its editing job (which holds its draft parcels) if needed.
 #[utoipa::path(post, path = "/api/v1/wf/jobs/{id}/editing", tag = "wf", params(("id" = i32, Path, description = "Job instance id")),
     responses((status = 200, body = WfEditingDto), (status = 409, description = "The job is not open")))]

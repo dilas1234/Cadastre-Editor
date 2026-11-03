@@ -44,6 +44,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         Some(cfg) => { tokio::spawn(cadastre_server::registry_sync::run(pool.clone(), cfg)); }
         None => tracing::info!("Registry link sync off (CADASTRE_REGISTRY_URL / _USER / _PASSWORD not set)"),
     }
+    // Parallel run with Aumentum: watch for UPINs Aumentum issued after this Cadastre gave them.
+    if cadastre_server::aumentum::UpinCheck::configured() {
+        tokio::spawn(cadastre_server::upin_watch::run(pool.clone()));
+    }
     let state = AppState { pool, config, jwks };
 
     let app = routes::router(state).merge(

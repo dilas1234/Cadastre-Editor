@@ -24,4 +24,6 @@ pub mod lrs;
 pub mod aumentum;
 pub mod registry;
 pub mod registry_sync;
+pub mod upin_watch;
+pub mod titledeed;
 pub mod wfengine;

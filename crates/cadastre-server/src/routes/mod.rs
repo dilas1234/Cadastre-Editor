@@ -16,6 +16,7 @@ pub mod me;
 pub mod mutations;
 pub mod parcels;
 pub mod promote;
+pub mod titledeed;
 pub mod registry;
 pub mod reports;
 pub mod sessions;
@@ -59,6 +60,9 @@ pub fn router(state: AppState) -> Router {
         .route("/api/v1/wf/jobs/{id}/area/{action}", post(wf::area_action))
         .route("/api/v1/wf/jobs/{id}/discard", post(wf::discard))
         .route("/api/v1/wf/jobs/{id}/commit", post(wf::commit))
+        .route("/api/v1/wf/jobs/{id}/next-upin", get(wf::next_upin))
+        .route("/api/v1/wf/jobs/{id}/titledeed", get(titledeed::get_plan).put(titledeed::put_plan))
+        .route("/api/v1/wf/jobs/{id}/titledeed.svg", get(titledeed::svg))
         .route("/api/v1/wf/jobs/{id}/finish", post(wf::finish))
         .route("/api/v1/wf/jobs/{id}/linkage", get(wf::get_linkage).put(wf::put_linkage))
         .route("/api/v1/wf/jobs/{id}/end", post(wf::end_job))
@@ -108,6 +112,7 @@ pub fn router(state: AppState) -> Router {
         // Registry Web Access map tab: Aumentum's Silverlight viewer, passed through to Aumentum.
         .route("/GISViewer/{*rest}", axum::routing::any(gisviewer_passthrough::forward))
         .route("/api/v1/registry/reconcile", post(registry::reconcile_now))
+        .route("/api/v1/registry/upin-watch", post(registry::upin_watch_now))
         .route("/api/v1/registry/find", get(registry::find))
         .route("/api/v1/registry/parcels/{upin}/work", get(registry::parcel_work))
         .route("/api/v1/registry/start-digitising", post(registry::start_digitising))

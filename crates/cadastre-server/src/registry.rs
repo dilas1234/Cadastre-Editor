@@ -224,6 +224,23 @@ pub fn check_link_allowed(transaction_number: &str, status: Option<&TransactionS
     }
 }
 
+/// Find file's search term as the Registry stores it: spaces dropped and upper case
+/// (`pl 67363` → `PL67363`), a bare number taken as a file number (`67363` → `PL67363`), and a
+/// short transaction number padded to the Registry's nine digits (`PLS138850` → `PLS000138850`).
+/// Leading zeros of a file number are kept: `PL001` is a real file number.
+pub fn normalise_file_query(q: &str) -> String {
+    let t: String = q.chars().filter(|c| !c.is_whitespace()).collect::<String>().to_uppercase();
+    if !t.is_empty() && t.chars().all(|c| c.is_ascii_digit()) {
+        return format!("PL{t}");
+    }
+    if let Some(d) = t.strip_prefix("PLS") {
+        if !d.is_empty() && d.len() < 9 && d.chars().all(|c| c.is_ascii_digit()) {
+            return format!("PLS{d:0>9}");
+        }
+    }
+    t
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -329,5 +346,16 @@ mod tests {
         assert!(check_link_allowed("X", Some(&st("transaction_rejected", "Rejected"))).is_err());
         let e = check_link_allowed("PLS000006909", None).unwrap_err();
         assert_eq!(e.to_string(), "Cannot retrieve information of the Transaction. Transaction number:'PLS000006909'.");
+    }
+
+    #[test]
+    fn find_file_terms_as_the_registry_stores_them() {
+        assert_eq!(super::normalise_file_query(" PL 67363 "), "PL67363");
+        assert_eq!(super::normalise_file_query("pl67363"), "PL67363");
+        assert_eq!(super::normalise_file_query("67363"), "PL67363");
+        assert_eq!(super::normalise_file_query("PLS138850"), "PLS000138850");
+        assert_eq!(super::normalise_file_query("pls 000138850"), "PLS000138850");
+        assert_eq!(super::normalise_file_query("PL001"), "PL001");
+        assert_eq!(super::normalise_file_query("P-12"), "P-12");
     }
 }

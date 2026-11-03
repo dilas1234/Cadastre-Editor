@@ -122,3 +122,62 @@ mod tests {
         assert!(String::from_utf8_lossy(&pdf).contains("No geometry to plot."));
     }
 }
+
+/// One boundary leg of a parcel, as Aumentum lists them (`GetParcelPointsData`) and as the title
+/// deed plan prints them.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Leg {
+    /// Beacon number at the start (or `P<n>` when no beacon lies within 5 cm of the vertex).
+    pub from: String,
+    pub from_e: f64,
+    pub from_n: f64,
+    pub to: String,
+    pub to_e: f64,
+    pub to_n: f64,
+    /// Grid distance (m).
+    pub distance: f64,
+    /// Decimal degrees from grid north, 6 decimals (Aumentum's `Azimuth`).
+    pub azimuth: String,
+    /// D°M'S" (Aumentum's `Bearing`).
+    pub bearing: String,
+}
+
+/// Aumentum's Azimuth (decimal degrees from grid north) and Bearing (D°M'S") of a leg.
+pub fn azimuth_bearing(from: (f64, f64), to: (f64, f64)) -> (f64, String, String) {
+    let (de, dn) = (to.0 - from.0, to.1 - from.1);
+    let dist = (de * de + dn * dn).sqrt();
+    let mut az = de.atan2(dn).to_degrees();
+    if az < 0.0 {
+        az += 360.0;
+    }
+    let total = (az * 3600.0).round() as i64 % (360 * 3600);
+    let (d, m, s) = (total / 3600, (total % 3600) / 60, total % 60);
+    (dist, format!("{az:.6}"), format!("{d}°{m:02}'{s:02}\""))
+}
+
+/// The legs of a posted parcel's exterior ring, in ring order, each corner named after the beacon
+/// within 5 cm of it (the nearest), else `P<n>`. Empty when the UPIN has no posted parcel.
+pub async fn parcel_legs(pool: &sqlx::PgPool, upin: &str) -> Result<Vec<Leg>, sqlx::Error> {
+    use sqlx::Row;
+    let rows = sqlx::query(
+        "WITH g AS (SELECT (ST_Dump(geom)).geom AS poly FROM cadastre.parcel WHERE parcel_number = $1 AND status = 'posted' LIMIT 1), \
+              v AS (SELECT (d).path[1] AS i, (d).geom AS pt FROM (SELECT ST_DumpPoints(ST_ExteriorRing(poly)) AS d FROM g) x) \
+         SELECT ST_X(pt) AS e, ST_Y(pt) AS n, (SELECT b.number FROM cadastre.beacon b WHERE ST_DWithin(b.geom, ST_Transform(pt, ST_SRID(b.geom)), 0.05) \
+                ORDER BY ST_Distance(b.geom, ST_Transform(pt, ST_SRID(b.geom))) LIMIT 1) AS name FROM v ORDER BY i",
+    )
+    .bind(upin)
+    .fetch_all(pool)
+    .await?;
+    let pts: Vec<(f64, f64, String)> = rows
+        .iter()
+        .enumerate()
+        .map(|(i, r)| (r.get("e"), r.get("n"), r.get::<Option<String>, _>("name").unwrap_or_else(|| format!("P{}", i + 1))))
+        .collect();
+    Ok(pts
+        .windows(2)
+        .map(|w| {
+            let (distance, azimuth, bearing) = azimuth_bearing((w[0].0, w[0].1), (w[1].0, w[1].1));
+            Leg { from: w[0].2.clone(), from_e: w[0].0, from_n: w[0].1, to: w[1].2.clone(), to_e: w[1].0, to_n: w[1].1, distance, azimuth, bearing }
+        })
+        .collect())
+}

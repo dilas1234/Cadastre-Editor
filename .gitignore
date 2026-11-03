@@ -16,3 +16,12 @@ Cargo.lock.orig
 # Local scripts/notes that contain database credentials. Never commit.
 /dump_all_tables.py
 tools/aumentum-inventory/aumentum-db.md
+
+# Windows deploy builds
+/dist
+
+# Local data, never commit: uploaded plan images, Aumentum files copied from production,
+# title deed workflow exports (job data).
+/files/
+/tools/aumentum-inventory/lrs-export/
+/tools/titledeed/titledeed-workflow-*/

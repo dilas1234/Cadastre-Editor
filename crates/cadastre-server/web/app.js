@@ -1227,7 +1227,12 @@ async function startEditParcel(upin, fileOnly) {
   let w;
   try { w = await api(`/api/v1/registry/parcels/${encodeURIComponent(upin)}/work`); } catch (e) { alert(e.message); return; }
   if (fileOnly) { if (w.transaction_number) regFind(w.transaction_number); else alert(`${upin} has no Registry file (transaction) yet.`); return; }
-  if (!w.linked && !w.job_instance_id) { alert(`${upin} is not linked in the Registry yet.\nThe Registry admin links it in the Registry; it then appears under Registry → Linked.`); return; }
+  // Not linked yet: the title deed work does not need the link. Find the parcel's file in the
+  // Registry (read-only) and start its job there (Start digitising).
+  if (!w.linked && !w.job_instance_id) {
+    if (w.property_number) { regFind(w.property_number); notify(`${upin} is not linked in the Registry yet. Its file ${w.property_number} is shown under Registry → Find file: Start digitising opens the title deed job.`); return; }
+    alert(`${upin} is not linked in the Registry and has no file number on its attributes.\nFind its file under Registry → Find file (PL… or PLS…) and choose Start digitising.`); return;
+  }
   let job = w.job_instance_id;
   if (!job) {
     if (!w.transaction_number) { alert(`${upin} is linked (${w.su_id}), but its Registry transaction is not known here. Find the file under Registry → Find file.`); return; }
@@ -1238,7 +1243,7 @@ async function startEditParcel(upin, fileOnly) {
   await openWorkflow(); await wfSelect(job);
   try { await wfWorkOn(job); } catch (e) { notify(e.message, "err"); }
   stepTools(`Title Deed Plan — ${upin}`, [
-    ["Open the title deed plan (template)", () => window.open(`/api/v1/jobs/${wf.editing.cadastre_job_id}/siteplan.pdf`, "_blank")],
+    ["Title Deed Plan… (form, print, plan image)", () => titleDeedDialog(job, upin)],
     ["Send the plan to the Registry…", () => openRegistry({ job, view: "send" })],
   ]);
   status(`Working on ${w.job_name || "job " + job} for ${upin}${w.current_task ? " — task: " + w.current_task : ""}.`);
@@ -2209,7 +2214,7 @@ async function saveSketchParcel() {
   // Attributes: the values already captured on this draft, else the job's Registry defaults.
   let prefill = {};
   if (id) { try { prefill = await api(`/api/v1/parcels/${id}/attributes`); } catch { prefill = {}; } }
-  const attrs = await parcelAttrDialog({ prefill, areaM2: saved && saved.computed_area != null ? Number(saved.computed_area) : sketchArea,
+  const attrs = await parcelAttrDialog({ prefill, parcelId: id, areaM2: saved && saved.computed_area != null ? Number(saved.computed_area) : sketchArea,
     title: "Update Parcel Attribute", saveLabel: "Save attributes" });
   if (!attrs || !Object.keys(attrs).length || !id) return; // closed: the shape stays saved
   try { await api(`/api/v1/parcels/${id}/attributes`, { method: "PUT", body: attrs }); status("Parcel attributes saved."); }
@@ -2244,6 +2249,10 @@ async function parcelAttrDialog(opts = {}) {
   // Values already captured on the draft (editing) take precedence over the job's linkage defaults.
   const pf = opts.prefill || {};
   const pv = (k, d) => (pf[k] != null && pf[k] !== "" ? pf[k] : d);
+  // Aumentum names a job's parcels PCL1, PCL2, … (93% of its records): suggest the next one.
+  const drafts = (state.drafts && state.drafts.features) || [];
+  const at = opts.parcelId ? drafts.findIndex((x) => x.properties.id === opts.parcelId) : -1;
+  const pclDefault = "PCL" + (at >= 0 ? at + 1 : drafts.length + 1);
   return new Promise((resolve) => {
     const f = {};
     const row = (label, ctrl) => h("div", { class: "frow" }, h("label", {}, label), ctrl);
@@ -2253,7 +2262,7 @@ async function parcelAttrDialog(opts = {}) {
 
     const general = h("div", {},
       ro("UPIN:", "— assigned on commit —"),
-      row("Parcel Name:", txt("parcel_name", pv("parcel_name", ""))),
+      row("Parcel Name:", txt("parcel_name", pv("parcel_name", pclDefault))),
       row("Block:", txt("block", pv("block", ""))),
       ro("Parcel Area:", areaM2 != null ? `${area2(areaM2)} m²` : "—"),
       row("Area Unit:", sel("_area_unit", ["sq.m.", "Hectare"], "sq.m.")),
@@ -2444,6 +2453,16 @@ function pointInRing(pt, ring) {
 }
 
 // --- Attributes (edit a draft parcel's captured attributes) ----------------------------------
+// Add Parcel Attributes (Plot Parcel step 1010): the job's one draft opens at once; with several,
+// click the one to edit (the Attributes tool).
+async function wfAddAttributes() {
+  try { await loadDrafts(); } catch { /* use what is loaded */ }
+  const mine = (state.drafts && state.drafts.features) || [];
+  if (!mine.length) { status("No draft parcel in this job yet: plot it first (Construct Parcel → Digitize Parcel)."); return; }
+  if (mine.length === 1) { await editDraftAttributes(mine[0].properties.id); return; }
+  setTool("attr");
+  status(`${mine.length} draft parcels in this job: click the one whose attributes you want to enter.`);
+}
 async function attrClick(e) {
   const layers = ["drafts-fill"].filter((l) => map.getLayer(l));
   const f = layers.length ? map.queryRenderedFeatures(e.point, { layers })[0] : null;
@@ -2455,7 +2474,7 @@ async function editDraftAttributes(id) {
   try { prefill = await api(`/api/v1/parcels/${id}/attributes`); } catch { prefill = {}; }
   const draft = state.drafts.features.find((x) => x.properties.id === id);
   const areaM2 = draft ? featureAreaM2(draft) : null;
-  const attrs = await parcelAttrDialog({ prefill, areaM2, title: "Update Parcel Attribute", saveLabel: "Save attributes" });
+  const attrs = await parcelAttrDialog({ prefill, parcelId: id, areaM2, title: "Update Parcel Attribute", saveLabel: "Save attributes" });
   if (attrs === null) return;
   try { await api(`/api/v1/parcels/${id}/attributes`, { method: "PUT", body: attrs }); status("Parcel attributes updated."); }
   catch (e) { alert("Update failed: " + e.message); }
@@ -3365,6 +3384,24 @@ function renderRegistry() {
         notify([r.new ? `${r.new} new link(s)` : "No new links", u && u.unlinked ? `${u.unlinked} unlink(s)` : null].filter(Boolean).join(" · ") + ".");
       }), { disabled: reg.busy || !(st && st.enabled) }))));
   if (st && st.enabled && !writes) body.append(h("div", { class: "regNote" }, "Read-only: writing to the Registry (link, unlink, send plan) is turned off on this server."));
+  // Parallel run: is each new UPIN checked with Aumentum, and when were duplicates last looked for.
+  if (st) {
+    const w = st.upin_watch;
+    body.append(h("div", { class: "regNote" }, st.aumentum_check
+      ? h("span", {}, "UPINs are checked with Aumentum before commit. ",
+          w ? (w.ok ? `Duplicates checked ${regClock(w.at)} UTC (${w.checked} UPIN${w.checked === 1 ? "" : "s"}). ` : `Last duplicate check failed: ${w.error}. `) : "Duplicates not checked yet. ",
+          regIconBtn(reg.busy ? "…" : "Check now", "Ask Aumentum now about every UPIN committed here", () => regRun("Duplicate check", async () => {
+            const r = await api("/api/v1/registry/upin-watch", { method: "POST" });
+            notify(r.ok ? (r.duplicates.length ? `${r.duplicates.length} duplicate UPIN(s) found.` : `No duplicates (${r.checked} UPIN(s) checked).`) : `Aumentum could not be asked: ${r.error}`, r.ok && !r.duplicates.length ? undefined : "warn");
+          }), { disabled: reg.busy }))
+      : "UPINs are not checked with Aumentum on this server (no parallel-run check configured)."));
+  }
+  // Parallel run: UPINs given here that Aumentum has since issued too (the duplicate watch).
+  const dups = (st && st.upin_watch && st.upin_watch.duplicates) || [];
+  if (dups.length) body.append(h("div", { class: "regNote", style: "background:#fde8e8;border-color:#c00;color:#900" },
+    h("b", {}, `Duplicate UPIN${dups.length > 1 ? "s" : ""}: `),
+    `${dups.map((d) => d.upin).join(", ")} ${dups.length > 1 ? "were" : "was"} committed here and Aumentum has issued ${dups.length > 1 ? "them" : "it"} too. `,
+    "Do not link until it is resolved (revert the commit here, or correct the parcel in Aumentum)."));
 
   // Summary = filters.
   const counts = { waiting: 0, job: 0, unlinked: 0 };
@@ -3822,7 +3859,24 @@ async function wfCommitDialog(opts = {}) {
       wf.detail = await api("/api/v1/wf/jobs/" + id); renderWorkflow();
     } catch (e) { commitBtn.disabled = false; msg.style.color = "#b00"; msg.textContent = e.message; }
   } }, opts.label || "Commit");
+  // The UPIN(s) this commit will give, and whether Aumentum was asked (parallel run). Advisory.
+  const upinLine = h("div", { style: "margin:0 0 8px;padding:6px 8px;border:1px solid #ccc;background:#f7f7f7" }, "Working out the UPIN to be issued…");
+  api(`/api/v1/wf/jobs/${id}/next-upin`).then((p) => {
+    upinLine.innerHTML = "";
+    const list = (p.upins || []).join(", ") || "—";
+    upinLine.append(h("b", {}, `UPIN${(p.upins || []).length > 1 ? "s" : ""} to be issued: ${list}`), h("br"));
+    if (p.aumentum === "checked") {
+      upinLine.append(h("span", { style: "color:#060" }, "Checked with Aumentum just now" +
+        (p.aumentum_skipped.length ? `; skipped ${p.aumentum_skipped.join(", ")} (already issued in Aumentum).` : ": not issued there.")));
+    } else if (p.aumentum === "unavailable") {
+      upinLine.style.borderColor = "#c00"; upinLine.style.background = "#fde8e8";
+      upinLine.append(h("span", { style: "color:#900" }, `Aumentum could not be asked (${p.message || "no answer"}): the commit will be refused until it can.`));
+    } else {
+      upinLine.append(h("span", { class: "muted" }, "Not checked with Aumentum on this server (no parallel-run check configured)."));
+    }
+  }).catch((e) => { upinLine.textContent = "Could not work out the next UPIN: " + e.message; });
   const w = floatWindow(opts.title || "Commit Parcels — Beacon Numbers", h("div", {},
+    upinLine,
     h("p", { class: "muted", style: "margin:0 0 6px" }, `${pts.length} corner point(s), numbered on the map. Type each beacon number from the surveyor's point list.`),
     h("div", { style: "max-height:320px;overflow:auto" }, t), paste, h("div", { class: "frow" }, fill), msg,
     h("div", { class: "frow", style: "justify-content:flex-end" }, commitBtn, h("button", { class: "btn", onclick: () => { w.remove(); src()?.setData(empty()); } }, "Cancel"))),
@@ -3914,6 +3968,108 @@ async function wfFinishPost(j, beacons) {
   finally { wf.busy = false; renderWorkflow(); }
 }
 // What a workflow step's "Open" does in this editor. Steps whose tools belong to later phases say so.
+// --- Title deed plan (Generate Title Deed Plan): the form, the sheet, the plan image -------------
+// The server prefills the form from the Registry (Aumentum's R_PROPINFO / R_HOLDERS) and the parcel
+// record; the officer confirms or types the rest, saves it with the job, prints the A4 sheet, and
+// turns it into the JPEG that Send plan files with the Registry transaction.
+const TD_SCALES = [250, 500, 750, 1000, 1250, 1500, 2000, 2500, 3000, 4000, 5000, 7500, 10000, 25000];
+async function titleDeedDialog(jobId, upin) {
+  let d;
+  try { d = await api(`/api/v1/wf/jobs/${jobId}/titledeed` + (upin ? `?upin=${encodeURIComponent(upin)}` : "")); }
+  catch (e) { alert("Title deed plan: " + e.message); return; }
+  const p = d.plan, f = p.fields;
+  const inp = (key, ph) => h("input", { value: f[key] || "", placeholder: ph || "", style: "width:100%;box-sizing:border-box", "data-k": key });
+  const row = (label, el) => h("div", { class: "frow" }, h("label", { style: "min-width:120px" }, label), el);
+  const lga = h("select", { "data-k": "lga", style: "width:100%" }, h("option", { value: "" }, ""),
+    ...[...new Set([...(f.lga ? [f.lga] : []), ...PLATEAU_LGAS])].map((l) => h("option", { value: l, selected: l === f.lga }, l)));
+  const scale = h("select", { style: "width:100%" }, h("option", { value: "" }, "Auto (largest standard scale that fits)"),
+    ...TD_SCALES.map((sc) => h("option", { value: sc, selected: f.scale === sc }, `1:${sc}`)));
+  const n = p.corners.length;
+  const names = p.corners.map((c, i) => h("input", { value: (f.corner_names || [])[i] || "", placeholder: c.name, style: "width:100px" }));
+  const ct = h("table", { class: "legs" }, h("tr", {}, h("th", {}, "#"), h("th", {}, "Beacon"), h("th", {}, "Easting"), h("th", {}, "Northing")),
+    ...p.corners.map((c, i) => h("tr", {}, h("td", { class: "n" }, String(i + 1)), h("td", {}, names[i]), h("td", {}, fmt3(c.e)), h("td", {}, fmt3(c.n)))));
+  const nameOf = (i) => names[i].value.trim() || p.corners[i].name;
+  const road = h("select", { style: "width:100%" }, h("option", { value: "" }, "No road"),
+    ...p.corners.map((c, i) => h("option", { value: i, selected: f.road_side === i }, `Side ${i + 1}: ${nameOf(i)} → ${nameOf((i + 1) % n)}`)));
+  const roadLabel = inp("road_label", "Access Road");
+  const reg = d.registry === "ok" ? h("span", { style: "color:#060" }, "Prefilled from the Registry (read only) and the parcel record.")
+    : d.registry === "off" ? h("span", { class: "muted" }, "Registry not configured on this server: type the holder and survey details.")
+    : h("span", { style: "color:#900" }, `Registry not read (${d.registry}): type the holder and survey details.`);
+  const missing = p.corners.filter((c, i) => !((f.corner_names || [])[i]) && /^P\d+$/.test(c.name)).length;
+  const keys = ["title_no", "plan_no", "tracing_no", "region", "location", "address", "holder", "surveyed_by", "survey_date", "plotted_by", "checked_by", "surveyor_general", "prepared_by"];
+  const fields = Object.fromEntries(keys.map((k) => [k, inp(k)]));
+  const collect = () => {
+    const out = {};
+    for (const k of keys) out[k] = fields[k].value.trim() || null;
+    out.lga = lga.value || null;
+    out.scale = scale.value ? Number(scale.value) : null;
+    out.corner_names = names.map((x) => x.value.trim() || null);
+    out.road_side = road.value === "" ? null : Number(road.value);
+    out.road_label = roadLabel.value.trim() || null;
+    return out;
+  };
+  const msg = h("div", { style: "min-height:1.2em;margin:4px 0" });
+  const save = async () => {
+    const r = await api(`/api/v1/wf/jobs/${jobId}/titledeed`, { method: "PUT", body: { upin: p.upin, fields: collect() } });
+    msg.style.color = "#060"; msg.textContent = "Saved with the job.";
+    return r;
+  };
+  const sheet = async () => { await save(); return api(`/api/v1/wf/jobs/${jobId}/titledeed.svg?upin=${encodeURIComponent(p.upin)}`); };
+  const preview = async () => {
+    try {
+      const svg = await sheet();
+      const w = window.open("", "_blank");
+      if (!w) { alert("Allow pop-ups for this site to preview the plan."); return; }
+      w.document.write(`<!doctype html><html><head><title>Title Deed Plan ${p.upin}</title><style>@page{size:A4;margin:0}body{margin:0;background:#888}
+        .page{width:210mm;height:297mm;margin:10px auto;background:#fff;box-shadow:0 0 6px #000}.bar{text-align:center;padding:8px;font:14px sans-serif}
+        @media print{body{background:#fff}.page{margin:0;box-shadow:none}.bar{display:none}}</style></head><body>
+        <div class="bar"><button onclick="window.print()">Print / Save as PDF</button></div><div class="page">${svg}</div></body></html>`);
+      w.document.close();
+    } catch (e) { msg.style.color = "#900"; msg.textContent = e.message; }
+  };
+  // The plan image Send plan files with the Registry transaction: the sheet as a JPEG (A4, 200 dpi).
+  const attach = async () => {
+    try {
+      msg.style.color = ""; msg.textContent = "Making the plan image…";
+      const svg = await sheet();
+      const url = URL.createObjectURL(new Blob([svg], { type: "image/svg+xml" }));
+      const img = new Image();
+      await new Promise((ok, bad) => { img.onload = ok; img.onerror = () => bad(new Error("the sheet could not be drawn")); img.src = url; });
+      const c = document.createElement("canvas"); c.width = 1654; c.height = 2339;
+      const g = c.getContext("2d"); g.fillStyle = "#fff"; g.fillRect(0, 0, c.width, c.height); g.drawImage(img, 0, 0, c.width, c.height);
+      URL.revokeObjectURL(url);
+      const blob = await new Promise((ok) => c.toBlob(ok, "image/jpeg", 0.92));
+      const name = `Title Deed Plan ${(fields.title_no.value || p.upin).trim()}.jpg`;
+      await authReady;
+      const r = await fetch(`/api/v1/wf/jobs/${jobId}/files?name=${encodeURIComponent(name)}`, { method: "POST", body: blob, headers: { "content-type": "application/octet-stream", ...authHeaders() } });
+      if (!r.ok) throw new Error((await r.json().catch(() => ({}))).message || r.statusText);
+      msg.style.color = "#060"; msg.textContent = `${name} attached to the job. Send plan files it with the Registry transaction.`;
+      if (wf.detail?.job?.id === jobId) await wfSelect(jobId);
+    } catch (e) { msg.style.color = "#900"; msg.textContent = "Plan image: " + e.message; }
+  };
+  const pick = d.upins.length > 1 ? row("Parcel:", h("select", { onchange: (e) => { w.remove(); titleDeedDialog(jobId, e.target.value); } },
+    ...d.upins.map((u) => h("option", { value: u, selected: u === p.upin }, u)))) : null;
+  const w = floatWindow(`Title Deed Plan — ${p.upin}`, h("div", {},
+    h("div", { style: "margin-bottom:6px" }, reg),
+    h("div", { class: "muted", style: "margin-bottom:6px" }, `Area ${area2(p.area_m2)} m² · ${n} beacons, clockwise from the westernmost`),
+    pick,
+    row("Title no.:", fields.title_no), row("Plan no.:", fields.plan_no), row("Tracing no.:", fields.tracing_no),
+    row("Region:", fields.region), row("Location:", fields.location), row("Address:", fields.address), row("L.G. area:", lga),
+    row("Holder:", fields.holder), row("Surveyed by:", fields.surveyed_by), row("Survey date:", fields.survey_date),
+    row("Plotted by:", fields.plotted_by), row("Checked by:", fields.checked_by), row("Surveyor-General:", fields.surveyor_general),
+    row("Prepared by:", fields.prepared_by), row("Scale:", scale), row("Access road:", road), row("Road label:", roadLabel),
+    h("div", { class: "cfHdr", style: "margin-top:6px" }, "Beacon numbers" + (missing ? ` — ${missing} to type (not in the fabric)` : "")),
+    h("div", { style: "max-height:180px;overflow:auto" }, ct),
+    msg,
+    h("div", { class: "frow", style: "flex-wrap:wrap;justify-content:flex-end" },
+      h("button", { class: "btn", onclick: () => save().catch((e) => { msg.style.color = "#900"; msg.textContent = e.message; }) }, "Save"),
+      h("button", { class: "btn", onclick: preview }, "Preview / Print"),
+      h("button", { class: "btn", onclick: attach }, "Attach as plan image"),
+      h("button", { class: "btn", onclick: () => openRegistry({ job: jobId, view: "send" }) }, "Send plan…"))),
+    { id: "titleDeedWin", width: 470 });
+  for (const x of names) x.addEventListener("input", () => [...road.options].slice(1).forEach((o, i) => { o.textContent = `Side ${i + 1}: ${nameOf(i)} → ${nameOf((i + 1) % n)}`; }));
+}
+
 function wfStepAction(s) {
   const jobId = wf.detail?.job?.id;
   const needJob = (fn) => async () => { if (!wf.editing || wf.editing.job_instance_id !== jobId) await wfWorkOn(jobId); fn(); };
@@ -3933,14 +4089,16 @@ function wfStepAction(s) {
       ["Create Donut Parcel (sketch the hole, then click the parcel)", () => startPickDraft("donut")], ["Parcel Separation (sketch the line, then click the parcel)", () => startPickDraft("separate")],
       ["Move Point…", movePointDialog], ["Point Attributes…", pointAttributesDialog], ["List Control Points…", listControlPoints]])), tip: "Create the parcel with Aumentum's computation tools" };
     case 1008: return { run: () => validateFabric(), tip: "Validate the fabric (topology)" };
-    case 1010: case 1011: case 1015: return { run: () => { setTool("identify"); status("Click a parcel to review its attributes."); }, tip: "Review parcel attributes" };
+    case 1010: return { run: needJob(wfAddAttributes), label: "Open", tip: "Enter the draft parcel's attributes (parcel name, property number, …)" };
+    case 1011: case 1015: return { run: () => { setTool("identify"); status("Click a parcel to review its attributes."); }, tip: "Review parcel attributes" };
     case 1002: case 1012: return { run: needJob(() => wfCommitDialog()), label: "Commit", tip: "Commit the job's parcels to the fabric" };
     case 1014: return { run: () => findDialog(), tip: "Search the cadastre for parcels" };
     case 1017: return { run: needJob(() => window.open(`/api/v1/jobs/${wf.editing.cadastre_job_id}/siteplan.pdf`, "_blank")), label: "Plan", tip: "Open the job's site plan (Title Deed Plan layout parity is Phase 6)" };
     // TDP, Generate / Save Title Deed Plan carry Aumentum's SendImageCommand: the plan image to the Registry.
     case 1003: case 1016: case 1018: return { run: needJob(() => stepTools("Title Deed Plan", [
+      ["Title Deed Plan… (form, print, plan image)", () => titleDeedDialog(jobId)],
       ["Open the job's site plan", () => window.open(`/api/v1/jobs/${wf.editing.cadastre_job_id}/siteplan.pdf`, "_blank")],
-      ["Send the plan image to the Registry…", () => openRegistry({ job: jobId, view: "send" })]])), label: "Plan", tip: "Site plan, and sending the plan image to the job's Registry transaction" };
+      ["Send the plan image to the Registry…", () => openRegistry({ job: jobId, view: "send" })]])), label: "Plan", tip: "Title deed plan, and sending the plan image to the job's Registry transaction" };
     case 1009: return { run: needJob(() => fciDialog()), label: "Import", tip: "Create parcels from a polygon feature class (shapefile)" };
     case 1013: return { run: async () => { const d = wf.detail && wf.detail.job.id === jobId ? wf.detail.job : null; await regFind(d && d.lrs_transaction_number); }, label: "Link", tip: "Link the parcel to the job's Registry transaction (Registry tab)" };
     case 1020: return { run: needJob(() => stepTools("Merge Parcel", [

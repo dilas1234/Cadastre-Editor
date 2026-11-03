@@ -162,3 +162,71 @@ async fn never_a_upin_aumentum_already_issued() {
     assert_eq!(before, after);
     std::env::remove_var("CADASTRE_AUMENTUM_JOBSERVICE_URL");
 }
+
+#[tokio::test]
+async fn the_commit_window_preview_is_the_upin_the_commit_gives() {
+    let Some(db_url) = test_db_url() else { return };
+    let _g = SERIAL.lock().await;
+    let app = app(&db_url).await;
+    let pool = sqlx::PgPool::connect(&db_url).await.unwrap();
+    std::env::set_var("CADASTRE_MC_SERVICE_USER", "administrator");
+    std::env::set_var("CADASTRE_MC_SERVICE_PASSWORD", "test");
+    // Aumentum issued the next two numbers after the data was copied.
+    let next: i64 = sqlx::query_scalar("SELECT cadastre.sync_upin_sequence()").fetch_one(&pool).await.unwrap();
+    let taken: Vec<String> = (0..2).map(|k| format!("PL{:012}", next + k)).collect();
+    std::env::set_var("CADASTRE_AUMENTUM_JOBSERVICE_URL", fake_aumentum(taken.clone(), true).await);
+
+    let mut conn = pool.acquire().await.unwrap();
+    let before: i64 = sqlx::query_scalar("SELECT count(*) FROM cadastre.issued_upin").fetch_one(&mut *conn).await.unwrap();
+    let p = cadastre_server::routes::jobs::preview_upins(&mut conn, 1).await.expect("preview");
+    let after: i64 = sqlx::query_scalar("SELECT count(*) FROM cadastre.issued_upin").fetch_one(&mut *conn).await.unwrap();
+    drop(conn);
+    assert_eq!(p.aumentum, "checked", "{p:?}");
+    assert_eq!(p.aumentum_skipped, taken, "Aumentum's numbers are shown as skipped");
+    assert_eq!(p.upins.len(), 1);
+    assert_eq!(before, after, "the preview records nothing");
+
+    let x = 500_000.0 + (seed() % 5_000) as f64 * 100.0;
+    let upin = post_one(app.clone(), x, 8_700_000.0).await.expect("commit");
+    assert_eq!(upin, p.upins[0], "the commit gives the UPIN the Commit window showed");
+
+    // Not configured: the preview says so and still gives the next number.
+    std::env::remove_var("CADASTRE_AUMENTUM_JOBSERVICE_URL");
+    let mut conn = pool.acquire().await.unwrap();
+    let p = cadastre_server::routes::jobs::preview_upins(&mut conn, 2).await.expect("preview");
+    assert_eq!(p.aumentum, "not_configured");
+    assert_eq!(p.upins.len(), 2);
+}
+
+#[tokio::test]
+async fn the_watch_flags_a_upin_aumentum_issued_after_it_was_given_here() {
+    let Some(db_url) = test_db_url() else { return };
+    let _g = SERIAL.lock().await;
+    let app = app(&db_url).await;
+    let pool = sqlx::PgPool::connect(&db_url).await.unwrap();
+    std::env::remove_var("CADASTRE_AUMENTUM_JOBSERVICE_URL");
+    let x = 600_000.0 + (seed() % 5_000) as f64 * 100.0;
+    let upin = post_one(app.clone(), x, 8_800_000.0).await.expect("commit");
+
+    // Later, Aumentum issues the same number (it does not know this Cadastre's numbers).
+    std::env::set_var("CADASTRE_MC_SERVICE_USER", "administrator");
+    std::env::set_var("CADASTRE_MC_SERVICE_PASSWORD", "test");
+    std::env::set_var("CADASTRE_AUMENTUM_JOBSERVICE_URL", fake_aumentum(vec![upin.clone()], true).await);
+    let s = cadastre_server::upin_watch::check_once(&pool).await;
+    assert_eq!(s["ok"], json!(true), "{s}");
+    let dups: Vec<String> = s["duplicates"].as_array().unwrap().iter().map(|d| d["upin"].as_str().unwrap().to_string()).collect();
+    assert!(dups.contains(&upin), "{upin} is flagged: {s}");
+
+    // Audited once, however many passes see it.
+    let _ = cadastre_server::upin_watch::check_once(&pool).await;
+    let audits: i64 = sqlx::query_scalar("SELECT count(*) FROM cadastre.audit_log WHERE action = 'duplicate_upin_found' AND entity_id = $1")
+        .bind(&upin).fetch_one(&pool).await.unwrap();
+    assert_eq!(audits, 1);
+
+    // Aumentum unreachable: the pass fails but keeps the duplicates already known.
+    std::env::set_var("CADASTRE_AUMENTUM_JOBSERVICE_URL", fake_aumentum(vec![], false).await);
+    let s = cadastre_server::upin_watch::check_once(&pool).await;
+    assert_eq!(s["ok"], json!(false));
+    assert!(s["duplicates"].as_array().unwrap().iter().any(|d| d["upin"] == json!(upin)), "{s}");
+    std::env::remove_var("CADASTRE_AUMENTUM_JOBSERVICE_URL");
+}
