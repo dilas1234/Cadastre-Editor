@@ -83,15 +83,17 @@ pub fn escape(s: &str) -> String {
     s.replace('&', "&amp;").replace('<', "&lt;").replace('>', "&gt;").replace('"', "&quot;").replace('\'', "&apos;")
 }
 
-struct HttpResponse {
-    status: u16,
+pub(crate) struct HttpResponse {
+    pub(crate) status: u16,
     date: Option<String>,
-    body: String,
+    /// `name=value` of the first Set-Cookie (ASP.NET session cookies).
+    pub(crate) cookie: Option<String>,
+    pub(crate) body: String,
 }
 
 /// Minimal HTTP/1.0 request over plain TCP (the Registry serves `http://` only). HTTP/1.0 and
 /// `Connection: close` keep the response unchunked and read to EOF.
-async fn http(url: &str, method: &str, headers: &[(&str, String)], body: &str) -> Result<HttpResponse, LrsError> {
+pub(crate) async fn http(url: &str, method: &str, headers: &[(&str, String)], body: &str) -> Result<HttpResponse, LrsError> {
     http_bytes(url, method, headers, body.as_bytes()).await
 }
 
@@ -123,7 +125,8 @@ async fn http_bytes(url: &str, method: &str, headers: &[(&str, String)], body: &
     let (head, body) = text.split_once("\r\n\r\n").ok_or_else(|| LrsError::Http("malformed HTTP response".into()))?;
     let status = head.lines().next().and_then(|l| l.split_whitespace().nth(1)).and_then(|s| s.parse().ok()).unwrap_or(0);
     let date = head.lines().find_map(|l| l.split_once(':').filter(|(k, _)| k.eq_ignore_ascii_case("date")).map(|(_, v)| v.trim().to_string()));
-    Ok(HttpResponse { status, date, body: body.to_string() })
+    let cookie = head.lines().find_map(|l| l.split_once(':').filter(|(k, _)| k.eq_ignore_ascii_case("set-cookie")).map(|(_, v)| v.trim().split(';').next().unwrap_or("").to_string()));
+    Ok(HttpResponse { status, date, cookie, body: body.to_string() })
 }
 
 async fn soap(cfg: &LrsConfig, service: &str, action: &str, header: &str, body: &str) -> Result<String, LrsError> {

@@ -1294,6 +1294,10 @@ async fn job_editing_follows_job_area_and_commit_rules() {
     assert!(rec.0 >= 1_000_000_000, "a new record's OBJECTID never clashes with Aumentum's: {}", rec.0);
     assert_eq!((rec.1, rec.2, rec.3, rec.4), (Some(prop.clone()), Some("12".into()), Some("0".into()), Some(0)),
         "captured attributes, Aumentum's status code 0 (Active), not linked until the Registry links it");
+    let cut: bool = sqlx::query_scalar("SELECT bool_and(a.parcel_area = trunc(ST_Area(p.geom)::numeric, 2)::float8) FROM cadastre.parcel_attribute a JOIN cadastre.parcel p ON p.parcel_number = a.upin WHERE a.upin = ANY($1)")
+        .bind(c["parcel_numbers"].as_array().unwrap().iter().map(|v| v.as_str().unwrap().to_string()).collect::<Vec<_>>())
+        .fetch_one(&pool).await.unwrap();
+    assert!(cut, "the recorded area is cut to 2 decimals, never rounded up");
     let (_, found) = send(&app, "GET", &format!("/api/v1/parcels/search?number={prop}"), None, None).await;
     assert_eq!(found.as_array().unwrap().len(), 1, "found once by its property number: {found}");
     let (_, found) = send(&app, "GET", &format!("/api/v1/beacons/search?q={tag}-3"), None, None).await;

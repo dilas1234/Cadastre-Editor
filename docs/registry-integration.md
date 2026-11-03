@@ -196,6 +196,7 @@ In the server's environment (`~/.config/cadastre/server.env` on the dev PC):
 | `CADASTRE_REGISTRY_WRITE` | `1`: allow writing to the Registry on user action (send plan). |
 | `CADASTRE_REGISTRY_POLL_SECS` / `_RECONCILE_SECS` | Link check (60) and unlink check (900) intervals. |
 | `CADASTRE_MC_SERVICE_USER` / `_PASSWORD` | The account the Registry signs in with to the job service. It must equal the Registry's `multicadastre` `mcUserName` / `mcPassword`. Set on 2026-11-02 from `.env`: `administrator`, the Registry's `mcUserName`. Checked: `Authenticate` accepts it and refuses a wrong password. The password must equal the Registry's `mcPassword`. |
+| `CADASTRE_AUMENTUM_JOBSERVICE_URL` | Parallel run with Aumentum: before giving a new UPIN the Cadastre asks Aumentum's job service (`http://10.10.10.6/ApplicationServerAdmin/WebServices/LRSWebServices.asmx`, signed in with `CADASTRE_MC_SERVICE_USER` / `_PASSWORD`) whether Aumentum already issued it; such numbers are recorded (`aumentum:live`) and skipped. If Aumentum cannot be asked the commit is refused. Remove after cut-over. |
 | `CADASTRE_GISVIEWER_OPEN` | `1` opens the Registry's map without a ticket. Development only. |
 | `CADASTRE_REGISTRY_CADASTRE_LINKING` | `1` re-enables linking from the Cadastre (off: PLAGIS links in the Registry). |
 
@@ -223,6 +224,24 @@ Aumentum's parcels only.
 5. Run both systems side by side on a few files, then retire Aumentum's job service and map.
 
 ---
+
+## 5a. Parallel run: UPINs
+
+Both systems number new parcels in the same series (`PL` + 12 digits, counting up). PLAGIS chose
+to continue after Aumentum (2026-11-03), so:
+
+* every commit here asks Aumentum first (`CADASTRE_AUMENTUM_JOBSERVICE_URL`) and never takes a number
+  Aumentum has issued; commits here never share a number with each other (one atomic counter, and
+  the issued-UPIN ledger's unique key);
+* Aumentum does **not** know this Cadastre's numbers: if a parcel is committed here first, Aumentum
+  will later issue the same number. **While both run, commit in one system at a time** (or freeze
+  commits in Aumentum during the trial).
+* A commit made by mistake can be undone before it is linked:
+  `cargo run -p cadastre-server --example revert_commit -- <job> <UPIN> [property no.] [--apply]`
+  (2026-11-03: job 17511, PL000000023896, which Aumentum had already given to PL68346).
+
+Areas are recorded and shown to 2 decimals, cut not rounded (903.1976 m² is 903.19 m²); the
+geometry keeps its exact area.
 
 ## 6. Open items
 

@@ -267,7 +267,7 @@ map.once("style.load", async () => {
       "text-field": ["format",
         ["coalesce", ["get", "property_number"], ["get", "parcel_number"], ""], {},
         "\n", {},
-        ["concat", ["number-format", ["coalesce", ["get", "parcel_area"], ["get", "area"]], { "min-fraction-digits": 2, "max-fraction-digits": 2 }], " sq.m."], { "font-scale": 0.92 }],
+        ["concat", ["number-format", ["/", ["floor", ["+", ["*", ["to-number", ["coalesce", ["get", "parcel_area"], ["get", "area"]]], 100], 0.0000001]], 100], { "min-fraction-digits": 2, "max-fraction-digits": 2 }], " sq.m."], { "font-scale": 0.92 }],
       "text-font": ["OpenSans-Regular"], "text-size": ["interpolate", ["linear"], ["zoom"], 16, 10, 19, 13],
       "text-padding": 2, "text-max-width": 12,
     },
@@ -1260,8 +1260,8 @@ function selectionStats() {
   const fs = selectedFC().features; const areas = fs.map((f) => Number(f.properties.area) || 0);
   const sum = areas.reduce((a, b) => a + b, 0);
   floatWindow("Selection Statistics", h("table", {},
-    ...[["Count", fs.length], ["Total area (m²)", sum.toFixed(1)], ["Mean area (m²)", fs.length ? (sum / fs.length).toFixed(1) : "—"],
-      ["Min area (m²)", fs.length ? Math.min(...areas).toFixed(1) : "—"], ["Max area (m²)", fs.length ? Math.max(...areas).toFixed(1) : "—"]]
+    ...[["Count", fs.length], ["Total area (m²)", area2(sum)], ["Mean area (m²)", fs.length ? area2(sum / fs.length) : "—"],
+      ["Min area (m²)", fs.length ? area2(Math.min(...areas)) : "—"], ["Max area (m²)", fs.length ? area2(Math.max(...areas)) : "—"]]
       .map(([k, v]) => h("tr", {}, h("th", {}, k), h("td", {}, String(v))))), { width: 300 });
 }
 function focusParcel(f) {
@@ -1398,7 +1398,7 @@ function findDialog() {
         const t = h("table", {}, h("tr", {}, h("th", {}, "Parcel"), h("th", {}, "Status"), h("th", {}, "Area (m²)")));
         for (const p of parcels.slice(0, 200)) {
           const area = p.computed_area ?? p.stated_area;
-          const tr = h("tr", { style: "cursor:pointer", title: "Zoom to parcel" }, h("td", {}, p.parcel_number || "(unposted)"), h("td", {}, p.status), h("td", {}, area != null ? Number(area).toFixed(1) : "—"));
+          const tr = h("tr", { style: "cursor:pointer", title: "Zoom to parcel" }, h("td", {}, p.parcel_number || "(unposted)"), h("td", {}, p.status), h("td", {}, area2(area)));
           tr.onclick = () => goToResult(p);
           t.append(tr);
         }
@@ -2190,29 +2190,30 @@ async function saveSketchParcel() {
   if (!state.job) { alert("Choose a Job Area first — a digitized parcel is saved as a draft under a job."); return; }
   const utm = edit.verts.slice();
   if (!(await ensureJobArea(utm))) return; // keep the sketch so nothing is lost
-  // A draft being re-shaped (Edit tool) shows the attributes already captured on it.
-  let prefill = {};
-  if (edit.editingId) { try { prefill = await api(`/api/v1/parcels/${edit.editingId}/attributes`); } catch { prefill = {}; } }
-  const attrs = await parcelAttrDialog(edit.editingId ? { prefill, title: "Update Parcel Attribute" } : {});
-  if (attrs === null) return; // cancelled — keep the sketch for editing
+  // Finish Sketch saves the shape at once (nothing to confirm, nothing lost if the attribute form
+  // is closed); the Update Parcel Attribute form then opens on the saved draft.
+  const editingId = edit.editingId, sketchArea = sketchAreaM2();
+  let saved;
   try {
     const geometry = { type: "Polygon", coordinates: [[...utm, utm[0]]] };
-    if (edit.editingId) {
-      await api(`/api/v1/jobs/${state.job.id}/parcels/${edit.editingId}`, { method: "PUT", body: { geometry, stated_area: null } });
-      if (attrs && Object.keys(attrs).length) await api(`/api/v1/parcels/${edit.editingId}/attributes`, { method: "PUT", body: attrs });
-      notify(`Draft parcel updated in ${state.job.reference}. ${draftNextStep()}`);
-    } else {
-      const body = { geometry, stated_area: null };
-      if (attrs && Object.keys(attrs).length) body.attributes = attrs;
-      await api(`/api/v1/jobs/${state.job.id}/parcels`, { method: "POST", body });
-      if (state.job.reference.startsWith("WF-")) notify(`Parcel saved as a draft to ${state.job.reference}. ${draftNextStep()}`);
-      else notify(`Parcel saved to ${state.job.reference}, which is not a workflow job. To work as in Aumentum, open the job in the Workflow panel and choose Work On This Job.`, "warn");
-    }
-    zoomToUTMRing(utm);
-    wfRefreshEditing();
-    await loadDrafts(); buildCatalog(); clearSketch(); refreshSketchProps(); updateEditorButtons();
-    renderWorkflow();
-  } catch (e) { alert("Save failed: " + e.message); }
+    saved = editingId
+      ? await api(`/api/v1/jobs/${state.job.id}/parcels/${editingId}`, { method: "PUT", body: { geometry, stated_area: null } })
+      : await api(`/api/v1/jobs/${state.job.id}/parcels`, { method: "POST", body: { geometry, stated_area: null } });
+  } catch (e) { alert("Save failed: " + e.message + "\nThe sketch is kept: correct it and Finish Sketch again."); return; }
+  const id = saved && saved.id ? saved.id : editingId;
+  if (!state.job.reference.startsWith("WF-")) notify(`Parcel saved to ${state.job.reference}, which is not a workflow job. To work as in Aumentum, open the job in the Workflow panel and choose Work On This Job.`, "warn");
+  else notify(`${editingId ? "Draft parcel updated" : "Parcel saved as a draft"} in ${state.job.reference}. ${draftNextStep()}`);
+  zoomToUTMRing(utm);
+  clearSketch(); refreshSketchProps(); updateEditorButtons();
+  try { await loadDrafts(); buildCatalog(); wfRefreshEditing(); renderWorkflow(); } catch { /* the draft is saved; the view refreshes later */ }
+  // Attributes: the values already captured on this draft, else the job's Registry defaults.
+  let prefill = {};
+  if (id) { try { prefill = await api(`/api/v1/parcels/${id}/attributes`); } catch { prefill = {}; } }
+  const attrs = await parcelAttrDialog({ prefill, areaM2: saved && saved.computed_area != null ? Number(saved.computed_area) : sketchArea,
+    title: "Update Parcel Attribute", saveLabel: "Save attributes" });
+  if (!attrs || !Object.keys(attrs).length || !id) return; // closed: the shape stays saved
+  try { await api(`/api/v1/parcels/${id}/attributes`, { method: "PUT", body: attrs }); status("Parcel attributes saved."); }
+  catch (e) { alert("The parcel is saved, but its attributes were not: " + e.message + "\nUse Update Parcel Attribute to enter them again."); }
 }
 // Property-document capture shown on Finish Sketch (parcel). Resolves to the attributes object
 // (possibly empty), or null if cancelled. Prefills the Registry link + property fields from the
@@ -2223,6 +2224,8 @@ const PLATEAU_LGAS = ["Barkin Ladi", "Bassa", "Bokkos", "Jos East", "Jos North",
 const PROPERTY_TYPES = ["Land Parcel", "Building", "Strata", "Easement", "Road", "Reserve"];
 const PARCEL_STATUSES = ["Active", "Pending", "Historic", "Archived"];
 // Signed area of the current sketch (m², UTM 32N) via the shoelace formula.
+// Areas are shown to 2 decimals, cut not rounded (PLAGIS: 903.1976 m² is 903.19 m²).
+function area2(v) { const n = Number(v); return v == null || v === "" || !isFinite(n) ? "—" : (Math.floor(n * 100 + 1e-7) / 100).toFixed(2); }
 function sketchAreaM2() {
   const v = edit.verts; if (v.length < 3) return null;
   let a = 0; for (let i = 0; i < v.length; i++) { const [x1, y1] = v[i], [x2, y2] = v[(i + 1) % v.length]; a += x1 * y2 - x2 * y1; }
@@ -2252,7 +2255,7 @@ async function parcelAttrDialog(opts = {}) {
       ro("UPIN:", "— assigned on commit —"),
       row("Parcel Name:", txt("parcel_name", pv("parcel_name", ""))),
       row("Block:", txt("block", pv("block", ""))),
-      ro("Parcel Area:", areaM2 != null ? `${areaM2.toFixed(1)} m²` : "—"),
+      ro("Parcel Area:", areaM2 != null ? `${area2(areaM2)} m²` : "—"),
       row("Area Unit:", sel("_area_unit", ["sq.m.", "Hectare"], "sq.m.")),
       row("Property Type:", sel("property_type", PROPERTY_TYPES, pv("property_type", link.property_type || "Land Parcel"))),
       row("Property Number:", txt("property_number", pv("property_number", link.property_number || jobNo))),
@@ -2459,6 +2462,8 @@ async function editDraftAttributes(id) {
 }
 // Area (m², UTM 32N) of a polygon feature (lng/lat), via the shoelace formula on its outer ring.
 function featureAreaM2(f) {
+  // The server's area of the stored shape (exact); the map's degrees are only a fallback.
+  const ca = f.properties && Number(f.properties.computed_area); if (ca > 0) return ca;
   const g = f.geometry; if (!g) return null;
   const ring = g.type === "Polygon" ? g.coordinates[0] : g.type === "MultiPolygon" ? g.coordinates[0][0] : null;
   if (!ring || ring.length < 4) return null;
@@ -2945,7 +2950,7 @@ async function lineageWindow(upin) {
   for (const r of d.retirements) body.append(h("div", { style: "margin:4px 0;padding:4px 6px;border-left:3px solid #666" }, h("b", {}, `${(r.date || "").slice(0, 10)}  Retired `), link(r.upin), `: ${r.reason || ""}`));
   if (d.shapes.length) {
     const t = h("table", { class: "legs", style: "margin-top:6px" }, h("tr", {}, h("th", {}, "UPIN"), h("th", {}, "Status"), h("th", {}, "Area (m²)"), h("th", {}, "")));
-    for (const s of d.shapes) t.append(h("tr", {}, h("td", {}, s.upin), h("td", {}, s.status === "posted" ? "active" : s.status), h("td", {}, s.area.toFixed(2)),
+    for (const s of d.shapes) t.append(h("tr", {}, h("td", {}, s.upin), h("td", {}, s.status === "posted" ? "active" : s.status), h("td", {}, area2(s.area)),
       h("td", {}, h("button", { class: "btn", style: "min-width:0", onclick: async () => {
         const l = await api(`/api/v1/parcels/search?number=${encodeURIComponent(s.upin)}`).catch(() => []);
         const p = l.find((x) => x.parcel_number === s.upin && x.status === s.status);
@@ -3860,7 +3865,7 @@ function wfEditingView(j, e) {
       const keep = m.kind === "separate" ? h("select", { title: "Separation Configuration: the part that keeps the parent's UPIN and attribute record", onchange: (e) => mutationKeepUpin(ed.job_instance_id, m, e.target.value) },
         h("option", { value: "" }, "every part gets a new UPIN"),
         ...m.drafts.map((d, i) => { const f = state.drafts.features.find((x) => String(x.properties.id) === String(d));
-          return h("option", { value: d, selected: m.keeps_upin === d }, `part ${i + 1} keeps ${m.parents[0]}${f && f.properties.computed_area ? ` (${Number(f.properties.computed_area).toFixed(1)} m²)` : ""}`); })) : null;
+          return h("option", { value: d, selected: m.keeps_upin === d }, `part ${i + 1} keeps ${m.parents[0]}${f && f.properties.computed_area ? ` (${area2(f.properties.computed_area)} m²)` : ""}`); })) : null;
       ul.append(h("li", {}, what, " ", keep, " ", h("button", { class: "btn", style: "min-width:0;padding:0 6px", title: "Cancel this mutation (its draft parcels are removed)", onclick: async () => {
         if (!confirm(`Cancel: ${what}?`)) return;
         try { await api(`/api/v1/wf/jobs/${ed.job_instance_id}/mutations/${m.group}`, { method: "DELETE" }); await afterMutation("Mutation cancelled."); } catch (e) { alert(e.message); }

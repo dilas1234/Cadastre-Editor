@@ -245,6 +245,7 @@ pub async fn post_drafts_with_ids(conn: &mut sqlx::PgConnection, job_id: Uuid) -
     sqlx::query("SELECT cadastre.sync_upin_sequence()").execute(&mut *conn).await?;
 
     let mut parcel_numbers = Vec::with_capacity(rows.len());
+    let mut aumentum: Option<Option<crate::aumentum::UpinCheck>> = None;
     for row in &rows {
         let parcel_id: Uuid = row.get("id");
         let fresh = row.get::<Option<String>, _>("parcel_number").is_none();
@@ -260,26 +261,47 @@ pub async fn post_drafts_with_ids(conn: &mut sqlx::PgConnection, job_id: Uuid) -
                 existing
             }
             None => {
-                let seq: i64 = sqlx::query_scalar("SELECT nextval('cadastre.parcel_number_seq')")
-                    .fetch_one(&mut *conn)
-                    .await?;
-                let upin = numbering::format_upin(seq);
-                // A newly allocated UPIN must never have been issued before (registry links
-                // to a completed transaction would otherwise move to this parcel).
-                let recorded = sqlx::query(
-                    "INSERT INTO cadastre.issued_upin (upin, source) VALUES ($1, 'posted') \
-                     ON CONFLICT (upin) DO NOTHING",
-                )
-                .bind(&upin)
-                .execute(&mut *conn)
-                .await?
-                .rows_affected();
-                if recorded == 0 {
-                    return Err(AppError::Conflict(format!(
-                        "UPIN {upin} has already been issued; posting stopped so it is not reused"
-                    )));
+                // Parallel run: ask Aumentum (once per commit) before giving a number it may have
+                // issued since the data was copied; refuse the commit if it cannot be asked.
+                if aumentum.is_none() {
+                    aumentum = Some(crate::aumentum::UpinCheck::connect().await.map_err(AppError::Conflict)?);
                 }
-                upin
+                let mut tries = 0;
+                loop {
+                    tries += 1;
+                    if tries > 50 {
+                        return Err(AppError::Conflict("no free UPIN found in 50 numbers; nothing was committed".into()));
+                    }
+                    // nextval is atomic: two officers committing at once never get the same number.
+                    let seq: i64 = sqlx::query_scalar("SELECT nextval('cadastre.parcel_number_seq')")
+                        .fetch_one(&mut *conn)
+                        .await?;
+                    let upin = numbering::format_upin(seq);
+                    if let Some(Some(check)) = &aumentum {
+                        if check.issued(&upin).await.map_err(AppError::Conflict)? {
+                            // Aumentum's: record it so it is never offered again, and move on.
+                            sqlx::query("INSERT INTO cadastre.issued_upin (upin, source) VALUES ($1, 'aumentum:live') ON CONFLICT (upin) DO NOTHING")
+                                .bind(&upin)
+                                .execute(&mut *conn)
+                                .await?;
+                            continue;
+                        }
+                    }
+                    // A newly allocated UPIN must never have been issued before (registry links to a
+                    // completed transaction would otherwise move to this parcel). The ledger's unique
+                    // key settles any race; an issued number is skipped, never reused.
+                    let recorded = sqlx::query(
+                        "INSERT INTO cadastre.issued_upin (upin, source) VALUES ($1, 'posted') \
+                         ON CONFLICT (upin) DO NOTHING",
+                    )
+                    .bind(&upin)
+                    .execute(&mut *conn)
+                    .await?
+                    .rows_affected();
+                    if recorded == 1 {
+                        break upin;
+                    }
+                }
             }
         };
         sqlx::query(
@@ -307,7 +329,7 @@ pub async fn post_drafts_with_ids(conn: &mut sqlx::PgConnection, job_id: Uuid) -
                 COALESCE(d.property_number, l.property_number), COALESCE(d.property_type, l.property_type), \
                 COALESCE(d.plot, l.plot), COALESCE(d.block, l.block), d.location, \
                 COALESCE(d.plan_number, l.plan_number), COALESCE(d.lga, l.lga), d.parcel_name, d.area_unit, \
-                d.surveyor_general, ST_Area(p.geom), CASE lower(COALESCE(d.status, 'active')) WHEN 'active' THEN '0' WHEN 'historic' THEN '1' ELSE d.status END, COALESCE(d.lrs_id, l.lrs_id), \
+                d.surveyor_general, trunc(ST_Area(p.geom)::numeric, 2), CASE lower(COALESCE(d.status, 'active')) WHEN 'active' THEN '0' WHEN 'historic' THEN '1' ELSE d.status END, COALESCE(d.lrs_id, l.lrs_id), \
                 CASE WHEN COALESCE(d.lrs_id, l.lrs_id) IS NOT NULL THEN COALESCE(l.linkage_status, 1) ELSE 0 END, \
                 CASE WHEN COALESCE(d.lrs_id, l.lrs_id) IS NOT NULL THEN to_char(now(), 'YYYYMMDD') END, \
                 now(), now(), now() \
@@ -333,6 +355,9 @@ pub async fn post_drafts_with_ids(conn: &mut sqlx::PgConnection, job_id: Uuid) -
         parcel_numbers.push((parcel_id, number));
     }
 
+    if let Some(Some(check)) = aumentum {
+        check.close().await;
+    }
     Ok(parcel_numbers)
 }
 

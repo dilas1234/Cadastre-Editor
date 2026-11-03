@@ -314,7 +314,7 @@ async fn ensure_attribute_record(conn: &mut sqlx::PgConnection, upin: &str) -> A
     if !has {
         sqlx::query("INSERT INTO cadastre.parcel_attribute (object_id, upin, status, creation_date, last_edit_date, parcel_area) \
                      SELECT nextval('cadastre.parcel_attribute_objectid_seq'), $1, '0', now()::timestamp, now()::timestamp, \
-                            (SELECT ST_Area(geom) FROM cadastre.parcel WHERE parcel_number = $1 AND status = 'posted' LIMIT 1)")
+                            (SELECT trunc(ST_Area(geom)::numeric, 2) FROM cadastre.parcel WHERE parcel_number = $1 AND status = 'posted' LIMIT 1)")
             .bind(upin).execute(&mut *conn).await?;
     }
     Ok(())
@@ -540,6 +540,12 @@ pub async fn start_digitising(State(state): State<AppState>, user: AuthUser, Jso
     let params = format!("@LRS:[Transaction]:[TransactionNumber]={txn}");
     let id = crate::routes::mcservice::create_job_instance(&state.pool, job_type, Some(&name), Some("Deed Plan Creationv2"), Some(&params), "1", &actor.label, "registry.start-digitising", true)
         .await.map_err(AppError::UnprocessableEntity)?;
+    // The file's property number is what the parcels of this job carry (Update Parcel Attribute
+    // defaults to it). No LRSID: the parcel is linked only when the Registry admin links it.
+    if let Some(f) = &file {
+        sqlx::query("INSERT INTO cadastre.wf_job_linkage (wf_job_instance_id, property_number, linkage_status) VALUES ($1, $2, 0) ON CONFLICT (wf_job_instance_id) DO NOTHING")
+            .bind(id).bind(f).execute(&state.pool).await?;
+    }
     Ok(Json(StartedJobDto { job_instance_id: id, name: Some(name), created: true }))
 }
 

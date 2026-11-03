@@ -59,8 +59,8 @@ pub async fn create_job_parcel(
     job_area_guard(&state, job_id, Some(&new.geometry)).await?;
 
     let sql = format!(
-        "INSERT INTO cadastre.parcel (job_id, geom, stated_area, status) \
-         VALUES ($1, ST_SetSRID(ST_GeomFromGeoJSON($2), 32632), $3, 'draft') \
+        "INSERT INTO cadastre.parcel (job_id, geom, stated_area, computed_area, status) \
+         VALUES ($1, ST_SetSRID(ST_GeomFromGeoJSON($2), 32632), $3, ST_Area(ST_SetSRID(ST_GeomFromGeoJSON($2), 32632)), 'draft') \
          RETURNING {PARCEL_SELECT}"
     );
     let row = sqlx::query(&sql)
@@ -142,6 +142,7 @@ pub async fn update_job_parcel(
     }
     let sql = format!(
         "UPDATE cadastre.parcel SET geom = ST_SetSRID(ST_GeomFromGeoJSON($3), 32632), \
+             computed_area = ST_Area(ST_SetSRID(ST_GeomFromGeoJSON($3), 32632)), \
              stated_area = COALESCE($4, stated_area), updated_at = now() \
          WHERE id = $2 AND job_id = $1 AND status = 'draft' RETURNING {PARCEL_SELECT}"
     );
@@ -439,8 +440,8 @@ pub async fn cut_job_parcel(
     sqlx::query("DELETE FROM cadastre.parcel_lineage WHERE pending AND parcel_id = $1 AND status = 1").bind(parcel_id).execute(&mut *tx).await?;
     sqlx::query("DELETE FROM cadastre.parcel WHERE id = $1").bind(parcel_id).execute(&mut *tx).await?;
     let insert = format!(
-        "INSERT INTO cadastre.parcel (job_id, geom, status) \
-         VALUES ($1, ST_SetSRID(ST_GeomFromGeoJSON($2), 32632), 'draft') RETURNING {PARCEL_SELECT}"
+        "INSERT INTO cadastre.parcel (job_id, geom, computed_area, status) \
+         VALUES ($1, ST_SetSRID(ST_GeomFromGeoJSON($2), 32632), ST_Area(ST_SetSRID(ST_GeomFromGeoJSON($2), 32632)), 'draft') RETURNING {PARCEL_SELECT}"
     );
     let mut out = Vec::with_capacity(pieces.len());
     for piece in &pieces {

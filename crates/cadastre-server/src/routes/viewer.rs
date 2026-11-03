@@ -63,7 +63,8 @@ pub async fn parcels_geojson(
                  'geometry', ST_AsGeoJSON(ST_Transform(p.geom,4326))::json, \
                  'properties', json_build_object('id', p.id, 'parcel_number', p.parcel_number, \
                      'status', p.status, 'job_id', p.job_id, \
-                     'area', round(COALESCE(p.computed_area, ST_Area(p.geom))::numeric,1), \
+                     'area', trunc(COALESCE(p.computed_area, ST_Area(p.geom))::numeric, 2), \
+                     'computed_area', ST_Area(p.geom), \
                      'property_number', a.property_number, 'parcel_area', a.parcel_area)) AS f \
                FROM cadastre.parcel p \
                LEFT JOIN LATERAL (SELECT NULLIF(btrim(pa.property_number), '') AS property_number, pa.parcel_area \

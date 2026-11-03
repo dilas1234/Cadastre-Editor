@@ -565,7 +565,7 @@ async fn inherit_attributes(conn: &mut sqlx::PgConnection, id: i32, posted: &[(U
                 // A separation part that kept the parent's UPIN keeps its attribute record:
                 // only the area, the mutation type and the edit date change.
                 let n = sqlx::query(
-                    "UPDATE cadastre.parcel_attribute SET parcel_area = (SELECT ST_Area(geom) FROM cadastre.parcel WHERE id = $2), \
+                    "UPDATE cadastre.parcel_attribute SET parcel_area = (SELECT trunc(ST_Area(geom)::numeric, 2) FROM cadastre.parcel WHERE id = $2), \
                         mutation_type = $3, last_edit_date = now()::timestamp, updated_at = now() \
                      WHERE upin = $1 AND (status = '0' OR status IS NULL)",
                 )
@@ -599,7 +599,7 @@ async fn inherit_attributes(conn: &mut sqlx::PgConnection, id: i32, posted: &[(U
                     creation_date, last_edit_date, dataset_name, region_name, plot, block, location, lga, property_type, area_unit, \
                     can_rollback, is_strata, lrs_id, linkage_status, parent) \
                  SELECT nextval('cadastre.parcel_attribute_objectid_seq'), $1, $2, $3, \
-                    (SELECT ST_Area(geom) FROM cadastre.parcel WHERE id = $2), '0', $4, now()::timestamp, now()::timestamp, \
+                    (SELECT trunc(ST_Area(geom)::numeric, 2) FROM cadastre.parcel WHERE id = $2), '0', $4, now()::timestamp, now()::timestamp, \
                     s.dataset_name, s.region_name, s.plot, s.block, s.location, s.lga, s.property_type, s.area_unit, \
                     s.can_rollback, s.is_strata, s.lrs_id, s.linkage_status, s.parent \
                  FROM (SELECT 1) one LEFT JOIN cadastre.parcel_attribute s ON s.object_id = $5",
