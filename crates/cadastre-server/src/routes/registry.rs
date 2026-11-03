@@ -159,7 +159,7 @@ pub async fn reconcile_now(State(state): State<AppState>, _user: AuthUser) -> Ap
     registry_sync::reconcile_and_record(&state.pool, &cfg).await.map(Json).map_err(AppError::UnprocessableEntity)
 }
 
-fn config() -> ApiResult<LrsConfig> {
+pub(crate) fn config() -> ApiResult<LrsConfig> {
     LrsConfig::from_env().ok_or_else(|| AppError::Conflict("the Registry connection is not configured on this server".into()))
 }
 

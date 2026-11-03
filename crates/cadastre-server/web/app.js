@@ -2274,6 +2274,8 @@ async function saveSketchParcel() {
   const utm = edit.verts.slice();
   // Verify Points: the digitiser checks every corner (beacon, coordinates) before anything is saved.
   if (!(await verifyPoints(utm))) { status("Back to the sketch: adjust the corners, then Finish Sketch again."); return; }
+  // System check before the next stage: nothing goes on to attributes and commit on taken land.
+  if (!(await runPrecheck(utm))) { status("Back to the sketch: the system check did not pass."); return; }
   if (!(await ensureJobArea(utm))) return; // keep the sketch so nothing is lost
   // Finish Sketch saves the shape at once (nothing to confirm, nothing lost if the attribute form
   // is closed); the Update Parcel Attribute form then opens on the saved draft.
@@ -2731,6 +2733,42 @@ async function verifyPoints(utm) {
     buttons: [{ label: "Back to sketch", value: false, cancel: true }, { label: "Confirm points", value: true, primary: true }] });
   if (!ok) return false;
   for (const [id, inp] of inputs) { const v = inp.value.trim().toUpperCase(); if (v) rememberPointId(id.easting, id.northing, v); }
+  return true;
+}
+
+// --- System check (before the next stage, and again at commit on the server) ---
+// Overlaps here and in Aumentum, the drop point (is the plot free?), a title on the land, and the
+// Registry transaction. A failure sends the digitiser back to the sketch; warnings need a reason,
+// which is recorded. Resolves true to go on.
+const CHECK_MARK = { pass: "✔", warn: "!", fail: "✕", skipped: "–" };
+function precheckTable(report) {
+  return h("table", { class: "verifyTbl checkTbl" },
+    ...report.items.map((i) => h("tr", { class: `chk-${i.result}` },
+      h("td", { class: "chkIcon" }, CHECK_MARK[i.result] || "?"), h("td", {}, h("b", {}, i.label)), h("td", { style: "white-space:normal" }, i.detail))));
+}
+async function runPrecheck(utm) {
+  if (!wf.editing?.job_instance_id) return true; // not a workflow job: the commit rules still apply
+  const id = wf.editing.job_instance_id;
+  status("System check: overlaps here and in Aumentum, drop point, title on the land, Registry transaction…");
+  const wait = h("div", { class: "toast" }, "Running the system check…"); document.body.append(wait);
+  let report;
+  try { report = await api(`/api/v1/wf/jobs/${id}/precheck`, { method: "POST", body: { vertices: utm, editing_id: edit.editingId || null } }); }
+  catch (e) { wait.remove(); await uiAlert("The system check could not run: " + e.message + "\nThe sketch is kept; try Finish Sketch again."); return false; }
+  wait.remove();
+  if (report.ok && !report.warnings) { notify("System check passed: the plot is free, no overlap, no title on the land."); return true; }
+  const fails = report.items.filter((i) => i.result === "fail").length;
+  const body = h("div", {},
+    h("p", {}, report.ok ? "The system check found warnings. Look at them before going on." : h("b", {}, `The system check failed (${fails} problem${fails > 1 ? "s" : ""}). Nothing can be committed on this land.`)),
+    h("div", { class: "verifyWrap" }, precheckTable(report)));
+  const buttons = report.ok
+    ? [{ label: "Back to sketch", value: false, cancel: true }, { label: "Continue…", value: true, primary: true }]
+    : [{ label: "Back to sketch", value: false, cancel: true, primary: true }];
+  const go = await uiDialog({ title: "System Check", message: body, kind: report.ok ? "warn" : "error", width: 720, buttons });
+  if (!go || !report.ok) return false;
+  const reason = await uiPrompt("Why go on despite the warnings? (recorded with the job)", "", { title: "System Check" });
+  if (!reason || !reason.trim()) return false;
+  try { await api(`/api/v1/wf/jobs/${id}/precheck`, { method: "POST", body: { vertices: utm, editing_id: edit.editingId || null, acknowledge: reason.trim() } }); }
+  catch (e) { await uiAlert("Going on was refused: " + e.message); return false; }
   return true;
 }
 

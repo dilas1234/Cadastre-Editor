@@ -1036,6 +1036,12 @@ pub async fn commit(State(state): State<AppState>, user: AuthUser, Path(id): Pat
         serde_json::from_slice(&body).map_err(|e| AppError::BadRequest(format!("invalid commit request: {e}")))?
     };
     let actor = resolve_actor(&state, &user).await?;
+    // The system check again at commit (overlaps here and in Aumentum, drop point, title, transaction):
+    // the land may have been taken since the sketch was checked.
+    let check = crate::routes::precheck::run(&state, id, &[], None).await?;
+    if !check.ok {
+        return Err(AppError::Conflict(format!("System check failed, nothing was committed. {}", crate::routes::precheck::failures(&check))));
+    }
     let mut tx = state.pool.begin().await?;
     let cur = lock_open_job(&mut tx, id, &actor).await?;
     if !is_commit_task(&mut tx, cur).await? {
@@ -1141,6 +1147,11 @@ async fn open_next_task(conn: &mut sqlx::PgConnection, id: i32, job_type_id: i32
 pub async fn finish(State(state): State<AppState>, user: AuthUser, Path(id): Path<i32>, Json(req): Json<WfFinishBody>) -> ApiResult<Json<WfFinishDto>> {
     let actor = resolve_actor(&state, &user).await?;
     let complete = req.complete.unwrap_or(true);
+    // Post & Finish commits too: the same system check first.
+    let check = crate::routes::precheck::run(&state, id, &[], None).await?;
+    if !check.ok {
+        return Err(AppError::Conflict(format!("System check failed, nothing was committed. {}", crate::routes::precheck::failures(&check))));
+    }
     let mut tx = state.pool.begin().await?;
     let row = sqlx::query(
         "SELECT j.job_type_id, j.current_task_id, s.is_open FROM cadastre.wf_job_instance j \

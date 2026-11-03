@@ -15,6 +15,7 @@ pub mod mcservice;
 pub mod me;
 pub mod mutations;
 pub mod parcels;
+pub mod precheck;
 pub mod promote;
 pub mod titledeed;
 pub mod registry;
@@ -56,6 +57,7 @@ pub fn router(state: AppState) -> Router {
         .route("/api/v1/wf/jobs/{id}/hold", post(wf::hold))
         .route("/api/v1/wf/jobs/{id}/editing", get(wf::get_editing).post(wf::start_editing))
         .route("/api/v1/wf/jobs/{id}/editing/corners", get(wfbeacons::corners))
+        .route("/api/v1/wf/jobs/{id}/precheck", post(precheck::precheck))
         .route("/api/v1/beacons/identify", post(wfbeacons::identify))
         .route("/api/v1/wf/jobs/{id}/area", put(wf::put_area).delete(wf::delete_area))
         .route("/api/v1/wf/jobs/{id}/area/{action}", post(wf::area_action))

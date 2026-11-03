@@ -28,7 +28,7 @@ use crate::routes::{
         crate::routes::wf::get_job, crate::routes::wf::create_job, crate::routes::wf::advance,
         crate::routes::wf::assign, crate::routes::wf::hold,
         crate::routes::wf::get_editing, crate::routes::wf::start_editing, crate::routes::wf::put_area, crate::routes::wf::area_action,
-        crate::routes::wf::delete_area, crate::routes::wf::discard, crate::routes::wf::commit, crate::routes::wfbeacons::corners, crate::routes::wfbeacons::identify, crate::routes::wf::finish, crate::routes::wf::end_job,
+        crate::routes::wf::delete_area, crate::routes::wf::discard, crate::routes::wf::commit, crate::routes::wfbeacons::corners, crate::routes::wfbeacons::identify, crate::routes::precheck::precheck, crate::routes::wf::finish, crate::routes::wf::end_job,
         crate::routes::wf::get_linkage, crate::routes::wf::put_linkage, crate::routes::wf::next_upin, crate::routes::titledeed::get_plan, crate::routes::titledeed::put_plan, crate::routes::titledeed::attach_pdf, crate::routes::titledeed::svg,
         crate::routes::wfadmin::list_files, crate::routes::wfadmin::get_file, crate::routes::wfadmin::upload_file,
         crate::routes::wfadmin::productivity, crate::routes::wfadmin::notifications, crate::routes::wfadmin::security,

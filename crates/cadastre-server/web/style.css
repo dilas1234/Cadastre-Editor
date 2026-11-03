@@ -392,3 +392,14 @@ table.legs tr.selrow td { background: #fff6cf; }
 .src-new { color: #8a5a00; }
 .linkish { color: #1a5fb4; text-decoration: none; }
 .linkish:hover { text-decoration: underline; }
+
+/* System Check report */
+.checkTbl td { vertical-align: top; }
+.checkTbl tr { cursor: default; }
+.checkTbl .chkIcon { width: 22px; text-align: center; font-weight: 700; }
+.checkTbl tr.chk-pass .chkIcon { color: #138a2a; }
+.checkTbl tr.chk-warn .chkIcon { color: #b07800; }
+.checkTbl tr.chk-warn td { background: #fff8e1; }
+.checkTbl tr.chk-fail .chkIcon { color: #c62020; }
+.checkTbl tr.chk-fail td { background: #fdecea; }
+.checkTbl tr.chk-skipped td { color: #888; }

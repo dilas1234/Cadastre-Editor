@@ -111,6 +111,35 @@ pub fn rewrite_location(v: &str, upstream: &str, own_host: Option<&str>) -> Stri
     }
 }
 
+/// A GET to Aumentum's GISViewer (e.g. a `gis.gate/0/0/query` search) for this server's own
+/// checks; `None` when no upstream is configured. Read-only.
+pub async fn aumentum_get(path_q: &str) -> Option<Result<Vec<u8>, String>> {
+    let up = upstream()?;
+    let (auth, host, port) = authority(&up)?;
+    let head = format!("GET {path_q} HTTP/1.0\r\nHost: {auth}\r\nConnection: close\r\nAccept: application/json\r\n\r\n");
+    let exchange = async {
+        let mut s = TcpStream::connect((host.as_str(), port)).await?;
+        s.write_all(head.as_bytes()).await?;
+        let mut raw = Vec::new();
+        (&mut s).take(MAX_BODY as u64).read_to_end(&mut raw).await?;
+        Ok::<_, std::io::Error>(raw)
+    };
+    Some(match tokio::time::timeout(Duration::from_secs(30), exchange).await {
+        Ok(Ok(raw)) => match parse_response(&raw) {
+            Some(p) if p.status == 200 => Ok(p.body),
+            Some(p) => Err(format!("Aumentum answered HTTP {}", p.status)),
+            None => Err("malformed answer from Aumentum".into()),
+        },
+        Ok(Err(e)) => Err(format!("Aumentum ({auth}) could not be reached: {e}")),
+        Err(_) => Err(format!("Aumentum ({auth}) did not answer in 30 s")),
+    })
+}
+
+/// Percent-encode a query value.
+pub fn pct_encode(v: &str) -> String {
+    v.bytes().map(|b| if b.is_ascii_alphanumeric() || b"-_.~".contains(&b) { (b as char).to_string() } else { format!("%{b:02X}") }).collect()
+}
+
 /// Fallback handler for `/GISViewer/{*rest}`.
 pub async fn forward(State(state): State<AppState>, req: Request) -> Response {
     let Some(up) = upstream() else {

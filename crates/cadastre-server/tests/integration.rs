@@ -1893,9 +1893,10 @@ impl FakeRegistry {
                         let closed = body.contains("TXNCLOSED");
                         let num = if closed { "TXNCLOSED" } else { "PLS777" };
                         ok(scalar_xml(&[vec!["10000000777", num, if closed { "transaction_completed" } else { "transaction_lodged" }, if closed { "Completed" } else { "Active" }]]))
-                    } else if body.contains("s.SpatialDate1 from com.landsystems.lrs.model.Transaction") {
+                    } else if body.contains("s.SpatialDate1, z.Label, y.Label from com.landsystems.lrs.model.Transaction") {
+                        // The transaction's properties, with the property's location (zone) and layout.
                         let u = prop_upin.lock().unwrap().clone().unwrap_or_default();
-                        ok(scalar_xml(&[vec!["10000000555", &su, &u, "PL777", "", "B7", ""]]))
+                        ok(scalar_xml(&[vec!["10000000555", &su, &u, "PL777", "", "B7", "", "Jos - Bukuru Metropolis", ""]]))
                     } else if body.contains("model.IncomingDocument d where d.Transaction.id = 10000000777") {
                         // The plans already filed in PLS777 (a resend marks them as replaced).
                         ok(scalar_xml(&[vec!["10000000901"]]))
