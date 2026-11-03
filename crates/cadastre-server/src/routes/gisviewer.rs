@@ -126,6 +126,7 @@ pub async fn page(RawQuery(q): RawQuery, headers: HeaderMap, body: Bytes) -> Res
                 <body style=\"font-family:Segoe UI,Arial;padding:20px\"><h3>Cadastre map</h3><p>{}</p></body></html>", escape(&msg))).into_response()
         }
         Ok(u) => {
+            tracing::info!("Registry map opened for {u} (map={}, {} input byte(s))", get("map"), get("initparam_inputobjects").len());
             let token = uuid::Uuid::new_v4().simple().to_string();
             tokens().lock().unwrap().insert(token.clone(), (u.clone(), Instant::now()));
             let input = decode_aumentum(&get("initparam_inputobjects")).unwrap_or(json!([]));
@@ -352,19 +353,27 @@ pub async fn apply_updates(pool: &sqlx::PgPool, lists: &[UpdateDataList], actor:
 pub async fn service(State(state): State<AppState>, body: Bytes) -> Response {
     let text = String::from_utf8_lossy(&body);
     let Some((op, header_auth, lists)) = parse_service_request(&text) else {
+        tracing::warn!("Registry link service: not a SOAP request ({} bytes)", body.len());
         return (StatusCode::BAD_REQUEST, "not a SOAP request").into_response();
     };
+    tracing::info!("Registry link service: {op} called ({} update list(s))", lists.len());
     // Aumentum's CadastralWebService checks the Registry user's ticket (AbstractSecurityWebService).
     let user = match (&header_auth, open_without_ticket()) {
         (_, true) => header_auth.as_ref().map(|h| h.0.clone()).unwrap_or_else(|| "dev".into()),
         (Some((u, t)), false) => match registry_cfg() {
             Some(cfg) => match lrs::ticket_valid(&cfg, u, t).await {
                 Ok(true) => u.clone(),
-                _ => return soap_ok(&op, &format!("<{op}Result><Error>The Registry session of {} is not valid.</Error></{op}Result>", escape(u))),
+                other => {
+                    tracing::warn!("Registry link service: {op} refused, the Registry session of {u} is not valid ({other:?})");
+                    return soap_ok(&op, &format!("<{op}Result><Error>The Registry session of {} is not valid.</Error></{op}Result>", escape(u)));
+                }
             },
             None => return soap_ok(&op, &format!("<{op}Result><Error>The Registry connection is not configured on this Cadastre.</Error></{op}Result>")),
         },
-        (None, false) => return soap_ok(&op, &format!("<{op}Result><Error>No SecurityHeader.</Error></{op}Result>")),
+        (None, false) => {
+            tracing::warn!("Registry link service: {op} refused, no SecurityHeader");
+            return soap_ok(&op, &format!("<{op}Result><Error>No SecurityHeader.</Error></{op}Result>"));
+        }
     };
     match op.as_str() {
         "UpdateCadastralData" => match apply_updates(&state.pool, &lists, &format!("registry:{user}")).await {
@@ -372,7 +381,10 @@ pub async fn service(State(state): State<AppState>, body: Bytes) -> Response {
                 tracing::info!("Registry map: {n} parcel record(s) updated by {user} ({})", upins.join(", "));
                 soap_ok(&op, "<UpdateCadastralDataResult />")
             }
-            Err(e) => soap_ok(&op, &format!("<UpdateCadastralDataResult><Error>{}</Error></UpdateCadastralDataResult>", escape(&e))),
+            Err(e) => {
+                tracing::warn!("Registry link service: UpdateCadastralData by {user} failed: {e}");
+                soap_ok(&op, &format!("<UpdateCadastralDataResult><Error>{}</Error></UpdateCadastralDataResult>", escape(&e)))
+            }
         },
         "GetVariables" => soap_ok(&op, "<GetVariablesResult />"),
         "DetectNeighbours" => soap_ok(&op, "<DetectNeighboursResult />"),
