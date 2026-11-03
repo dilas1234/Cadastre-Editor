@@ -55,3 +55,5 @@ CADASTRE_TEST_DATABASE_URL=postgres://cadastre:cadastre@localhost:5432/cadastre 
 Both the editor and server ship as native `.exe` for **Windows Server 2012 R2**. This is a
 deliberately old target that constrains the whole project — see
 [docs/windows-2012r2-build.md](docs/windows-2012r2-build.md).
+The server is built with `scripts/build-windows.sh` and deployed (staging: 10.10.10.4) per
+[docs/windows-deployment.md](docs/windows-deployment.md).

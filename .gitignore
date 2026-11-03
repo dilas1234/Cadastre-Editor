@@ -16,3 +16,6 @@ Cargo.lock.orig
 # Local scripts/notes that contain database credentials. Never commit.
 /dump_all_tables.py
 tools/aumentum-inventory/aumentum-db.md
+
+# Windows deploy builds
+/dist

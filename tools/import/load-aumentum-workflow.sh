@@ -52,6 +52,17 @@ stage event_log "id text, time text, eventid text, userid text, module text, reg
 stage auditlog "id text, sid text, action text, object text, success text, time text, description text"
 stage dsssettings "id text, category text, name text, value text"
 cat <<'SQL'
+-- Aumentum's job and task ids stay below this Cadastre's own range (migration 0019); an export
+-- with ids in that range is refused rather than mixed with the jobs created here.
+DO $$
+BEGIN
+  IF EXISTS (SELECT 1 FROM s_wfjobInstance WHERE id::int > cadastre.wf_own_base())
+     OR EXISTS (SELECT 1 FROM s_wfTaskInstance WHERE id::int > cadastre.wf_own_base()) THEN
+    RAISE EXCEPTION 'Aumentum job/task ids of %+ found in the export: that range belongs to this Cadastre; nothing was loaded',
+      cadastre.wf_own_base();
+  END IF;
+END $$;
+
 -- People
 INSERT INTO cadastre.principal (sid, code, name, description, is_user, is_locked, is_system, os_account, email, department, job_title, phone)
 SELECT s.sid::int, s.code, COALESCE(u.name, s.name), s.descr, s.is_user = '1', s.is_locked = '1', s.is_system = '1', s.os_account,
@@ -129,9 +140,14 @@ SELECT t.id::int, t.jobInstanceID::int, NULLIF(t.jobID, '')::int, t.taskID::int,
        NULLIF(t.assigned, '')::timestamp, NULLIF(t.started, '')::timestamp, NULLIF(t.ended, '')::timestamp, t.comment, t.parameters
 FROM s_wfTaskInstance t
 WHERE t.jobInstanceID::int IN (SELECT id FROM cadastre.wf_job_instance) AND t.taskID::int IN (SELECT id FROM cadastre.wf_task)
-ON CONFLICT (id) DO UPDATE SET job_instance_id = EXCLUDED.job_instance_id, job_type_id = EXCLUDED.job_type_id, task_id = EXCLUDED.task_id,
+ON CONFLICT (id) DO UPDATE SET job_type_id = EXCLUDED.job_type_id, task_id = EXCLUDED.task_id,
   sid = EXCLUDED.sid, assigned = EXCLUDED.assigned, started = EXCLUDED.started, ended = EXCLUDED.ended,
-  comment = EXCLUDED.comment, parameters = EXCLUDED.parameters;
+  comment = EXCLUDED.comment, parameters = EXCLUDED.parameters
+-- Only Aumentum's own task row of the same job is refreshed. A row with this number that belongs to
+-- another job was made here (before migration 0019 moved this Cadastre's numbers): it is kept, and
+-- reported below as a clash.
+WHERE cadastre.wf_task_instance.job_instance_id = EXCLUDED.job_instance_id
+  AND EXISTS (SELECT 1 FROM cadastre.wf_job_instance w WHERE w.id = EXCLUDED.job_instance_id AND w.source = 'aumentum');
 SELECT cadastre.wf_sync_sequences();
 
 -- The UPIN register: every UPIN Aumentum allocated is reserved, used by a parcel or not.
@@ -184,8 +200,17 @@ SELECT format('%-22s file %6s | in database %6s', 'task steps', $(rows TaskSteps
 SELECT format('%-22s file %6s | in database %6s', 'job types', $(rows wfjob), count(*)) FROM cadastre.wf_job_type;
 SELECT format('%-22s file %6s | in database %6s', 'task graph edges', $(rows wftaskflow), count(*)) FROM cadastre.wf_task_flow;
 SELECT format('%-22s file %6s | in database %6s', 'task permissions', $(rows wftaskPermission), count(*)) FROM cadastre.wf_task_permission;
-SELECT format('%-22s file %6s | in database %6s  %s', 'job instances', $(rows wfjobInstance), count(*), CASE WHEN count(*) = $(rows wfjobInstance) THEN 'OK' ELSE 'MISMATCH' END) FROM cadastre.wf_job_instance WHERE id IN (SELECT id::int FROM s_wfjobinstance);
-SELECT format('%-22s file %6s | in database %6s  %s', 'task instances', $(rows wfTaskInstance), count(*), CASE WHEN count(*) = $(rows wfTaskInstance) THEN 'OK' ELSE 'MISMATCH' END) FROM cadastre.wf_task_instance WHERE id IN (SELECT id::int FROM s_wftaskinstance);
+SELECT format('%-22s file %6s | in database %6s  %s', 'job instances', $(rows wfjobInstance), count(*), CASE WHEN count(*) = $(rows wfjobInstance) THEN 'OK' ELSE 'MISMATCH' END) FROM cadastre.wf_job_instance w JOIN s_wfjobinstance s ON s.id::int = w.id WHERE w.source = 'aumentum';
+SELECT format('%-22s file %6s | in database %6s  %s', 'task instances', $(rows wfTaskInstance), count(*), CASE WHEN count(*) = $(rows wfTaskInstance) THEN 'OK' ELSE 'MISMATCH' END) FROM cadastre.wf_task_instance t JOIN s_wftaskinstance s ON s.id::int = t.id AND s.jobInstanceID::int = t.job_instance_id;
+-- Clashes: an Aumentum id already used here for a job or task of this Cadastre (kept, not overwritten).
+SELECT format('%-22s jobs %6s | tasks %6s  %s', 'number clashes',
+  (SELECT count(*) FROM s_wfjobinstance s JOIN cadastre.wf_job_instance w ON w.id = s.id::int WHERE w.source IS DISTINCT FROM 'aumentum'),
+  (SELECT count(*) FROM s_wftaskinstance s JOIN cadastre.wf_task_instance t ON t.id = s.id::int WHERE t.job_instance_id <> s.jobInstanceID::int),
+  CASE WHEN EXISTS (SELECT 1 FROM s_wfjobinstance s JOIN cadastre.wf_job_instance w ON w.id = s.id::int WHERE w.source IS DISTINCT FROM 'aumentum')
+         OR EXISTS (SELECT 1 FROM s_wftaskinstance s JOIN cadastre.wf_task_instance t ON t.id = s.id::int WHERE t.job_instance_id <> s.jobInstanceID::int)
+       THEN 'CHECK: Aumentum rows with these numbers were not loaded' ELSE 'OK' END);
+SELECT format('%-22s next new job #%s, next task #%s', 'this Cadastre''s range',
+  (SELECT last_value + 1 FROM cadastre.wf_job_instance_seq), (SELECT last_value + 1 FROM cadastre.wf_task_instance_seq));
 SELECT format('%-22s file %6s | reserved %6s  (ledger now %s; next UPIN PL%s)', 'UPIN register', $(rows UPIN),
   (SELECT count(*) FROM cadastre.issued_upin WHERE source = 'aumentum:register'), (SELECT count(*) FROM cadastre.issued_upin),
   lpad((SELECT CASE WHEN is_called THEN last_value + 1 ELSE last_value END FROM cadastre.parcel_number_seq)::text, 12, '0'));

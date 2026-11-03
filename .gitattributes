@@ -1,0 +1,4 @@
+# Windows scripts must be CRLF (cmd.exe misreads labels/goto in LF-only batch files).
+deploy/windows/*.cmd text eol=crlf
+deploy/windows/*.ps1 text eol=crlf
+deploy/windows/*.env.example text eol=crlf

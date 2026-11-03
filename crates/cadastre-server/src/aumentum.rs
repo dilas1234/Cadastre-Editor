@@ -26,6 +26,11 @@ fn envelope(op: &str, inner: &str) -> String {
 }
 
 impl UpinCheck {
+    /// Whether the parallel-run check is configured on this server.
+    pub fn configured() -> bool {
+        std::env::var("CADASTRE_AUMENTUM_JOBSERVICE_URL").ok().is_some_and(|s| !s.trim().is_empty())
+    }
+
     /// Signed in to Aumentum's job service, or `Ok(None)` when the check is not configured.
     pub async fn connect() -> Result<Option<Self>, String> {
         let Some(url) = std::env::var("CADASTRE_AUMENTUM_JOBSERVICE_URL").ok().map(|s| s.trim().to_string()).filter(|s| !s.is_empty()) else {

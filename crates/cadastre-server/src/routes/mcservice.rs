@@ -156,18 +156,7 @@ pub fn transaction_from_parameters(p: &str) -> Option<String> {
         .filter(|v| !v.is_empty())
 }
 
-/// Aumentum's Azimuth (decimal degrees from grid north) and Bearing (D°M'S") of a leg.
-pub fn azimuth_bearing(from: (f64, f64), to: (f64, f64)) -> (f64, String, String) {
-    let (de, dn) = (to.0 - from.0, to.1 - from.1);
-    let dist = (de * de + dn * dn).sqrt();
-    let mut az = de.atan2(dn).to_degrees();
-    if az < 0.0 {
-        az += 360.0;
-    }
-    let total = (az * 3600.0).round() as i64 % (360 * 3600);
-    let (d, m, s) = (total / 3600, (total % 3600) / 60, total % 60);
-    (dist, format!("{az:.6}"), format!("{d}°{m:02}'{s:02}\""))
-}
+pub use crate::report::azimuth_bearing;
 
 fn job_instance_xml(name: &str, r: &sqlx::postgres::PgRow) -> String {
     format!(
@@ -516,18 +505,9 @@ async fn call(state: &AppState, user: &str, op: &str, p: &HashMap<String, String
         }
         "GetParcelPointsData" => {
             let upin = str_param(p, "pUpin").ok_or("missing pUpin")?.to_uppercase();
-            let pts = sqlx::query(
-                "WITH g AS (SELECT (ST_Dump(geom)).geom AS poly FROM cadastre.parcel WHERE parcel_number = $1 AND status = 'posted' LIMIT 1), \
-                      v AS (SELECT (d).path[1] AS i, (d).geom AS pt FROM (SELECT ST_DumpPoints(ST_ExteriorRing(poly)) AS d FROM g) x) \
-                 SELECT ST_X(pt) AS e, ST_Y(pt) AS n, (SELECT b.number FROM cadastre.beacon b WHERE ST_DWithin(b.geom, ST_Transform(pt, ST_SRID(b.geom)), 0.05) \
-                        ORDER BY ST_Distance(b.geom, ST_Transform(pt, ST_SRID(b.geom))) LIMIT 1) AS name FROM v ORDER BY i",
-            )
-            .bind(&upin).fetch_all(&state.pool).await.map_err(db)?;
-            let pts: Vec<(f64, f64, String)> = pts.iter().enumerate().map(|(i, r)| (r.get("e"), r.get("n"), r.get::<Option<String>, _>("name").unwrap_or_else(|| format!("P{}", i + 1)))).collect();
-            let legs: String = pts.windows(2).map(|w| {
-                let (dist, az, brg) = azimuth_bearing((w[0].0, w[0].1), (w[1].0, w[1].1));
-                format!("<PointInformationDTO>{}{}{}{}{}{}{}{}{}</PointInformationDTO>", el("FromPointName", &w[0].2), el("FromNorth", w[0].1), el("FromEast", w[0].0),
-                    el("ToPointName", &w[1].2), el("ToNorth", w[1].1), el("ToEast", w[1].0), el("Distance", format!("{dist:.3}")), el("Azimuth", az), el("Bearing", brg))
+            let legs: String = crate::report::parcel_legs(&state.pool, &upin).await.map_err(db)?.iter().map(|l| {
+                format!("<PointInformationDTO>{}{}{}{}{}{}{}{}{}</PointInformationDTO>", el("FromPointName", &l.from), el("FromNorth", l.from_n), el("FromEast", l.from_e),
+                    el("ToPointName", &l.to), el("ToNorth", l.to_n), el("ToEast", l.to_e), el("Distance", format!("{:.3}", l.distance)), el("Azimuth", &l.azimuth), el("Bearing", &l.bearing))
             }).collect();
             format!("<GetParcelPointsDataResult>{legs}</GetParcelPointsDataResult>")
         }
