@@ -676,12 +676,34 @@ pub async fn parcel_work(State(state): State<AppState>, Path(upin): Path<String>
                                     WHERE p.parcel_number = $1 AND w.lrs_transaction_number IS NOT NULL ORDER BY w.id DESC LIMIT 1")
             .bind(&upin).fetch_optional(&state.pool).await?.flatten(),
     };
-    let job = match &txn {
+    let mut job = match &txn {
         Some(t) => sqlx::query("SELECT j.id, j.name, tk.name AS task FROM cadastre.wf_job_instance j JOIN cadastre.wf_job_status s ON s.code = j.status \
                                 LEFT JOIN cadastre.wf_task tk ON tk.id = j.current_task_id WHERE j.lrs_transaction_number = $1 AND s.is_open ORDER BY j.id DESC LIMIT 1")
             .bind(t).fetch_optional(&state.pool).await?,
         None => None,
     };
+    // Fallback: links that reached the attributes without a sync event (Aumentum-era links) carry
+    // no transaction. An open job for the parcel's file still serves it: found by its linkage
+    // (property number / LRSID) or by its name Job-<file number> / Job-<UPIN>, and its
+    // transaction is the parcel's.
+    let mut txn = txn;
+    if txn.is_none() {
+        job = sqlx::query(
+            "SELECT j.id, j.name, tk.name AS task, j.lrs_transaction_number FROM cadastre.wf_job_instance j \
+             JOIN cadastre.wf_job_status s ON s.code = j.status \
+             LEFT JOIN cadastre.wf_job_linkage l ON l.wf_job_instance_id = j.id \
+             LEFT JOIN cadastre.wf_task tk ON tk.id = j.current_task_id \
+             WHERE s.is_open AND j.lrs_transaction_number IS NOT NULL AND j.lrs_transaction_number <> '' \
+               AND ((NULLIF($2, '') IS NOT NULL AND upper(l.property_number) = upper($2)) \
+                 OR (NULLIF($3, '') IS NOT NULL AND upper(l.lrs_id) = upper($3)) \
+                 OR upper(j.name) = upper('Job-' || $1) \
+                 OR (NULLIF($2, '') IS NOT NULL AND upper(j.name) = upper('Job-' || $2))) \
+             ORDER BY j.id DESC LIMIT 1",
+        )
+        .bind(&upin).bind(&pn).bind(&su)
+        .fetch_optional(&state.pool).await?;
+        txn = job.as_ref().and_then(|j| j.get::<Option<String>, _>("lrs_transaction_number"));
+    }
     Ok(Json(ParcelWorkDto {
         upin, linked, su_id: su, property_number: pn, transaction_number: txn,
         job_instance_id: job.as_ref().map(|j| j.get("id")), job_name: job.as_ref().and_then(|j| j.get("name")), current_task: job.and_then(|j| j.get("task")),
