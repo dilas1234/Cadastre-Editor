@@ -3981,7 +3981,7 @@ function doneCard(j) {
   const conf = j.confirmation;
   return h("div", { class: "regCard " + (mine ? "job" : "gone"), title: "Double-click to zoom", ondblclick: () => firstUpin && registryZoom(firstUpin) },
     h("div", { class: "regCardTop" }, h("span", { class: "regUpin" }, j.property_number || j.name || "#" + j.id),
-      h("span", { class: "regPill " + (mine ? "ok" : "gone") }, mine ? "New editor" : "Aumentum")),
+      h("span", { class: "regPill " + (mine ? "ok" : "gone") }, mine ? "Plagis editor" : "Aumentum")),
     regStatus(linked.length ? "job" : "wait", linked.length ? `Linked: ${linked.map((p) => p.upin).join(", ")}` : upins.length ? `Committed ${upins.join(", ")} · not linked yet` : "Completed (no parcel found)"),
     h("div", { class: "regKv" },
       h("div", {}, h("i", {}, "Job"), `${j.name || ""} (#${j.id}) · ${j.job_type}`),
@@ -4000,7 +4000,7 @@ function renderCompleted() {
   const run = () => { done.q = q.value.trim(); doneLoad(true); };
   q.addEventListener("keydown", (e) => e.key === "Enter" && run());
   const src = h("select", { onchange: (e) => { done.source = e.target.value; doneLoad(true); } },
-    ...[["", "All"], ["cadastre", "New editor"], ["aumentum", "Aumentum"]].map(([v, l]) => h("option", { value: v, selected: done.source === v }, l)));
+    ...[["", "All"], ["cadastre", "Plagis editor"], ["aumentum", "Aumentum"]].map(([v, l]) => h("option", { value: v, selected: done.source === v }, l)));
   box.append(h("div", { class: "frow", style: "margin:6px 8px 2px" }, q, h("button", { class: "btn", style: "min-width:0", onclick: run }, "Find"), src),
     h("div", { class: "muted", style: "margin:0 8px 4px" }, done.busy && !done.jobs.length ? "Loading…" : `${done.total.toLocaleString()} completed job(s)${done.q ? ` matching “${done.q}”` : ""}, newest first`),
     done.regErr ? h("div", { class: "muted", style: "margin:0 8px 4px;color:#a35a00" }, `Registry details not shown: ${done.regErr}`) : null,
