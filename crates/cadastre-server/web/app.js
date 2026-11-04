@@ -2282,6 +2282,33 @@ async function saveSketchJobArea() {
     renderWorkflow();
   } catch (e) { uiAlert("Saving the job area failed: " + e.message); }
 }
+// Digitize Parcel (Construct Parcel / Create Parcel steps). The points typed or pasted for the job
+// area are the parcel's corners from the survey plan, so they are not asked for again: an empty
+// sketch starts from the job area's points (beacon numbers that came with them are kept by
+// coordinates), and the digitiser checks them and presses Finish Sketch. Not when the job already
+// has a draft parcel, nor from the box the editor makes itself when no job area was drawn.
+function isAutoJobArea(g) {
+  const ring = g?.coordinates?.[0] || [];
+  const pts = ring.slice(0, -1);
+  if (pts.length !== 4) return false;
+  return pts.every((p, i) => { const q = pts[(i + 1) % 4]; return Math.abs(p[0] - q[0]) < 0.001 || Math.abs(p[1] - q[1]) < 0.001; });
+}
+function digitizeParcel() {
+  selectTemplate("parcel");
+  if (!edit.active) startEditing("sketch"); else setTool("sketch");
+  const area = wf.editing?.area_utm;
+  if (edit.verts.length || !area || (wf.editing?.drafts || 0) > 0) {
+    if ((wf.editing?.drafts || 0) > 0) status("The job already has a draft parcel: click it with the Edit tool to change it, or sketch another.");
+    return;
+  }
+  if (isAutoJobArea(area)) { status("Click the parcel's corners on the map (the job area was made automatically, so there are no plan points to load)."); return; }
+  const ring = (area.coordinates?.[0] || []).slice(0, -1).map((c) => [c[0], c[1]]);
+  if (ring.length < 3) return;
+  edit.verts = ring; edit.sel = ring.length - 1; edit.editingId = null;
+  afterVertexChange(); showSketchExtent(true);
+  const named = ring.filter(([e, n]) => pointIds.get(ptKey(e, n))).length;
+  notify(`Loaded the ${ring.length} points you entered for the job area${named ? ` (${named} with beacon numbers)` : ""}. Check them, then Finish Sketch.`);
+}
 // The bounding box of a set of UTM vertices, expanded by `margin` metres, as a closed ring.
 function bboxRingUTM(verts, margin) {
   let minE = Infinity, minN = Infinity, maxE = -Infinity, maxN = -Infinity;
@@ -2746,7 +2773,7 @@ async function verifyPoints(utm) {
     h("tr", {}, h("th", {}, "#"), h("th", {}, "Beacon"), h("th", {}, "Easting"), h("th", {}, "Northing"), h("th", {}, "Source"), h("th", {}, "To next (m)")));
   ids.forEach((id, i) => {
     const isNew = id.source !== "beacon";
-    const label = cornerLabel(id, isNew ? ++k : 0);
+    const label = cornerLabel(id, isNew && !pointIds.get(ptKey(id.easting, id.northing)) ? ++k : 0);
     const cell = isNew
       ? h("input", { class: "uiInput", style: "margin:0;width:118px", value: pointIds.get(ptKey(id.easting, id.northing)) || "", placeholder: label })
       : h("b", {}, label);
@@ -2842,7 +2869,7 @@ function openSketchProps() {
   edit.verts.forEach(([E, N], i) => {
     const id = known && known[i];
     const bcell = h("td", { class: id ? `src-${id.source}` : "muted", title: id ? (id.source === "shared" ? `Shared corner (${id.shared_with.join(", ")})` : CORNER_SOURCE[id.source]) : "Checking…" },
-      id ? cornerLabel(id, id.source !== "beacon" ? ++newNo : 0) : "…");
+      id ? cornerLabel(id, id.source !== "beacon" && !pointIds.get(ptKey(id.easting, id.northing)) ? ++newNo : 0) : "…");
     const x = h("input", { type: "number", step: "0.001", value: E.toFixed(3), style: "width:92px" });
     const y = h("input", { type: "number", step: "0.001", value: N.toFixed(3), style: "width:92px" });
     x.oninput = () => { const v = parseFloat(x.value); if (isFinite(v)) { edit.verts[i][0] = v; drawSketch(); } };
@@ -4550,10 +4577,10 @@ function wfStepAction(s) {
     case 1007: return { run: needJob(() => openTask("survey")), tip: "Enter the survey (COGO traverse)" };
     // Aumentum's Construct Parcel / Create Parcel steps carry several tools: offer exactly those.
     case 1019: return { run: needJob(() => stepTools("Construct Parcel", [
-      ["Digitize Parcel (Sketch)", () => { edit.template = "parcel"; startEditing("sketch"); selectTemplate("parcel"); }],
+      ["Digitize Parcel (Sketch)", digitizeParcel],
       ["Import Feature Class…", fciDialog], ["COGO Tools (survey entry)…", () => openTask("survey")], ["Computation Tools (35)…", openComputeTools]])), tip: "Construct the parcel: digitize, import a feature class, or COGO" };
     case 3: return { run: needJob(() => stepTools("Create Parcel", [
-      ["Digitize Parcel (Sketch)", () => { edit.template = "parcel"; startEditing("sketch"); selectTemplate("parcel"); }],
+      ["Digitize Parcel (Sketch)", digitizeParcel],
       ["COGO Tools (survey entry)…", () => openTask("survey")], ["Create Connection Line…", connectionLineDialog], ["Create Multi Point Line…", multiPointLineDialog],
       ["Create Donut Parcel (sketch the hole, then click the parcel)", () => startPickDraft("donut")], ["Parcel Separation (sketch the line, then click the parcel)", () => startPickDraft("separate")],
       ["Move Point…", movePointDialog], ["Point Attributes…", pointAttributesDialog], ["List Control Points…", listControlPoints]])), tip: "Create the parcel with Aumentum's computation tools" };
