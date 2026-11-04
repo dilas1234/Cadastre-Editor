@@ -2210,7 +2210,7 @@ function startEditing(tool = "sketch") {
 }
 async function stopEditing() {
   if (edit.verts.length && !(await uiConfirm("You have an unfinished sketch. Discard it and stop editing?", { ok: "Discard", kind: "warn" }))) return;
-  edit.active = false; clearSketch();
+  edit.active = false; clearSketch(); orthoClose();
   $("createFeaturesWin")?.remove(); $("sketchPropsWin")?.remove();
   setTool("pan"); updateEditorButtons(); status("Editing stopped.");
 }
@@ -2350,6 +2350,7 @@ function orthoOpen() {
       finishBtn));
   floatWindow("Orthophoto — actual view of the plot", body, { id: "orthoWin", width: 460 });
   const w = $("orthoWin"); const r = $("mapFrame").getBoundingClientRect();
+  w?.querySelector(".fhead .fx")?.addEventListener("click", () => { ortho.map?.remove(); ortho.map = null; ortho.dismissed = true; });
   if (w) { w.style.left = Math.max(r.left + 8, r.right - 470) + "px"; w.style.top = (r.top + 8) + "px"; }
   const m = new maplibregl.Map({
     container: box, attributionControl: { compact: true }, maxZoom: 21, boxZoom: false, doubleClickZoom: true,
@@ -2389,7 +2390,14 @@ function orthoRing() {
   const a = wf.editing?.area_utm?.coordinates?.[0];
   return a && a.length >= 4 ? a.slice(0, -1).map((c) => [c[0], c[1]]) : null;
 }
+function orthoClose() { ortho.map?.remove(); ortho.map = null; $("orthoWin")?.remove(); ortho.dismissed = false; }
 function orthoSketchChanged() {
+  // It appears by itself while a parcel is being sketched (however the sketch was started), unless
+  // the digitiser closed it for this sketch.
+  if (!$("orthoWin") && edit.active && edit.template === "parcel" && edit.geomType === "polygon" && edit.verts.length && !ortho.dismissed) {
+    setTimeout(() => { if (!$("orthoWin")) orthoOpen(); }, 0);
+    return;
+  }
   if (!$("orthoWin") || !ortho.map) return;
   clearTimeout(ortho.timer); ortho.timer = setTimeout(orthoUpdate, 400);
 }
@@ -2487,7 +2495,7 @@ async function saveSketchParcel() {
   if (!state.job.reference.startsWith("WF-")) notify(`Parcel saved to ${state.job.reference}, which is not a workflow job. To work as in Aumentum, open the job in the Workflow panel and choose Work On This Job.`, "warn");
   else notify(`${editingId ? "Draft parcel updated" : "Parcel saved as a draft"} in ${state.job.reference}. ${draftNextStep()}`);
   zoomToUTMRing(utm);
-  clearSketch(); refreshSketchProps(); updateEditorButtons();
+  clearSketch(); orthoClose(); refreshSketchProps(); updateEditorButtons();
   try { await loadDrafts(); buildCatalog(); wfRefreshEditing(); renderWorkflow(); } catch { /* the draft is saved; the view refreshes later */ }
   // Attributes: the values already captured on this draft, else the job's Registry defaults.
   let prefill = {};
@@ -2565,6 +2573,19 @@ async function parcelAttrDialog(opts = {}) {
     const sel = (key, opts, val) => { const s = h("select", { style: "flex:1;min-width:0" }, ...opts.map((o) => h("option", { selected: o === (val || "") }, o))); f[key] = s; return s; };
     // A Registry list as a dropdown. A value already on the parcel that is not in the list (the
     // codes 1 to 4 Aumentum stored) is kept and shown as it is; with no list, a text box.
+    // Location: every place the Registry knows — its 4 zones, then its areas and layouts — typed
+    // to search (e.g. "Bukuru"); free text stays possible, and Aumentum's codes 1 to 4 are kept.
+    const placeSearch = (key, val) => {
+      const lists = [["location", "Zone"], ["property_area", "Area"], ["layout_type", "Layout"]];
+      const id = "places-" + key;
+      const dl = h("datalist", { id }, ...lists.flatMap(([k, kind]) => (places[k] || []).map((x) => h("option", { value: x.label, label: kind }))));
+      const n = lists.reduce((t, [k]) => t + (places[k] || []).length, 0);
+      const i = h("input", { list: id, value: val || "", style: "flex:1;min-width:0", autocomplete: "off",
+        placeholder: n ? `Type to search ${n.toLocaleString()} Registry places` : "Location",
+        title: places.stale ? `Registry list from ${String(places.fetched_at || "").slice(0, 10)} (the Registry could not be reached)` : "From the Registry: zones, areas and layouts" });
+      f[key] = i;
+      return h("span", { style: "flex:1;min-width:0;display:flex" }, i, dl);
+    };
     const placeSelect = (key, list, val) => {
       if (!list || !list.length) return txt(key, val);
       const labels = list.map((x) => x.label);
@@ -2584,7 +2605,7 @@ async function parcelAttrDialog(opts = {}) {
       row("Property Type:", sel("property_type", PROPERTY_TYPES, pv("property_type", link.property_type || "Land Parcel"))),
       row("Property Number:", txt("property_number", pv("property_number", link.property_number || jobNo))),
       row("Plot:", txt("plot", pv("plot", link.plot || ""))),
-      row("Location:", placeSelect("location", places.location, pv("location", regProp?.location || ""))),
+      row("Location:", placeSearch("location", pv("location", regProp?.location || ""))),
       row("Plan Number:", txt("plan_number", pv("plan_number", link.plan_number || ""))),
       row("LGA:", sel("lga", ["", ...PLATEAU_LGAS], pv("lga", link.lga || ""))),
       row("Status:", sel("status", PARCEL_STATUSES, pv("status", "Active"))),
