@@ -730,6 +730,68 @@ pub async fn link_job(State(state): State<AppState>, user: AuthUser, Path(id): P
     Ok(Json(out))
 }
 
+/// The title deed queue: files the Registry has at Raise Title Deed Plan (C of O processing) whose
+/// property the Registry admin has linked (holds a UPIN), read live from the Registry, with what this
+/// Cadastre has for each (the parcel, the title deed job, the plan sent). The title deed unit works
+/// them from here; the link itself stays with the Registry admin (Aumentum's flow).
+#[utoipa::path(get, path = "/api/v1/registry/title-deed-queue", tag = "registry", responses((status = 200)))]
+pub async fn title_deed_queue(State(state): State<AppState>) -> ApiResult<Json<serde_json::Value>> {
+    let cfg = config()?;
+    let session = Session::start(&cfg).await.map_err(registry_err)?;
+    let read = async {
+        let open = session.query(
+            "select ph.TransactionId, ph.TaskName, ph.TaskDescription, ph.TaskCreate from com.landsystems.lrs.model.ProcessHistory ph \
+             where ph.TaskComplete is null and ph.ProcessName = 'Raise Title Deed Plan'", 20000).await.map_err(registry_err)?;
+        let mut stage: std::collections::HashMap<String, (String, String, String)> = std::collections::HashMap::new();
+        for r in open.iter().filter(|r| r.len() >= 4) {
+            stage.insert(r[0].trim().to_string(), (r[1].trim().to_string(), r[2].trim().to_string(), r[3].trim().to_string()));
+        }
+        let ids: Vec<String> = stage.keys().filter(|k| k.chars().all(|c| c.is_ascii_digit()) && !k.is_empty()).cloned().collect();
+        let mut props = Vec::new();
+        for chunk in ids.chunks(300) {
+            let rows = session.query(&format!(
+                "select t.Id, t.TransactionNumber, s.SuID, s.Refnum, s.Upin, s.SpatialDate1 from com.landsystems.lrs.model.Transaction t \
+                 join t.Properties l join l.SpatialUnits s where t.Id in ({}) and l.EndLifespanVersion is null and s.EndLifespanVersion is null \
+                 and s.Upin is not null and s.Upin <> ''", chunk.join(",")), 5000).await.map_err(registry_err)?;
+            props.extend(rows);
+        }
+        Ok::<_, AppError>((stage, props))
+    }.await;
+    session.end().await;
+    let (stage, props) = read?;
+    let upins: Vec<String> = props.iter().filter(|r| r.len() >= 6).map(|r| r[4].trim().to_uppercase()).collect();
+    let txns: Vec<String> = props.iter().filter(|r| r.len() >= 6).map(|r| r[1].trim().to_uppercase()).collect();
+    // What this Cadastre has: the committed parcel; the latest job of the transaction; the plan sent.
+    let parcels: Vec<(String, Option<chrono::DateTime<chrono::Utc>>)> = sqlx::query_as(
+        "SELECT parcel_number, posted_at FROM cadastre.parcel WHERE status = 'posted' AND parcel_number = ANY($1)").bind(&upins).fetch_all(&state.pool).await?;
+    let jobs: Vec<(String, i32, String, bool)> = sqlx::query_as(
+        "SELECT DISTINCT ON (upper(j.lrs_transaction_number)) upper(j.lrs_transaction_number), j.id, s.label, s.is_open FROM cadastre.wf_job_instance j \
+         JOIN cadastre.wf_job_status s ON s.code = j.status WHERE upper(j.lrs_transaction_number) = ANY($1) ORDER BY upper(j.lrs_transaction_number), j.id DESC")
+        .bind(&txns).fetch_all(&state.pool).await?;
+    let sent: Vec<(String, chrono::DateTime<chrono::Utc>, String)> = sqlx::query_as(
+        "SELECT DISTINCT ON (upper(payload->>'transaction_number')) upper(payload->>'transaction_number'), created_at, action FROM cadastre.audit_log \
+         WHERE action IN ('registry_plan_sent', 'registry_plan_withdrawn') AND upper(payload->>'transaction_number') = ANY($1) \
+         ORDER BY upper(payload->>'transaction_number'), id DESC").bind(&txns).fetch_all(&state.pool).await?;
+    let mut files: Vec<serde_json::Value> = props.iter().filter(|r| r.len() >= 6).map(|r| {
+        let (tid, txn, upin) = (r[0].trim(), r[1].trim().to_uppercase(), r[4].trim().to_uppercase());
+        let (task, task_label, since) = stage.get(tid).cloned().unwrap_or_default();
+        let parcel = parcels.iter().find(|p| p.0 == upin);
+        let job = jobs.iter().find(|j| j.0 == txn);
+        let plan = sent.iter().find(|p| p.0 == txn);
+        serde_json::json!({
+            "transaction_number": txn, "su_id": r[2].trim(), "property_number": r[3].trim(), "upin": upin,
+            "linked_at": lrs::parse_datetime(&r[5]).map(|d| d.format("%Y-%m-%dT%H:%M:%S").to_string()),
+            "stage": task, "stage_label": task_label, "stage_since": lrs::parse_datetime(&since).map(|d| d.format("%Y-%m-%dT%H:%M:%S").to_string()),
+            "in_cadastre": parcel.is_some(), "committed_at": parcel.and_then(|p| p.1).map(|t| t.to_rfc3339()),
+            "job_instance_id": job.map(|j| j.1), "job_status": job.map(|j| j.2.clone()), "job_open": job.map(|j| j.3),
+            "plan": plan.map(|p| serde_json::json!({ "action": p.2, "at": p.1.to_rfc3339() })),
+        })
+    }).collect();
+    files.sort_by(|a, b| b["stage_since"].as_str().cmp(&a["stage_since"].as_str()));
+    let waiting = stage.len();
+    Ok(Json(serde_json::json!({ "files": files, "at_stage": waiting, "linked": files.len(), "read_at": chrono::Utc::now().to_rfc3339() })))
+}
+
 /// Plans this Cadastre has sent for a job (audit), newest first.
 #[utoipa::path(get, path = "/api/v1/wf/jobs/{id}/registry/sent", tag = "registry", params(("id" = i32, Path, description = "Job instance id")),
     responses((status = 200)))]

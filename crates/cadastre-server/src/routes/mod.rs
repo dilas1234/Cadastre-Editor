@@ -128,6 +128,7 @@ pub fn router(state: AppState) -> Router {
         .route("/api/v1/registry/find", get(registry::find))
         .route("/api/v1/registry/lookups", get(registry::lookups))
         .route("/api/v1/registry/link-problems", get(registry::link_problems))
+        .route("/api/v1/registry/title-deed-queue", get(registry::title_deed_queue))
         .route("/api/v1/wf/jobs/{id}/registry/link", post(registry::link_job))
         .route("/api/v1/registry/parcels/{upin}/work", get(registry::parcel_work))
         .route("/api/v1/registry/start-digitising", post(registry::start_digitising))

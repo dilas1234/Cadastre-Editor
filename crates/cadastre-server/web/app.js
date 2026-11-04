@@ -3963,7 +3963,37 @@ async function openCompleted() {
   showCompleted(true); buildTocTools();
   if (!done.loaded) await doneLoad(true); else renderCompleted();
 }
+// The title deed queue: files the Registry has at Raise Title Deed Plan, linked by the Registry admin.
+async function queueLoad() {
+  done.busy = true; done.err = ""; renderCompleted();
+  try { done.queue = await api("/api/v1/registry/title-deed-queue"); done.queueLoaded = true; } catch (e) { done.err = e.message; done.queue = null; }
+  done.busy = false; renderCompleted();
+}
+function queueCard(f) {
+  const stageAge = f.stage_since ? fmtDT(f.stage_since) : "—";
+  const job = f.job_instance_id ? `#${f.job_instance_id} (${f.job_status})` : "none yet";
+  const plan = f.plan ? `${f.plan.action === "registry_plan_withdrawn" ? "Withdrawn" : "Sent"} ${fmtDT(f.plan.at)}` : "Not sent from this editor";
+  const actions = [];
+  if (f.in_cadastre) actions.push(regLink("Zoom", "Zoom to the parcel", () => registryZoom(f.upin)));
+  actions.push(regLink("Title deed plan", "Open (or start) the file's title deed job and its plan", async () => {
+    if (f.job_instance_id && f.job_open) { await openWorkflow(); await wfSelect(f.job_instance_id); titleDeedDialog(f.job_instance_id, f.upin); }
+    else startEditParcel(f.upin);
+  }, !f.in_cadastre));
+  actions.push(regLink("Point List", "Beacons, bearings and distances", () => pointListWindow(f.upin), !f.in_cadastre));
+  return h("div", { class: "regCard " + (f.in_cadastre ? "job" : "wait") },
+    h("div", { class: "regCardTop" }, h("span", { class: "regUpin" }, f.property_number || f.transaction_number), h("span", { class: "regPill ok" }, f.stage_label || f.stage)),
+    regStatus(f.in_cadastre ? "job" : "wait", f.in_cadastre ? `Linked to ${f.upin}` : `Linked to ${f.upin}, which is not a parcel in this Cadastre`),
+    h("div", { class: "regKv" },
+      h("div", {}, h("i", {}, "Transaction"), f.transaction_number),
+      h("div", {}, h("i", {}, "Property"), f.su_id),
+      h("div", {}, h("i", {}, "Linked"), f.linked_at ? fmtDT(f.linked_at) : "— (no link date in the Registry)"),
+      h("div", {}, h("i", {}, "At stage since"), stageAge),
+      h("div", {}, h("i", {}, "Job here"), job),
+      h("div", {}, h("i", {}, "Plan"), plan)),
+    h("div", { class: "regCardFoot" }, h("span", { class: "regLinks" }, ...actions)));
+}
 async function doneLoad(reset) {
+  if (done.source === "queue") { await queueLoad(); return; }
   if (reset) { done.offset = 0; done.jobs = []; }
   done.busy = true; done.err = ""; renderCompleted();
   try {
@@ -4016,14 +4046,26 @@ function renderCompleted() {
   const box = $("doneBody"); if (!box) return;
   box.innerHTML = "";
   const q = h("input", { class: "tinput", value: done.q, placeholder: "File, transaction or UPIN (e.g. PL68928)", style: "flex:1;min-width:0" });
-  const run = () => { done.q = q.value.trim(); doneLoad(true); };
+  const run = () => { done.q = q.value.trim(); if (done.source === "queue" && done.queueLoaded) renderCompleted(); else doneLoad(true); };
   q.addEventListener("keydown", (e) => e.key === "Enter" && run());
   const src = h("select", { onchange: (e) => { done.source = e.target.value; doneLoad(true); } },
-    ...[["", "All"], ["cadastre", "Plagis editor"], ["aumentum", "Aumentum"]].map(([v, l]) => h("option", { value: v, selected: done.source === v }, l)));
+    ...[["queue", "Title deed queue (Registry)"], ["", "All completed"], ["cadastre", "Plagis editor"], ["aumentum", "Aumentum"]].map(([v, l]) => h("option", { value: v, selected: done.source === v }, l)));
   box.append(h("div", { class: "frow", style: "margin:6px 8px 2px" }, q, h("button", { class: "btn", style: "min-width:0", onclick: run }, "Find"), src),
-    h("div", { class: "muted", style: "margin:0 8px 4px" }, done.busy && !done.jobs.length ? "Loading…" : `${done.total.toLocaleString()} completed job(s)${done.q ? ` matching “${done.q}”` : ""}, newest first`),
-    done.regErr ? h("div", { class: "muted", style: "margin:0 8px 4px;color:#a35a00" }, `Registry details not shown: ${done.regErr}`) : null,
-    done.err ? h("div", { style: "margin:0 8px 4px;color:#b00" }, done.err) : null);
+    done.source === "queue" ? null : h("div", { class: "muted", style: "margin:0 8px 4px" }, done.busy && !done.jobs.length ? "Loading…" : `${done.total.toLocaleString()} completed job(s)${done.q ? ` matching “${done.q}”` : ""}, newest first`),
+    done.regErr && done.source !== "queue" ? h("div", { class: "muted", style: "margin:0 8px 4px;color:#a35a00" }, `Registry details not shown: ${done.regErr}`) : null,
+    done.err && done.source !== "queue" ? h("div", { style: "margin:0 8px 4px;color:#b00" }, done.err) : null);
+  if (done.source === "queue") {
+    const qv = normName(done.q);
+    const all = done.queue?.files || [];
+    const files = all.filter((f) => !qv || normName(`${f.property_number} ${f.transaction_number} ${f.upin} ${f.su_id} ${f.stage_label}`).includes(qv));
+    box.append(h("div", { class: "muted", style: "margin:0 8px 4px" }, done.busy ? "Reading the Registry…" : done.queue
+      ? `${files.length.toLocaleString()} file(s) at Raise Title Deed Plan, linked by the Registry admin${qv ? ` matching “${done.q}”` : ""} (of ${done.queue.at_stage.toLocaleString()} at that stage) · read ${fmtDT(done.queue.read_at)}`
+      : ""));
+    if (done.err) box.append(h("div", { style: "margin:0 8px 4px;color:#b00" }, done.err));
+    for (const f of files.slice(0, 300)) box.append(queueCard(f));
+    if (files.length > 300) box.append(h("div", { class: "muted", style: "margin:6px 8px" }, `Showing 300 of ${files.length}: search to narrow.`));
+    return;
+  }
   for (const j of done.jobs) box.append(doneCard(j));
   if (done.jobs.length < done.total) box.append(h("div", { class: "frow", style: "margin:6px 8px 10px" },
     h("button", { class: "btn", disabled: done.busy, onclick: () => doneLoad(false) }, done.busy ? "Loading…" : `More (${(done.total - done.jobs.length).toLocaleString()} left)`)));
