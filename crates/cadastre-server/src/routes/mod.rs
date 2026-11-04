@@ -139,6 +139,7 @@ pub fn router(state: AppState) -> Router {
         .route("/api/v1/registry/history", get(registry::file_history))
         .route("/api/v1/wf/jobs/{id}/registry/link", post(registry::link_job))
         .route("/api/v1/registry/parcels/{upin}/work", get(registry::parcel_work))
+        .route("/api/v1/wf/correct-aumentum", post(completed::correct_aumentum))
         .route("/api/v1/registry/start-digitising", post(registry::start_digitising))
         .route("/api/v1/registry/transactions/{number}", get(registry::transaction))
         .route("/api/v1/registry/link", post(registry::link))

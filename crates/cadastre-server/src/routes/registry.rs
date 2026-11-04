@@ -177,7 +177,7 @@ fn registry_err(e: impl std::fmt::Display) -> AppError {
 
 /// A transaction number, property id or UPIN as typed: letters, digits and '-' only (they go
 /// into the Registry's HQL, as in Aumentum's query definitions).
-fn ident(kind: &str, v: &str) -> ApiResult<String> {
+pub(crate) fn ident(kind: &str, v: &str) -> ApiResult<String> {
     let v = v.trim();
     if v.is_empty() || v.len() > 40 || !v.chars().all(|c| c.is_ascii_alphanumeric() || c == '-') {
         return Err(AppError::BadRequest(format!("invalid {kind}: {v}")));
@@ -1063,20 +1063,26 @@ pub async fn start_digitising(State(state): State<AppState>, user: AuthUser, Jso
     if req.title_deed && digitised.is_empty() {
         return Err(AppError::Conflict(format!("{} is not digitised in this Cadastre yet: there is no parcel for its title deed.", file.as_deref().unwrap_or(&txn))));
     }
-    let job_type: i32 = sqlx::query_scalar("SELECT id FROM cadastre.wf_job_type WHERE active AND lower(name) = lower($1) ORDER BY id LIMIT 1")
-        .bind(registry_sync::setting(&state.pool, "registry.job_deedplan_creation").await?.unwrap_or_else(|| "Deed Plan Creationv2".into()))
-        .fetch_optional(&state.pool).await?.ok_or_else(|| AppError::Conflict("the job type Deed Plan Creationv2 is not active".into()))?;
-    let name = format!("Job-{}", file.as_deref().unwrap_or(&txn));
-    let params = format!("@LRS:[Transaction]:[TransactionNumber]={txn}");
-    let id = crate::routes::mcservice::create_job_instance(&state.pool, job_type, Some(&name), Some("Deed Plan Creationv2"), Some(&params), "1", &actor.label, "registry.start-digitising", true)
-        .await.map_err(AppError::UnprocessableEntity)?;
-    // The file's property number is what the parcels of this job carry (Update Parcel Attribute
-    // defaults to it). No LRSID: the parcel is linked only when the Registry admin links it.
-    if let Some(f) = &file {
-        sqlx::query("INSERT INTO cadastre.wf_job_linkage (wf_job_instance_id, property_number, linkage_status) VALUES ($1, $2, 0) ON CONFLICT (wf_job_instance_id) DO NOTHING")
-            .bind(id).bind(f).execute(&state.pool).await?;
-    }
+    let (id, name) = create_file_job(&state.pool, &actor.label, &txn, file.as_deref(), "registry.start-digitising").await?;
     Ok(Json(StartedJobDto { job_instance_id: id, name: Some(name), created: true }))
+}
+
+/// A new file job, as the Registry created them in Aumentum: "Deed Plan Creationv2", named
+/// Job-<file number>, parameters @LRS:[Transaction]:[TransactionNumber]=PLS…, with the file's
+/// property number on its linkage (no LRSID: the Registry admin links it).
+pub(crate) async fn create_file_job(pool: &sqlx::PgPool, actor: &str, txn: &str, file: Option<&str>, via: &str) -> ApiResult<(i32, String)> {
+    let job_type: i32 = sqlx::query_scalar("SELECT id FROM cadastre.wf_job_type WHERE active AND lower(name) = lower($1) ORDER BY id LIMIT 1")
+        .bind(registry_sync::setting(pool, "registry.job_deedplan_creation").await?.unwrap_or_else(|| "Deed Plan Creationv2".into()))
+        .fetch_optional(pool).await?.ok_or_else(|| AppError::Conflict("the job type Deed Plan Creationv2 is not active".into()))?;
+    let name = format!("Job-{}", file.unwrap_or(txn));
+    let params = format!("@LRS:[Transaction]:[TransactionNumber]={txn}");
+    let id = crate::routes::mcservice::create_job_instance(pool, job_type, Some(&name), Some("Deed Plan Creationv2"), Some(&params), "1", actor, via, true)
+        .await.map_err(AppError::UnprocessableEntity)?;
+    if let Some(f) = file {
+        sqlx::query("INSERT INTO cadastre.wf_job_linkage (wf_job_instance_id, property_number, linkage_status) VALUES ($1, $2, 0) ON CONFLICT (wf_job_instance_id) DO NOTHING")
+            .bind(id).bind(f).execute(pool).await?;
+    }
+    Ok((id, name))
 }
 
 #[derive(Debug, Serialize, ToSchema)]

@@ -378,7 +378,7 @@ pub async fn post_drafts_with_ids(conn: &mut sqlx::PgConnection, job_id: Uuid) -
         };
         // A new UPIN gets its attribute record here; so does a corrected parcel, which keeps its UPIN
         // but whose record went back to the draft (Correct). A pre-numbered parcel with a record keeps it.
-        let needs_record = fresh || !sqlx::query_scalar::<_, bool>("SELECT EXISTS (SELECT 1 FROM cadastre.parcel_attribute WHERE upin = $1)")
+        let needs_record = fresh || !sqlx::query_scalar::<_, bool>("SELECT EXISTS (SELECT 1 FROM cadastre.parcel_attribute WHERE upin = $1 AND (status = '0' OR status IS NULL))")
             .bind(&number).fetch_one(&mut *conn).await?;
         sqlx::query(
             "UPDATE cadastre.parcel \

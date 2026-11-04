@@ -1440,11 +1440,15 @@ async function pointListWindow(upin, draft) {
 async function correctAndRecommit(upin) {
   let d; try { d = await api("/api/v1/parcels/points?upin=" + encodeURIComponent(upin)); } catch (e) { uiAlert(e.message); return; }
   if (!d.can_correct) { await uiAlert(`${upin} cannot be corrected here: ${d.why_not}.`, { title: "Correct & Recommit", kind: "warn" }); return; }
-  const reason = await uiPrompt(`Correct ${upin} (${d.job_name || "job " + d.job_instance_id})?\n\nThe job is reopened with ${upin} back as a draft that keeps its UPIN, and its points open for correction. Then Finish Sketch, check, save the attributes and commit again. Reason:`, "", { title: "Correct & Recommit", ok: "Reopen and correct" });
+  const aum = d.committed_in === "aumentum";
+  const reason = await uiPrompt(aum
+    ? `Correct ${upin}?\n\nIt was committed in Aumentum. Its file's job is opened here (the open one, or a new Job-<file number> on its Active Registry transaction) with ${upin} back as a draft that keeps its UPIN, and its points open for correction. Then Finish Sketch, check, save the attributes and commit again. The correction is in the file's history. Reason:`
+    : `Correct ${upin} (${d.job_name || "job " + d.job_instance_id})?\n\nThe job is reopened with ${upin} back as a draft that keeps its UPIN, and its points open for correction. Then Finish Sketch, check, save the attributes and commit again. Reason:`, "", { title: "Correct & Recommit", ok: "Reopen and correct" });
   if (!reason || !reason.trim()) return;
   let r;
-  try { r = await api(`/api/v1/wf/jobs/${d.job_instance_id}/correct`, { method: "POST", body: { upin, reason: reason.trim() } }); }
+  try { r = await api(aum ? "/api/v1/wf/correct-aumentum" : `/api/v1/wf/jobs/${d.job_instance_id}/correct`, { method: "POST", body: { upin, reason: reason.trim() } }); }
   catch (e) { uiAlert("Correct refused: " + e.message); return; }
+  if (aum) { d.job_instance_id = r.job_instance_id; notify(`${upin}: ${r.created ? "new job" : "the file's open job"} ${r.job_name} (${r.transaction_number}).`); }
   for (const b of r.beacons || []) rememberPointId(b.easting, b.northing, b.number);
   // Keep the numbers of beacons shared with neighbours too (they stay in the fabric and are matched again).
   for (const p of d.points) if (!/^P\d+$/.test(p.beacon)) rememberPointId(p.easting, p.northing, p.beacon);
@@ -4212,6 +4216,7 @@ async function doneCorrect(j, parcels) {
     const pick = await uiPrompt(`Which parcel of ${j.name} to correct? (${parcels.map((p) => p.upin).join(", ")})`, upin, { title: "Correct" });
     if (!pick) return; upin = pick.trim().toUpperCase();
   }
+  if (j.source === "aumentum") { await correctAndRecommit(upin); done.loaded = false; return; }
   const reason = await uiPrompt(`Correct ${upin}?\n\nThe job is reopened at its commit step with ${upin} back as a draft (it keeps this UPIN). Fix the shape, beacons or attributes, commit again, then resend the corrected plan. Refused if the parcel is linked in the Registry (unlink it there first). Reason:`, "", { title: "Correct", ok: "Reopen to correct" });
   if (!reason || !reason.trim()) return;
   try {
