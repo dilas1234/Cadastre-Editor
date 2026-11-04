@@ -510,7 +510,8 @@ pub async fn send_plan(State(state): State<AppState>, user: AuthUser, Path(id): 
     }
     let txn = ident("transaction number", &txn)?;
     let sent_before: Option<chrono::DateTime<chrono::Utc>> = sqlx::query_scalar(
-        "SELECT max(created_at) FROM cadastre.audit_log WHERE entity = 'wf_job_instance' AND entity_id = $1 AND action = 'registry_plan_sent' AND payload->>'transaction_number' = $2")
+        "SELECT max(s.created_at) FROM cadastre.audit_log s WHERE s.entity = 'wf_job_instance' AND s.entity_id = $1 AND s.action = 'registry_plan_sent' AND s.payload->>'transaction_number' = $2 \
+           AND s.id > COALESCE((SELECT max(w.id) FROM cadastre.audit_log w WHERE w.entity = 'wf_job_instance' AND w.entity_id = $1 AND w.action = 'registry_plan_withdrawn'), 0)")
         .bind(id.to_string()).bind(&txn).fetch_one(&state.pool).await?;
     if let (Some(at), false) = (sent_before, req.resend) {
         return Err(AppError::Conflict(format!("the plan was already sent to {txn} ({} UTC). To correct it, use Resend corrected plan.", at.format("%Y-%m-%d %H:%M"))));
@@ -569,6 +570,62 @@ pub async fn send_plan(State(state): State<AppState>, user: AuthUser, Path(id): 
     tx.commit().await?;
     Ok(Json(serde_json::json!({ "transaction_number": t.transaction_number, "file_name": sent_name, "document_type": doc_type,
         "resend": resend, "replaced": replaced, "replace_note": replace_note })))
+}
+
+#[derive(Debug, Deserialize, ToSchema)]
+pub struct WithdrawPlanRequest {
+    /// Why the plan is withdrawn (recorded in the Registry document and the audit log).
+    pub reason: String,
+}
+
+/// Withdraw a job's title deed plan: the plan documents in the job's Registry transaction are
+/// marked "WITHDRAWN" (nothing is deleted in the Registry, as with a resend's "REPLACED"), and the
+/// saved title deed form is cleared. The parcel and its UPIN stay. A new plan can then be sent.
+#[utoipa::path(post, path = "/api/v1/wf/jobs/{id}/registry/withdraw-plan", tag = "registry", params(("id" = i32, Path, description = "Job instance id")),
+    request_body = WithdrawPlanRequest, responses((status = 200), (status = 409, description = "No plan sent, or writing turned off")))]
+pub async fn withdraw_plan(State(state): State<AppState>, user: AuthUser, Path(id): Path<i32>, Json(req): Json<WithdrawPlanRequest>) -> ApiResult<Json<serde_json::Value>> {
+    let actor = crate::routes::wf::resolve_actor(&state, &user).await?;
+    let reason = req.reason.trim().to_string();
+    if reason.is_empty() {
+        return Err(AppError::BadRequest("say why the plan is withdrawn".into()));
+    }
+    let txn: Option<String> = sqlx::query_scalar("SELECT lrs_transaction_number FROM cadastre.wf_job_instance WHERE id = $1").bind(id)
+        .fetch_optional(&state.pool).await?.ok_or_else(|| AppError::NotFound(format!("job instance {id}")))?;
+    let txn = ident("transaction number", txn.as_deref().map(str::trim).unwrap_or(""))?;
+    let cfg = write_config()?;
+    let doc_type = registry_sync::setting(&state.pool, "aumentum.Integration.SurveyPlanFromMC").await?.unwrap_or_else(|| "sd_titledeedPlan".into());
+    let now = chrono::Local::now();
+    let note: String = format!("Survey Plan - WITHDRAWN {} ({})", now.format("%d-%m-%Y %H:%M"), reason).chars().take(240).collect();
+    let session = Session::start(&cfg).await.map_err(registry_err)?;
+    let result = async {
+        let t = load_transaction(&session, &txn).await?
+            .ok_or_else(|| AppError::NotFound(format!("Cannot retrieve information of the Transaction. Transaction number:'{txn}'.")))?;
+        let ids = plan_documents(&session, t.id, &doc_type).await
+            .map_err(|e| AppError::Conflict(format!("the plans in {txn} could not be looked up in the Registry ({e}); nothing was changed")))?;
+        if ids.is_empty() {
+            return Err(AppError::Conflict(format!("there is no title deed plan in {txn} to withdraw")));
+        }
+        let (mut marked, mut failed) = (Vec::new(), Vec::new());
+        for d in ids {
+            match session.save_entity(t.id, &lrs::entity_xml("IncomingDocument", &[("Id", Some(&d)), ("Comments", Some(&note))])).await {
+                Ok(()) => marked.push(d),
+                Err(e) => failed.push(format!("{d}: {e}")),
+            }
+        }
+        Ok::<_, AppError>((t, marked, failed))
+    }.await;
+    session.end().await;
+    let (t, marked, failed) = result?;
+    if marked.is_empty() {
+        return Err(AppError::Conflict(format!("the plan could not be marked as withdrawn in the Registry: {}", failed.join("; "))));
+    }
+    let mut tx = state.pool.begin().await?;
+    let cleared = sqlx::query("DELETE FROM cadastre.title_deed_plan WHERE wf_job_instance_id = $1").bind(id).execute(&mut *tx).await?.rows_affected();
+    audit::append(&mut tx, &actor.label, "registry_plan_withdrawn", "wf_job_instance", Some(&id.to_string()), serde_json::json!({
+        "transaction_number": t.transaction_number, "reason": reason, "documents": marked, "failed": failed, "comments": note, "forms_cleared": cleared,
+    })).await?;
+    tx.commit().await?;
+    Ok(Json(serde_json::json!({ "transaction_number": t.transaction_number, "withdrawn": marked, "failed": failed, "forms_cleared": cleared })))
 }
 
 /// Plans this Cadastre has sent for a job (audit), newest first.

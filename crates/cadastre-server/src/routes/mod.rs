@@ -3,6 +3,7 @@
 pub mod audit;
 pub mod beacons;
 pub mod catalog;
+pub mod completed;
 pub mod editor;
 pub mod fci;
 pub mod fabric;
@@ -58,6 +59,9 @@ pub fn router(state: AppState) -> Router {
         .route("/api/v1/wf/jobs/{id}/editing", get(wf::get_editing).post(wf::start_editing))
         .route("/api/v1/wf/jobs/{id}/editing/corners", get(wfbeacons::corners))
         .route("/api/v1/wf/jobs/{id}/precheck", post(precheck::precheck))
+        .route("/api/v1/wf/completed", get(completed::list))
+        .route("/api/v1/wf/jobs/{id}/correct", post(completed::correct))
+        .route("/api/v1/wf/jobs/{id}/registry/withdraw-plan", post(registry::withdraw_plan))
         .route("/api/v1/wf/jobs/{id}/registry-confirmation", get(precheck::last_confirmation).post(precheck::confirm))
         .route("/api/v1/beacons/identify", post(wfbeacons::identify))
         .route("/api/v1/wf/jobs/{id}/area", put(wf::put_area).delete(wf::delete_area))

@@ -1298,6 +1298,44 @@ async fn job_editing_follows_job_area_and_commit_rules() {
         .bind(c["parcel_numbers"].as_array().unwrap().iter().map(|v| v.as_str().unwrap().to_string()).collect::<Vec<_>>())
         .fetch_one(&pool).await.unwrap();
     assert!(cut, "the recorded area is cut to 2 decimals, never rounded up");
+
+    // A commit is the end of digitising: the job is completed.
+    let job_status: i16 = sqlx::query_scalar("SELECT status FROM cadastre.wf_job_instance WHERE id = $1").bind(id as i32).fetch_one(&pool).await.unwrap();
+    assert_eq!(job_status, 3, "committed means completed");
+    // Correct: the job reopens at its commit task with the parcel back as a draft that keeps its
+    // UPIN; the beacons its commit added come off (handed back by coordinates); committing again
+    // gives the same UPIN.
+    let fix = c["parcel_numbers"][0].as_str().unwrap().to_string();
+    let (st, r) = send(&app, "POST", &format!("/api/v1/wf/jobs/{id}/correct"), None, Some(json!({"upin": fix, "reason": " "}))).await;
+    assert_eq!(st, StatusCode::BAD_REQUEST, "a reason is required: {r}");
+    let (st, r) = send(&app, "POST", &format!("/api/v1/wf/jobs/{id}/correct"), None, Some(json!({"upin": fix, "reason": "corner moved"}))).await;
+    assert_eq!(st, StatusCode::OK, "{r}");
+    let handed: Vec<Value> = r["beacons"].as_array().unwrap().clone();
+    assert!(!handed.is_empty(), "the beacons the commit added are handed back: {r}");
+    let (status, number): (String, Option<String>) = sqlx::query_as("SELECT status, parcel_number FROM cadastre.parcel WHERE id = $1::uuid")
+        .bind(r["parcel_id"].as_str().unwrap()).fetch_one(&pool).await.unwrap();
+    assert_eq!((status.as_str(), number.as_deref()), ("draft", Some(fix.as_str())), "a draft that keeps its UPIN");
+    let job_status: i16 = sqlx::query_scalar("SELECT status FROM cadastre.wf_job_instance WHERE id = $1").bind(id as i32).fetch_one(&pool).await.unwrap();
+    assert_eq!(job_status, 2, "the job is open again");
+    let attrs: i64 = sqlx::query_scalar("SELECT count(*) FROM cadastre.parcel_attribute WHERE upin = $1").bind(&fix).fetch_one(&pool).await.unwrap();
+    assert_eq!(attrs, 0, "its attribute record moves back to the draft");
+    let (st, r) = send(&app, "POST", &format!("/api/v1/wf/jobs/{id}/correct"), None, Some(json!({"upin": fix, "reason": "again"}))).await;
+    assert_eq!(st, StatusCode::CONFLICT, "not a committed parcel any more: {r}");
+    let (_, pts) = send(&app, "GET", &format!("/api/v1/wf/jobs/{id}/editing/corners"), None, None).await;
+    let retyped: Vec<Value> = pts.as_array().unwrap().iter().filter(|p| p["beacon_id"].is_null()).map(|p| {
+        let n = handed.iter().find(|b| (b["easting"].as_f64().unwrap() - p["easting"].as_f64().unwrap()).abs() < 0.002
+            && (b["northing"].as_f64().unwrap() - p["northing"].as_f64().unwrap()).abs() < 0.002).map(|b| b["number"].clone()).unwrap();
+        json!({"easting": p["easting"], "northing": p["northing"], "number": n})
+    }).collect();
+    let (st, c2) = send(&app, "POST", &format!("/api/v1/wf/jobs/{id}/commit"), None, Some(json!({"beacons": retyped}))).await;
+    assert_eq!(st, StatusCode::OK, "{c2}");
+    assert_eq!(c2["parcel_numbers"], json!([fix]), "committed again with the same UPIN");
+    let pillar: i64 = sqlx::query_scalar("SELECT count(*) FROM cadastre.beacon WHERE number = $1").bind(format!("{tag}X")).fetch_one(&pool).await.unwrap();
+    assert_eq!(pillar, 1, "the shared pillar (not added by the commit) is never removed by Correct");
+    let job_status: i16 = sqlx::query_scalar("SELECT status FROM cadastre.wf_job_instance WHERE id = $1").bind(id as i32).fetch_one(&pool).await.unwrap();
+    assert_eq!(job_status, 3, "completed again");
+    // The rest of this test goes on editing the same job: open it again directly.
+    sqlx::query("UPDATE cadastre.wf_job_instance SET status = 2, ended = NULL WHERE id = $1").bind(id as i32).execute(&pool).await.unwrap();
     let (_, found) = send(&app, "GET", &format!("/api/v1/parcels/search?number={prop}"), None, None).await;
     assert_eq!(found.as_array().unwrap().len(), 1, "found once by its property number: {found}");
     let (_, found) = send(&app, "GET", &format!("/api/v1/beacons/search?q={tag}-3"), None, None).await;
@@ -2035,6 +2073,23 @@ async fn registry_write_back_like_aumentum() {
     assert!(!saves.iter().any(|b| b.contains("<lrs:status>deleted")), "nothing deleted");
     let (_, sent) = send(&app, "GET", &format!("/api/v1/wf/jobs/{job}/registry/sent"), None, None).await;
     assert_eq!((sent.as_array().unwrap().len(), sent[0]["detail"]["resend"].as_bool()), (2, Some(true)));
+
+    // Withdraw the plan: the plan documents are marked WITHDRAWN (nothing deleted), the saved title
+    // deed form is cleared, the parcel stays; a fresh plan can then be sent (not only a resend).
+    sqlx::query("INSERT INTO cadastre.title_deed_plan (wf_job_instance_id, upin, fields) VALUES ($1, $2, '{}'::jsonb) ON CONFLICT DO NOTHING")
+        .bind(job as i32).bind(&upin).execute(&pool).await.unwrap();
+    let (st, r) = send(&app, "POST", &format!("/api/v1/wf/jobs/{job}/registry/withdraw-plan"), None, Some(json!({"reason": ""}))).await;
+    assert_eq!(st, StatusCode::BAD_REQUEST, "a reason is required: {r}");
+    let (st, r) = send(&app, "POST", &format!("/api/v1/wf/jobs/{job}/registry/withdraw-plan"), None, Some(json!({"reason": "wrong holder name"}))).await;
+    assert_eq!(st, StatusCode::OK, "{r}");
+    assert_eq!((r["withdrawn"].clone(), r["forms_cleared"].as_u64()), (json!(["10000000901"]), Some(1)), "{r}");
+    let marked = fake.bodies("SaveEntity").pop().unwrap();
+    assert!(marked.contains("<lrs:name>Id</lrs:name><lrs:value>10000000901</lrs:value>") && marked.contains("Survey Plan - WITHDRAWN ") && marked.contains("wrong holder name"), "{marked}");
+    assert!(!fake.bodies("SaveEntity").iter().any(|b| b.contains("<lrs:status>deleted")), "nothing deleted");
+    let still: i64 = sqlx::query_scalar("SELECT count(*) FROM cadastre.parcel WHERE parcel_number = $1 AND status = 'posted'").bind(&upin).fetch_one(&pool).await.unwrap();
+    assert_eq!(still, 1, "the parcel and its UPIN stay");
+    let (st, r) = send(&app, "POST", &format!("/api/v1/wf/jobs/{job}/registry/send-plan"), None, Some(json!({"file_id": file}))).await;
+    assert_eq!(st, StatusCode::OK, "after a withdrawal a new plan is sent plainly: {r}");
 
     // Unlink: the Registry property's UPIN cleared; the parcel's link fields cleared.
     let (st, r) = send(&app, "POST", "/api/v1/registry/unlink", None, Some(json!({"upin": upin}))).await;
