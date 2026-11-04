@@ -1272,6 +1272,7 @@ function parcelMenu(e) {
     beaconLabels.upin === upin ? { label: "Hide Beacons", action: () => hideBeacons() } : { label: "Show Beacons", action: () => showParcelBeacons(upin) },
     { label: "Point List…", action: () => pointListWindow(upin) },
     { label: "Correct & Recommit…", icon: "editor", action: () => correctAndRecommit(upin) },
+    { label: "History…", action: () => historyWindow({ upin, title: upin }) },
     "-",
     { label: "Parcel Lineage…", action: () => lineageOfSelection() },
   ], ev.clientX, ev.clientY);
@@ -3963,6 +3964,61 @@ async function openCompleted() {
   showCompleted(true); buildTocTools();
   if (!done.loaded) await doneLoad(true); else renderCompleted();
 }
+// --- File history: the Registry's stages and this Cadastre's own events, one timeline, read only ---
+function historyText(e) {
+  const d = e.detail || {};
+  switch (e.kind) {
+    case "wf_commit": return `Committed: ${(d.parcel_numbers || []).join(", ") || "—"}${d.retired && d.retired.length ? ` (replaced ${d.retired.join(", ")})` : ""}`;
+    case "registry_confirmation": return `Registry confirmation: ${d.ok ? "confirmed" : "not confirmed"}`;
+    case "registry_link_made": return `Linked to the Registry property ${d.su_id || ""}${d.how === "commit" ? " (on commit)" : ""}`;
+    case "registry_link_reverted": return `Link removed (${d.su_id || ""})`;
+    case "registry_link_synced": return `Linked in the Registry: property ${d.su_id || ""}`;
+    case "registry_unlink_synced": return "Unlinked in the Registry";
+    case "registry_link_failed": return `Could not be linked: ${d.reason || ""}`;
+    case "registry_plan_sent": return `Title deed plan ${d.resend ? "resent (corrected)" : "sent"} to the Registry: ${d.file_name || ""}`;
+    case "registry_plan_withdrawn": return `Title deed plan withdrawn: ${d.reason || ""}`;
+    case "title_deed_plan_deleted": return "Title deed plan deleted";
+    case "wf_reopened_for_correction": return `Reopened for correction (${d.upin || ""}): ${d.reason || ""}`;
+    case "wf_commit_reverted": return `Commit undone (${d.upin || ""})`;
+    case "wf_job_area_save": return "Job area saved";
+    case "precheck_acknowledged": return `System check warnings accepted: ${d.reason || ""}`;
+    case "duplicate_upin_found": return `Duplicate UPIN reported: ${d.upin || ""}`;
+    default: return e.text || e.kind.replace(/_/g, " ");
+  }
+}
+async function historyWindow(opts) {
+  const q = new URLSearchParams(); for (const k of ["txn", "job", "upin"]) if (opts[k]) q.set(k, opts[k]);
+  const body = h("div", {}, h("p", { class: "muted" }, "Reading the history…"));
+  floatWindow(`History — ${opts.title || opts.txn || opts.upin || "job " + opts.job}`, body, { id: "historyWin", width: 720 });
+  let d;
+  try { d = await api("/api/v1/registry/history?" + q); } catch (e) { body.innerHTML = ""; body.append(h("p", { style: "color:#b00" }, e.message)); return; }
+  const r = d.registry || {};
+  const rows = [];
+  for (const st of r.stages || []) rows.push({ at: st.started, src: "Registry", what: `${st.workflow} → ${st.stage_label}`, by: st.by,
+    extra: st.finished ? `finished ${fmtDT(st.finished)}${st.next ? " → " + st.next : ""}` : "open now" });
+  for (const j of r.cadastre_jobs || []) rows.push({ at: j.started, src: "Registry", what: `Cadastre job ${j.name} (#${j.job}) recorded`, by: "", extra: j.ended ? `completed ${fmtDT(j.ended)}` : "not completed" });
+  for (const e of d.cadastre || []) rows.push({ at: e.at, src: "Cadastre", what: historyText(e), by: e.by || "", extra: e.end ? `finished ${fmtDT(e.end)}` : e.note || "" });
+  rows.sort((a, b) => String(b.at || "").localeCompare(String(a.at || "")));
+  const cur = (r.current || []).map((c) => `${c.workflow} → ${c.stage_label} (since ${fmtDT(c.started)})`).join("; ");
+  const props = (r.properties || []).map((p) => p.upin ? `${p.property_number || p.su_id}: linked to ${p.upin}` : `${p.property_number || p.su_id}: not linked yet`).join("; ");
+  const tbl = h("table", { class: "verifyTbl histTbl" }, h("tr", {}, h("th", {}, "When"), h("th", {}, "Where"), h("th", {}, "What"), h("th", {}, "By"), h("th", {}, "")));
+  for (const x of rows) tbl.append(h("tr", { class: "src-" + x.src.toLowerCase() }, h("td", { style: "white-space:nowrap" }, fmtDT(x.at) || "—"),
+    h("td", {}, h("span", { class: "histSrc " + x.src.toLowerCase() }, x.src)), h("td", { style: "white-space:normal" }, x.what), h("td", {}, x.by || ""), h("td", { class: "muted", style: "white-space:normal" }, x.extra || "")));
+  const text = [`History of ${d.transaction_number || opts.upin || ""}`, cur ? `Now at: ${cur}` : "", props, ...rows.map((x) => `${fmtDT(x.at)}\t${x.src}\t${x.what}\t${x.by || ""}\t${x.extra || ""}`)].filter(Boolean).join("\n");
+  body.innerHTML = "";
+  body.append(
+    h("div", { class: "histHead" },
+      h("div", {}, h("b", {}, "File: "), d.transaction_number || "— (no Registry transaction)", d.upins && d.upins.length ? ` · UPIN ${d.upins.join(", ")}` : ""),
+      !d.transaction_number ? null
+        : !r.reachable ? h("div", { style: "color:#a35a00" }, r.error || "The Registry (10.10.10.5) can't be reached: its stages aren't shown.")
+        : r.found === false ? h("div", { class: "muted" }, "The Registry has no such transaction.")
+        : h("div", {}, h("b", {}, "Now at: "), cur || "no open stage (finished in the Registry)", h("br"), h("b", {}, "Link: "), props || "—")),
+    h("div", { class: "verifyWrap" }, tbl),
+    h("div", { class: "frow", style: "margin-top:6px;gap:4px" },
+      h("button", { class: "btn", onclick: () => historyWindow(opts) }, "Refresh"),
+      h("button", { class: "btn", onclick: async (ev) => { try { await navigator.clipboard.writeText(text); ev.target.textContent = "Copied"; } catch { status("Select the table to copy it."); } } }, "Copy")));
+}
+
 // The title deed queue: files the Registry has at Raise Title Deed Plan, linked by the Registry admin.
 async function queueLoad() {
   done.busy = true; done.err = ""; renderCompleted();
@@ -3980,6 +4036,7 @@ function queueCard(f) {
     else startEditParcel(f.upin);
   }, !f.in_cadastre));
   actions.push(regLink("Point List", "Beacons, bearings and distances", () => pointListWindow(f.upin), !f.in_cadastre));
+  actions.push(regLink("History", "The file's Registry stages and this Cadastre's events", () => historyWindow({ txn: f.transaction_number, upin: f.upin, title: f.property_number })));
   return h("div", { class: "regCard " + (f.in_cadastre ? "job" : "wait") },
     h("div", { class: "regCardTop" }, h("span", { class: "regUpin" }, f.property_number || f.transaction_number), h("span", { class: "regPill ok" }, f.stage_label || f.stage)),
     regStatus(f.in_cadastre ? "job" : "wait", f.in_cadastre ? `Linked to ${f.upin}` : `Linked to ${f.upin}, which is not a parcel in this Cadastre`),
@@ -4022,6 +4079,7 @@ function doneCard(j) {
   const actions = [];
   if (firstUpin) actions.push(regLink("Zoom", "Zoom to the parcel", () => registryZoom(firstUpin)));
   actions.push(regLink("Open job", "Open the job in the Workflow", async () => { await openWorkflow(); await wfSelect(j.id); }));
+  actions.push(regLink("History", "The file's Registry stages and this Cadastre's events", () => historyWindow({ job: j.id, txn: j.transaction_number, title: j.property_number || j.name })));
   if (mine) actions.push(regLink("Registry check", "Ask the Registry whether the committed parcels are visible there", () => registryConfirmDialog(j.id)));
   if (mine && upins.length) actions.push(regLink("Title deed plan", "Open the title deed plan (form, sheet, PDF, send)", () => titleDeedDialog(j.id, upins[0])));
   if (mine && plan && plan.action === "registry_plan_sent") actions.push(regLink("Withdraw plan", "Mark the plan sent to the Registry as withdrawn (the parcel and UPIN stay)", () => doneWithdraw(j)));
@@ -4039,6 +4097,7 @@ function doneCard(j) {
       linked.length ? h("div", {}, h("i", {}, "Linked"), linked.map((p) => `${p.upin} ${p.linked_at ? fmtD(p.linked_at) : ""}${p.lrs_id ? " → " + p.lrs_id : ""}`).join("; ")) : null,
       h("div", {}, h("i", {}, "Plan"), planText),
       h("div", {}, h("i", {}, "Registry"), regText),
+      reg && reg.stages && reg.stages.length ? h("div", {}, h("i", {}, "Registry stage"), reg.stages.map((x) => `${x.workflow} → ${x.stage} (since ${fmtDT(x.since)})`).join("; ")) : null,
       conf ? h("div", {}, h("i", {}, "Confirmed"), `${conf.ok ? "✔" : "✕"} ${fmtDT(conf.at)}`) : null),
     h("div", { class: "regCardFoot" }, h("span", { class: "regLinks" }, ...actions)));
 }
@@ -4555,8 +4614,9 @@ function wfDetailView(d) {
     box.append(ol);
   }
   if (j.is_open) box.append(wfEditingView(j, wf.selEditing));
-  else box.append(h("div", { class: "frow", style: "margin:6px 0" },
-    h("button", { class: "btn", title: "Ask the Registry (10.10.10.5) whether this job's committed parcels are visible there", onclick: () => registryConfirmDialog(j.id) }, "Registry Confirmation")));
+  else box.append(h("div", { class: "frow", style: "margin:6px 0;gap:4px" },
+    h("button", { class: "btn", title: "Ask the Registry (10.10.10.5) whether this job's committed parcels are visible there", onclick: () => registryConfirmDialog(j.id) }, "Registry Confirmation"),
+    h("button", { class: "btn", title: "The file's Registry stages and this Cadastre's events", onclick: () => historyWindow({ job: j.id, txn: j.lrs_transaction_number, title: j.name }) }, "History")));
   if (j.is_open) {
     const comment = h("textarea", { rows: 2, placeholder: "Comment for this task (optional)", style: "width:100%;box-sizing:border-box" });
     const assign = h("select", { style: "flex:1;min-width:0" }, h("option", { value: "" }, "Default assignee"),
@@ -4893,6 +4953,7 @@ function wfEditingView(j, e) {
     h("button", { class: "btn", onclick: async () => { await loadDrafts(); await wfSelect(j.id); status("Reloaded from the fabric."); } }, "Reload"),
     h("button", { class: "btn", title: "Ask the Registry (10.10.10.5) whether this job's committed parcels are visible there", onclick: () => registryConfirmDialog(j.id) }, "Registry Confirmation"),
     h("button", { class: "btn", title: "The actual view of the plot on the satellite imagery, with overlaps and titles", onclick: orthoOpen }, "Orthophoto"),
+    h("button", { class: "btn", title: "The file's Registry stages and this Cadastre's events", onclick: () => historyWindow({ job: j.id, txn: j.lrs_transaction_number, title: j.name }) }, "History"),
     ed.is_commit_task ? h("button", { class: "btn", disabled: !ed.drafts && !(wf.mutations || []).length, title: "Give the job's draft parcels their UPINs and add them to the fabric", onclick: () => wfCommitDialog() }, "Commit Parcels…") : null));
   // Mutations recorded in the job (Phase 4), applied when the parcels are committed.
   if ((wf.mutations || []).length) {

@@ -432,3 +432,11 @@ table.legs tr.selrow td { background: #fff6cf; }
 .staffRow { padding: 4px 7px; cursor: pointer; }
 .staffRow:hover { background: var(--hover); }
 .staffRow.add { color: #1a5fb4; border-top: 1px solid #eee; font-weight: 600; }
+
+/* File history */
+.histHead { margin: 0 0 6px; line-height: 1.5; }
+.histTbl td { vertical-align: top; }
+.histTbl tr { cursor: default; }
+.histSrc { display: inline-block; padding: 0 6px; border-radius: 3px; font-size: 11px; font-weight: 600; }
+.histSrc.registry { background: #e4eef5; color: #1f5f8b; }
+.histSrc.cadastre { background: #e9f6ec; color: #13612a; }

@@ -780,8 +780,8 @@ pub async fn title_deed_queue(State(state): State<AppState>) -> ApiResult<Json<s
         let plan = sent.iter().find(|p| p.0 == txn);
         serde_json::json!({
             "transaction_number": txn, "su_id": r[2].trim(), "property_number": r[3].trim(), "upin": upin,
-            "linked_at": lrs::parse_datetime(&r[5]).map(|d| d.format("%Y-%m-%dT%H:%M:%S").to_string()),
-            "stage": task, "stage_label": task_label, "stage_since": lrs::parse_datetime(&since).map(|d| d.format("%Y-%m-%dT%H:%M:%S").to_string()),
+            "linked_at": lrs::parse_datetime(&r[5]).map(|d| d.format("%Y-%m-%dT%H:%M:%SZ").to_string()),
+            "stage": task, "stage_label": task_label, "stage_since": lrs::parse_datetime(&since).map(|d| d.format("%Y-%m-%dT%H:%M:%SZ").to_string()),
             "in_cadastre": parcel.is_some(), "committed_at": parcel.and_then(|p| p.1).map(|t| t.to_rfc3339()),
             "job_instance_id": job.map(|j| j.1), "job_status": job.map(|j| j.2.clone()), "job_open": job.map(|j| j.3),
             "plan": plan.map(|p| serde_json::json!({ "action": p.2, "at": p.1.to_rfc3339() })),
@@ -790,6 +790,140 @@ pub async fn title_deed_queue(State(state): State<AppState>) -> ApiResult<Json<s
     files.sort_by(|a, b| b["stage_since"].as_str().cmp(&a["stage_since"].as_str()));
     let waiting = stage.len();
     Ok(Json(serde_json::json!({ "files": files, "at_stage": waiting, "linked": files.len(), "read_at": chrono::Utc::now().to_rfc3339() })))
+}
+
+#[derive(Debug, Deserialize, IntoParams)]
+#[into_params(parameter_in = Query)]
+pub struct FileHistoryQuery {
+    /// The file's Registry transaction (PLS…). Or give a job or a UPIN and it is found.
+    #[serde(default)]
+    pub txn: Option<String>,
+    #[serde(default)]
+    pub job: Option<i32>,
+    #[serde(default)]
+    pub upin: Option<String>,
+}
+
+/// A file's history, read only: the Registry's stages for its transaction (workflow, stage, started,
+/// finished, by, next) and the Registry's record of its Cadastre jobs, with this Cadastre's own
+/// events (job and task history, commit, correction, title deed plan, links). Nothing is written.
+/// When the Registry cannot be reached the Cadastre part is still returned.
+#[utoipa::path(get, path = "/api/v1/registry/history", tag = "registry", params(FileHistoryQuery), responses((status = 200)))]
+pub async fn file_history(State(state): State<AppState>, Query(q): Query<FileHistoryQuery>) -> ApiResult<Json<serde_json::Value>> {
+    // Find the transaction from what was given.
+    let mut txn = q.txn.as_deref().map(|t| t.trim().to_uppercase()).filter(|t| !t.is_empty());
+    let upin_in = q.upin.as_deref().map(|u| u.trim().to_uppercase()).filter(|u| !u.is_empty());
+    if txn.is_none() {
+        if let Some(j) = q.job {
+            txn = sqlx::query_scalar::<_, Option<String>>("SELECT upper(lrs_transaction_number) FROM cadastre.wf_job_instance WHERE id = $1").bind(j).fetch_optional(&state.pool).await?.flatten();
+        }
+    }
+    if txn.is_none() {
+        if let Some(u) = &upin_in {
+            txn = sqlx::query_scalar::<_, Option<String>>(
+                "SELECT upper(w.lrs_transaction_number) FROM cadastre.parcel p JOIN cadastre.wf_job_instance w ON w.cadastre_job_id = p.job_id \
+                 WHERE p.parcel_number = $1 AND w.lrs_transaction_number IS NOT NULL ORDER BY w.id DESC LIMIT 1").bind(u).fetch_optional(&state.pool).await?.flatten();
+            if txn.is_none() {
+                // Aumentum's parcels: their job by the property number ("Job-PL68928").
+                txn = sqlx::query_scalar::<_, Option<String>>(
+                    "SELECT upper(w.lrs_transaction_number) FROM cadastre.parcel_attribute a JOIN cadastre.wf_job_instance w ON upper(w.name) = upper('Job-' || a.property_number) \
+                     WHERE a.upin = $1 AND w.lrs_transaction_number IS NOT NULL ORDER BY w.id DESC LIMIT 1").bind(u).fetch_optional(&state.pool).await?.flatten();
+            }
+        }
+    }
+    let txn = txn.map(|t| t.chars().filter(|c| c.is_ascii_alphanumeric() || *c == '-').collect::<String>());
+    // This Cadastre: the file's jobs, their parcels, task history and audit events.
+    let mut jobs: Vec<i32> = match &txn {
+        Some(t) => sqlx::query_scalar("SELECT id FROM cadastre.wf_job_instance WHERE upper(lrs_transaction_number) = $1 ORDER BY id").bind(t).fetch_all(&state.pool).await?,
+        None => Vec::new(),
+    };
+    if let Some(j) = q.job { if !jobs.contains(&j) { jobs.push(j); } }
+    let mut upins: Vec<String> = sqlx::query_scalar(
+        "SELECT DISTINCT p.parcel_number FROM cadastre.wf_job_instance w JOIN cadastre.parcel p ON p.job_id = w.cadastre_job_id \
+         WHERE w.id = ANY($1) AND p.parcel_number IS NOT NULL").bind(&jobs).fetch_all(&state.pool).await?;
+    if let Some(u) = &upin_in { if !upins.contains(u) { upins.push(u.clone()); } }
+    let tasks = sqlx::query(
+        "SELECT ti.job_instance_id, w.name AS job_name, t.name AS task, \
+                CASE WHEN w.source = 'aumentum' THEN ti.started AT TIME ZONE 'Africa/Lagos' ELSE ti.started AT TIME ZONE 'UTC' END AS started, \
+                CASE WHEN w.source = 'aumentum' THEN ti.ended AT TIME ZONE 'Africa/Lagos' ELSE ti.ended AT TIME ZONE 'UTC' END AS ended, \
+                COALESCE(p.name, p.code) AS who, ti.comment \
+         FROM cadastre.wf_task_instance ti JOIN cadastre.wf_task t ON t.id = ti.task_id JOIN cadastre.wf_job_instance w ON w.id = ti.job_instance_id \
+         LEFT JOIN cadastre.principal p ON p.sid = ti.sid WHERE ti.job_instance_id = ANY($1) ORDER BY ti.started NULLS LAST, ti.id").bind(&jobs).fetch_all(&state.pool).await?;
+    let job_rows = sqlx::query(
+        "SELECT w.id, w.name, jt.name AS job_type, \
+                CASE WHEN w.source = 'aumentum' THEN w.created AT TIME ZONE 'Africa/Lagos' ELSE w.created AT TIME ZONE 'UTC' END AS created, \
+                CASE WHEN w.source = 'aumentum' THEN w.ended AT TIME ZONE 'Africa/Lagos' ELSE w.ended AT TIME ZONE 'UTC' END AS ended, s.label \
+         FROM cadastre.wf_job_instance w JOIN cadastre.wf_job_type jt ON jt.id = w.job_type_id \
+         JOIN cadastre.wf_job_status s ON s.code = w.status WHERE w.id = ANY($1)").bind(&jobs).fetch_all(&state.pool).await?;
+    let audits = sqlx::query(
+        "SELECT created_at, actor, action, entity, entity_id, payload FROM cadastre.audit_log \
+         WHERE (entity = 'wf_job_instance' AND entity_id = ANY($1)) OR (entity IN ('registry_link', 'upin') AND entity_id = ANY($2)) \
+         ORDER BY id").bind(jobs.iter().map(|j| j.to_string()).collect::<Vec<_>>()).bind(&upins).fetch_all(&state.pool).await?;
+    let ts = |d: Option<chrono::DateTime<chrono::Utc>>| d.map(|d| d.to_rfc3339());
+    let mut cadastre: Vec<serde_json::Value> = Vec::new();
+    for r in &job_rows {
+        cadastre.push(serde_json::json!({ "at": ts(r.get("created")), "kind": "job_created", "job": r.get::<i32, _>("id"),
+            "text": format!("Job {} created ({})", r.get::<Option<String>, _>("name").unwrap_or_default(), r.get::<String, _>("job_type")) }));
+        if let Some(e) = r.get::<Option<chrono::DateTime<chrono::Utc>>, _>("ended") {
+            cadastre.push(serde_json::json!({ "at": ts(Some(e)), "kind": "job_ended", "job": r.get::<i32, _>("id"),
+                "text": format!("Job {} {}", r.get::<Option<String>, _>("name").unwrap_or_default(), r.get::<String, _>("label").to_lowercase()) }));
+        }
+    }
+    for r in &tasks {
+        cadastre.push(serde_json::json!({ "at": ts(r.get("started")), "end": ts(r.get("ended")), "kind": "task", "job": r.get::<i32, _>("job_instance_id"),
+            "text": format!("Step: {}", r.get::<String, _>("task")), "by": r.get::<Option<String>, _>("who"), "note": r.get::<Option<String>, _>("comment") }));
+    }
+    for r in &audits {
+        let action: String = r.get("action");
+        if matches!(action.as_str(), "wf_advance" | "wf_create" | "wf_complete" | "wf_start_editing") { continue; } // shown by the task / job lines
+        let p: serde_json::Value = r.get("payload");
+        cadastre.push(serde_json::json!({ "at": r.get::<chrono::DateTime<chrono::Utc>, _>("created_at").to_rfc3339(), "kind": action, "by": r.get::<String, _>("actor"),
+            "entity_id": r.get::<Option<String>, _>("entity_id"), "detail": p }));
+    }
+    // The Registry, read only.
+    let mut registry = serde_json::json!({ "reachable": false });
+    if let Some(t) = &txn {
+        let read = async {
+            let cfg = config()?;
+            let session = Session::start(&cfg).await.map_err(registry_err)?;
+            let out = async {
+                let tr = load_transaction(&session, t).await?;
+                let Some(tr) = tr else { return Ok::<_, AppError>(None) };
+                let stages = session.query(&format!(
+                    "select ph.ProcessName, ph.TaskName, ph.TaskDescription, ph.TaskCreate, ph.TaskComplete, ph.TaskTransition, ph.Actor \
+                     from com.landsystems.lrs.model.ProcessHistory ph where ph.TransactionId = {} order by ph.TaskCreate", tr.id), 2000).await.map_err(registry_err)?;
+                let mc = session.query(&format!(
+                    "select j.JobInstanceId, j.JobName, j.JobStatus, j.JobStarted, j.JobEnded from com.landsystems.lrs.model.McJob j where j.TransactionId = {}", tr.id), 100).await.unwrap_or_default();
+                Ok(Some((tr, stages, mc)))
+            }.await;
+            session.end().await;
+            out
+        }.await;
+        let when = |v: &String| lrs::parse_datetime(v).map(|d| d.format("%Y-%m-%dT%H:%M:%SZ").to_string());
+        let o = |v: &String| Some(v.trim().to_string()).filter(|s| !s.is_empty());
+        registry = match read {
+            Err(e) => {
+                let why = match e { AppError::Conflict(m) | AppError::BadRequest(m) | AppError::NotFound(m) => m, other => other.to_string() };
+                serde_json::json!({ "reachable": false, "error": format!("The Registry (10.10.10.5) can't be reached: its stages aren't shown ({why}).") })
+            }
+            Ok(None) => serde_json::json!({ "reachable": true, "found": false }),
+            Ok(Some((tr, stages, mc))) => {
+                let st: Vec<serde_json::Value> = stages.iter().filter(|r| r.len() >= 7).map(|r| serde_json::json!({
+                    "workflow": r[0].trim(), "stage": r[1].trim(), "stage_label": o(&r[2]).unwrap_or_else(|| r[1].trim().to_string()),
+                    "started": when(&r[3]), "finished": when(&r[4]), "next": o(&r[5]), "by": o(&r[6]),
+                })).collect();
+                let current: Vec<serde_json::Value> = st.iter().filter(|s| s["finished"].is_null()).cloned().collect();
+                serde_json::json!({
+                    "reachable": true, "found": true, "transaction_number": tr.transaction_number, "status": tr.status,
+                    "properties": tr.properties.iter().map(|p| serde_json::json!({ "su_id": p.su_id, "property_number": p.refnum, "upin": p.upin, "linked_at": p.linked_at })).collect::<Vec<_>>(),
+                    "current": current, "stages": st,
+                    "cadastre_jobs": mc.iter().filter(|r| r.len() >= 5).map(|r| serde_json::json!({
+                        "job": r[0].trim(), "name": r[1].trim(), "status": r[2].trim(), "started": when(&r[3]), "ended": when(&r[4]) })).collect::<Vec<_>>(),
+                })
+            }
+        };
+    }
+    Ok(Json(serde_json::json!({ "transaction_number": txn, "jobs": jobs, "upins": upins, "registry": registry, "cadastre": cadastre })))
 }
 
 /// Plans this Cadastre has sent for a job (audit), newest first.

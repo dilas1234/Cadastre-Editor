@@ -121,22 +121,29 @@ async fn registry_details(jobs: &mut [Value]) -> Result<(), String> {
     let props = session.query(&format!(
         "select t.TransactionNumber, s.SuID, s.Refnum, s.Upin, s.SpatialDate1 from com.landsystems.lrs.model.Transaction t join t.Properties l join l.SpatialUnits s \
          where t.TransactionNumber in ({list}) and l.EndLifespanVersion is null and s.EndLifespanVersion is null"), 2000).await;
+    let open = session.query(&format!(
+        "select t.TransactionNumber, ph.ProcessName, ph.TaskDescription, ph.TaskCreate from com.landsystems.lrs.model.ProcessHistory ph, com.landsystems.lrs.model.Transaction t \
+         where ph.TransactionId = t.Id and ph.TaskComplete is null and t.TransactionNumber in ({list})"), 2000).await;
     session.end().await;
     let status = status.map_err(|e| e.to_string())?;
     let props = props.unwrap_or_default();
+    let open = open.unwrap_or_default();
     for j in jobs.iter_mut() {
         let Some(t) = j["transaction_number"].as_str().map(|t| t.trim().to_uppercase()) else { continue };
         let st = status.iter().find(|r| r.len() >= 2 && r[0].trim().eq_ignore_ascii_case(&t)).map(|r| r[1].trim().to_string());
         let pn = j["property_number"].as_str().unwrap_or("").to_uppercase();
         let mine: Vec<&Vec<String>> = props.iter().filter(|r| r.len() >= 5 && r[0].trim().eq_ignore_ascii_case(&t)).collect();
         let p = mine.iter().find(|r| r[2].trim().eq_ignore_ascii_case(&pn)).or(mine.first());
+        let stages: Vec<Value> = open.iter().filter(|r| r.len() >= 4 && r[0].trim().eq_ignore_ascii_case(&t))
+            .map(|r| json!({ "workflow": r[1].trim(), "stage": r[2].trim(), "since": crate::lrs::parse_datetime(&r[3]).map(|d| d.format("%Y-%m-%dT%H:%M:%SZ").to_string()) })).collect();
         j["registry"] = json!({
+            "stages": stages,
             "found": st.is_some(),
             "status": st,
             "property": p.map(|r| r[1].trim().to_string()),
             "refnum": p.map(|r| r[2].trim().to_string()).filter(|s| !s.is_empty()),
             "upin": p.map(|r| r[3].trim().to_string()).filter(|s| !s.is_empty()),
-            "linked_at": p.and_then(|r| crate::lrs::parse_datetime(&r[4])).map(|d| d.format("%Y-%m-%dT%H:%M:%S").to_string()),
+            "linked_at": p.and_then(|r| crate::lrs::parse_datetime(&r[4])).map(|d| d.format("%Y-%m-%dT%H:%M:%SZ").to_string()),
         });
     }
     Ok(())
