@@ -27,12 +27,22 @@ use crate::auth::AuthUser;
 use crate::error::{ApiResult, AppError};
 use crate::lrs::{LrsConfig, Session};
 use crate::state::AppState;
-use crate::titledeed::{plan_order, render_svg, PlanData, PlanFields};
+use crate::titledeed::{cap_words, plan_order, render_svg, PlanData, PlanFields, SYMBOLS};
 
 #[derive(Debug, Deserialize, IntoParams)]
 pub struct PlanQuery {
     /// The parcel, when the job has more than one.
     pub upin: Option<String>,
+}
+
+/// An entry of the plan's symbol list, for the form.
+#[derive(Debug, Serialize, ToSchema)]
+pub struct SymbolDto {
+    pub id: String,
+    pub label: String,
+    pub group: String,
+    /// Placed at one spot; the others are lines.
+    pub point: bool,
 }
 
 #[derive(Debug, Serialize, ToSchema)]
@@ -47,6 +57,8 @@ pub struct TitleDeedDto {
     pub upins: Vec<String>,
     /// `ok`, `off` (not configured) or why the Registry could not be read.
     pub registry: String,
+    /// The symbols a feature on the plan can use, in the form's order.
+    pub symbols: Vec<SymbolDto>,
 }
 
 #[derive(Debug, Deserialize, ToSchema)]
@@ -172,6 +184,11 @@ fn merge(prefill: &PlanFields, saved: &PlanFields) -> PlanFields {
         scale: saved.scale.or(prefill.scale),
         corner_names: if saved.corner_names.iter().any(|c| c.as_deref().is_some_and(|s| !s.trim().is_empty())) { saved.corner_names.clone() } else { prefill.corner_names.clone() },
         road_side: saved.road_side.or(prefill.road_side),
+        road_sides: if saved.road_sides.is_empty() { prefill.road_sides.clone() } else { saved.road_sides.clone() },
+        grid: saved.grid.or(prefill.grid),
+        grid_corner: saved.grid_corner.or(prefill.grid_corner),
+        features: saved.features.clone(),
+        label_moves: saved.label_moves.clone(),
         road_label: non_empty(saved.road_label.clone()).or_else(|| prefill.road_label.clone()) } } }
     pick!(region, location, plan_no, tracing_no, title_no, address, lga, holder, surveyed_by, survey_date, plotted_by, checked_by, surveyor_general, prepared_by)
 }
@@ -196,7 +213,7 @@ async fn load(state: &AppState, id: i32, want: Option<String>, user: Option<&Aut
     let corners = plan_order(&ring);
 
     // Prefill from the parcel record, then the Registry.
-    let attr = sqlx::query("SELECT property_number, plan_number, lga, surveyor_general, lrs_id FROM cadastre.parcel_attribute WHERE upin = $1 ORDER BY (status = '0') DESC NULLS LAST, object_id DESC LIMIT 1")
+    let attr = sqlx::query("SELECT property_number, plan_number, lga, surveyor_general, lrs_id, region_name FROM cadastre.parcel_attribute WHERE upin = $1 ORDER BY (status = '0') DESC NULLS LAST, object_id DESC LIMIT 1")
         .bind(&upin)
         .fetch_optional(&state.pool)
         .await?;
@@ -215,6 +232,13 @@ async fn load(state: &AppState, id: i32, want: Option<String>, user: Option<&Aut
     }
     let file_for_registry = prefill.title_no.clone();
     let registry = registry_prefill(&mut prefill, su_id, txn.as_deref(), file_for_registry.as_deref()).await;
+    // The region: the Registry's, else the parcel record's dataset region (Plateau_State →
+    // Plateau), else Plateau.
+    if prefill.region.is_none() {
+        let ds: Option<String> = attr.as_ref().and_then(|a| a.try_get::<Option<String>, _>("region_name").ok().flatten());
+        prefill.region = Some(ds.as_deref().and_then(|r| r.strip_suffix("_State")).map(|r| r.replace('_', " ")).unwrap_or_else(|| "Plateau".into()));
+    }
+    prefill.surveyed_by = prefill.surveyed_by.as_deref().map(cap_words);
     if let Some(u) = user {
         if let Ok(actor) = crate::routes::wf::resolve_actor(state, u).await {
             prefill.plotted_by = Some(actor.label);
@@ -228,8 +252,10 @@ async fn load(state: &AppState, id: i32, want: Option<String>, user: Option<&Aut
         .fetch_optional(&state.pool)
         .await?
         .and_then(|v| serde_json::from_value(v).ok());
-    let fields = match &saved { Some(s) => merge(&prefill, s), None => prefill.clone() };
-    Ok(TitleDeedDto { plan: PlanData { upin, area_m2: area, corners, fields }, prefill, saved, upins, registry })
+    let mut fields = match &saved { Some(s) => merge(&prefill, s), None => prefill.clone() };
+    fields.surveyed_by = fields.surveyed_by.as_deref().map(cap_words);
+    let symbols = SYMBOLS.iter().map(|y| SymbolDto { id: y.id.into(), label: y.label.into(), group: y.group.into(), point: y.point }).collect();
+    Ok(TitleDeedDto { plan: PlanData { upin, area_m2: area, corners, fields }, prefill, saved, upins, registry, symbols })
 }
 
 /// The job's title deed plan: data, prefill and saved form.
@@ -249,13 +275,15 @@ pub async fn put_plan(State(state): State<AppState>, user: AuthUser, Path(id): P
     if !upins.contains(&upin) {
         return Err(AppError::Conflict(format!("{upin} is not a committed parcel of this job")));
     }
+    let mut fields = req.fields;
+    fields.surveyed_by = non_empty(fields.surveyed_by).map(|s| cap_words(&s));
     sqlx::query(
         "INSERT INTO cadastre.title_deed_plan (wf_job_instance_id, upin, fields, updated_by) VALUES ($1, $2, $3, $4) \
          ON CONFLICT (wf_job_instance_id, upin) DO UPDATE SET fields = EXCLUDED.fields, updated_by = EXCLUDED.updated_by, updated_at = now()",
     )
     .bind(id)
     .bind(&upin)
-    .bind(serde_json::to_value(&req.fields).map_err(|e| AppError::BadRequest(e.to_string()))?)
+    .bind(serde_json::to_value(&fields).map_err(|e| AppError::BadRequest(e.to_string()))?)
     .bind(&actor.label)
     .execute(&state.pool)
     .await?;

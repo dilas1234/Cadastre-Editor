@@ -12,6 +12,7 @@ const toLL = (e, n) => proj4("EPSG:32632", "EPSG:4326", [e, n]);
 const $ = (id) => document.getElementById(id);
 const esc = (s) => String(s ?? "").replace(/[&<>"']/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
 const empty = () => ({ type: "FeatureCollection", features: [] });
+let tdDraw = null; // a title deed plan feature being drawn on the map (see tdStartDraw)
 function h(tag, attrs = {}, ...kids) {
   const e = document.createElement(tag);
   for (const [k, v] of Object.entries(attrs || {})) {
@@ -339,6 +340,12 @@ map.once("style.load", async () => {
   map.addSource("measure", { type: "geojson", data: empty() });
   map.addLayer({ id: "measure-line", type: "line", source: "measure",
     paint: { "line-color": "#ff00ff", "line-width": 2, "line-dasharray": [2, 1] } });
+  // The features drawn for the open title deed plan.
+  map.addSource("tdfeat", { type: "geojson", data: empty() });
+  map.addLayer({ id: "tdfeat-line", type: "line", source: "tdfeat", filter: ["==", ["geometry-type"], "LineString"],
+    paint: { "line-color": "#00e5ff", "line-width": 2.5 } });
+  map.addLayer({ id: "tdfeat-point", type: "circle", source: "tdfeat", filter: ["==", ["geometry-type"], "Point"],
+    paint: { "circle-color": "#00e5ff", "circle-radius": 5, "circle-stroke-color": "#000", "circle-stroke-width": 1 } });
 
   // Digitizing sketch (fill + segments + vertices). Last/selected vertex is drawn red.
   map.addSource("sketch", { type: "geojson", data: empty() });
@@ -1099,6 +1106,7 @@ const TOOL_CURSOR = {
   sketch: "crosshair", editVertex: "pointer", cut: "crosshair", attr: "pointer",
 };
 function setTool(tool) {
+  if (tool !== "tdFeature" && tdDraw) tdEnd(null);
   // The sketch/edit tools require an active edit session, like ArcMap's "Start Editing".
   if ((tool === "sketch" || tool === "editVertex") && !edit.active) { startEditing(tool); return; }
   if (tool === "cut" && !edit.active) { startEditing("cut"); return; }
@@ -1113,6 +1121,7 @@ function setTool(tool) {
 }
 function cancelInteraction() {
   if (box) { box.el.remove(); box = null; }
+  if (tdDraw) { tdEnd(null); return; }
   if (state.tool === "measure") clearMeasure();
   if (state.tool === "cut" && edit.cut.length) { clearCut(); status("Cut cancelled."); return; }
   if (edit.active && edit.verts.length) { clearSketch(); refreshSketchProps(); updateEditorButtons(); status("Sketch cancelled."); }
@@ -1193,6 +1202,7 @@ map.on("click", (e) => {
     }
     case "identify": identifyAt(e); break;
     case "measure": measureClick(e.lngLat); break;
+    case "tdFeature": tdClick(e.lngLat); break;
     case "survey": setSurveyStart(e.lngLat); break;
     case "text": addTextGraphic(e.lngLat); break;
     case "selectEl": selectGraphicAt(e); break;
@@ -1222,7 +1232,8 @@ function editDraftFeature(d) {
   status(`Editing draft parcel corners (${edit.verts.length}). Drag them, or retype them in Edit Sketch Properties; Finish Sketch saves.`);
 }
 map.on("dblclick", (e) => {
-  if (state.tool === "measure") { e.preventDefault(); finishMeasure(); }
+  if (state.tool === "tdFeature") { e.preventDefault(); tdFinish(); }
+  else if (state.tool === "measure") { e.preventDefault(); finishMeasure(); }
   else if (state.tool === "sketch" && edit.verts.length) { e.preventDefault(); finishSketch(); }
   else if (state.tool === "cut" && edit.cut.length) { e.preventDefault(); finishCut(); }
   else if (parcelAt(e.point)) { e.preventDefault(); parcelMenu(e); }
@@ -4886,6 +4897,39 @@ async function wfFinishPost(j, beacons, staff) {
 // The server prefills the form from the Registry (Aumentum's R_PROPINFO / R_HOLDERS) and the parcel
 // record; the officer confirms or types the rest, saves it with the job, prints the A4 sheet, and
 // turns it into the PDF that Send plan files with the Registry transaction.
+// A feature of the plan drawn on the map: click its points and double-click to finish (a point
+// symbol takes one click), Esc to cancel. onDone gets the UTM points, or null when cancelled.
+function tdStartDraw(point, onDone) {
+  tdDraw = { pts: [], point, onDone };
+  setTool("tdFeature");
+  status(point ? "Plan feature: click its position on the map. Esc cancels." : "Plan feature: click along it on the map, double-click to finish. Esc cancels.");
+}
+function tdClick(ll) {
+  if (!tdDraw) return;
+  // A double-click also delivers two clicks at the same spot; don't add zero-length segments.
+  const last = tdDraw.pts[tdDraw.pts.length - 1];
+  if (last) { const a = map.project(last), b = map.project(ll); if (Math.hypot(a.x - b.x, a.y - b.y) < 3) return; }
+  tdDraw.pts.push([ll.lng, ll.lat]);
+  if (tdDraw.point) { tdFinish(); return; }
+  map.getSource("measure").setData({ type: "FeatureCollection", features: tdDraw.pts.length > 1 ? [{ type: "Feature", geometry: { type: "LineString", coordinates: tdDraw.pts }, properties: {} }] : [] });
+}
+function tdFinish() {
+  if (!tdDraw) return;
+  if (tdDraw.pts.length < (tdDraw.point ? 1 : 2)) { status("Plan feature: a line needs at least two points."); return; }
+  tdEnd(tdDraw.pts);
+}
+function tdEnd(pts) {
+  const d = tdDraw;
+  tdDraw = null;
+  map.getSource("measure")?.setData(empty());
+  setTool("pan");
+  d.onDone(pts ? pts.map(([x, y]) => toUTM(x, y).map((v) => Math.round(v * 1000) / 1000)) : null);
+}
+// The plan's drawn features on the map, while its form is open.
+function tdShow(feats) {
+  map.getSource("tdfeat")?.setData({ type: "FeatureCollection", features: feats.filter((x) => x.points?.length).map((x) => ({ type: "Feature", properties: {},
+    geometry: x.points.length > 1 ? { type: "LineString", coordinates: x.points.map(([e, n]) => toLL(e, n)) } : { type: "Point", coordinates: toLL(...x.points[0]) } })) });
+}
 const TD_SCALES = [250, 500, 750, 1000, 1250, 1500, 2000, 2500, 3000, 4000, 5000, 7500, 10000, 25000];
 async function titleDeedDialog(jobId, upin) {
   let d;
@@ -4903,23 +4947,77 @@ async function titleDeedDialog(jobId, upin) {
   const ct = h("table", { class: "legs" }, h("tr", {}, h("th", {}, "#"), h("th", {}, "Beacon"), h("th", {}, "Easting"), h("th", {}, "Northing")),
     ...p.corners.map((c, i) => h("tr", {}, h("td", { class: "n" }, String(i + 1)), h("td", {}, names[i]), h("td", {}, fmt3(c.e)), h("td", {}, fmt3(c.n)))));
   const nameOf = (i) => names[i].value.trim() || p.corners[i].name;
-  const road = h("select", { style: "width:100%" }, h("option", { value: "" }, "No road"),
-    ...p.corners.map((c, i) => h("option", { value: i, selected: f.road_side === i }, `Side ${i + 1}: ${nameOf(i)} → ${nameOf((i + 1) % n)}`)));
+  // Access roads: any number of sides (two neighbouring sides meet in a junction on the sheet).
+  const roadSet = new Set((f.road_sides && f.road_sides.length) ? f.road_sides : (f.road_side != null ? [f.road_side] : []));
+  const sideText = (i) => `Side ${i + 1}: ${nameOf(i)} → ${nameOf((i + 1) % n)}`;
+  const roadBoxes = p.corners.map((c, i) => h("input", { type: "checkbox", checked: roadSet.has(i) }));
+  const roadLabels = p.corners.map((c, i) => h("span", {}, sideText(i)));
+  const road = h("div", { style: "width:100%;max-height:90px;overflow:auto" },
+    ...p.corners.map((c, i) => h("label", { style: "display:block;white-space:nowrap" }, roadBoxes[i], " ", roadLabels[i])));
+  // Grid: ticks on the frame edges at the whole-metre Easting / Northing, on or off.
+  const gridOn = h("input", { type: "checkbox", checked: f.grid !== false });
+  const grid = h("label", { style: "white-space:nowrap" }, gridOn, " Show grid ticks on the frame edges");
   const roadLabel = inp("road_label", "Access Road");
+  // Plan features: a symbol placed along a side of the parcel, or drawn on the map.
+  const feats = (f.features || []).map((x) => ({ ...x }));
+  const symOf = (id) => d.symbols.find((y) => y.id === id);
+  const symSel = h("select", { style: "width:100%" }, ...[...new Set(d.symbols.map((y) => y.group))].map((g) =>
+    h("optgroup", { label: g }, ...d.symbols.filter((y) => y.group === g).map((y) => h("option", { value: y.id }, y.label)))));
+  const placeSel = h("select", { style: "width:100%" }, h("option", { value: "" }, "Draw on the map"), ...p.corners.map((c, i) => h("option", { value: i }, sideText(i))));
+  const featLabel = h("input", { placeholder: "Optional, e.g. River Delimi", style: "width:100%;box-sizing:border-box" });
+  const featList = h("div", { style: "max-height:110px;overflow:auto" });
+  const featText = (x) => `${symOf(x.symbol)?.label || x.symbol}${x.label ? ` "${x.label}"` : ""}: ${x.side != null ? sideText(x.side) : "drawn on the map"}`;
+  const renderFeats = () => {
+    featList.replaceChildren(...feats.map((x, i) => h("div", { style: "display:flex;gap:6px;align-items:center;margin-top:3px" }, h("span", { style: "flex:1" }, featText(x)),
+      h("button", { class: "btn", onclick: () => { feats.splice(i, 1); dropFeatureMove(i); featsChanged(); } }, "Remove"))));
+    tdShow(feats);
+  };
+  // Label moves of the plan, kept by label: a removed feature's goes, the later ones shift down.
+  let moves = { ...(f.label_moves || {}) };
+  const dropFeatureMove = (i) => {
+    moves = Object.fromEntries(Object.entries(moves).flatMap(([k, v]) => {
+      const m = /^feature:(\d+)$/.exec(k);
+      if (!m || Number(m[1]) < i) return [[k, v]];
+      return Number(m[1]) === i ? [] : [[`feature:${Number(m[1]) - 1}`, v]];
+    }));
+  };
+  const featsChanged = () => { renderFeats(); save().catch((e) => { msg.style.color = "#900"; msg.textContent = e.message; }); };
+  const addFeat = () => {
+    const base = { symbol: symSel.value, label: featLabel.value.trim() || null, side: null, points: [] };
+    const added = (x) => { feats.push(x); featLabel.value = ""; featsChanged(); };
+    if (placeSel.value !== "") { added({ ...base, side: Number(placeSel.value) }); return; }
+    w.style.display = "none"; // out of the way of the map while drawing
+    zoomToUTMRing(p.corners.map((c) => [c.e, c.n]));
+    tdStartDraw(symOf(base.symbol).point, (points) => {
+      w.style.display = "";
+      if (points) added({ ...base, points }); else status("Plan feature cancelled.");
+    });
+  };
   const reg = d.registry === "ok" ? h("span", { style: "color:#060" }, "Prefilled from the Registry (read only) and the parcel record.")
     : d.registry === "off" ? h("span", { class: "muted" }, "Registry not configured on this server: type the holder and survey details.")
     : h("span", { style: "color:#900" }, `Registry not read (${d.registry}): type the holder and survey details.`);
   const missing = p.corners.filter((c, i) => !((f.corner_names || [])[i]) && /^P\d+$/.test(c.name)).length;
   const keys = ["title_no", "plan_no", "tracing_no", "region", "location", "address", "holder", "surveyed_by", "survey_date", "plotted_by", "checked_by", "surveyor_general", "prepared_by"];
   const fields = Object.fromEntries(keys.map((k) => [k, inp(k)]));
+  // Surveyed by: each word starts with a capital (the server enforces it too).
+  const capWords = (v) => v.replace(/(^|[^\p{L}\p{N}'’])(\p{L})/gu, (m, a, b) => a + b.toUpperCase());
+  fields.surveyed_by.addEventListener("input", () => {
+    const el = fields.surveyed_by, pos = el.selectionStart, v = capWords(el.value);
+    if (v !== el.value) { el.value = v; el.setSelectionRange(pos, pos); }
+  });
   const collect = () => {
     const out = {};
     for (const k of keys) out[k] = fields[k].value.trim() || null;
     out.lga = lga.value || null;
     out.scale = scale.value ? Number(scale.value) : null;
     out.corner_names = names.map((x) => x.value.trim() || null);
-    out.road_side = road.value === "" ? null : Number(road.value);
+    out.road_side = null;
+    out.road_sides = roadBoxes.flatMap((b, i) => (b.checked ? [i] : []));
+    out.grid = gridOn.checked;
+    out.grid_corner = null;
     out.road_label = roadLabel.value.trim() || null;
+    out.features = feats;
+    out.label_moves = moves;
     return out;
   };
   const msg = h("div", { style: "min-height:1.2em;margin:4px 0" });
@@ -4927,6 +5025,106 @@ async function titleDeedDialog(jobId, upin) {
     const r = await api(`/api/v1/wf/jobs/${jobId}/titledeed`, { method: "PUT", body: { upin: p.upin, fields: collect() } });
     msg.style.color = "#060"; msg.textContent = "Saved with the job.";
     return r;
+  };
+  // Adjust labels: the sheet full size. Drag a label to move it, double-click it to put it back;
+  // only the writing moves. Plan features can be added here too: drawn on the sheet (clicks become
+  // ground co-ordinates through its data-grid) or tied to a side, and the sheet redraws at once,
+  // so a road is seen stopping at the road it meets.
+  const adjust = async () => {
+    const before = { ...moves };
+    const fail = (e) => { msg.style.color = "#900"; msg.textContent = e.message; };
+    const page = h("div", { style: "width:900px;margin:0 auto 20px;background:#fff;touch-action:none;user-select:none" });
+    let el = null, drag = null, draw = null;
+    const show = async () => {
+      page.innerHTML = await sheet();
+      el = page.querySelector("svg");
+      el.removeAttribute("height"); el.setAttribute("width", "100%"); el.style.display = "block";
+    };
+    try { await show(); } catch (e) { fail(e); return; }
+    const hint = h("span", {}, "");
+    const idle = "Drag a label to move it. Double-click a label to put it back.";
+    hint.textContent = idle;
+    const adjSym = symSel.cloneNode(true), adjPlace = placeSel.cloneNode(true);
+    adjPlace.options[0].textContent = "Draw on the sheet";
+    adjSym.style.width = adjPlace.style.width = "170px";
+    const adjLabel = h("input", { placeholder: "Label (optional)", style: "width:130px" });
+    const drawBtn = h("button", { class: "btn" }, "Add feature");
+    // Paper mm at a mouse position, and ground co-ordinates of paper mm.
+    const mmAt = (e) => { const q = new DOMPoint(e.clientX, e.clientY).matrixTransform(el.getScreenCTM().inverse()); return [q.x, q.y]; };
+    const toGround = ([x, y]) => {
+      const [e0, n0, k, x0, y1] = el.getAttribute("data-grid").split(" ").map(Number);
+      const r = (v) => Math.round(v * 1000) / 1000;
+      return [r(e0 + (x - x0) / k), r(n0 + (y1 - y) / k)];
+    };
+    const addFeature = (x) => { feats.push(x); adjLabel.value = ""; renderFeats(); show().catch(fail); };
+    const stopDraw = () => {
+      draw?.line.remove(); draw = null;
+      page.classList.remove("drawing"); drawBtn.textContent = "Add feature"; hint.textContent = idle;
+    };
+    const finishDraw = () => {
+      const x = { ...draw.base, points: draw.pts.map(toGround) };
+      stopDraw(); addFeature(x);
+    };
+    drawBtn.addEventListener("click", () => {
+      if (draw) { stopDraw(); return; }
+      const base = { symbol: adjSym.value, label: adjLabel.value.trim() || null, side: null, points: [] };
+      if (adjPlace.value !== "") { addFeature({ ...base, side: Number(adjPlace.value) }); return; }
+      const point = symOf(base.symbol).point;
+      const line = document.createElementNS("http://www.w3.org/2000/svg", "polyline");
+      line.setAttribute("fill", "none"); line.setAttribute("stroke", "#f0f"); line.setAttribute("stroke-width", "0.4");
+      el.append(line);
+      draw = { pts: [], point, base, line };
+      page.classList.add("drawing"); drawBtn.textContent = "Cancel drawing";
+      hint.textContent = point ? "Click its position on the sheet. Esc cancels." : "Click along it on the sheet, double-click to finish. Esc cancels.";
+    });
+    const onKey = (e) => { if (e.key === "Escape" && draw) stopDraw(); };
+    document.addEventListener("keydown", onKey);
+    const close = () => { stopDraw(); document.removeEventListener("keydown", onKey); ov.remove(); };
+    const place = (g, key) => { const m = moves[key]; if (m) g.setAttribute("transform", `translate(${m[0]} ${m[1]})`); else g.removeAttribute("transform"); };
+    const bar = h("div", { style: "position:sticky;top:0;z-index:1;padding:8px;background:#333;color:#fff;font:13px sans-serif;text-align:center" },
+      h("div", { style: "display:flex;gap:8px;align-items:center;justify-content:center;margin-bottom:6px" }, adjSym, adjPlace, adjLabel, drawBtn,
+        h("button", { class: "btn", onclick: () => { if (!feats.length || draw) return; feats.pop(); dropFeatureMove(feats.length); renderFeats(); show().catch(fail); } }, "Remove last feature")),
+      h("div", { style: "display:flex;gap:8px;align-items:center;justify-content:center" }, hint,
+        h("button", { class: "btn", onclick: () => { moves = {}; page.querySelectorAll("[data-move]").forEach((g) => g.removeAttribute("transform")); } }, "Reset all labels"),
+        h("button", { class: "btn", title: "Put the labels back as they were; added features stay", onclick: () => { moves = before; close(); save().catch(fail); } }, "Cancel label moves"),
+        h("button", { class: "btn", onclick: () => { close(); save().catch(fail); } }, "Done")));
+    const ov = h("div", { style: "position:fixed;inset:0;z-index:2000;overflow:auto;background:#777" },
+      h("style", {}, "[data-move]{cursor:move}[data-move]:hover text{fill:#06c}.drawing svg,.drawing [data-move]{cursor:crosshair}"), bar, page);
+    document.body.append(ov);
+    page.addEventListener("pointerdown", (e) => {
+      if (draw) return;
+      const g = e.target.closest("[data-move]");
+      if (!g) return;
+      const key = g.getAttribute("data-move");
+      drag = { g, key, x: e.clientX, y: e.clientY, base: moves[key] || [0, 0], mm: el.getScreenCTM().a };
+      e.preventDefault();
+    });
+    ov.addEventListener("pointermove", (e) => {
+      if (!drag) return;
+      const r = (v) => Math.round(v * 100) / 100;
+      moves[drag.key] = [r(drag.base[0] + (e.clientX - drag.x) / drag.mm), r(drag.base[1] + (e.clientY - drag.y) / drag.mm)];
+      place(drag.g, drag.key);
+    });
+    const drop = () => { drag = null; };
+    ov.addEventListener("pointerup", drop);
+    ov.addEventListener("pointercancel", drop);
+    page.addEventListener("click", (e) => {
+      if (!draw) return;
+      // A double-click also delivers two clicks at the same spot; don't add zero-length segments.
+      const q = mmAt(e), last = draw.pts[draw.pts.length - 1];
+      if (last && Math.hypot(q[0] - last[0], q[1] - last[1]) < 0.5) return;
+      draw.pts.push(q);
+      if (draw.point) { finishDraw(); return; }
+      draw.line.setAttribute("points", draw.pts.map((p) => p.join(",")).join(" "));
+    });
+    page.addEventListener("dblclick", (e) => {
+      if (draw) { if (draw.pts.length >= 2) finishDraw(); return; }
+      const g = e.target.closest("[data-move]");
+      if (!g) return;
+      const key = g.getAttribute("data-move");
+      delete moves[key];
+      place(g, key);
+    });
   };
   const sheet = async () => { await save(); return api(`/api/v1/wf/jobs/${jobId}/titledeed.svg?upin=${encodeURIComponent(p.upin)}`); };
   const preview = async () => {
@@ -4966,23 +5164,34 @@ async function titleDeedDialog(jobId, upin) {
     ...d.upins.map((u) => h("option", { value: u, selected: u === p.upin }, u)))) : null;
   const w = floatWindow(`Title Deed Plan — ${p.upin}`, h("div", {},
     h("div", { style: "margin-bottom:6px" }, reg),
-    h("div", { class: "muted", style: "margin-bottom:6px" }, `Area ${area2(p.area_m2)} m² · ${n} beacons, clockwise from the westernmost`),
+    h("div", { class: "muted", style: "margin-bottom:6px" }, `Area ${(Math.floor(p.area_m2 * 1000 + 1e-7) / 1000).toFixed(3)} m² · ${n} beacons, clockwise from the westernmost`),
     pick,
     row("Title no.:", fields.title_no), row("Plan no.:", fields.plan_no), row("Tracing no.:", fields.tracing_no),
     row("Region:", fields.region), row("Location:", fields.location), row("Address:", fields.address), row("L.G. area:", lga),
     row("Holder:", fields.holder), row("Surveyed by:", fields.surveyed_by), row("Survey date:", fields.survey_date),
     row("Plotted by:", fields.plotted_by), row("Checked by:", fields.checked_by), row("Surveyor-General:", fields.surveyor_general),
-    row("Prepared by:", fields.prepared_by), row("Scale:", scale), row("Access road:", road), row("Road label:", roadLabel),
+    row("Prepared by:", fields.prepared_by), row("Scale:", scale), row("Access roads:", road), row("Road label:", roadLabel), row("Grid:", grid),
+    h("div", { class: "cfHdr", style: "margin-top:6px" }, "Plan features"),
+    row("Symbol:", symSel), row("Place:", placeSel), row("Label:", featLabel),
+    h("div", { class: "frow", style: "justify-content:flex-end" }, h("button", { class: "btn", onclick: addFeat }, "Add feature")),
+    featList,
     h("div", { class: "cfHdr", style: "margin-top:6px" }, "Beacon numbers" + (missing ? ` — ${missing} to type (not in the fabric)` : "")),
     h("div", { style: "max-height:180px;overflow:auto" }, ct),
     msg,
     h("div", { class: "frow", style: "flex-wrap:wrap;justify-content:flex-end" },
       h("button", { class: "btn", onclick: () => save().catch((e) => { msg.style.color = "#900"; msg.textContent = e.message; }) }, "Save"),
+      h("button", { class: "btn", onclick: adjust, title: "On the sheet: drag beacon numbers, bearings and distances, and add roads and other features" }, "Adjust labels"),
       h("button", { class: "btn", onclick: preview }, "Preview / Print"),
       h("button", { class: "btn", onclick: attach, title: "File the plan on the job as a PDF, for Send plan" }, "Attach as PDF"),
       h("button", { class: "btn", onclick: () => openRegistry({ job: jobId, view: "send" }) }, "Send plan…"))),
     { id: "titleDeedWin", width: 470 });
-  for (const x of names) x.addEventListener("input", () => [...road.options].slice(1).forEach((o, i) => { o.textContent = `Side ${i + 1}: ${nameOf(i)} → ${nameOf((i + 1) % n)}`; }));
+  for (const x of names) x.addEventListener("input", () => {
+    roadLabels.forEach((l, i) => { l.textContent = sideText(i); });
+    [...placeSel.options].slice(1).forEach((o, i) => { o.textContent = sideText(i); });
+    renderFeats();
+  });
+  renderFeats();
+  w.querySelector(".fx").addEventListener("click", () => tdShow([]));
 }
 
 function wfStepAction(s) {
