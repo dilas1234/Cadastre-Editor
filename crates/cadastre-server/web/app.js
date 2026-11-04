@@ -12,6 +12,7 @@ const toLL = (e, n) => proj4("EPSG:32632", "EPSG:4326", [e, n]);
 const $ = (id) => document.getElementById(id);
 const esc = (s) => String(s ?? "").replace(/[&<>"']/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
 const empty = () => ({ type: "FeatureCollection", features: [] });
+let tdDraw = null; // a title deed plan feature being drawn on the map (see tdStartDraw)
 function h(tag, attrs = {}, ...kids) {
   const e = document.createElement(tag);
   for (const [k, v] of Object.entries(attrs || {})) {
@@ -319,6 +320,12 @@ map.once("style.load", async () => {
   map.addSource("measure", { type: "geojson", data: empty() });
   map.addLayer({ id: "measure-line", type: "line", source: "measure",
     paint: { "line-color": "#ff00ff", "line-width": 2, "line-dasharray": [2, 1] } });
+  // The features drawn for the open title deed plan.
+  map.addSource("tdfeat", { type: "geojson", data: empty() });
+  map.addLayer({ id: "tdfeat-line", type: "line", source: "tdfeat", filter: ["==", ["geometry-type"], "LineString"],
+    paint: { "line-color": "#00e5ff", "line-width": 2.5 } });
+  map.addLayer({ id: "tdfeat-point", type: "circle", source: "tdfeat", filter: ["==", ["geometry-type"], "Point"],
+    paint: { "circle-color": "#00e5ff", "circle-radius": 5, "circle-stroke-color": "#000", "circle-stroke-width": 1 } });
 
   // Digitizing sketch (fill + segments + vertices). Last/selected vertex is drawn red.
   map.addSource("sketch", { type: "geojson", data: empty() });
@@ -1074,6 +1081,7 @@ const TOOL_CURSOR = {
   sketch: "crosshair", editVertex: "pointer", cut: "crosshair", attr: "pointer",
 };
 function setTool(tool) {
+  if (tool !== "tdFeature" && tdDraw) tdEnd(null);
   // The sketch/edit tools require an active edit session, like ArcMap's "Start Editing".
   if ((tool === "sketch" || tool === "editVertex") && !edit.active) { startEditing(tool); return; }
   if (tool === "cut" && !edit.active) { startEditing("cut"); return; }
@@ -1088,6 +1096,7 @@ function setTool(tool) {
 }
 function cancelInteraction() {
   if (box) { box.el.remove(); box = null; }
+  if (tdDraw) { tdEnd(null); return; }
   if (state.tool === "measure") clearMeasure();
   if (state.tool === "cut" && edit.cut.length) { clearCut(); status("Cut cancelled."); return; }
   if (edit.active && edit.verts.length) { clearSketch(); refreshSketchProps(); updateEditorButtons(); status("Sketch cancelled."); }
@@ -1168,6 +1177,7 @@ map.on("click", (e) => {
     }
     case "identify": identifyAt(e); break;
     case "measure": measureClick(e.lngLat); break;
+    case "tdFeature": tdClick(e.lngLat); break;
     case "survey": setSurveyStart(e.lngLat); break;
     case "text": addTextGraphic(e.lngLat); break;
     case "selectEl": selectGraphicAt(e); break;
@@ -1193,7 +1203,8 @@ function editDraftAt(pt) {
   status(`Editing draft parcel corners (${edit.verts.length}). Drag them, or retype them in Edit Sketch Properties; Finish Sketch saves.`);
 }
 map.on("dblclick", (e) => {
-  if (state.tool === "measure") { e.preventDefault(); finishMeasure(); }
+  if (state.tool === "tdFeature") { e.preventDefault(); tdFinish(); }
+  else if (state.tool === "measure") { e.preventDefault(); finishMeasure(); }
   else if (state.tool === "sketch" && edit.verts.length) { e.preventDefault(); finishSketch(); }
   else if (state.tool === "cut" && edit.cut.length) { e.preventDefault(); finishCut(); }
   else if (parcelAt(e.point)) { e.preventDefault(); parcelMenu(e); }
@@ -3998,6 +4009,39 @@ async function wfFinishPost(j, beacons) {
 // The server prefills the form from the Registry (Aumentum's R_PROPINFO / R_HOLDERS) and the parcel
 // record; the officer confirms or types the rest, saves it with the job, prints the A4 sheet, and
 // turns it into the PDF that Send plan files with the Registry transaction.
+// A feature of the plan drawn on the map: click its points and double-click to finish (a point
+// symbol takes one click), Esc to cancel. onDone gets the UTM points, or null when cancelled.
+function tdStartDraw(point, onDone) {
+  tdDraw = { pts: [], point, onDone };
+  setTool("tdFeature");
+  status(point ? "Plan feature: click its position on the map. Esc cancels." : "Plan feature: click along it on the map, double-click to finish. Esc cancels.");
+}
+function tdClick(ll) {
+  if (!tdDraw) return;
+  // A double-click also delivers two clicks at the same spot; don't add zero-length segments.
+  const last = tdDraw.pts[tdDraw.pts.length - 1];
+  if (last) { const a = map.project(last), b = map.project(ll); if (Math.hypot(a.x - b.x, a.y - b.y) < 3) return; }
+  tdDraw.pts.push([ll.lng, ll.lat]);
+  if (tdDraw.point) { tdFinish(); return; }
+  map.getSource("measure").setData({ type: "FeatureCollection", features: tdDraw.pts.length > 1 ? [{ type: "Feature", geometry: { type: "LineString", coordinates: tdDraw.pts }, properties: {} }] : [] });
+}
+function tdFinish() {
+  if (!tdDraw) return;
+  if (tdDraw.pts.length < (tdDraw.point ? 1 : 2)) { status("Plan feature: a line needs at least two points."); return; }
+  tdEnd(tdDraw.pts);
+}
+function tdEnd(pts) {
+  const d = tdDraw;
+  tdDraw = null;
+  map.getSource("measure")?.setData(empty());
+  setTool("pan");
+  d.onDone(pts ? pts.map(([x, y]) => toUTM(x, y).map((v) => Math.round(v * 1000) / 1000)) : null);
+}
+// The plan's drawn features on the map, while its form is open.
+function tdShow(feats) {
+  map.getSource("tdfeat")?.setData({ type: "FeatureCollection", features: feats.filter((x) => x.points?.length).map((x) => ({ type: "Feature", properties: {},
+    geometry: x.points.length > 1 ? { type: "LineString", coordinates: x.points.map(([e, n]) => toLL(e, n)) } : { type: "Point", coordinates: toLL(...x.points[0]) } })) });
+}
 const TD_SCALES = [250, 500, 750, 1000, 1250, 1500, 2000, 2500, 3000, 4000, 5000, 7500, 10000, 25000];
 async function titleDeedDialog(jobId, upin) {
   let d;
@@ -4026,6 +4070,32 @@ async function titleDeedDialog(jobId, upin) {
   const gridOn = h("input", { type: "checkbox", checked: f.grid !== false });
   const grid = h("label", { style: "white-space:nowrap" }, gridOn, " Show grid ticks on the frame edges");
   const roadLabel = inp("road_label", "Access Road");
+  // Plan features: a symbol placed along a side of the parcel, or drawn on the map.
+  const feats = (f.features || []).map((x) => ({ ...x }));
+  const symOf = (id) => d.symbols.find((y) => y.id === id);
+  const symSel = h("select", { style: "width:100%" }, ...[...new Set(d.symbols.map((y) => y.group))].map((g) =>
+    h("optgroup", { label: g }, ...d.symbols.filter((y) => y.group === g).map((y) => h("option", { value: y.id }, y.label)))));
+  const placeSel = h("select", { style: "width:100%" }, h("option", { value: "" }, "Draw on the map"), ...p.corners.map((c, i) => h("option", { value: i }, sideText(i))));
+  const featLabel = h("input", { placeholder: "Optional, e.g. River Delimi", style: "width:100%;box-sizing:border-box" });
+  const featList = h("div", { style: "max-height:110px;overflow:auto" });
+  const featText = (x) => `${symOf(x.symbol)?.label || x.symbol}${x.label ? ` "${x.label}"` : ""}: ${x.side != null ? sideText(x.side) : "drawn on the map"}`;
+  const renderFeats = () => {
+    featList.replaceChildren(...feats.map((x, i) => h("div", { style: "display:flex;gap:6px;align-items:center;margin-top:3px" }, h("span", { style: "flex:1" }, featText(x)),
+      h("button", { class: "btn", onclick: () => { feats.splice(i, 1); featsChanged(); } }, "Remove"))));
+    tdShow(feats);
+  };
+  const featsChanged = () => { renderFeats(); save().catch((e) => { msg.style.color = "#900"; msg.textContent = e.message; }); };
+  const addFeat = () => {
+    const base = { symbol: symSel.value, label: featLabel.value.trim() || null, side: null, points: [] };
+    const added = (x) => { feats.push(x); featLabel.value = ""; featsChanged(); };
+    if (placeSel.value !== "") { added({ ...base, side: Number(placeSel.value) }); return; }
+    w.style.display = "none"; // out of the way of the map while drawing
+    zoomToUTMRing(p.corners.map((c) => [c.e, c.n]));
+    tdStartDraw(symOf(base.symbol).point, (points) => {
+      w.style.display = "";
+      if (points) added({ ...base, points }); else status("Plan feature cancelled.");
+    });
+  };
   const reg = d.registry === "ok" ? h("span", { style: "color:#060" }, "Prefilled from the Registry (read only) and the parcel record.")
     : d.registry === "off" ? h("span", { class: "muted" }, "Registry not configured on this server: type the holder and survey details.")
     : h("span", { style: "color:#900" }, `Registry not read (${d.registry}): type the holder and survey details.`);
@@ -4049,6 +4119,7 @@ async function titleDeedDialog(jobId, upin) {
     out.grid = gridOn.checked;
     out.grid_corner = null;
     out.road_label = roadLabel.value.trim() || null;
+    out.features = feats;
     return out;
   };
   const msg = h("div", { style: "min-height:1.2em;margin:4px 0" });
@@ -4102,6 +4173,10 @@ async function titleDeedDialog(jobId, upin) {
     row("Holder:", fields.holder), row("Surveyed by:", fields.surveyed_by), row("Survey date:", fields.survey_date),
     row("Plotted by:", fields.plotted_by), row("Checked by:", fields.checked_by), row("Surveyor-General:", fields.surveyor_general),
     row("Prepared by:", fields.prepared_by), row("Scale:", scale), row("Access roads:", road), row("Road label:", roadLabel), row("Grid:", grid),
+    h("div", { class: "cfHdr", style: "margin-top:6px" }, "Plan features"),
+    row("Symbol:", symSel), row("Place:", placeSel), row("Label:", featLabel),
+    h("div", { class: "frow", style: "justify-content:flex-end" }, h("button", { class: "btn", onclick: addFeat }, "Add feature")),
+    featList,
     h("div", { class: "cfHdr", style: "margin-top:6px" }, "Beacon numbers" + (missing ? ` — ${missing} to type (not in the fabric)` : "")),
     h("div", { style: "max-height:180px;overflow:auto" }, ct),
     msg,
@@ -4113,7 +4188,11 @@ async function titleDeedDialog(jobId, upin) {
     { id: "titleDeedWin", width: 470 });
   for (const x of names) x.addEventListener("input", () => {
     roadLabels.forEach((l, i) => { l.textContent = sideText(i); });
+    [...placeSel.options].slice(1).forEach((o, i) => { o.textContent = sideText(i); });
+    renderFeats();
   });
+  renderFeats();
+  w.querySelector(".fx").addEventListener("click", () => tdShow([]));
 }
 
 function wfStepAction(s) {

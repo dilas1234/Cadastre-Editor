@@ -7,6 +7,8 @@
 //!   (degrees at one end, minutes at the other) and the distance, the file no. and area in the
 //!   middle, access roads (dashed, parallel to chosen sides), grid values at the frame's lower
 //!   corners and a tick on its edges every 100 mm of paper (so the ground step follows the scale);
+//!   features from the symbol list (roads, water, drainage, point features), drawn on the map or
+//!   tied to a side, clipped to the frame;
 //! * footer: WGS 1984 co-ordinates of the first beacon, surveyed by / survey date / sheet no. /
 //!   prepared by (left), the computation note and plotted / checked by (centre), the
 //!   Surveyor-General's signature and date lines (right).
@@ -30,6 +32,64 @@ pub struct Corner {
     pub e: f64,
     pub n: f64,
 }
+
+/// A feature added to the plan: a symbol from [`SYMBOLS`], placed either along a side of the parcel
+/// (`side`) or at the ground co-ordinates drawn on the map (`points`).
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize, ToSchema)]
+#[serde(default)]
+pub struct PlanFeature {
+    /// The symbol's id in [`SYMBOLS`].
+    pub symbol: String,
+    /// Printed beside the feature, e.g. a river's name; blank = none.
+    pub label: Option<String>,
+    /// The side it runs along, outside the parcel (side k runs from corner k to corner k+1).
+    pub side: Option<usize>,
+    /// Drawn on the map: Easting and Northing of its points (one for a point symbol).
+    pub points: Vec<[f64; 2]>,
+}
+
+/// One entry of the plan's symbol list.
+pub struct Symbol {
+    pub id: &'static str,
+    pub label: &'static str,
+    pub group: &'static str,
+    /// Placed at one spot; the others are lines.
+    pub point: bool,
+    stroke: &'static str,
+    /// Line width on paper (mm).
+    width: f64,
+    dash: &'static str,
+    /// A white line down the middle this wide (mm): a double line.
+    inner: f64,
+}
+
+const fn line(id: &'static str, label: &'static str, group: &'static str, stroke: &'static str, width: f64, dash: &'static str, inner: f64) -> Symbol {
+    Symbol { id, label, group, point: false, stroke, width, dash, inner }
+}
+
+const fn spot(id: &'static str, label: &'static str) -> Symbol {
+    Symbol { id, label, group: "Point features", point: true, stroke: "#000", width: 0.0, dash: "", inner: 0.0 }
+}
+
+const WATER: &str = "#1f6fb5";
+
+/// The symbols of the plan form, in its order.
+pub const SYMBOLS: [Symbol; 14] = [
+    line("road", "Road", "Roads", "#000", 0.3, "2.5 1.5", 0.0),
+    line("road_unpaved", "Road, unpaved", "Roads", "#555", 0.25, "1.2 1.2", 0.0),
+    line("road_proposed", "Road, proposed", "Roads", RED, 0.3, "", 0.0),
+    line("footpath", "Footpath", "Roads", "#000", 0.2, "0.5 1", 0.0),
+    line("river", "River", "Water", WATER, 0.6, "", 0.0),
+    line("stream", "Stream or creek", "Water", WATER, 0.3, "", 0.0),
+    line("stream_intermittent", "Stream, intermittent", "Water", WATER, 0.3, "2 0.8 0.5 0.8", 0.0),
+    line("canal", "Canal", "Water", WATER, 0.9, "", 0.5),
+    line("gutter", "Gutter or drain", "Drainage", "#444", 0.8, "", 0.4),
+    line("culvert", "Culvert", "Drainage", "#444", 0.6, "1 1", 0.0),
+    spot("tree", "Tree"),
+    spot("pole", "Electric pole"),
+    spot("well", "Well or borehole"),
+    spot("building_corner", "Building corner"),
+];
 
 /// What the officer confirms or types on the plan form (saved per job). Every field is optional:
 /// a blank one is printed blank.
@@ -65,6 +125,8 @@ pub struct PlanFields {
     pub grid: Option<bool>,
     /// No longer used (the beacon of an earlier co-ordinate cross); kept so saved forms read.
     pub grid_corner: Option<usize>,
+    /// Roads, water, drainage and point features added to the plan.
+    pub features: Vec<PlanFeature>,
 }
 
 impl PlanFields {
@@ -113,8 +175,15 @@ const LINE: &str = "#8b2f2f";
 /// A white outline under labels that may cross a line (beacon numbers, bearings, the road).
 const HALO: &str = r##"stroke="#fff" stroke-width="0.7" paint-order="stroke""##;
 /// A side shorter than this on paper (mm) has no room for its bearing and distance: they are
-/// written in the frame's lower-left corner instead ("N9998V - N9997V = 282°27'@3.78m").
+/// written in the frame's lower-right corner instead ("PN6503 - PN6499 = 21° 16' @ 2.57m").
 const SHORT_SIDE_MM: f64 = 12.0;
+/// A feature tied to a side runs this far outside it (mm), and a second one on the same side this
+/// much further out.
+const FEATURE_OFF: f64 = 4.0;
+const FEATURE_STEP: f64 = 2.5;
+/// Beacon numbers: their font size, and the least distance between two that share a column (mm).
+const BEACON_SIZE: f64 = 2.7;
+const BEACON_LINE: f64 = 3.3;
 /// The grid step on paper, from the frame's lower-left corner: on the ground this is the scale's
 /// tenth in metres (50 m at 1:500, as PL65487's 484781 → 484831).
 const GRID_MM: f64 = 100.0;
@@ -212,6 +281,59 @@ fn along(svg: &mut String, a: (f64, f64), b: (f64, f64), t: f64, off: f64, size:
         ang += 180.0;
     }
     let _ = writeln!(svg, r##"<text x="{x:.2}" y="{y:.2}" font-size="{size}" text-anchor="middle" dominant-baseline="middle" stroke="#fff" stroke-width="0.7" paint-order="stroke" transform="rotate({ang:.2} {x:.2} {y:.2})">{}</text>"##, esc(s));
+}
+
+/// A beacon number on paper: its left and right edges (estimated from its length) and baseline.
+struct LabelBox {
+    left: f64,
+    right: f64,
+    y: f64,
+}
+
+/// Move labels that would touch apart, up and down by the same amount, to a line's height (a few
+/// passes, as a move can bring a label to a third). Labels that do not touch stay where they are.
+fn spread_labels(boxes: &mut [LabelBox]) {
+    for _ in 0..8 {
+        let mut moved = false;
+        for i in 0..boxes.len() {
+            for j in i + 1..boxes.len() {
+                let (head, tail) = boxes.split_at_mut(j);
+                let (a, b) = (&mut head[i], &mut tail[0]);
+                let gap = (a.y - b.y).abs();
+                if a.left < b.right && b.left < a.right && gap < BEACON_LINE - 1e-6 {
+                    let push = (BEACON_LINE - gap) / 2.0;
+                    let (upper, lower) = if a.y <= b.y { (a, b) } else { (b, a) };
+                    upper.y -= push;
+                    lower.y += push;
+                    moved = true;
+                }
+            }
+        }
+        if !moved {
+            break;
+        }
+    }
+}
+
+/// A line symbol along paper points.
+fn feature_line(svg: &mut String, sym: &Symbol, pts: &[(f64, f64)]) {
+    let d: String = pts.iter().map(|q| format!("{:.2},{:.2}", q.0, q.1)).collect::<Vec<_>>().join(" ");
+    let dash = if sym.dash.is_empty() { String::new() } else { format!(r#" stroke-dasharray="{}""#, sym.dash) };
+    let _ = writeln!(svg, r#"<polyline points="{d}" fill="none" stroke="{}" stroke-width="{}" stroke-linejoin="round"{dash}/>"#, sym.stroke, sym.width);
+    if sym.inner > 0.0 {
+        let _ = writeln!(svg, r##"<polyline points="{d}" fill="none" stroke="#fff" stroke-width="{}" stroke-linejoin="round"/>"##, sym.inner);
+    }
+}
+
+/// A point symbol at a paper point.
+fn feature_point(svg: &mut String, sym: &Symbol, q: (f64, f64)) {
+    let glyph = match sym.id {
+        "tree" => r##"<g stroke="#2e7d32" stroke-width="0.25" fill="none"><circle r="1.5"/><circle r="0.3" fill="#2e7d32"/></g>"##,
+        "pole" => r##"<g stroke="#000" stroke-width="0.25"><line x1="0" y1="-1.6" x2="0" y2="1.6"/><line x1="-1" y1="-1.6" x2="1" y2="-1.6"/><circle r="0.5" fill="#000"/></g>"##,
+        "well" => r##"<g stroke="#1f6fb5" stroke-width="0.25" fill="none"><circle r="1.2"/><circle r="0.5" fill="#1f6fb5"/></g>"##,
+        _ => r##"<path d="M-1.5 1.5 L-1.5 -1.5 L1.5 -1.5" fill="none" stroke="#000" stroke-width="0.35"/>"##,
+    };
+    let _ = writeln!(svg, r#"<g transform="translate({:.2} {:.2})">{glyph}</g>"#, q.0, q.1);
 }
 
 /// The sheet as SVG.
@@ -368,6 +490,47 @@ pub fn render_svg(d: &PlanData) -> String {
         along(&mut s, m, (m.0 + r.u.0 * r.len, m.1 + r.u.1 * r.len), 0.5, 0.0, 2.8, &label);
     }
 
+    // Features from the symbol list, under the parcel, and cut at the frame: a drawn one can run
+    // past it. One on a side keeps that side's length, outside the parcel.
+    let _ = writeln!(s, r#"<clipPath id="planFrame"><rect x="{x0}" y="{y0}" width="{}" height="{}"/></clipPath><g clip-path="url(#planFrame)">"#, x1 - x0, y1 - y0);
+    let mut on_side = vec![0u32; p.len()];
+    for feat in &f.features {
+        let Some(sym) = SYMBOLS.iter().find(|y| y.id == feat.symbol) else { continue };
+        let label = feat.label.as_deref().map(str::trim).filter(|l| !l.is_empty());
+        let (pts, label_off): (Vec<(f64, f64)>, f64) = match feat.side {
+            Some(i) if i < p.len() && p.len() >= 3 => {
+                let (a, b) = (p[i], p[(i + 1) % p.len()]);
+                let len = ((b.0 - a.0).powi(2) + (b.1 - a.1).powi(2)).sqrt().max(1e-9);
+                let left = ((b.1 - a.1) / len, -(b.0 - a.0) / len);
+                let (mx, my) = ((a.0 + b.0) / 2.0, (a.1 + b.1) / 2.0);
+                let sign = if (mx + left.0 - pcx).powi(2) + (my + left.1 - pcy).powi(2) > (mx - pcx).powi(2) + (my - pcy).powi(2) { 1.0 } else { -1.0 };
+                let off = sign * (FEATURE_OFF + FEATURE_STEP * on_side[i] as f64);
+                on_side[i] += 1;
+                let shift = |q: (f64, f64)| (q.0 + left.0 * off, q.1 + left.1 * off);
+                (if sym.point { vec![shift((mx, my))] } else { vec![shift(a), shift(b)] }, sign * 1.8)
+            }
+            Some(_) => continue,
+            None => (feat.points.iter().map(|q| paper(q[0], q[1])).collect(), 1.8),
+        };
+        if sym.point {
+            let Some(&q) = pts.first() else { continue };
+            feature_point(&mut s, sym, q);
+            if let Some(l) = label {
+                text(&mut s, q.0 + 2.2, q.1 + 0.9, 2.4, "start", HALO, &esc(l));
+            }
+        } else if pts.len() >= 2 {
+            feature_line(&mut s, sym, &pts);
+            if let Some(l) = label {
+                // On the longest stretch, where it has the most room.
+                let seg = |w: &&[(f64, f64)]| (w[1].0 - w[0].0).powi(2) + (w[1].1 - w[0].1).powi(2);
+                if let Some(w) = pts.windows(2).max_by(|x, y| seg(x).total_cmp(&seg(y))) {
+                    along(&mut s, w[0], w[1], 0.5, label_off, 2.4, l);
+                }
+            }
+        }
+    }
+    s.push_str("</g>\n");
+
     // Parcel, beacons, bearings and distances.
     if p.len() >= 2 {
         let pts: String = p.iter().map(|q| format!("{:.2},{:.2}", q.0, q.1)).collect::<Vec<_>>().join(" ");
@@ -393,28 +556,38 @@ pub fn render_svg(d: &PlanData) -> String {
         let reads_from_a = if dx.abs() > 1e-6 { dx > 0.0 } else { a.1 < b.1 };
         let (t_deg, t_min) = if reads_from_a { (0.2, 0.8) } else { (0.8, 0.2) };
         if paper_len < SHORT_SIDE_MM && p.len() >= 3 {
-            short.push(format!("{} - {} = {deg}°{min:02}'@{dist:.2}m", esc(&corners[i].name), esc(&corners[(i + 1) % corners.len()].name)));
+            short.push(format!("{} - {} = {deg}° {min:02}' @ {dist:.2}m", esc(&corners[i].name), esc(&corners[(i + 1) % corners.len()].name)));
             continue;
         }
         along(&mut s, a, b, t_deg, out, 2.6, &format!("{deg}°"));
         along(&mut s, a, b, t_min, out, 2.6, &format!("{min:02}'"));
         along(&mut s, a, b, 0.5, -out, 2.6, &format!("{dist:.2}m"));
     }
-    for (i, q) in p.iter().enumerate() {
+    let mut labels: Vec<(f64, f64, &str)> = Vec::new();
+    for q in &p {
         let _ = writeln!(s, r##"<path d="M{:.2} {:.2} l2 2 M{:.2} {:.2} l-2 2" stroke="#000" stroke-width="0.3" transform="translate(-1 -1)"/>"##, q.0 - 0.0, q.1, q.0 + 2.0, q.1);
         let (vx, vy) = (q.0 - pcx, q.1 - pcy);
         let vl = (vx * vx + vy * vy).sqrt().max(1e-9);
         let (tx, ty) = (q.0 + vx / vl * 5.0, q.1 + vy / vl * 4.0 + 1.0);
-        let anchor = if vx < -0.5 { "end" } else if vx > 0.5 { "start" } else { "middle" };
-        text(&mut s, tx, ty, 2.7, anchor, HALO, &esc(&corners[i].name));
+        labels.push((tx, ty, if vx < -0.5 { "end" } else if vx > 0.5 { "start" } else { "middle" }));
+    }
+    // Close beacons: their numbers are moved apart so that none is written over another.
+    let mut boxes: Vec<LabelBox> = labels.iter().zip(&corners).map(|(&(x, y, anchor), c)| {
+        let w = c.name.chars().count() as f64 * BEACON_SIZE * 0.65;
+        let left = match anchor { "end" => x - w, "start" => x, _ => x - w / 2.0 };
+        LabelBox { left, right: left + w, y }
+    }).collect();
+    spread_labels(&mut boxes);
+    for ((&(x, _, anchor), b), c) in labels.iter().zip(&boxes).zip(&corners) {
+        text(&mut s, x, b.y, BEACON_SIZE, anchor, HALO, &esc(&c.name));
     }
     let file_no = if f.plan_no.as_deref().unwrap_or("").is_empty() { title_no.clone() } else { up(&f.plan_no) };
     text(&mut s, pcx, pcy - 0.8, 2.6, "middle", "", &file_no);
     text(&mut s, pcx, pcy + 2.8, 2.6, "middle", "", &format!("{} Sq.m", area3(d.area_m2)));
 
-    // Short sides, bottom-left inside the frame (the last one lowest).
+    // Short sides, bottom-right inside the frame (the last one lowest).
     for (j, line) in short.iter().rev().enumerate() {
-        text(&mut s, FRAME.0 + 2.0, FRAME.3 - 2.5 - j as f64 * 4.0, 2.6, "start", "", line);
+        text(&mut s, FRAME.2 - 2.0, FRAME.3 - 2.5 - j as f64 * 4.0, 2.6, "end", "", line);
     }
 
     // Footer.
@@ -597,9 +770,82 @@ mod tests {
         // PL68374 at 1:500: N9997V → N9998V is 3.78 m (7.6 mm on paper), as its printed plan.
         let fields = PlanFields { scale: Some(500), ..Default::default() };
         let svg = render_svg(&PlanData { upin: "X".into(), area_m2: 902.203, corners: pl68374(), fields });
-        assert!(svg.contains(">N9997V - N9998V = 282°27'@3.78m<"));
+        assert!(svg.contains(r#"x="196.00" y="225.50" font-size="2.6" text-anchor="end""#), "the lower-right corner");
+        assert!(svg.contains(">N9997V - N9998V = 282° 27' @ 3.78m<"));
         assert!(!svg.contains(">3.78m<") && !svg.contains(">282°<"), "not on the side itself");
         assert!(svg.contains(">29.30m<") && svg.contains(">25.53m<"), "the long sides keep theirs");
+    }
+
+    #[test]
+    fn close_beacon_numbers_are_moved_apart() {
+        // PL68374 at 1:500: N9997V and N9998V are 7.6 mm apart on paper.
+        let fields = PlanFields { scale: Some(500), ..Default::default() };
+        let svg = render_svg(&PlanData { upin: "X".into(), area_m2: 902.203, corners: pl68374(), fields });
+        let y_of = |name: &str| -> f64 {
+            let line = svg.lines().find(|l| l.ends_with(&format!(">{name}</text>"))).unwrap();
+            line.split("y=\"").nth(1).unwrap().split('"').next().unwrap().parse().unwrap()
+        };
+        assert!((y_of("N9997V") - y_of("N9998V")).abs() >= BEACON_LINE - 0.01);
+
+        let mut b = [LabelBox { left: 0.0, right: 10.0, y: 50.0 }, LabelBox { left: 5.0, right: 15.0, y: 51.0 }, LabelBox { left: 40.0, right: 50.0, y: 50.5 }];
+        spread_labels(&mut b);
+        assert!((b[1].y - b[0].y - BEACON_LINE).abs() < 1e-6, "touching: a line apart, the upper one stays upper");
+        assert!((b[0].y + b[1].y - 101.0).abs() < 1e-6, "each moved by the same amount");
+        assert_eq!(b[2].y, 50.5, "a label that touches none stays");
+    }
+
+    #[test]
+    fn features_are_drawn_at_their_co_ordinates_or_along_a_side() {
+        let feat = |symbol: &str, label: Option<&str>, side, points| PlanFeature { symbol: symbol.into(), label: label.map(Into::into), side, points };
+        let features = vec![
+            // 1:500 puts 495116 / 1092379 on the frame's lower-left corner (12, 228): 2 mm per metre.
+            feat("river", Some("River Delimi"), None, vec![[495126.0, 1092389.0], [495146.0, 1092389.0]]),
+            feat("tree", Some("Mango"), None, vec![[495126.0, 1092399.0]]),
+            feat("gutter", None, Some(2), vec![]),
+            feat("no_such_symbol", None, None, vec![[495126.0, 1092389.0], [495146.0, 1092389.0]]),
+            feat("road", None, Some(99), vec![]),
+            feat("river", None, None, vec![[495126.0, 1092389.0]]),
+        ];
+        let fields = PlanFields { scale: Some(500), features, ..Default::default() };
+        let svg = render_svg(&PlanData { upin: "X".into(), area_m2: 902.203, corners: pl68374(), fields });
+        assert_eq!(svg.matches("<polyline").count(), 3, "the river, and the gutter's two lines; nothing for the bad ones");
+        assert!(svg.contains(r##"points="32.00,208.00 72.00,208.00" fill="none" stroke="#1f6fb5""##), "the river at its ground co-ordinates");
+        assert!(svg.contains(">River Delimi<") && svg.contains(">Mango<"));
+        assert!(svg.contains(r#"translate(32.00 188.00)"#), "the tree");
+        assert!(svg.find("planFrame").unwrap() < svg.find("<polygon").unwrap(), "under the parcel, cut at the frame");
+
+        // The gutter on side 2 (N9996V → N9997V) runs parallel to it, on the side away from the parcel.
+        let c = pl68374();
+        let (a, b) = (&c[2], &c[3]);
+        let at = |c: &Corner| (12.0 + (c.e - 495116.0) * 2.0, 228.0 - (c.n - 1092379.0) * 2.0);
+        let (pa, pb) = (at(a), at(b));
+        let line = svg.lines().find(|l| l.contains(r##"stroke="#444""##)).unwrap();
+        let pts: Vec<f64> = line.split('"').nth(1).unwrap().split([' ', ',']).map(|v| v.parse().unwrap()).collect();
+        let (dx, dy) = (pts[0] - pa.0, pts[1] - pa.1);
+        assert!((dx.hypot(dy) - FEATURE_OFF).abs() < 0.02, "4 mm from the side");
+        assert!(((pts[2] - pb.0) - dx).abs() < 0.02 && ((pts[3] - pb.1) - dy).abs() < 0.02, "parallel");
+        assert!(dy > 0.0, "south of the parcel, lower on the sheet");
+    }
+
+    #[test]
+    fn a_second_feature_on_a_side_goes_further_out_and_a_point_sits_at_its_middle() {
+        let f = |symbol: &str| PlanFeature { symbol: symbol.into(), side: Some(2), ..Default::default() };
+        let fields = PlanFields { scale: Some(500), features: vec![f("gutter"), f("tree")], ..Default::default() };
+        let c = pl68374();
+        let svg = render_svg(&PlanData { upin: "X".into(), area_m2: 1.0, corners: c.clone(), fields });
+        let at = |c: &Corner| (12.0 + (c.e - 495116.0) * 2.0, 228.0 - (c.n - 1092379.0) * 2.0);
+        let (a, b) = (at(&c[2]), at(&c[3]));
+        let (mx, my) = ((a.0 + b.0) / 2.0, (a.1 + b.1) / 2.0);
+        let t = svg.split("translate(").nth(1).unwrap().split(')').next().unwrap();
+        let q: Vec<f64> = t.split(' ').map(|v| v.parse().unwrap()).collect();
+        assert!(((q[0] - mx).hypot(q[1] - my) - (FEATURE_OFF + FEATURE_STEP)).abs() < 0.02);
+    }
+
+    #[test]
+    fn a_form_saved_before_features_still_reads() {
+        let f: PlanFields = serde_json::from_str(r#"{"plan_no":"PL1"}"#).unwrap();
+        assert!(f.features.is_empty());
+        assert_eq!(SYMBOLS.iter().map(|y| y.id).collect::<std::collections::BTreeSet<_>>().len(), SYMBOLS.len(), "ids are unique");
     }
 
     #[test]

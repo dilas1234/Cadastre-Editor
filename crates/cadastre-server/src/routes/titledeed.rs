@@ -27,12 +27,22 @@ use crate::auth::AuthUser;
 use crate::error::{ApiResult, AppError};
 use crate::lrs::{LrsConfig, Session};
 use crate::state::AppState;
-use crate::titledeed::{cap_words, plan_order, render_svg, PlanData, PlanFields};
+use crate::titledeed::{cap_words, plan_order, render_svg, PlanData, PlanFields, SYMBOLS};
 
 #[derive(Debug, Deserialize, IntoParams)]
 pub struct PlanQuery {
     /// The parcel, when the job has more than one.
     pub upin: Option<String>,
+}
+
+/// An entry of the plan's symbol list, for the form.
+#[derive(Debug, Serialize, ToSchema)]
+pub struct SymbolDto {
+    pub id: String,
+    pub label: String,
+    pub group: String,
+    /// Placed at one spot; the others are lines.
+    pub point: bool,
 }
 
 #[derive(Debug, Serialize, ToSchema)]
@@ -47,6 +57,8 @@ pub struct TitleDeedDto {
     pub upins: Vec<String>,
     /// `ok`, `off` (not configured) or why the Registry could not be read.
     pub registry: String,
+    /// The symbols a feature on the plan can use, in the form's order.
+    pub symbols: Vec<SymbolDto>,
 }
 
 #[derive(Debug, Deserialize, ToSchema)]
@@ -175,6 +187,7 @@ fn merge(prefill: &PlanFields, saved: &PlanFields) -> PlanFields {
         road_sides: if saved.road_sides.is_empty() { prefill.road_sides.clone() } else { saved.road_sides.clone() },
         grid: saved.grid.or(prefill.grid),
         grid_corner: saved.grid_corner.or(prefill.grid_corner),
+        features: saved.features.clone(),
         road_label: non_empty(saved.road_label.clone()).or_else(|| prefill.road_label.clone()) } } }
     pick!(region, location, plan_no, tracing_no, title_no, address, lga, holder, surveyed_by, survey_date, plotted_by, checked_by, surveyor_general, prepared_by)
 }
@@ -240,7 +253,8 @@ async fn load(state: &AppState, id: i32, want: Option<String>, user: Option<&Aut
         .and_then(|v| serde_json::from_value(v).ok());
     let mut fields = match &saved { Some(s) => merge(&prefill, s), None => prefill.clone() };
     fields.surveyed_by = fields.surveyed_by.as_deref().map(cap_words);
-    Ok(TitleDeedDto { plan: PlanData { upin, area_m2: area, corners, fields }, prefill, saved, upins, registry })
+    let symbols = SYMBOLS.iter().map(|y| SymbolDto { id: y.id.into(), label: y.label.into(), group: y.group.into(), point: y.point }).collect();
+    Ok(TitleDeedDto { plan: PlanData { upin, area_m2: area, corners, fields }, prefill, saved, upins, registry, symbols })
 }
 
 /// The job's title deed plan: data, prefill and saved form.

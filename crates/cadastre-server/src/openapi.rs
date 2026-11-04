@@ -109,7 +109,7 @@ use crate::routes::{
     ),
     components(schemas(
         crate::routes::jobs::UpinPreview, crate::routes::titledeed::TitleDeedDto, crate::routes::titledeed::SaveTitleDeed,
-        crate::titledeed::PlanData, crate::titledeed::PlanFields, crate::titledeed::Corner,
+        crate::titledeed::PlanData, crate::titledeed::PlanFields, crate::titledeed::PlanFeature, crate::titledeed::Corner, crate::routes::titledeed::SymbolDto,
         crate::routes::wf::WfDefinitionsDto, crate::routes::wf::WfJobTypeDto, crate::routes::wf::WfEdgeDto,
         crate::routes::wf::WfTaskDto, crate::routes::wf::WfStepDto, crate::routes::wf::WfStatusDto,
         crate::routes::wf::WfJobDto, crate::routes::wf::WfJobListDto, crate::routes::wf::WfJobDetailDto,
