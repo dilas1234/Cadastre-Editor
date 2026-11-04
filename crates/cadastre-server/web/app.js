@@ -1210,6 +1210,10 @@ function editDraftAt(pt) {
   if (!f) { status("Edit tool: click one of the job's draft parcels to edit its corners."); return; }
   const d = state.drafts.features.find((x) => String(x.properties.id) === String(f.properties.id));
   if (!d) return;
+  editDraftFeature(d);
+}
+function editDraftFeature(d) {
+  if (!edit.active) startEditing("editVertex");
   const ring = d.geometry.type === "MultiPolygon" ? d.geometry.coordinates[0][0] : d.geometry.coordinates[0];
   selectTemplate("parcel");
   edit.verts = ring.slice(0, -1).map(([x, y]) => toUTM(x, y).map((v) => Math.round(v * 1000) / 1000));
@@ -1227,7 +1231,16 @@ map.on("dblclick", (e) => {
 map.on("contextmenu", (e) => {
   if (edit.active && state.tool === "sketch") { e.preventDefault(); absoluteXYDialog(e.lngLat); }
 });
-map.on("contextmenu", (e) => { if (state.tool !== "sketch" && parcelAt(e.point)) { e.preventDefault(); parcelMenu(e); } });
+map.on("contextmenu", (e) => {
+  if (state.tool === "sketch") return;
+  if (parcelAt(e.point)) { e.preventDefault(); parcelMenu(e); return; }
+  const d = draftAt(e.point); if (d) { e.preventDefault(); draftMenu(d, e); }
+});
+function draftAt(point) {
+  const layers = ["drafts-fill"].filter((l) => map.getLayer(l)); if (!layers.length) return null;
+  const f = map.queryRenderedFeatures([[point.x - 3, point.y - 3], [point.x + 3, point.y + 3]], { layers })[0];
+  return f ? state.drafts.features.find((x) => String(x.properties.id) === String(f.properties.id)) || null : null;
+}
 function parcelAt(point) {
   const layers = ["parcels-fill"].filter((l) => map.getLayer(l));
   const f = layers.length ? map.queryRenderedFeatures(point, { layers })[0] : null;
@@ -1245,8 +1258,109 @@ function parcelMenu(e) {
     { label: "Zoom To Parcel", icon: "fullExtent", action: () => registryZoom(upin) },
     { label: "Registry File…", icon: "registry", action: () => startEditParcel(upin, true) },
     "-",
+    beaconLabels.upin === upin ? { label: "Hide Beacons", action: () => hideBeacons() } : { label: "Show Beacons", action: () => showParcelBeacons(upin) },
+    { label: "Point List…", action: () => pointListWindow(upin) },
+    { label: "Correct & Recommit…", icon: "editor", action: () => correctAndRecommit(upin) },
+    "-",
     { label: "Parcel Lineage…", action: () => lineageOfSelection() },
   ], ev.clientX, ev.clientY);
+}
+// A draft parcel of the job: its beacons, its point list, or edit its corners.
+function draftMenu(d, e) {
+  const ev = e.originalEvent; const key = "draft:" + d.properties.id;
+  contextMenu([
+    { label: "Edit Corners (point list)", icon: "editor", action: () => editDraftFeature(d) },
+    beaconLabels.upin === key ? { label: "Hide Beacons", action: () => hideBeacons() } : { label: "Show Beacons", action: () => showDraftBeacons(d) },
+    { label: "Point List…", action: () => pointListWindow(null, d) },
+  ], ev.clientX, ev.clientY);
+}
+
+/* =====================================================================================
+ * Beacons and the point list of a parcel (right-click): see each corner's beacon on the map,
+ * open the point list (beacon, Easting, Northing, bearing and distance to the next corner), and
+ * Correct & Recommit a parcel committed here (reopened as a draft keeping its UPIN, straight into
+ * the sketch with its point list and the Orthophoto; then Finish → Verify → Check → Attributes →
+ * Commit as usual).
+ * ===================================================================================== */
+const beaconLabels = { upin: null };
+function setBeaconLabels(key, pts) {
+  if (!map.getSource("beacon-labels")) {
+    map.addSource("beacon-labels", { type: "geojson", data: empty() });
+    map.addLayer({ id: "beacon-labels-pt", type: "circle", source: "beacon-labels", paint: { "circle-radius": 4.5, "circle-color": "#ffeb3b", "circle-stroke-color": "#b00", "circle-stroke-width": 1.5 } });
+    map.addLayer({ id: "beacon-labels-txt", type: "symbol", source: "beacon-labels",
+      layout: { "text-field": ["get", "label"], "text-font": ["OpenSans-Regular"], "text-size": 13, "text-offset": [0.8, -0.8], "text-anchor": "bottom-left", "text-allow-overlap": true },
+      paint: { "text-color": "#fff", "text-halo-color": "#b00", "text-halo-width": 2 } });
+  }
+  map.getSource("beacon-labels").setData({ type: "FeatureCollection", features: pts.map((p) => ({ type: "Feature", properties: { label: p.beacon }, geometry: { type: "Point", coordinates: toLL(p.easting, p.northing) } })) });
+  beaconLabels.upin = key;
+}
+function hideBeacons() { map.getSource("beacon-labels")?.setData(empty()); beaconLabels.upin = null; status("Beacons hidden."); }
+window.addEventListener("keydown", (e) => { if (e.key === "Escape" && beaconLabels.upin && !document.querySelector(".uiModalBack")) hideBeacons(); });
+async function showParcelBeacons(upin) {
+  let d; try { d = await api("/api/v1/parcels/points?upin=" + encodeURIComponent(upin)); } catch (e) { uiAlert(e.message); return; }
+  setBeaconLabels(upin, d.points); status(`${upin}: ${d.points.length} beacons shown (right-click → Hide Beacons, or Esc).`);
+}
+// A draft's corners: its own ring, named as Verify Points names them.
+async function draftPoints(d) {
+  const ring = (d.geometry.type === "MultiPolygon" ? d.geometry.coordinates[0][0] : d.geometry.coordinates[0]).slice(0, -1).map(([x, y]) => toUTM(x, y));
+  let ids = []; try { ids = await identifyVertices(ring); } catch { /* names unknown */ }
+  let k = 0;
+  return ring.map(([e, n], i) => {
+    const id = ids[i]; const nx = ring[(i + 1) % ring.length];
+    const typed = pointIds.get(ptKey(e, n));
+    const beacon = id?.source === "beacon" ? id.beacon_number : typed || `P${++k}`;
+    const dist = Math.hypot(nx[0] - e, nx[1] - n);
+    let az = Math.atan2(nx[0] - e, nx[1] - n) * 180 / Math.PI; if (az < 0) az += 360;
+    const dd = Math.floor(az), mm = Math.floor((az - dd) * 60), ss = Math.round(((az - dd) * 60 - mm) * 60);
+    return { beacon, easting: e, northing: n, distance: dist, bearing: `${dd}°${String(mm).padStart(2, "0")}'${String(ss).padStart(2, "0")}"` };
+  });
+}
+async function showDraftBeacons(d) { const pts = await draftPoints(d); setBeaconLabels("draft:" + d.properties.id, pts); status(`Draft parcel: ${pts.length} corners shown (Esc hides them).`); }
+async function pointListWindow(upin, draft) {
+  let data;
+  if (upin) { try { data = await api("/api/v1/parcels/points?upin=" + encodeURIComponent(upin)); } catch (e) { uiAlert(e.message); return; } }
+  else data = { upin: null, points: await draftPoints(draft), area_m2: featureAreaM2(draft), can_correct: false };
+  const pts = data.points;
+  const tbl = h("table", { class: "verifyTbl" }, h("tr", {}, h("th", {}, "#"), h("th", {}, "Beacon"), h("th", {}, "Easting"), h("th", {}, "Northing"), h("th", {}, "Bearing"), h("th", {}, "Distance (m)")));
+  pts.forEach((p, i) => {
+    const tr = h("tr", { title: "Zoom to this corner" }, h("td", { class: "n" }, String(i + 1)), h("td", {}, h("b", {}, p.beacon)), h("td", {}, fmt3(p.easting)), h("td", {}, fmt3(p.northing)),
+      h("td", {}, p.bearing), h("td", { class: "n" }, Number(p.distance).toFixed(2)));
+    tr.onclick = () => { map.easeTo({ center: toLL(p.easting, p.northing), zoom: Math.max(map.getZoom(), 19) }); tbl.querySelectorAll("tr.selrow").forEach((r) => r.classList.remove("selrow")); tr.classList.add("selrow"); };
+    tbl.append(tr);
+  });
+  const listText = pts.map((p) => `${p.beacon} ${fmt3(p.easting)} ${fmt3(p.northing)}`).join("\n");
+  const title = upin ? `Point List — ${upin}` : "Point List — draft parcel";
+  floatWindow(title, h("div", {},
+    h("p", { class: "muted", style: "margin:0 0 4px" }, `${pts.length} corners · area ${area2(data.area_m2)} m²${data.job_name ? " · " + data.job_name : ""}${data.committed_at ? " · committed " + fmtDT(data.committed_at) : ""}`),
+    h("div", { class: "verifyWrap" }, tbl),
+    h("div", { class: "frow", style: "margin-top:6px;flex-wrap:wrap;gap:4px" },
+      h("button", { class: "btn", title: "Beacon Easting Northing, one per line (the surveyor's format)", onclick: async (ev) => {
+        try { await navigator.clipboard.writeText(listText); ev.target.textContent = "Copied"; } catch { status("Select the table to copy it."); } } }, "Copy list"),
+      h("button", { class: "btn", onclick: () => upin ? showParcelBeacons(upin) : showDraftBeacons(draft) }, "Show Beacons"),
+      upin ? h("button", { class: "btn btnPrimary", title: data.can_correct ? "Reopen as a draft (same UPIN), fix the points, commit again" : data.why_not, disabled: !data.can_correct,
+        onclick: () => correctAndRecommit(upin) }, "Correct & Recommit…") : null,
+      upin && !data.can_correct ? h("span", { class: "muted", style: "font-size:11px" }, `Correct here: no, ${data.why_not}.`) : null)),
+    { id: "pointListWin", width: 560 });
+}
+async function correctAndRecommit(upin) {
+  let d; try { d = await api("/api/v1/parcels/points?upin=" + encodeURIComponent(upin)); } catch (e) { uiAlert(e.message); return; }
+  if (!d.can_correct) { await uiAlert(`${upin} cannot be corrected here: ${d.why_not}.`, { title: "Correct & Recommit", kind: "warn" }); return; }
+  const reason = await uiPrompt(`Correct ${upin} (${d.job_name || "job " + d.job_instance_id})?\n\nThe job is reopened with ${upin} back as a draft that keeps its UPIN, and its points open for correction. Then Finish Sketch, check, save the attributes and commit again. Reason:`, "", { title: "Correct & Recommit", ok: "Reopen and correct" });
+  if (!reason || !reason.trim()) return;
+  let r;
+  try { r = await api(`/api/v1/wf/jobs/${d.job_instance_id}/correct`, { method: "POST", body: { upin, reason: reason.trim() } }); }
+  catch (e) { uiAlert("Correct refused: " + e.message); return; }
+  for (const b of r.beacons || []) rememberPointId(b.easting, b.northing, b.number);
+  // Keep the numbers of beacons shared with neighbours too (they stay in the fabric and are matched again).
+  for (const p of d.points) if (!/^P\d+$/.test(p.beacon)) rememberPointId(p.easting, p.northing, p.beacon);
+  $("pointListWin")?.remove(); hideBeacons(); done.loaded = false;
+  await wfResume(d.job_instance_id);
+  await loadDrafts(); await loadParcels(false);
+  const draft = state.drafts.features.find((x) => String(x.properties.id) === String(r.parcel_id));
+  if (!draft) { notify(`${upin} is a draft again; open the job and use the Edit tool on it.`, "warn"); return; }
+  editDraftFeature(draft); setTool("editVertex");
+  orthoSketchChanged();
+  notify(`${upin} is a draft again (it keeps its UPIN). Correct the points (drag, or retype in Edit Sketch Properties), then Finish Sketch.`);
 }
 async function startEditParcel(upin, fileOnly) {
   let w;

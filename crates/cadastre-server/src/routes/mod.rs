@@ -107,6 +107,7 @@ pub fn router(state: AppState) -> Router {
         .route("/api/v1/parcels/search", get(parcels::search_parcels))
         .route("/api/v1/parcels/metadata", get(parcels::parcel_metadata))
         .route("/api/v1/parcels/overlaps", post(parcels::sketch_overlaps))
+        .route("/api/v1/parcels/points", get(parcels::parcel_points))
         .route("/api/v1/parcels/lineage", get(mutations::lineage))
         .route("/api/v1/wf/jobs/{id}/mutations", get(mutations::list).post(mutations::create))
         .route("/api/v1/wf/jobs/{id}/mutations/{group}", delete(mutations::cancel))

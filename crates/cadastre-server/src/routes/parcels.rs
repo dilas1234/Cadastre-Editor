@@ -681,3 +681,50 @@ pub async fn sketch_overlaps(State(state): State<AppState>, Json(req): Json<Sket
     }
     Ok(Json(serde_json::json!({ "free": overlaps.is_empty() && at_point.is_empty(), "overlaps": overlaps, "at_point": at_point, "titled": titled })))
 }
+
+#[derive(Debug, Deserialize, utoipa::IntoParams)]
+pub struct ParcelPointsQuery {
+    /// The committed parcel's UPIN.
+    pub upin: String,
+}
+
+/// A committed parcel's point list (right-click → Point List / Show Beacons): each corner's beacon
+/// (or P-number), coordinates, and the bearing and distance to the next corner, with the area; and
+/// whether it can be corrected here (Correct & Recommit) or, if not, why.
+#[utoipa::path(get, path = "/api/v1/parcels/points", tag = "parcels", params(ParcelPointsQuery), responses((status = 200), (status = 404)))]
+pub async fn parcel_points(State(state): State<AppState>, Query(q): Query<ParcelPointsQuery>) -> ApiResult<Json<serde_json::Value>> {
+    let upin = q.upin.trim().to_uppercase();
+    let row = sqlx::query(
+        "SELECT p.id, p.job_id, p.posted_at, trunc(ST_Area(p.geom)::numeric, 2)::float8 AS area, \
+                (SELECT w.id FROM cadastre.wf_job_instance w WHERE p.job_id IS NOT NULL AND w.cadastre_job_id = p.job_id ORDER BY w.id DESC LIMIT 1) AS job_instance_id, \
+                (SELECT w.name FROM cadastre.wf_job_instance w WHERE p.job_id IS NOT NULL AND w.cadastre_job_id = p.job_id ORDER BY w.id DESC LIMIT 1) AS job_name, \
+                EXISTS (SELECT 1 FROM cadastre.parcel_attribute a WHERE a.upin = p.parcel_number AND (a.linkage_status = 1 OR a.lrs_id IS NOT NULL)) \
+                  OR EXISTS (SELECT 1 FROM cadastre.registry_property r WHERE r.upin = p.parcel_number) AS linked, \
+                EXISTS (SELECT 1 FROM cadastre.parcel_lineage l WHERE l.parcel_id = p.id OR l.parent_id = p.id OR l.upin = p.parcel_number OR l.parent_upin = p.parcel_number) AS lineage \
+         FROM cadastre.parcel p WHERE p.parcel_number = $1 AND p.status = 'posted' LIMIT 1",
+    )
+    .bind(&upin)
+    .fetch_optional(&state.pool)
+    .await?
+    .ok_or_else(|| AppError::NotFound(format!("{upin} is not a committed parcel")))?;
+    let legs = crate::report::parcel_legs(&state.pool, &upin).await?;
+    let job: Option<i32> = row.get("job_instance_id");
+    let (linked, lineage): (bool, bool) = (row.get::<Option<bool>, _>("linked").unwrap_or(false), row.get::<Option<bool>, _>("lineage").unwrap_or(false));
+    let why_not = if job.is_none() { Some("it was committed in Aumentum: correct it with a mutation job (re-survey)") }
+        else if linked { Some("it is linked in the Registry: unlink it there first") }
+        else if lineage { Some("it has split / merge history: correct it with a mutation job") }
+        else { None };
+    Ok(Json(serde_json::json!({
+        "upin": upin,
+        "area_m2": row.get::<Option<f64>, _>("area"),
+        "committed_at": row.get::<Option<chrono::DateTime<chrono::Utc>>, _>("posted_at").map(|t| t.to_rfc3339()),
+        "job_instance_id": job,
+        "job_name": row.get::<Option<String>, _>("job_name"),
+        "can_correct": why_not.is_none(),
+        "why_not": why_not,
+        "points": legs.iter().map(|l| serde_json::json!({
+            "beacon": l.from, "easting": (l.from_e * 1000.0).round() / 1000.0, "northing": (l.from_n * 1000.0).round() / 1000.0,
+            "to": l.to, "distance": (l.distance * 1000.0).round() / 1000.0, "bearing": l.bearing,
+        })).collect::<Vec<_>>(),
+    })))
+}
