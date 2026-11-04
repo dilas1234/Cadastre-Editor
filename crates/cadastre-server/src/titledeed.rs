@@ -185,6 +185,8 @@ const SHORT_SIDE_MM: f64 = 12.0;
 /// much further out.
 const FEATURE_OFF: f64 = 4.0;
 const FEATURE_STEP: f64 = 2.5;
+/// The corners of an access road T-junction are rounded, starting this far from the corner (mm).
+const ROAD_FILLET: f64 = 6.0;
 /// Road junctions, on paper (mm). An end this close past another road is cut back to it...
 const TRIM_MM: f64 = 12.0;
 /// ...and one this close short of it is carried on to it.
@@ -486,7 +488,7 @@ pub fn render_svg(d: &PlanData) -> String {
     let paper = |e: f64, n: f64| (x0 + (e - e_left) * k, y1 - (n - n_bottom) * k);
 
     let mut s = String::new();
-    let _ = writeln!(s, r#"<svg xmlns="http://www.w3.org/2000/svg" width="210mm" height="297mm" viewBox="0 0 210 297" font-family="Arial, Helvetica, sans-serif">"#);
+    let _ = writeln!(s, r#"<svg xmlns="http://www.w3.org/2000/svg" width="210mm" height="297mm" viewBox="0 0 210 297" font-family="Arial, Helvetica, sans-serif" data-grid="{e_left} {n_bottom} {k} {x0} {y1}">"#);
     let _ = writeln!(s, r##"<rect width="210" height="297" fill="#fff"/>"##);
 
     // Header, left.
@@ -554,7 +556,8 @@ pub fn render_svg(d: &PlanData) -> String {
     let p: Vec<(f64, f64)> = corners.iter().map(|c| paper(c.e, c.n)).collect();
     let (pcx, pcy) = (p.iter().map(|q| q.0).sum::<f64>() / p.len().max(1) as f64, p.iter().map(|q| q.1).sum::<f64>() / p.len().max(1) as f64);
     // Access roads: two dashed lines parallel to each chosen side, outside the parcel. Roads on
-    // neighbouring sides meet in a junction: the longer runs through, the other ends at it.
+    // neighbouring sides meet in a junction: the longer runs through, the other ends at it, and
+    // the two corners of the opening are rounded, as on the printed plans.
     let roads: Vec<usize> = f.roads().into_iter().filter(|&i| i < p.len() && p.len() >= 3).collect();
     const ROAD_IN: f64 = 5.0;
     const ROAD_OUT: f64 = 13.0;
@@ -573,6 +576,7 @@ pub fn render_svg(d: &PlanData) -> String {
         Road { a, u: (ux, uy), nrm: (nx, ny), len, t0: -ext, t1: len + ext, t0_out: -ext, t1_out: len + ext, gaps: Vec::new() }
     }).collect();
     let off_pt = |r: &Road, off: f64| (r.a.0 + r.nrm.0 * off, r.a.1 + r.nrm.1 * off);
+    let mut fillets: Vec<(Pt, Pt, Pt)> = Vec::new(); // from, corner, to
     for i in 0..rd.len() {
         for j in i + 1..rd.len() {
             // Two roads whose inner lines would cross (neighbouring sides, or sides a short side
@@ -587,12 +591,20 @@ pub fn render_svg(d: &PlanData) -> String {
             let tin = (off_pt(&rd[thr], ROAD_IN), rd[thr].u);
             let jout = off_pt(&rd[join], ROAD_OUT);
             let (Some(cut_out), Some(g_out)) = (meet(jout, rd[join].u, tin.0, tin.1), meet(tin.0, tin.1, jout, rd[join].u)) else { continue };
-            // The joining road ends at the through road's inner line, at its end nearer the crossing.
+            // The joining road ends at the through road's inner line, at its end nearer the crossing,
+            // short of it by the rounded corner.
+            let (jin, ju) = (off_pt(&rd[join], ROAD_IN), rd[join].u);
             let r = &mut rd[join];
-            if t_join < r.len / 2.0 { r.t0 = t_join; r.t0_out = cut_out; } else { r.t1 = t_join; r.t1_out = cut_out; }
+            let back = if t_join < r.len / 2.0 { ROAD_FILLET } else { -ROAD_FILLET };
+            if back > 0.0 { r.t0 = t_join + back; r.t0_out = cut_out + back; } else { r.t1 = t_join + back; r.t1_out = cut_out + back; }
+            // The rounded corners: the through road's line, round the corner, into the joining road's.
+            let on = |o: Pt, u: Pt, t: f64| (o.0 + u.0 * t, o.1 + u.1 * t);
+            let away = if t_thr < g_out { -ROAD_FILLET } else { ROAD_FILLET };
+            fillets.push((on(tin.0, tin.1, t_thr + away), on(tin.0, tin.1, t_thr), on(jin, ju, t_join + back)));
+            fillets.push((on(tin.0, tin.1, g_out - away), on(tin.0, tin.1, g_out), on(jout, ju, cut_out + back)));
             // The through road runs on past the junction, open where the other road comes in.
             let r = &mut rd[thr];
-            let (g0, g1) = (t_thr.min(g_out), t_thr.max(g_out));
+            let (g0, g1) = (t_thr.min(g_out) - ROAD_FILLET, t_thr.max(g_out) + ROAD_FILLET);
             if g1 + 6.0 > r.t1 { r.t1 = g1 + 6.0; r.t1_out = r.t1_out.max(r.t1); }
             if g0 - 6.0 < r.t0 { r.t0 = g0 - 6.0; r.t0_out = r.t0_out.min(r.t0); }
             r.gaps.push((g0, g1));
@@ -674,6 +686,10 @@ pub fn render_svg(d: &PlanData) -> String {
         begin_move(&mut s, moves, &format!("road:{side}"));
         along(&mut s, m, (m.0 + r.u.0 * r.len, m.1 + r.u.1 * r.len), 0.5, 0.0, 2.8, &label);
         end_move(&mut s);
+    }
+
+    for (a, c, b) in &fillets {
+        let _ = writeln!(s, r##"<path d="M{:.2} {:.2} Q{:.2} {:.2} {:.2} {:.2}" fill="none" stroke="#000" stroke-width="0.3" stroke-dasharray="2.5 1.5"/>"##, a.0, a.1, c.0, c.1, b.0, b.1);
     }
 
     // Features from the symbol list, under the parcel, and cut at the frame: a drawn one can run
@@ -1046,6 +1062,13 @@ mod tests {
     }
 
     #[test]
+    fn the_sheet_says_where_its_grid_is_for_drawing_on_it() {
+        let fields = PlanFields { scale: Some(500), ..Default::default() };
+        let svg = render_svg(&PlanData { upin: "X".into(), area_m2: 1.0, corners: pl68374(), fields });
+        assert!(svg.contains(r#"data-grid="495116 1092379 2 12 228""#));
+    }
+
+    #[test]
     fn a_road_end_stops_at_the_road_it_meets() {
         let bar = |x: f64| [(x, -30.0), (x, 30.0)];
         let trim = |road: Vec<Pt>, fixed: &[[Pt; 2]]| { let mut r = vec![road]; trim_roads(&mut r, fixed); r.remove(0) };
@@ -1114,8 +1137,9 @@ mod tests {
         let c = pl68374();
         // Sides 1 (N9995V → N9996V) and 2 (N9996V → N9997V) share N9996V.
         let svg = render_svg(&PlanData { upin: "X".into(), area_m2: 1.0, corners: c, fields: PlanFields { road_sides: vec![1, 2], grid: Some(false), ..Default::default() } });
-        // Through road: inner line broken in two + outer; joining road: inner + outer.
-        assert_eq!(svg.matches("stroke-dasharray=\"2.5 1.5\"").count(), 5);
+        // Through road: inner line broken in two + outer; joining road: inner + outer; two rounded corners.
+        assert_eq!(svg.matches("stroke-dasharray=\"2.5 1.5\"").count(), 7);
+        assert_eq!(svg.matches(" Q").count(), 2, "the corners of the opening are rounded");
     }
 
     #[test]

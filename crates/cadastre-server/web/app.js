@@ -5026,26 +5026,73 @@ async function titleDeedDialog(jobId, upin) {
     msg.style.color = "#060"; msg.textContent = "Saved with the job.";
     return r;
   };
-  // Adjust labels: the sheet full size; drag a label to move it, double-click it to put it back.
-  // Only the writing moves: beacons, boundary and features stay at their co-ordinates.
+  // Adjust labels: the sheet full size. Drag a label to move it, double-click it to put it back;
+  // only the writing moves. Plan features can be added here too: drawn on the sheet (clicks become
+  // ground co-ordinates through its data-grid) or tied to a side, and the sheet redraws at once,
+  // so a road is seen stopping at the road it meets.
   const adjust = async () => {
-    let svg;
-    try { svg = await sheet(); } catch (e) { msg.style.color = "#900"; msg.textContent = e.message; return; }
     const before = { ...moves };
-    const page = h("div", { html: svg, style: "width:900px;margin:0 auto 20px;background:#fff;touch-action:none;user-select:none" });
-    const close = () => ov.remove();
+    const fail = (e) => { msg.style.color = "#900"; msg.textContent = e.message; };
+    const page = h("div", { style: "width:900px;margin:0 auto 20px;background:#fff;touch-action:none;user-select:none" });
+    let el = null, drag = null, draw = null;
+    const show = async () => {
+      page.innerHTML = await sheet();
+      el = page.querySelector("svg");
+      el.removeAttribute("height"); el.setAttribute("width", "100%"); el.style.display = "block";
+    };
+    try { await show(); } catch (e) { fail(e); return; }
+    const hint = h("span", {}, "");
+    const idle = "Drag a label to move it. Double-click a label to put it back.";
+    hint.textContent = idle;
+    const adjSym = symSel.cloneNode(true), adjPlace = placeSel.cloneNode(true);
+    adjPlace.options[0].textContent = "Draw on the sheet";
+    adjSym.style.width = adjPlace.style.width = "170px";
+    const adjLabel = h("input", { placeholder: "Label (optional)", style: "width:130px" });
+    const drawBtn = h("button", { class: "btn" }, "Add feature");
+    // Paper mm at a mouse position, and ground co-ordinates of paper mm.
+    const mmAt = (e) => { const q = new DOMPoint(e.clientX, e.clientY).matrixTransform(el.getScreenCTM().inverse()); return [q.x, q.y]; };
+    const toGround = ([x, y]) => {
+      const [e0, n0, k, x0, y1] = el.getAttribute("data-grid").split(" ").map(Number);
+      const r = (v) => Math.round(v * 1000) / 1000;
+      return [r(e0 + (x - x0) / k), r(n0 + (y1 - y) / k)];
+    };
+    const addFeature = (x) => { feats.push(x); adjLabel.value = ""; renderFeats(); show().catch(fail); };
+    const stopDraw = () => {
+      draw?.line.remove(); draw = null;
+      page.classList.remove("drawing"); drawBtn.textContent = "Add feature"; hint.textContent = idle;
+    };
+    const finishDraw = () => {
+      const x = { ...draw.base, points: draw.pts.map(toGround) };
+      stopDraw(); addFeature(x);
+    };
+    drawBtn.addEventListener("click", () => {
+      if (draw) { stopDraw(); return; }
+      const base = { symbol: adjSym.value, label: adjLabel.value.trim() || null, side: null, points: [] };
+      if (adjPlace.value !== "") { addFeature({ ...base, side: Number(adjPlace.value) }); return; }
+      const point = symOf(base.symbol).point;
+      const line = document.createElementNS("http://www.w3.org/2000/svg", "polyline");
+      line.setAttribute("fill", "none"); line.setAttribute("stroke", "#f0f"); line.setAttribute("stroke-width", "0.4");
+      el.append(line);
+      draw = { pts: [], point, base, line };
+      page.classList.add("drawing"); drawBtn.textContent = "Cancel drawing";
+      hint.textContent = point ? "Click its position on the sheet. Esc cancels." : "Click along it on the sheet, double-click to finish. Esc cancels.";
+    });
+    const onKey = (e) => { if (e.key === "Escape" && draw) stopDraw(); };
+    document.addEventListener("keydown", onKey);
+    const close = () => { stopDraw(); document.removeEventListener("keydown", onKey); ov.remove(); };
     const place = (g, key) => { const m = moves[key]; if (m) g.setAttribute("transform", `translate(${m[0]} ${m[1]})`); else g.removeAttribute("transform"); };
-    const bar = h("div", { style: "position:sticky;top:0;z-index:1;display:flex;gap:8px;align-items:center;justify-content:center;padding:8px;background:#333;color:#fff;font:13px sans-serif" },
-      "Drag a label to move it. Double-click a label to put it back.",
-      h("button", { class: "btn", onclick: () => { moves = {}; page.querySelectorAll("[data-move]").forEach((g) => g.removeAttribute("transform")); } }, "Reset all"),
-      h("button", { class: "btn", onclick: () => { moves = before; close(); } }, "Cancel"),
-      h("button", { class: "btn", onclick: () => { close(); save().catch((e) => { msg.style.color = "#900"; msg.textContent = e.message; }); } }, "Done"));
-    const ov = h("div", { style: "position:fixed;inset:0;z-index:2000;overflow:auto;background:#777" }, h("style", {}, "[data-move]{cursor:move}[data-move]:hover text{fill:#06c}"), bar, page);
+    const bar = h("div", { style: "position:sticky;top:0;z-index:1;padding:8px;background:#333;color:#fff;font:13px sans-serif;text-align:center" },
+      h("div", { style: "display:flex;gap:8px;align-items:center;justify-content:center;margin-bottom:6px" }, adjSym, adjPlace, adjLabel, drawBtn,
+        h("button", { class: "btn", onclick: () => { if (!feats.length || draw) return; feats.pop(); dropFeatureMove(feats.length); renderFeats(); show().catch(fail); } }, "Remove last feature")),
+      h("div", { style: "display:flex;gap:8px;align-items:center;justify-content:center" }, hint,
+        h("button", { class: "btn", onclick: () => { moves = {}; page.querySelectorAll("[data-move]").forEach((g) => g.removeAttribute("transform")); } }, "Reset all labels"),
+        h("button", { class: "btn", title: "Put the labels back as they were; added features stay", onclick: () => { moves = before; close(); save().catch(fail); } }, "Cancel label moves"),
+        h("button", { class: "btn", onclick: () => { close(); save().catch(fail); } }, "Done")));
+    const ov = h("div", { style: "position:fixed;inset:0;z-index:2000;overflow:auto;background:#777" },
+      h("style", {}, "[data-move]{cursor:move}[data-move]:hover text{fill:#06c}.drawing svg,.drawing [data-move]{cursor:crosshair}"), bar, page);
     document.body.append(ov);
-    const el = page.querySelector("svg");
-    el.removeAttribute("height"); el.setAttribute("width", "100%"); el.style.display = "block";
-    let drag = null;
-    el.addEventListener("pointerdown", (e) => {
+    page.addEventListener("pointerdown", (e) => {
+      if (draw) return;
       const g = e.target.closest("[data-move]");
       if (!g) return;
       const key = g.getAttribute("data-move");
@@ -5061,7 +5108,17 @@ async function titleDeedDialog(jobId, upin) {
     const drop = () => { drag = null; };
     ov.addEventListener("pointerup", drop);
     ov.addEventListener("pointercancel", drop);
-    el.addEventListener("dblclick", (e) => {
+    page.addEventListener("click", (e) => {
+      if (!draw) return;
+      // A double-click also delivers two clicks at the same spot; don't add zero-length segments.
+      const q = mmAt(e), last = draw.pts[draw.pts.length - 1];
+      if (last && Math.hypot(q[0] - last[0], q[1] - last[1]) < 0.5) return;
+      draw.pts.push(q);
+      if (draw.point) { finishDraw(); return; }
+      draw.line.setAttribute("points", draw.pts.map((p) => p.join(",")).join(" "));
+    });
+    page.addEventListener("dblclick", (e) => {
+      if (draw) { if (draw.pts.length >= 2) finishDraw(); return; }
       const g = e.target.closest("[data-move]");
       if (!g) return;
       const key = g.getAttribute("data-move");
@@ -5123,7 +5180,7 @@ async function titleDeedDialog(jobId, upin) {
     msg,
     h("div", { class: "frow", style: "flex-wrap:wrap;justify-content:flex-end" },
       h("button", { class: "btn", onclick: () => save().catch((e) => { msg.style.color = "#900"; msg.textContent = e.message; }) }, "Save"),
-      h("button", { class: "btn", onclick: adjust, title: "Drag beacon numbers, bearings and distances on the sheet" }, "Adjust labels"),
+      h("button", { class: "btn", onclick: adjust, title: "On the sheet: drag beacon numbers, bearings and distances, and add roads and other features" }, "Adjust labels"),
       h("button", { class: "btn", onclick: preview }, "Preview / Print"),
       h("button", { class: "btn", onclick: attach, title: "File the plan on the job as a PDF, for Send plan" }, "Attach as PDF"),
       h("button", { class: "btn", onclick: () => openRegistry({ job: jobId, view: "send" }) }, "Send plan…"))),
