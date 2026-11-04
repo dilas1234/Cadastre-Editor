@@ -1461,17 +1461,17 @@ async function startEditParcel(upin, fileOnly) {
   let w;
   try { w = await api(`/api/v1/registry/parcels/${encodeURIComponent(upin)}/work`); } catch (e) { uiAlert(e.message); return; }
   if (fileOnly) { if (w.transaction_number) regFind(w.transaction_number); else uiAlert(`${upin} has no Registry file (transaction) yet.`); return; }
-  // Not linked yet: the title deed work does not need the link. Find the parcel's file in the
-  // Registry (read-only) and start its job there (Start digitising).
+  // Digitised but not linked yet: Aumentum's flow, the Registry admin links it at Raise Title
+  // Deed Plan; then it is in the title deed queue. It is not digitised again.
   if (!w.linked && !w.job_instance_id) {
-    if (w.property_number) { regFind(w.property_number); notify(`${upin} is not linked in the Registry yet. Its file ${w.property_number} is shown under Registry → Find file: Start digitising opens the title deed job.`); return; }
-    uiAlert(`${upin} is not linked in the Registry and has no file number on its attributes.\nFind its file under Registry → Find file (PL… or PLS…) and choose Start digitising.`); return;
+    uiAlert(`${upin} is digitised${w.property_number ? ` (file ${w.property_number})` : ""}, but not linked in the Registry yet.\nThe Registry admin links it when the file reaches Raise Title Deed Plan; it then shows in the title deed queue (Completed tab).`);
+    return;
   }
   let job = w.job_instance_id;
   if (!job) {
     if (!w.transaction_number) { uiAlert(`${upin} is linked (${w.su_id}), but its Registry transaction is not known here. Find the file under Registry → Find file.`); return; }
     if (!(await uiConfirm(`No open job for ${w.transaction_number}. Start the title deed job (Job-${w.property_number || upin})?`))) return;
-    try { job = (await api("/api/v1/registry/start-digitising", { method: "POST", body: { transaction_number: w.transaction_number, property_number: w.property_number } })).job_instance_id; }
+    try { job = (await api("/api/v1/registry/start-digitising", { method: "POST", body: { transaction_number: w.transaction_number, property_number: w.property_number, title_deed: true } })).job_instance_id; }
     catch (e) { uiAlert(e.message); return; }
   }
   await openWorkflow(); await wfSelect(job);
@@ -4274,19 +4274,6 @@ async function registryZoom(upin) {
 }
 // A job for the transaction, as the Registry created them in Aumentum: job type 9 "Deed Plan
 // Creationv2", named Job-<property number>, carrying the transaction number.
-async function registryStartJob(l) {
-  const types = (wf.defs?.job_types || []).filter((t) => t.active && t.start_task_id);
-  const type = types.find((t) => t.id === 9) || types[0];
-  if (!type) { uiAlert("No active job type to start."); return; }
-  const name = `Job-${l.property_number || l.upin}`;
-  if (!(await uiConfirm(`Start a "${type.name}" job ${name} for Registry transaction ${l.transaction_number} (parcel ${l.upin})?`, { ok: "Start job" }))) return;
-  try {
-    const d = await api("/api/v1/wf/jobs", { method: "POST", body: { job_type_id: type.id, name, lrs_transaction_number: l.transaction_number, comment: `Registry property ${l.su_id} linked to ${l.upin} on ${regTime(l.linked_at)}` } });
-    await registryLoad(); renderRegistry(); await registryZoom(l.upin);
-    status(`Job ${d.job.id} (${name}) started on "${d.job.current_task}". Open it in Workflow, choose Work On This Job, then input the survey points.`);
-    if (await uiConfirm(`Job ${name} started. Open it in the Workflow now to input the points?`, { ok: "Open job", cancel: "Not now" })) registryOpenJob(d.job.id);
-  } catch (e) { uiAlert(e.message); }
-}
 async function registryOpenJob(id) { await openWorkflow(); await wfSelect(id); }
 // --- transaction lookup, link / unlink (Aumentum LinkageManager.LinkParcel) ---
 async function regLookup(no) {
@@ -4334,7 +4321,7 @@ const regDay = (iso) => {
 };
 const regClock = (iso) => (iso ? iso.slice(11, 16) : "");
 const regKind = (l) => (!l.linked_now ? "unlinked" : l.job_instance_id ? "job" : l.parcel_id ? "waiting" : "nofabric");
-const REG_KIND = { waiting: ["Waiting for a job", "wait"], job: ["Job started", "job"], unlinked: ["Unlinked in the Registry", "gone"], nofabric: ["Parcel not in the fabric", "gone"] };
+const REG_KIND = { waiting: ["Digitised, linked: no title deed job yet", "wait"], job: ["Job started", "job"], unlinked: ["Unlinked in the Registry", "gone"], nofabric: ["Parcel not in the fabric", "gone"] };
 function regPill(kind, text) { return h("span", { class: "regPill " + REG_KIND[kind][1] }, text || REG_KIND[kind][0]); }
 // A card's status line: a coloured dot and words (fits any pane width).
 function regStatus(cls, text) { return h("div", { class: "regStatus " + cls }, h("span", { class: "regStatusDot" }), text); }
@@ -4429,7 +4416,7 @@ function regInboxList(list) {
     const d = regDay(l.linked_at);
     if (d !== day) { day = d; list.append(h("div", { class: "regDayHead" }, d)); }
     const kind = regKind(l);
-    const main = kind === "waiting" && can("digitise") ? regIconBtn("Start job", "Start a Deed Plan job for this transaction, to input the survey points", () => registryStartJob(l), { primary: true })
+    const main = kind === "waiting" && can("titledeed") ? regIconBtn("Title deed", "Digitised and linked: open (or start) the file's title deed job", () => startEditParcel(l.upin), { primary: true })
       : kind === "job" ? regIconBtn("Open job", `Open ${l.job_name || "the job"} in the Workflow`, () => registryOpenJob(l.job_instance_id)) : null;
     const card = h("div", { class: "regCard " + REG_KIND[kind][1], title: l.parcel_id ? "Click to zoom to the parcel" : "", onclick: () => l.parcel_id && registryZoom(l.upin) },
       h("div", { class: "regCardTop" }, h("span", { class: "regUpin" }, l.upin), h("span", { class: "muted regTime" }, regClock(l.linked_at))),
@@ -4477,18 +4464,28 @@ function regFindView(box) {
   for (const f of reg.found) {
     const active = f.status_code === "transaction_lodged";
     const linked = !!f.upin;
+    const here = f.cadastre_upins || [];
+    const done = linked || here.length > 0;   // digitised: here, in Aumentum, or linked in the Registry
+    const upin = f.upin || here[0] || null;
     const main = f.job_instance_id
       ? regIconBtn("Open job", `Open ${f.job_name || "the job"} in the Workflow`, () => registryOpenJob(f.job_instance_id), { primary: true })
+      : done ? regIconBtn("History", "The file's Registry stages and this Cadastre's events", () => historyWindow({ txn: f.transaction_number, upin, title: f.property_number }), { primary: true })
       : can("digitise") ? regIconBtn("Start digitising", active ? "Create the file's job and open it" : `The transaction is ${f.status}: only Active files are digitised`, () => regStartDigitising(f), { primary: true, disabled: !active || reg.busy }) : null;
-    box.append(h("div", { class: "regCard " + (f.job_instance_id ? "job" : active ? "wait" : "gone") },
+    const say = f.job_instance_id ? `Job: ${f.job_name || "#" + f.job_instance_id}`
+      : linked ? `Digitised, linked in the Registry to ${f.upin}`
+      : done ? `Digitised (UPIN ${here.join(", ")}): waiting for the Registry link at title deed`
+      : "Not digitised yet";
+    box.append(h("div", { class: "regCard " + (f.job_instance_id || done ? "job" : active ? "wait" : "gone") },
       h("div", { class: "regCardTop" }, h("span", { class: "regUpin" }, f.property_number || f.transaction_number), regTxnPill(f.status_code, f.status)),
-      regStatus(f.job_instance_id ? "job" : linked ? "job" : "wait", f.job_instance_id ? `Job: ${f.job_name || "#" + f.job_instance_id}` : linked ? `Linked in the Registry to ${f.upin}` : "Not digitised / linked yet"),
+      regStatus(f.job_instance_id || done ? "job" : "wait", say),
       h("div", { class: "regKv" },
         h("div", {}, h("i", {}, "Transaction"), f.transaction_number),
         h("div", {}, h("i", {}, "Property"), f.su_id || "—"),
-        h("div", {}, h("i", {}, "UPIN"), f.upin || "— (given at commit; the Registry links it)"),
-        regMetaRow(f)),
-      h("div", { class: "regCardFoot" }, h("span", { class: "regLinks" }, regLink("Zoom", "Zoom to the parcel", () => registryZoom(f.upin), !linked)), main)));
+        h("div", {}, h("i", {}, "UPIN"), upin ? (linked ? upin : `${here.join(", ")} (in this Cadastre; not on the Registry file yet)`) : "— (given at commit; the Registry links it at title deed)"),
+        regMetaRow({ ...f, upin })),
+      h("div", { class: "regCardFoot" }, h("span", { class: "regLinks" },
+        regLink("Zoom", "Zoom to the parcel", () => registryZoom(upin), !upin),
+        done && !f.job_instance_id && can("digitise") ? regLink("Correct", "Correct & Recommit: the parcel keeps its UPIN and its history", () => correctAndRecommit(upin)) : null), main)));
   }
 }
 
