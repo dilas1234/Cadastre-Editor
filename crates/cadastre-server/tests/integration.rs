@@ -1350,6 +1350,15 @@ async fn job_editing_follows_job_area_and_commit_rules() {
     assert_eq!(pillar, 1, "the shared pillar (not added by the commit) is never removed by Correct");
     let job_status: i16 = sqlx::query_scalar("SELECT status FROM cadastre.wf_job_instance WHERE id = $1").bind(id as i32).fetch_one(&pool).await.unwrap();
     assert_eq!(job_status, 3, "completed again");
+    // History, read only: with no Registry configured here, the Cadastre part still comes back
+    // (job, steps, commits by the picked staff member) and the Registry part says it can't be shown.
+    let (st, hist) = send(&app, "GET", &format!("/api/v1/registry/history?job={id}"), None, None).await;
+    assert_eq!(st, StatusCode::OK, "{hist}");
+    let kinds: Vec<&str> = hist["cadastre"].as_array().unwrap().iter().filter_map(|e| e["kind"].as_str()).collect();
+    assert!(kinds.contains(&"job_created") && kinds.contains(&"task") && kinds.contains(&"wf_commit"), "{kinds:?}");
+    assert!(hist["cadastre"].as_array().unwrap().iter().any(|e| e["kind"] == "wf_commit" && e["by"] == staff_name.as_str()), "the commit shows who committed");
+    assert!(hist["cadastre"].as_array().unwrap().iter().all(|e| e["at"].is_null() || e["at"].as_str().unwrap().contains('+') || e["at"].as_str().unwrap().ends_with('Z')),
+        "every time carries its time zone: {hist}");
     // The rest of this test goes on editing the same job: open it again directly.
     sqlx::query("UPDATE cadastre.wf_job_instance SET status = 2, ended = NULL WHERE id = $1").bind(id as i32).execute(&pool).await.unwrap();
     let (_, found) = send(&app, "GET", &format!("/api/v1/parcels/search?number={prop}"), None, None).await;
