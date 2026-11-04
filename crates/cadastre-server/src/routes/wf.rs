@@ -818,6 +818,9 @@ pub struct WfCommitDto {
     /// Parcels the job's mutations made historic or archived.
     pub retired: Vec<String>,
     pub editing: WfEditingDto,
+    /// The link to the job's Registry file made right after the commit, per parcel.
+    #[schema(value_type = Vec<Object>)]
+    pub registry_links: Vec<serde_json::Value>,
 }
 #[derive(Default, Deserialize, ToSchema)]
 pub struct WfFinishBody {
@@ -843,6 +846,9 @@ pub struct WfFinishDto {
     /// Whether the job was completed.
     pub completed: bool,
     pub job: WfJobDto,
+    /// The link to the job's Registry file made right after the commit, per parcel.
+    #[schema(value_type = Vec<Object>)]
+    pub registry_links: Vec<serde_json::Value>,
 }
 
 pub(crate) async fn is_commit_task(conn: &mut sqlx::PgConnection, task_id: Option<i32>) -> ApiResult<bool> {
@@ -1122,7 +1128,9 @@ pub async fn commit(State(state): State<AppState>, user: AuthUser, Path(id): Pat
         complete_after_commit(&mut tx, id, job_type_id, cur, &edges, end_task, &who, None).await?;
     }
     tx.commit().await?;
-    Ok(Json(WfCommitDto { parcel_numbers: c.numbers, beacons_added: c.beacons_added, retired: c.retired, editing: editing_info(&state, id).await? }))
+    // On commit the UPIN goes onto the Registry file (with its link date), as Map → Connect would.
+    let registry_links = crate::routes::registry::link_after_commit(&state, &who, id, &c.numbers).await;
+    Ok(Json(WfCommitDto { parcel_numbers: c.numbers, beacons_added: c.beacons_added, retired: c.retired, editing: editing_info(&state, id).await?, registry_links }))
 }
 
 /// Post a job's draft parcels to the fabric: beacon numbers for the new corners, the job's
@@ -1348,9 +1356,10 @@ pub async fn finish(State(state): State<AppState>, user: AuthUser, Path(id): Pat
     }
 
     tx.commit().await?;
+    let registry_links = crate::routes::registry::link_after_commit(&state, &who, id, &numbers).await;
     let detail = load_detail(&state, id).await?;
     let tasks_passed = task_refs(&state.pool, &passed).await?;
-    Ok(Json(WfFinishDto { parcel_numbers: numbers, tasks_passed, completed, job: detail.job }))
+    Ok(Json(WfFinishDto { parcel_numbers: numbers, tasks_passed, completed, job: detail.job, registry_links }))
 }
 
 /// A job's Registry linkage target (the property its LRS transaction serves). Parcels committed

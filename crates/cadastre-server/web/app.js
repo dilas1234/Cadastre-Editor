@@ -2585,6 +2585,13 @@ async function orthoUpdate() {
   }
 }
 
+// What happened with the Registry file right after the commit (the UPIN and link date written).
+function linkSummary(links) {
+  if (!links || !links.length) return "";
+  const ok = links.filter((l) => l.linked), bad = links.filter((l) => !l.linked);
+  return [ok.length ? `Linked to the Registry file: ${ok.map((l) => `${l.upin} → ${l.su_id}`).join(", ")}.` : "",
+    bad.length ? `Not linked: ${bad.map((l) => `${l.upin} (${l.reason})`).join("; ")}. Use Link now on the Completed tab once fixed.` : ""].filter(Boolean).join(" ");
+}
 // Digitising done (the commit completed the job): a clean start for the next job. The edit session
 // ends (nothing is left to save), the editing windows close, the job is no longer worked on, and
 // the map shows the Table Of Contents, zoomed to the parcel just committed.
@@ -3988,6 +3995,7 @@ function doneCard(j) {
   if (mine) actions.push(regLink("Registry check", "Ask the Registry whether the committed parcels are visible there", () => registryConfirmDialog(j.id)));
   if (mine && upins.length) actions.push(regLink("Title deed plan", "Open the title deed plan (form, sheet, PDF, send)", () => titleDeedDialog(j.id, upins[0])));
   if (mine && plan && plan.action === "registry_plan_sent") actions.push(regLink("Withdraw plan", "Mark the plan sent to the Registry as withdrawn (the parcel and UPIN stay)", () => doneWithdraw(j)));
+  if (mine && upins.length && parcels.some((p) => !p.linked) && j.transaction_number) actions.push(regLink("Link now", "Write the UPIN and link date onto the Registry file (as on commit)", () => doneLinkNow(j)));
   if (j.can_correct && upins.length) actions.push(regLink("Correct", "Reopen the job to fix the parcel (same UPIN), then commit again and resend the plan", () => doneCorrect(j, parcels)));
   const conf = j.confirmation;
   return h("div", { class: "regCard " + (mine ? "job" : "gone"), title: "Double-click to zoom", ondblclick: () => firstUpin && registryZoom(firstUpin) },
@@ -4019,6 +4027,15 @@ function renderCompleted() {
   for (const j of done.jobs) box.append(doneCard(j));
   if (done.jobs.length < done.total) box.append(h("div", { class: "frow", style: "margin:6px 8px 10px" },
     h("button", { class: "btn", disabled: done.busy, onclick: () => doneLoad(false) }, done.busy ? "Loading…" : `More (${(done.total - done.jobs.length).toLocaleString()} left)`)));
+}
+async function doneLinkNow(j) {
+  if (!(await uiConfirm(`Link ${j.property_number || j.name}'s committed parcel(s) to Registry file ${j.transaction_number}?\nThe Registry property gets the UPIN and today's link date, as Map → Connect does.`, { title: "Link now", ok: "Link" }))) return;
+  try {
+    const out = await api(`/api/v1/wf/jobs/${j.id}/registry/link`, { method: "POST", body: {} });
+    const msg = linkSummary(out);
+    notify(msg || "Nothing to link.", out.some((l) => !l.linked) ? "warn" : "ok");
+    await doneLoad(true);
+  } catch (e) { uiAlert("Link failed: " + e.message); }
 }
 async function doneWithdraw(j) {
   const reason = await uiPrompt(`Withdraw the title deed plan of ${j.property_number || j.name} from Registry transaction ${j.transaction_number}?\n\nThe plan documents in the transaction are marked WITHDRAWN (nothing is deleted in the Registry) and the saved title deed form is cleared. The parcel and its UPIN stay. Reason:`, "", { title: "Withdraw Plan", ok: "Withdraw" });
@@ -4775,7 +4792,7 @@ async function wfCommitDialog(opts = {}) {
       notify(`Committed ${r.parcel_numbers.length} parcel(s): ${r.parcel_numbers.join(", ")}; ${r.beacons_added.length} beacon(s) added.` + (r.retired?.length ? ` Replaced / retired: ${r.retired.join(", ")}.` : ""));
       loadHistory(); await wfRefreshEditing();
       wf.detail = await api("/api/v1/wf/jobs/" + id); renderWorkflow();
-      if (r.parcel_numbers.length) await registryConfirmDialog(id, { headline: `Committed: ${r.parcel_numbers.join(", ")}.` });
+      if (r.parcel_numbers.length) await registryConfirmDialog(id, { headline: `Committed: ${r.parcel_numbers.join(", ")}. ${linkSummary(r.registry_links)}` });
       if (wf.detail?.job && !wf.detail.job.is_open) await goHome(r.parcel_numbers);
     } catch (e) { commitBtn.disabled = false; msg.style.color = "#b00"; msg.textContent = e.message; }
   } }, opts.label || "Commit");
@@ -4882,7 +4899,7 @@ async function wfFinishPost(j, beacons, staff) {
     const nums = (r.parcel_numbers || []).join(", ") || "(none)";
     status(r.completed ? `Done — ${nums} posted; job completed.` : `${nums} posted.`);
     await loadParcels(false); await loadDrafts(); showJobArea();
-    const confirmed = registryConfirmDialog(j.id, { headline: `Parcel posted. UPIN: ${nums}. ${r.completed ? "Job completed." : "Job now at: " + (r.job?.current_task || "—")}` });
+    const confirmed = registryConfirmDialog(j.id, { headline: `Parcel posted. UPIN: ${nums}. ${r.completed ? "Job completed." : "Job now at: " + (r.job?.current_task || "—")} ${linkSummary(r.registry_links)}` });
     if (r.completed) confirmed.then(() => goHome(r.parcel_numbers || []));
     wf.detail = await api("/api/v1/wf/jobs/" + j.id);
     wf.selEditing = await api(`/api/v1/wf/jobs/${j.id}/editing`).catch(() => wf.selEditing);
