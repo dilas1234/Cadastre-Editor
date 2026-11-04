@@ -176,6 +176,8 @@ const W: f64 = 210.0;
 const FRAME: (f64, f64, f64, f64) = (12.0, 60.0, 198.0, 228.0); // x0, y0, x1, y1
 const RED: &str = "#c00000";
 const LINE: &str = "#8b2f2f";
+/// The WGS 1984 co-ordinates in the footer: a light green that still reads on white paper.
+const COORD_GREEN: &str = "#4caf50";
 /// A white outline under labels that may cross a line (beacon numbers, bearings, the road).
 const HALO: &str = r##"stroke="#fff" stroke-width="0.7" paint-order="stroke""##;
 /// A side shorter than this on paper (mm) has no room for its bearing and distance: they are
@@ -790,9 +792,9 @@ pub fn render_svg(d: &PlanData) -> String {
     // Footer.
     let fx0 = 12.0;
     if let Some(o) = corners.first() {
-        text(&mut s, fx0, 236.0, 2.8, "start", &format!(r#"font-weight="bold" fill="{LINE}""#), &format!("WGS 1984 Co-ordinates of {}", esc(&o.name)));
-        text(&mut s, fx0, 240.5, 2.8, "start", &format!(r#"font-weight="bold" fill="{LINE}""#), &format!("N: {:.3}m", o.n));
-        text(&mut s, fx0, 245.0, 2.8, "start", &format!(r#"font-weight="bold" fill="{LINE}""#), &format!("E: {:.3}m", o.e));
+        text(&mut s, fx0, 236.0, 2.8, "start", &format!(r#"font-weight="bold" fill="{COORD_GREEN}""#), &format!("WGS 1984 Co-ordinates of {}", esc(&o.name)));
+        text(&mut s, fx0, 240.5, 2.8, "start", &format!(r#"font-weight="bold" fill="{COORD_GREEN}""#), &format!("N: {:.3}m", o.n));
+        text(&mut s, fx0, 245.0, 2.8, "start", &format!(r#"font-weight="bold" fill="{COORD_GREEN}""#), &format!("E: {:.3}m", o.e));
     }
     text(&mut s, fx0, 251.0, 2.8, "start", r#"font-weight="bold""#, &format!("SURVEYED BY: {}", esc(&cap_words(f.surveyed_by.as_deref().unwrap_or("")))));
     text(&mut s, fx0, 256.0, 2.8, "start", r#"font-weight="bold""#, &format!("SURVEY DATE: {}", esc(f.survey_date.as_deref().unwrap_or(""))));
@@ -885,6 +887,7 @@ mod tests {
             let want = want.replace("&#39;", "'");
             assert!(svg.contains(&want), "missing {want}");
         }
+        assert_eq!(svg.matches(r##"fill="#4caf50""##).count(), 3, "the WGS 1984 lines are light green");
         // An explicit scale is kept.
         fields.scale = Some(750);
         let svg = render_svg(&PlanData { upin: "PL000000023268".into(), area_m2: 249.489, corners: c, fields });
