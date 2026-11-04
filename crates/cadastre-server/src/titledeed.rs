@@ -185,6 +185,13 @@ const SHORT_SIDE_MM: f64 = 12.0;
 /// much further out.
 const FEATURE_OFF: f64 = 4.0;
 const FEATURE_STEP: f64 = 2.5;
+/// Road junctions, on paper (mm). An end this close past another road is cut back to it...
+const TRIM_MM: f64 = 12.0;
+/// ...and one this close short of it is carried on to it.
+const SNAP_MM: f64 = 3.0;
+/// A road tied to a side runs this far past each end of the side, as an access road does, so that
+/// roads on neighbouring sides reach each other.
+const ROAD_EXT_MM: f64 = 6.0;
 /// Beacon numbers: their font size, and the least distance between two that share a column (mm).
 const BEACON_SIZE: f64 = 2.7;
 const BEACON_LINE: f64 = 3.3;
@@ -225,26 +232,131 @@ pub fn fit_scale(corners: &[Corner]) -> u32 {
     *SCALES.iter().find(|&&s| w * 1000.0 / s as f64 <= fw && h * 1000.0 / s as f64 <= fh).unwrap_or(SCALES.last().unwrap())
 }
 
-/// Sheet number: the thousands of the Easting and Northing of a point (484903 E, 1082927 N →
-/// `484-1082`), each stepped down to even at its third digit (495142 E, 1092430 N → `494-1082`).
+/// Sheet number: the thousands of the Easting and Northing of a point, each rounded down to an
+/// even number (491176 E, 1092270 N → `490-1092`; 484903 E, 1082927 N → `484-1082`).
 pub fn sheet_no(e: f64, n: f64) -> String {
-    format!("{}-{}", sheet_part((e / 1000.0).floor() as i64), sheet_part((n / 1000.0).floor() as i64))
-}
-
-/// A sheet number part with an odd third digit stepped down to the even one below (495 → 494,
-/// 1092 → 1082).
-fn sheet_part(v: i64) -> i64 {
-    let digits = v.abs().to_string();
-    match digits.as_bytes().get(2) {
-        Some(d) if (d - b'0') % 2 == 1 => v - v.signum() * 10_i64.pow(digits.len() as u32 - 3),
-        _ => v,
-    }
+    let part = |v: f64| { let k = (v / 1000.0).floor() as i64; k - k.rem_euclid(2) };
+    format!("{}-{}", part(e), part(n))
 }
 
 /// Where line `p + t·u` meets line `q + s·v`: `t`, or `None` if they are (nearly) parallel.
 fn meet(p: (f64, f64), u: (f64, f64), q: (f64, f64), v: (f64, f64)) -> Option<f64> {
     let den = u.0 * v.1 - u.1 * v.0;
     (den.abs() > 0.1).then(|| ((q.0 - p.0) * v.1 - (q.1 - p.1) * v.0) / den)
+}
+
+type Pt = (f64, f64);
+
+/// Where segment a–b crosses segment c–d: the fraction along a–b.
+fn seg_cross(a: Pt, b: Pt, c: Pt, d: Pt) -> Option<f64> {
+    let (r, q) = ((b.0 - a.0, b.1 - a.1), (d.0 - c.0, d.1 - c.1));
+    let den = r.0 * q.1 - r.1 * q.0;
+    if den.abs() < 1e-9 {
+        return None;
+    }
+    let t = ((c.0 - a.0) * q.1 - (c.1 - a.1) * q.0) / den;
+    let u = ((c.0 - a.0) * r.1 - (c.1 - a.1) * r.0) / den;
+    ((0.0..=1.0).contains(&t) && (0.0..=1.0).contains(&u)).then_some(t)
+}
+
+fn dist(a: Pt, b: Pt) -> f64 {
+    (b.0 - a.0).hypot(b.1 - a.1)
+}
+
+fn length(line: &[Pt]) -> f64 {
+    line.windows(2).map(|w| dist(w[0], w[1])).sum()
+}
+
+/// The T-junctions of the drawn roads: each end of a road stops at the road it meets. An end that
+/// runs up to `TRIM_MM` past a road is cut back to it (the crossing nearest the road's body, when
+/// it runs over both lines of an access road), and one up to `SNAP_MM` short is carried on to it.
+/// `fixed` lines (access roads) always win; of two roads ending at each other the longer runs
+/// through. A road that carries on further than that crosses, and is left alone.
+fn trim_roads(roads: &mut [Vec<Pt>], fixed: &[[Pt; 2]]) {
+    let all: Vec<Vec<Pt>> = roads.to_vec();
+    // Whether a crossing at `x` on road `i` stops road `i` against road `j`.
+    let yields = |i: usize, j: usize, x: Pt| {
+        let (other, ends_there) = (&all[j], dist(x, all[j][0]).min(dist(x, all[j][all[j].len() - 1])) <= TRIM_MM);
+        !ends_there || length(&all[i]) < length(other) || (length(&all[i]) == length(other) && i > j)
+    };
+    for i in 0..roads.len() {
+        for _end in 0..2 {
+            roads[i].reverse(); // both ends, and back to the way it was drawn
+            let line = roads[i].clone();
+            let n = line.len();
+            let total = length(&line);
+            // Walk back from the end: the crossing furthest from it, within reach.
+            let mut cut: Option<(f64, usize, Pt)> = None;
+            let mut walked = 0.0;
+            for k in (0..n - 1).rev() {
+                let (a, b) = (line[k], line[k + 1]);
+                let seg = dist(a, b);
+                let mut consider = |c: Pt, d: Pt, wins: &dyn Fn(Pt) -> bool| {
+                    if let Some(t) = seg_cross(a, b, c, d) {
+                        let x = (a.0 + (b.0 - a.0) * t, a.1 + (b.1 - a.1) * t);
+                        let back = walked + seg * (1.0 - t);
+                        if back > 1e-6 && back <= TRIM_MM && back < total / 2.0 && wins(x) && cut.is_none_or(|(best, _, _)| back > best) {
+                            cut = Some((back, k, x));
+                        }
+                    }
+                };
+                for w in fixed {
+                    consider(w[0], w[1], &|_| true);
+                }
+                for (j, other) in all.iter().enumerate().filter(|&(j, _)| j != i) {
+                    for w in other.windows(2) {
+                        consider(w[0], w[1], &|x| yields(i, j, x));
+                    }
+                }
+                walked += seg;
+                if walked > TRIM_MM {
+                    break;
+                }
+            }
+            if let Some((_, k, x)) = cut {
+                roads[i].truncate(k + 1);
+                roads[i].push(x);
+                continue;
+            }
+            // Short of a road: carry the last stretch on, to the nearest within reach.
+            let (a, b) = (line[n - 2], line[n - 1]);
+            let seg = dist(a, b).max(1e-9);
+            let far = (b.0 + (b.0 - a.0) / seg * SNAP_MM, b.1 + (b.1 - a.1) / seg * SNAP_MM);
+            let targets = fixed.iter().map(|w| (w[0], w[1], None)).chain(all.iter().enumerate().filter(|&(j, _)| j != i)
+                .flat_map(|(j, o)| o.windows(2).map(move |w| (w[0], w[1], Some(j)))));
+            let hit = targets.filter_map(|(c, d, j)| {
+                let t = seg_cross(b, far, c, d)?;
+                let x = (b.0 + (far.0 - b.0) * t, b.1 + (far.1 - b.1) * t);
+                j.is_none_or(|j| yields(i, j, x)).then_some((t, x))
+            }).min_by(|x, y| x.0.total_cmp(&y.0));
+            if let Some((_, x)) = hit {
+                roads[i].push(x);
+            }
+        }
+    }
+}
+
+/// An access road line from `o` along `u`, `t0`..`t1`, over a side `len` long: the stretch past the
+/// side stops at a drawn road running across it (not at one that ends there, which stops at it).
+fn stop_at_through(o: Pt, u: Pt, len: f64, (start, end): (f64, f64), roads: &[Vec<Pt>]) -> (f64, f64) {
+    let (a, b) = ((o.0 + u.0 * start, o.1 + u.1 * start), (o.0 + u.0 * end, o.1 + u.1 * end));
+    let (mut t0, mut t1) = (start, end);
+    for road in roads {
+        for w in road.windows(2) {
+            let Some(f) = seg_cross(a, b, w[0], w[1]) else { continue };
+            let x = (a.0 + (b.0 - a.0) * f, a.1 + (b.1 - a.1) * f);
+            if dist(x, road[0]).min(dist(x, road[road.len() - 1])) <= TRIM_MM {
+                continue;
+            }
+            let t = start + (end - start) * f;
+            if t < 0.0 {
+                t0 = t0.max(t);
+            } else if t > len {
+                t1 = t1.min(t);
+            }
+        }
+    }
+    (t0, t1)
 }
 
 /// Whole-circle bearing of a leg, rounded to the minute: (degrees, minutes).
@@ -486,6 +598,65 @@ pub fn render_svg(d: &PlanData) -> String {
             r.gaps.push((g0, g1));
         }
     }
+    // Where each feature goes on paper. One on a side keeps that side's length, outside the parcel.
+    struct Placed<'a> { fi: usize, sym: &'a Symbol, label: Option<&'a str>, pts: Vec<Pt>, label_off: f64 }
+    let mut on_side = vec![0u32; p.len()];
+    let mut placed: Vec<Placed> = Vec::new();
+    for (fi, feat) in f.features.iter().enumerate() {
+        let Some(sym) = SYMBOLS.iter().find(|y| y.id == feat.symbol) else { continue };
+        let label = feat.label.as_deref().map(str::trim).filter(|l| !l.is_empty());
+        let (pts, label_off): (Vec<Pt>, f64) = match feat.side {
+            Some(i) if i < p.len() && p.len() >= 3 => {
+                let (a, b) = (p[i], p[(i + 1) % p.len()]);
+                let len = dist(a, b).max(1e-9);
+                let u = ((b.0 - a.0) / len, (b.1 - a.1) / len);
+                let left = (u.1, -u.0);
+                let (mx, my) = ((a.0 + b.0) / 2.0, (a.1 + b.1) / 2.0);
+                let sign = if (mx + left.0 - pcx).powi(2) + (my + left.1 - pcy).powi(2) > (mx - pcx).powi(2) + (my - pcy).powi(2) { 1.0 } else { -1.0 };
+                let off = sign * (FEATURE_OFF + FEATURE_STEP * on_side[i] as f64);
+                on_side[i] += 1;
+                let shift = |q: Pt, along: f64| (q.0 + left.0 * off + u.0 * along, q.1 + left.1 * off + u.1 * along);
+                let ext = if sym.group == "Roads" { ROAD_EXT_MM } else { 0.0 };
+                (if sym.point { vec![shift((mx, my), 0.0)] } else { vec![shift(a, -ext), shift(b, ext)] }, sign * 1.8)
+            }
+            Some(_) => continue,
+            None => (feat.points.iter().map(|q| paper(q[0], q[1])).collect(), 1.8),
+        };
+        placed.push(Placed { fi, sym, label, pts, label_off });
+    }
+
+    // Road junctions: drawn roads stop at the roads they meet, and an access road's overshoot at a
+    // drawn road running across it.
+    let inner_pieces = |r: &Road| {
+        let mut gaps = r.gaps.clone();
+        gaps.sort_by(|x, y| x.0.total_cmp(&y.0));
+        let (mut out, mut t) = (Vec::new(), r.t0);
+        for (g0, g1) in gaps {
+            out.push((t, g0.min(r.t1)));
+            t = t.max(g1);
+        }
+        out.push((t, r.t1));
+        out
+    };
+    let at = |o: Pt, u: Pt, t: f64| (o.0 + u.0 * t, o.1 + u.1 * t);
+    let access: Vec<[Pt; 2]> = rd.iter().flat_map(|r| {
+        let (i, o) = (off_pt(r, ROAD_IN), off_pt(r, ROAD_OUT));
+        inner_pieces(r).into_iter().map(move |(t0, t1)| [at(i, r.u, t0), at(i, r.u, t1)]).chain([[at(o, r.u, r.t0_out), at(o, r.u, r.t1_out)]]).collect::<Vec<_>>()
+    }).collect();
+    let is_road = |x: &Placed| x.sym.group == "Roads" && !x.sym.point && x.pts.len() >= 2;
+    let mut drawn: Vec<Vec<Pt>> = placed.iter().filter(|x| is_road(x)).map(|x| x.pts.clone()).collect();
+    trim_roads(&mut drawn, &access);
+    let mut trimmed = drawn.iter();
+    for x in &mut placed {
+        if is_road(x) {
+            x.pts.clone_from(trimmed.next().expect("one per road"));
+        }
+    }
+    for r in &mut rd {
+        (r.t0, r.t1) = stop_at_through(off_pt(r, ROAD_IN), r.u, r.len, (r.t0, r.t1), &drawn);
+        (r.t0_out, r.t1_out) = stop_at_through(off_pt(r, ROAD_OUT), r.u, r.len, (r.t0_out, r.t1_out), &drawn);
+    }
+
     let dashed = |s: &mut String, o: (f64, f64), u: (f64, f64), t0: f64, t1: f64| {
         if t1 - t0 > 0.2 {
             let _ = writeln!(s, r##"<line x1="{:.2}" y1="{:.2}" x2="{:.2}" y2="{:.2}" stroke="#000" stroke-width="0.3" stroke-dasharray="2.5 1.5"/>"##,
@@ -495,14 +666,9 @@ pub fn render_svg(d: &PlanData) -> String {
     let label = f.road_label.clone().filter(|l| !l.trim().is_empty()).unwrap_or_else(|| "Access Road".into());
     for (r, side) in rd.iter().zip(&roads) {
         // Inner line, broken where a joining road comes in.
-        let mut gaps = r.gaps.clone();
-        gaps.sort_by(|x, y| x.0.total_cmp(&y.0));
-        let mut t = r.t0;
-        for (g0, g1) in gaps {
-            dashed(&mut s, off_pt(r, ROAD_IN), r.u, t, g0.min(r.t1));
-            t = t.max(g1);
+        for (t0, t1) in inner_pieces(r) {
+            dashed(&mut s, off_pt(r, ROAD_IN), r.u, t0, t1);
         }
-        dashed(&mut s, off_pt(r, ROAD_IN), r.u, t, r.t1);
         dashed(&mut s, off_pt(r, ROAD_OUT), r.u, r.t0_out, r.t1_out);
         let m = off_pt(r, (ROAD_IN + ROAD_OUT) / 2.0);
         begin_move(&mut s, moves, &format!("road:{side}"));
@@ -511,27 +677,10 @@ pub fn render_svg(d: &PlanData) -> String {
     }
 
     // Features from the symbol list, under the parcel, and cut at the frame: a drawn one can run
-    // past it. One on a side keeps that side's length, outside the parcel.
+    // past it.
     let _ = writeln!(s, r#"<clipPath id="planFrame"><rect x="{x0}" y="{y0}" width="{}" height="{}"/></clipPath><g clip-path="url(#planFrame)">"#, x1 - x0, y1 - y0);
-    let mut on_side = vec![0u32; p.len()];
-    for (fi, feat) in f.features.iter().enumerate() {
-        let Some(sym) = SYMBOLS.iter().find(|y| y.id == feat.symbol) else { continue };
-        let label = feat.label.as_deref().map(str::trim).filter(|l| !l.is_empty());
-        let (pts, label_off): (Vec<(f64, f64)>, f64) = match feat.side {
-            Some(i) if i < p.len() && p.len() >= 3 => {
-                let (a, b) = (p[i], p[(i + 1) % p.len()]);
-                let len = ((b.0 - a.0).powi(2) + (b.1 - a.1).powi(2)).sqrt().max(1e-9);
-                let left = ((b.1 - a.1) / len, -(b.0 - a.0) / len);
-                let (mx, my) = ((a.0 + b.0) / 2.0, (a.1 + b.1) / 2.0);
-                let sign = if (mx + left.0 - pcx).powi(2) + (my + left.1 - pcy).powi(2) > (mx - pcx).powi(2) + (my - pcy).powi(2) { 1.0 } else { -1.0 };
-                let off = sign * (FEATURE_OFF + FEATURE_STEP * on_side[i] as f64);
-                on_side[i] += 1;
-                let shift = |q: (f64, f64)| (q.0 + left.0 * off, q.1 + left.1 * off);
-                (if sym.point { vec![shift((mx, my))] } else { vec![shift(a), shift(b)] }, sign * 1.8)
-            }
-            Some(_) => continue,
-            None => (feat.points.iter().map(|q| paper(q[0], q[1])).collect(), 1.8),
-        };
+    for Placed { fi, sym, label, pts, label_off } in &placed {
+        let (fi, sym, label, label_off) = (*fi, *sym, *label, *label_off);
         if sym.point {
             let Some(&q) = pts.first() else { continue };
             feature_point(&mut s, sym, q);
@@ -541,7 +690,7 @@ pub fn render_svg(d: &PlanData) -> String {
                 end_move(&mut s);
             }
         } else if pts.len() >= 2 {
-            feature_line(&mut s, sym, &pts);
+            feature_line(&mut s, sym, pts);
             if let Some(l) = label {
                 // On the longest stretch, where it has the most room.
                 let seg = |w: &&[(f64, f64)]| (w[1].0 - w[0].0).powi(2) + (w[1].1 - w[0].1).powi(2);
@@ -727,10 +876,11 @@ mod tests {
     }
 
     #[test]
-    fn sheet_number_steps_an_odd_third_digit_down() {
-        assert_eq!(sheet_no(495142.578, 1092430.989), "494-1082", "PL68374: 495 → 494, 1092 → 1082");
-        assert_eq!(sheet_no(484903.293, 1082927.804), "484-1082", "even third digits stay");
-        assert_eq!(sheet_no(497000.0, 1093999.0), "496-1083", "the third digit, not the last: 1093 → 1083");
+    fn sheet_number_rounds_the_thousands_down_to_even() {
+        assert_eq!(sheet_no(491176.685, 1092270.579), "490-1092", "491 → 490, 1092 stays");
+        assert_eq!(sheet_no(495142.578, 1092430.989), "494-1092", "PL68374");
+        assert_eq!(sheet_no(484903.293, 1082927.804), "484-1082", "even thousands stay");
+        assert_eq!(sheet_no(497000.0, 1093999.0), "496-1092", "an odd Northing steps down too");
     }
 
     #[test]
@@ -762,7 +912,7 @@ mod tests {
         assert_eq!(svg.matches(">ACCESS ROAD<").count(), 2, "one label per road");
         assert!(svg.matches("stroke-dasharray=\"2.5 1.5\"").count() >= 4, "two lines per road");
         assert!(svg.contains(" mE<") && svg.contains(" mN<"));
-        assert!(svg.contains("SHEET NO. 494 - 1082"));
+        assert!(svg.contains("SHEET NO. 494 - 1092"));
         // Grid off: no ticks, no values.
         let svg = render_svg(&PlanData { upin: "PL000000023480".into(), area_m2: 902.203, corners: c.clone(), fields: PlanFields { grid: Some(false), ..fields } });
         assert!(!svg.contains(" mE<") && !svg.contains(" mN<"));
@@ -893,6 +1043,70 @@ mod tests {
         assert!(after.contains(r#"<g data-move="beacon:0" transform="translate(3.50 -2.00)">"#));
         let marks = |s: &str| s.lines().filter(|l| l.contains(" h2 M") || l.contains("<polygon")).map(String::from).collect::<Vec<_>>();
         assert_eq!(marks(&before), marks(&after), "the beacons and the boundary stay where they are");
+    }
+
+    #[test]
+    fn a_road_end_stops_at_the_road_it_meets() {
+        let bar = |x: f64| [(x, -30.0), (x, 30.0)];
+        let trim = |road: Vec<Pt>, fixed: &[[Pt; 2]]| { let mut r = vec![road]; trim_roads(&mut r, fixed); r.remove(0) };
+        let close = |a: Pt, b: Pt| assert!(dist(a, b) < 1e-6, "{a:?} {b:?}");
+        // Past it: cut back. Short of it: carried on. Far past it: a crossing, left alone.
+        close(*trim(vec![(0.0, 0.0), (40.0, 0.0)], &[bar(35.0)]).last().unwrap(), (35.0, 0.0));
+        close(*trim(vec![(0.0, 0.0), (33.0, 0.0)], &[bar(35.0)]).last().unwrap(), (35.0, 0.0));
+        assert_eq!(trim(vec![(0.0, 0.0), (60.0, 0.0)], &[bar(35.0)]), vec![(0.0, 0.0), (60.0, 0.0)]);
+        // Over both lines of an access road: stops at the first it comes to.
+        close(*trim(vec![(0.0, 0.0), (45.0, 0.0)], &[bar(35.0), bar(43.0)]).last().unwrap(), (35.0, 0.0));
+        // The start of a road too, and a bend past the junction goes with the cut.
+        let r = trim(vec![(40.0, 5.0), (40.0, 0.0), (30.0, 0.0), (0.0, 0.0)], &[bar(35.0)]);
+        assert_eq!(r.len(), 3);
+        close(r[0], (35.0, 0.0));
+    }
+
+    #[test]
+    fn two_roads_make_a_t_the_one_that_ends_stops() {
+        let mut r = vec![vec![(0.0, 0.0), (50.0, 0.0)], vec![(25.0, -20.0), (25.0, 3.0)]];
+        trim_roads(&mut r, &[]);
+        assert_eq!(r[0], vec![(0.0, 0.0), (50.0, 0.0)], "the through road");
+        assert_eq!(r[1], vec![(25.0, -20.0), (25.0, 0.0)]);
+        // A long road ending at the middle of a short one is still the one that stops.
+        let mut r = vec![vec![(0.0, 0.0), (50.0, 0.0)], vec![(45.0, -15.0), (45.0, 15.0)]];
+        trim_roads(&mut r, &[]);
+        assert_eq!(r[0], vec![(0.0, 0.0), (45.0, 0.0)]);
+        // Both ending at the crossing: the longer runs through.
+        let mut r = vec![vec![(0.0, 0.0), (50.0, 0.0)], vec![(48.0, -20.0), (48.0, 3.0)]];
+        trim_roads(&mut r, &[]);
+        assert_eq!(r[0], vec![(0.0, 0.0), (50.0, 0.0)]);
+        assert_eq!(r[1], vec![(48.0, -20.0), (48.0, 0.0)]);
+    }
+
+    #[test]
+    fn an_access_road_overshoot_stops_at_a_drawn_road_across_it() {
+        let through = vec![vec![(60.0, -40.0), (60.0, 40.0)]];
+        assert_eq!(stop_at_through((0.0, 0.0), (1.0, 0.0), 50.0, (-10.0, 70.0), &through), (-10.0, 60.0));
+        // One that ends on the access road stops at it, and leaves it whole.
+        let ending = vec![vec![(60.0, -40.0), (60.0, 0.0)]];
+        assert_eq!(stop_at_through((0.0, 0.0), (1.0, 0.0), 50.0, (-10.0, 70.0), &ending), (-10.0, 70.0));
+        // Along the side itself it is not cut.
+        let beside = vec![vec![(30.0, -40.0), (30.0, 40.0)]];
+        assert_eq!(stop_at_through((0.0, 0.0), (1.0, 0.0), 50.0, (-10.0, 70.0), &beside), (-10.0, 70.0));
+    }
+
+    #[test]
+    fn a_drawn_road_stops_at_the_access_roads_outer_line() {
+        let c = pl68374();
+        let at = |c: &Corner| (12.0 + (c.e - 495116.0) * 2.0, 228.0 - (c.n - 1092379.0) * 2.0);
+        let (a, b) = (at(&c[2]), at(&c[3]));
+        let len = dist(a, b);
+        let mut n = ((b.1 - a.1) / len, -(b.0 - a.0) / len);
+        if n.1 < 0.0 { n = (-n.0, -n.1); } // south, down the sheet: away from the parcel
+        let mid = ((a.0 + b.0) / 2.0 + n.0 * 13.0, (a.1 + b.1) / 2.0 + n.1 * 13.0);
+        let ground = |q: Pt| [495116.0 + (q.0 - 12.0) / 2.0, 1092379.0 + (228.0 - q.1) / 2.0];
+        let road = PlanFeature { symbol: "road".into(), points: vec![ground((mid.0 + n.0 * 30.0, mid.1 + n.1 * 30.0)), ground((mid.0 - n.0 * 3.0, mid.1 - n.1 * 3.0))], ..Default::default() };
+        let fields = PlanFields { scale: Some(500), road_sides: vec![2], features: vec![road], ..Default::default() };
+        let svg = render_svg(&PlanData { upin: "X".into(), area_m2: 1.0, corners: c, fields });
+        let line = svg.lines().find(|l| l.starts_with("<polyline")).unwrap();
+        let v: Vec<f64> = line.split('"').nth(1).unwrap().split([' ', ',']).map(|v| v.parse().unwrap()).collect();
+        assert!(dist((v[v.len() - 2], v[v.len() - 1]), mid) < 0.02, "ends on the outer line, not inside the road");
     }
 
     #[test]
