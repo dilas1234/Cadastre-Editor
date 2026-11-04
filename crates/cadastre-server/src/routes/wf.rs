@@ -769,6 +769,9 @@ pub struct WfFinishBody {
     /// Beacon numbers for the new corners (as for Commit Parcels).
     #[serde(default)]
     pub beacons: Vec<crate::routes::wfbeacons::WfBeaconNumber>,
+    /// The staff member committing (recorded in the audit log with the commit).
+    #[serde(default)]
+    pub staff_name: Option<String>,
 }
 #[derive(Serialize, ToSchema)]
 pub struct WfFinishDto {
@@ -1048,12 +1051,13 @@ pub async fn commit(State(state): State<AppState>, user: AuthUser, Path(id): Pat
         return Err(AppError::Conflict("parcels are committed at the job's commit task (e.g. Commit Parcel)".into()));
     }
     let c = commit_drafts(&mut tx, id, &req).await?;
-    audit::append(&mut tx, &actor.label, "wf_commit", "wf_job_instance", Some(&id.to_string()), json!({ "parcel_numbers": c.numbers, "beacons_added": c.beacons_added, "retired": c.retired })).await?;
+    let who = committed_by(req.staff_name.as_deref(), &actor.label);
+    audit::append(&mut tx, &who, "wf_commit", "wf_job_instance", Some(&id.to_string()), json!({ "parcel_numbers": c.numbers, "beacons_added": c.beacons_added, "retired": c.retired, "staff_name": req.staff_name, "login": actor.label })).await?;
     // A commit is the end of digitising: the job is completed (Correct reopens it).
     let job_type_id: i32 = sqlx::query_scalar("SELECT job_type_id FROM cadastre.wf_job_instance WHERE id = $1").bind(id).fetch_one(&mut *tx).await?;
     let (edges, end_task) = graph(&state.pool, job_type_id).await?;
     if let Some(cur) = cur {
-        complete_after_commit(&mut tx, id, job_type_id, cur, &edges, end_task, &actor.label, None).await?;
+        complete_after_commit(&mut tx, id, job_type_id, cur, &edges, end_task, &who, None).await?;
     }
     tx.commit().await?;
     Ok(Json(WfCommitDto { parcel_numbers: c.numbers, beacons_added: c.beacons_added, retired: c.retired, editing: editing_info(&state, id).await? }))
@@ -1106,6 +1110,16 @@ struct Committed {
 
 
 /// The job type's commit task: the task in its graph whose steps carry the Commit Parcel tool.
+/// Who a commit is recorded under: the staff name typed at commit (with the login when there is
+/// one), else the signed-in user.
+pub(crate) fn committed_by(staff: Option<&str>, login: &str) -> String {
+    match staff.map(|s| s.split_whitespace().collect::<Vec<_>>().join(" ")).filter(|s| !s.is_empty()) {
+        Some(s) if login.is_empty() || login == "dev" || login.eq_ignore_ascii_case(&s) => s.chars().take(80).collect(),
+        Some(s) => format!("{} ({login})", s.chars().take(80).collect::<String>()),
+        None => login.to_string(),
+    }
+}
+
 /// After a commit: walk the job on to its end task and complete it. A committed job is the end of
 /// digitising (PLAGIS); the title deed plan is made on the completed job, and Correct reopens it.
 /// Returns whether the job was completed and the tasks passed on the way.
@@ -1244,15 +1258,16 @@ pub async fn finish(State(state): State<AppState>, user: AuthUser, Path(id): Pat
     if !wfengine::may_act(&task_permitted(&mut tx, current).await?, &actor.sids, actor.admin) {
         return Err(AppError::Forbidden(format!("{} may not commit this job", actor.label)));
     }
-    let c = commit_drafts(&mut tx, id, &crate::routes::wfbeacons::WfCommitRequest { beacons: req.beacons.clone() }).await?;
+    let c = commit_drafts(&mut tx, id, &crate::routes::wfbeacons::WfCommitRequest { beacons: req.beacons.clone(), staff_name: req.staff_name.clone() }).await?;
     let numbers = c.numbers;
-    audit::append(&mut tx, &actor.label, "wf_commit", "wf_job_instance", Some(&id.to_string()), json!({ "parcel_numbers": numbers, "beacons_added": c.beacons_added, "retired": c.retired, "fast_track": true })).await?;
+    let who = committed_by(req.staff_name.as_deref(), &actor.label);
+    audit::append(&mut tx, &who, "wf_commit", "wf_job_instance", Some(&id.to_string()), json!({ "parcel_numbers": numbers, "beacons_added": c.beacons_added, "retired": c.retired, "fast_track": true, "staff_name": req.staff_name, "login": actor.label })).await?;
 
     // Carry on to the end task and complete. Best-effort: the parcels are already posted, so a
     // restricted downstream task simply leaves the job open there rather than failing the post.
     let mut completed = false;
     if complete {
-        let (done, more) = complete_after_commit(&mut tx, id, job_type_id, current, &edges, end_task, &actor.label, req.comment.as_deref()).await?;
+        let (done, more) = complete_after_commit(&mut tx, id, job_type_id, current, &edges, end_task, &who, req.comment.as_deref()).await?;
         completed = done;
         passed.extend(more);
     }

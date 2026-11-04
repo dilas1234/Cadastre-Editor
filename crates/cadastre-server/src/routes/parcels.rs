@@ -619,3 +619,62 @@ pub async fn parcel_metadata(State(state): State<AppState>, Query(q): Query<Parc
         })
     }).collect()))
 }
+
+#[derive(Debug, Deserialize, utoipa::ToSchema)]
+pub struct SketchOverlapRequest {
+    /// The sketch (UTM 32N metres, ring order, no closing repeat).
+    pub vertices: Vec<[f64; 2]>,
+    /// A draft being reshaped (not checked against itself).
+    #[serde(default)]
+    pub editing_id: Option<Uuid>,
+}
+
+/// For the Orthophoto window, as the digitiser sketches: the committed parcels the sketch
+/// overlaps (with the overlapping area as GeoJSON in WGS 84, to shade red), whether the plot's
+/// position is already digitised, and whether a title exists on the land (a parcel there linked
+/// to a Registry property). This Cadastre's fabric only, so it answers at once; the System Check
+/// adds Aumentum's live parcels and the Registry before anything is saved.
+#[utoipa::path(post, path = "/api/v1/parcels/overlaps", tag = "parcels", request_body = SketchOverlapRequest, responses((status = 200)))]
+pub async fn sketch_overlaps(State(state): State<AppState>, Json(req): Json<SketchOverlapRequest>) -> ApiResult<Json<serde_json::Value>> {
+    if req.vertices.len() < 3 {
+        return Ok(Json(serde_json::json!({ "free": true, "overlaps": [], "at_point": [], "titled": [] })));
+    }
+    if req.vertices.len() > 2000 || req.vertices.iter().flatten().any(|v| !v.is_finite()) {
+        return Err(AppError::BadRequest("vertices must be numbers (UTM 32N metres)".into()));
+    }
+    let mut ring: Vec<[f64; 2]> = req.vertices.clone();
+    ring.push(req.vertices[0]);
+    let shape = serde_json::json!({ "type": "Polygon", "coordinates": [ring] }).to_string();
+    let rows = sqlx::query(
+        "WITH s AS (SELECT ST_MakeValid(ST_SetSRID(ST_GeomFromGeoJSON($1), 32632)) AS g), \
+              pt AS (SELECT ST_PointOnSurface(g) AS p FROM s) \
+         SELECT p.parcel_number, ST_Area(ST_Intersection(p.geom, s.g)) AS a, \
+                ST_AsGeoJSON(ST_Transform(ST_Intersection(p.geom, s.g), 4326), 7)::json AS geom, \
+                ST_Contains(p.geom, (SELECT p FROM pt)) AS at_point, \
+                COALESCE(r.su_id, x.lrs_id) AS su_id, COALESCE(r.refnum, x.property_number) AS refnum, \
+                (r.su_id IS NOT NULL OR x.lrs_id IS NOT NULL) AS titled \
+         FROM s JOIN cadastre.parcel p ON p.status = 'posted' AND p.geom && s.g AND ST_Intersects(p.geom, s.g) \
+         LEFT JOIN cadastre.registry_property r ON r.upin = p.parcel_number \
+         LEFT JOIN LATERAL (SELECT lrs_id, property_number FROM cadastre.parcel_attribute y WHERE y.upin = p.parcel_number AND y.linkage_status = 1 \
+                            AND (y.status = '0' OR y.status IS NULL) LIMIT 1) x ON true \
+         WHERE ($2::uuid IS NULL OR p.id <> $2) \
+         ORDER BY a DESC LIMIT 30",
+    )
+    .bind(&shape)
+    .bind(req.editing_id)
+    .fetch_all(&state.pool)
+    .await?;
+    let mut overlaps = Vec::new();
+    let (mut at_point, mut titled) = (Vec::new(), Vec::new());
+    for r in &rows {
+        let upin: Option<String> = r.get("parcel_number");
+        let a: f64 = r.get::<Option<f64>, _>("a").unwrap_or(0.0);
+        if r.get::<Option<bool>, _>("at_point").unwrap_or(false) { at_point.push(upin.clone()); }
+        if a <= 0.01 { continue; }
+        if r.get::<Option<bool>, _>("titled").unwrap_or(false) {
+            titled.push(serde_json::json!({ "upin": upin, "su_id": r.get::<Option<String>, _>("su_id"), "refnum": r.get::<Option<String>, _>("refnum") }));
+        }
+        overlaps.push(serde_json::json!({ "upin": upin, "area_m2": (a * 100.0).floor() / 100.0, "geometry": r.get::<Option<serde_json::Value>, _>("geom") }));
+    }
+    Ok(Json(serde_json::json!({ "free": overlaps.is_empty() && at_point.is_empty(), "overlaps": overlaps, "at_point": at_point, "titled": titled })))
+}

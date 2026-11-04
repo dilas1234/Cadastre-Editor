@@ -43,6 +43,9 @@ pub struct WfCommitRequest {
     /// Beacon numbers for the new corner points.
     #[serde(default)]
     pub beacons: Vec<WfBeaconNumber>,
+    /// The staff member committing (recorded in the audit log with the commit).
+    #[serde(default)]
+    pub staff_name: Option<String>,
 }
 
 #[derive(Debug, Clone)]

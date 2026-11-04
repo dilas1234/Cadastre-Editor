@@ -1327,8 +1327,11 @@ async fn job_editing_follows_job_area_and_commit_rules() {
             && (b["northing"].as_f64().unwrap() - p["northing"].as_f64().unwrap()).abs() < 0.002).map(|b| b["number"].clone()).unwrap();
         json!({"easting": p["easting"], "northing": p["northing"], "number": n})
     }).collect();
-    let (st, c2) = send(&app, "POST", &format!("/api/v1/wf/jobs/{id}/commit"), None, Some(json!({"beacons": retyped}))).await;
+    let (st, c2) = send(&app, "POST", &format!("/api/v1/wf/jobs/{id}/commit"), None, Some(json!({"beacons": retyped, "staff_name": "  Ngozi   Dung "}))).await;
     assert_eq!(st, StatusCode::OK, "{c2}");
+    let who: String = sqlx::query_scalar("SELECT actor FROM cadastre.audit_log WHERE entity = 'wf_job_instance' AND entity_id = $1 AND action = 'wf_commit' ORDER BY id DESC LIMIT 1")
+        .bind(id.to_string()).fetch_one(&pool).await.unwrap();
+    assert_eq!(who, "Ngozi Dung", "the staff name typed at commit is who the commit is recorded under");
     assert_eq!(c2["parcel_numbers"], json!([fix]), "committed again with the same UPIN");
     let pillar: i64 = sqlx::query_scalar("SELECT count(*) FROM cadastre.beacon WHERE number = $1").bind(format!("{tag}X")).fetch_one(&pool).await.unwrap();
     assert_eq!(pillar, 1, "the shared pillar (not added by the commit) is never removed by Correct");
