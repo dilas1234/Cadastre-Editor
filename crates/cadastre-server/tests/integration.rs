@@ -1216,7 +1216,7 @@ async fn job_editing_follows_job_area_and_commit_rules() {
     // Update Parcel Attribute on a draft (the property document), carried into its record at commit.
     let prop = format!("PLT{}", b);
     let (st, r) = send(&app, "PUT", &format!("/api/v1/parcels/{}/attributes", d1["id"].as_str().unwrap()), None,
-        Some(json!({"property_number": prop, "plot": "12", "status": "Active"}))).await;
+        Some(json!({"property_number": prop, "plot": "12", "status": "Active", "location": "Jos - Bukuru Metropolis", "layout": "Bukuru Lowcost", "area_name": "A new area name"}))).await;
     assert_eq!(st, StatusCode::OK, "{r}");
 
     // Edit Vertices on a saved draft: moved inside the area is saved, outside is refused with
@@ -1292,6 +1292,10 @@ async fn job_editing_follows_job_area_and_commit_rules() {
         .bind(c["parcel_numbers"].as_array().unwrap().iter().map(|v| v.as_str().unwrap().to_string()).collect::<Vec<_>>())
         .fetch_one(&pool).await.unwrap();
     assert!(rec.0 >= 1_000_000_000, "a new record's OBJECTID never clashes with Aumentum's: {}", rec.0);
+    let places: (Option<String>, Option<String>, Option<String>) = sqlx::query_as("SELECT location, layout, area_name FROM cadastre.parcel_attribute WHERE object_id = $1")
+        .bind(rec.0).fetch_one(&pool).await.unwrap();
+    assert_eq!(places, (Some("Jos - Bukuru Metropolis".into()), Some("Bukuru Lowcost".into()), Some("A new area name".into())),
+        "Location, Layout and Area (a Registry name or a new one) are kept with the committed parcel");
     assert_eq!((rec.1, rec.2, rec.3, rec.4), (Some(prop.clone()), Some("12".into()), Some("0".into()), Some(0)),
         "captured attributes, Aumentum's status code 0 (Active), not linked until the Registry links it");
     let cut: bool = sqlx::query_scalar("SELECT bool_and(a.parcel_area = trunc(ST_Area(p.geom)::numeric, 2)::float8) FROM cadastre.parcel_attribute a JOIN cadastre.parcel p ON p.parcel_number = a.upin WHERE a.upin = ANY($1)")
@@ -1327,8 +1331,20 @@ async fn job_editing_follows_job_area_and_commit_rules() {
             && (b["northing"].as_f64().unwrap() - p["northing"].as_f64().unwrap()).abs() < 0.002).map(|b| b["number"].clone()).unwrap();
         json!({"easting": p["easting"], "northing": p["northing"], "number": n})
     }).collect();
-    let (st, c2) = send(&app, "POST", &format!("/api/v1/wf/jobs/{id}/commit"), None, Some(json!({"beacons": retyped}))).await;
+    // Committed by: a staff member added to the users list (numbered from 1,000,000), then picked.
+    let staff_name = format!("Ngozi Dung {tag}");
+    let (st, u) = send(&app, "POST", "/api/v1/wf/principals", None, Some(json!({"name": format!("  {staff_name} ")}))).await;
+    assert_eq!(st, StatusCode::CREATED, "{u}");
+    let sid = u["sid"].as_i64().unwrap();
+    assert!(sid > 1_000_000, "new users never meet Aumentum's numbers: {u}");
+    assert!(u["code"].as_str().unwrap().starts_with('n'), "login made from the name: {u}");
+    let (st, r) = send(&app, "POST", "/api/v1/wf/principals", None, Some(json!({"name": staff_name.to_uppercase()}))).await;
+    assert_eq!(st, StatusCode::CONFLICT, "the same person twice: {r}");
+    let (st, c2) = send(&app, "POST", &format!("/api/v1/wf/jobs/{id}/commit"), None, Some(json!({"beacons": retyped, "staff_sid": sid, "staff_name": "ignored when a user is picked"}))).await;
     assert_eq!(st, StatusCode::OK, "{c2}");
+    let (who, psid): (String, Option<i64>) = sqlx::query_as("SELECT actor, (payload->>'staff_sid')::bigint FROM cadastre.audit_log WHERE entity = 'wf_job_instance' AND entity_id = $1 AND action = 'wf_commit' ORDER BY id DESC LIMIT 1")
+        .bind(id.to_string()).fetch_one(&pool).await.unwrap();
+    assert_eq!((who.as_str(), psid), (staff_name.as_str(), Some(sid)), "the commit is recorded under the picked user (name and id)");
     assert_eq!(c2["parcel_numbers"], json!([fix]), "committed again with the same UPIN");
     let pillar: i64 = sqlx::query_scalar("SELECT count(*) FROM cadastre.beacon WHERE number = $1").bind(format!("{tag}X")).fetch_one(&pool).await.unwrap();
     assert_eq!(pillar, 1, "the shared pillar (not added by the commit) is never removed by Correct");
@@ -1931,10 +1947,10 @@ impl FakeRegistry {
                         let closed = body.contains("TXNCLOSED");
                         let num = if closed { "TXNCLOSED" } else { "PLS777" };
                         ok(scalar_xml(&[vec!["10000000777", num, if closed { "transaction_completed" } else { "transaction_lodged" }, if closed { "Completed" } else { "Active" }]]))
-                    } else if body.contains("s.SpatialDate1, z.Label, y.Label from com.landsystems.lrs.model.Transaction") {
+                    } else if body.contains("s.SpatialDate1, z.Label, y.Label, pa.Label from com.landsystems.lrs.model.Transaction") {
                         // The transaction's properties, with the property's location (zone) and layout.
                         let u = prop_upin.lock().unwrap().clone().unwrap_or_default();
-                        ok(scalar_xml(&[vec!["10000000555", &su, &u, "PL777", "", "B7", "", "Jos - Bukuru Metropolis", ""]]))
+                        ok(scalar_xml(&[vec!["10000000555", &su, &u, "PL777", "", "B7", "", "Jos - Bukuru Metropolis", "", ""]]))
                     } else if body.contains("model.IncomingDocument d where d.Transaction.id = 10000000777") {
                         // The plans already filed in PLS777 (a resend marks them as replaced).
                         ok(scalar_xml(&[vec!["10000000901"]]))

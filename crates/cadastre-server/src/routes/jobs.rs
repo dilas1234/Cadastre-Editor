@@ -399,7 +399,7 @@ pub async fn post_drafts_with_ids(conn: &mut sqlx::PgConnection, job_id: Uuid) -
             "INSERT INTO cadastre.parcel_attribute \
                (object_id, upin, parcel_id, dataset_name, region_name, property_number, property_type, \
                 plot, block, location, plan_number, lga, parcel_name, area_unit, surveyor_general, \
-                parcel_area, status, lrs_id, linkage_status, linkage_date, creation_date, last_edit_date, updated_at) \
+                parcel_area, status, lrs_id, linkage_status, linkage_date, creation_date, last_edit_date, updated_at, layout, area_name) \
              SELECT nextval('cadastre.parcel_attribute_objectid_seq'), $2, p.id, \
                 'PLATEAU_STATE_PARCELS', 'Plateau_State', \
                 COALESCE(d.property_number, l.property_number), COALESCE(d.property_type, l.property_type), \
@@ -408,7 +408,7 @@ pub async fn post_drafts_with_ids(conn: &mut sqlx::PgConnection, job_id: Uuid) -
                 d.surveyor_general, trunc(ST_Area(p.geom)::numeric, 2), CASE lower(COALESCE(d.status, 'active')) WHEN 'active' THEN '0' WHEN 'historic' THEN '1' ELSE d.status END, COALESCE(d.lrs_id, l.lrs_id), \
                 CASE WHEN COALESCE(d.lrs_id, l.lrs_id) IS NOT NULL THEN COALESCE(l.linkage_status, 1) ELSE 0 END, \
                 CASE WHEN COALESCE(d.lrs_id, l.lrs_id) IS NOT NULL THEN to_char(now(), 'YYYYMMDD') END, \
-                now(), now(), now() \
+                now(), now(), now(), d.layout, d.area_name \
              FROM cadastre.parcel p \
              LEFT JOIN cadastre.parcel_draft_attribute d ON d.parcel_id = p.id \
              LEFT JOIN LATERAL ( \

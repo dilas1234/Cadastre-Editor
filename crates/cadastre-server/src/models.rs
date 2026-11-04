@@ -243,6 +243,12 @@ pub struct ParcelAttributesInput {
     pub block: Option<String>,
     /// Location / address text.
     pub location: Option<String>,
+    /// Layout (Registry dictionary `layout_type`, or a new name).
+    #[serde(default)]
+    pub layout: Option<String>,
+    /// Area (Registry dictionary `property_area`, or a new name).
+    #[serde(default)]
+    pub area_name: Option<String>,
     /// Survey plan number.
     pub plan_number: Option<String>,
     /// Local Government Area.
@@ -272,7 +278,7 @@ impl ParcelAttributesInput {
             }
         }
         for f in [
-            &mut self.property_number, &mut self.property_type, &mut self.plot, &mut self.block,
+            &mut self.property_number, &mut self.property_type, &mut self.plot, &mut self.block, &mut self.layout, &mut self.area_name,
             &mut self.location, &mut self.plan_number, &mut self.lga, &mut self.parcel_name,
             &mut self.surveyor_general, &mut self.status, &mut self.lrs_id,
         ] {

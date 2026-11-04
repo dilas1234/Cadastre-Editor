@@ -202,6 +202,9 @@ pub struct RegistryPropertyDto {
     /// The property's layout (Registry dictionary `layout_type`).
     #[serde(default)]
     pub layout: Option<String>,
+    /// The property's area (Registry dictionary `property_area`).
+    #[serde(default)]
+    pub area: Option<String>,
 }
 
 #[derive(Debug, Serialize, ToSchema)]
@@ -225,8 +228,8 @@ pub(crate) async fn load_transaction(session: &Session, number: &str) -> ApiResu
     let Some(t) = t.into_iter().find(|r| r.len() >= 4) else { return Ok(None) };
     let props = session
         .query(&format!(
-            "select s.Id, s.SuID, s.Upin, s.Refnum, s.LotNumber, s.BlockNumber, s.SpatialDate1, z.Label, y.Label from com.landsystems.lrs.model.Transaction t \
-             join t.Properties l join l.SpatialUnits s left join s.Zone z left join s.Layout y \
+            "select s.Id, s.SuID, s.Upin, s.Refnum, s.LotNumber, s.BlockNumber, s.SpatialDate1, z.Label, y.Label, pa.Label from com.landsystems.lrs.model.Transaction t \
+             join t.Properties l join l.SpatialUnits s left join s.Zone z left join s.Layout y left join s.PropertyArea pa \
              where t.TransactionNumber = '{number}' and l.EndLifespanVersion is null and s.EndLifespanVersion is null"
         ), 500)
         .await
@@ -244,7 +247,7 @@ pub(crate) async fn load_transaction(session: &Session, number: &str) -> ApiResu
         properties: props.iter().filter(|r| r.len() >= 7).map(|r| RegistryPropertyDto {
             id: r[0].trim().to_string(), su_id: r[1].trim().to_string(), upin: o(&r[2]), refnum: o(&r[3]),
             lot: o(&r[4]), block: o(&r[5]), linked_at: lrs::parse_datetime(&r[6]).map(|d| d.format("%Y-%m-%dT%H:%M:%S").to_string()),
-            location: r.get(7).and_then(o), layout: r.get(8).and_then(o),
+            location: r.get(7).and_then(o), layout: r.get(8).and_then(o), area: r.get(9).and_then(o),
         }).collect(),
     }))
 }
