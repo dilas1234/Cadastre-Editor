@@ -185,29 +185,26 @@ const POSTABLE_STAGE = "approved"; // server only posts approved jobs
  * switch so the administrator can come back.
  * ===================================================================================== */
 const VIEWS = {
-  sysadmin: { label: "Sysadmin", all: true, panel: null },
-  digitising: { label: "Digitising", features: ["digitise", "edit", "workflow", "registry", "tasks", "completed"], panel: "workflow" },
-  titledeed: { label: "Title Deed", features: ["titledeed", "workflow", "registry", "completed"], panel: "queue" },
-  reporting: { label: "Reporting & Chat", features: ["completed", "reports"], panel: "completed" },
+  sysadmin: { label: "Sysadmin", path: "/sys-editor", all: true, panel: null },
+  digitising: { label: "Digitising", path: "/digitising", features: ["digitise", "edit", "workflow", "registry", "tasks", "completed"], panel: "workflow" },
+  titledeed: { label: "Title Deed", path: "/title-deed", features: ["titledeed", "workflow", "registry", "completed"], panel: "queue" },
+  reporting: { label: "Reporting & Chat", path: "/reporting", features: ["completed", "reports"], panel: "completed" },
 };
 const VIEW_FOR = { digitise: "Digitising", edit: "Digitising", titledeed: "Title Deed", admin: "Sysadmin", reports: "Reporting & Chat" };
+// The view comes from the address each unit is given: /digitising, /title-deed, /reporting, and
+// /sys-editor for the system administrator.
 const currentView = (() => {
-  let v = null;
-  try {
-    const u = new URLSearchParams(location.search).get("view");
-    if (u && VIEWS[u]) { v = u; localStorage.setItem("cad.view", u); }
-    if (!v) v = localStorage.getItem("cad.view");
-  } catch { /* storage unavailable */ }
-  return VIEWS[v] ? v : "sysadmin";
+  const path = location.pathname.replace(/\/+$/, "");
+  return Object.keys(VIEWS).find((k) => VIEWS[k].path === path) || "digitising";
 })();
 const viewDef = VIEWS[currentView];
 const can = (feature) => !!viewDef.all || (viewDef.features || []).includes(feature);
 let adminTab = false; try { adminTab = currentView === "sysadmin" || sessionStorage.getItem("cad.adminSwitch") === "1"; } catch { /* storage */ }
 function switchView(v) {
   if (!VIEWS[v]) return;
-  try { localStorage.setItem("cad.view", v); sessionStorage.setItem("cad.adminSwitch", "1"); } catch { /* storage */ }
+  try { sessionStorage.setItem("cad.adminSwitch", "1"); } catch { /* storage */ }
   try { saveSession(); } catch { /* not ready */ }
-  const u = new URL(location.href); u.searchParams.delete("view"); location.href = u.toString();
+  location.href = VIEWS[v].path + location.search;
 }
 document.body.classList.add("view-" + currentView);
 document.title = `PLAGIS CADASTRE Editor — ${viewDef.label}`;
@@ -462,7 +459,7 @@ function zoomToFC(fc, opts = {}, regionOnly = false) {
 // No in-page title bar: the browser window/tab title carries it, as the native window title did.
 function setTitle() {
   const who = state.me ? ` - Connected as ${state.me.username}` : "";
-  document.title = `${REGION} - ${APP}${who}`;
+  document.title = `${viewDef.label} - ${APP}${who}`;
 }
 api("/api/v1/me").then((me) => { state.me = me; setTitle(); }).catch(() => setTitle());
 setTitle();
@@ -584,11 +581,15 @@ function buildMenus() {
     bar.append(m);
   }
   // The current view, and the switch (Sysadmin, or a tab switched from it).
-  const vb = h("div", { class: "viewBadge" + (adminTab ? " canSwitch" : ""), title: adminTab ? "Switch to another view" : "This PC's view" }, `View: ${viewDef.label}`, adminTab ? " ▾" : "");
+  const vb = h("div", { class: "viewBadge" + (adminTab ? " canSwitch" : ""), title: adminTab ? "Switch to another view" : `This unit's view (${location.origin}${viewDef.path})` }, `View: ${viewDef.label}`, adminTab ? " ▾" : "");
   if (adminTab) vb.addEventListener("mousedown", (ev) => {
     ev.stopPropagation(); closeMenus();
     const r = vb.getBoundingClientRect();
-    contextMenu(Object.entries(VIEWS).map(([k, v]) => ({ label: (k === currentView ? "✓ " : "") + v.label, action: () => switchView(k) })), r.left, r.bottom);
+    contextMenu([...Object.entries(VIEWS).map(([k, v]) => ({ label: `${k === currentView ? "✓ " : ""}${v.label}   ${v.path}`, action: () => switchView(k) })), "-",
+      { label: "Copy the units' addresses", action: async () => {
+        const t = Object.values(VIEWS).map((v) => `${v.label}: ${location.origin}${v.path}`).join("\n");
+        try { await navigator.clipboard.writeText(t); notify("Addresses copied."); } catch { uiAlert(t, { title: "Addresses" }); }
+      } }], r.left, r.bottom);
   });
   bar.append(vb);
 }

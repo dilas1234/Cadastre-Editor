@@ -44,7 +44,14 @@ pub fn router(state: AppState) -> Router {
         .route("/ready", get(health::ready))
         // Browser viewer + editor (Phase 7/4, FR-VIEW/FR-SUR)
         .route("/viewer", get(viewer::viewer))
-        .route("/editor", get(editor::index))
+        // One address per unit (views): the same editor, the view chosen by the address.
+        .route("/editor", get(|axum::extract::RawQuery(q): axum::extract::RawQuery| async move {
+            axum::response::Redirect::temporary(&format!("/digitising{}", q.map(|q| format!("?{q}")).unwrap_or_default()))
+        }))
+        .route("/sys-editor", get(editor::index))
+        .route("/digitising", get(editor::index))
+        .route("/title-deed", get(editor::index))
+        .route("/reporting", get(editor::index))
         .route("/editor/{*path}", get(editor::asset))
         .route("/api/v1/me", get(me::me))
         .route("/api/v1/auth/config", get(me::auth_config))
