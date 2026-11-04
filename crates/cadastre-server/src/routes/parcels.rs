@@ -227,9 +227,9 @@ pub async fn separate_job_parcel(
         .execute(&mut *tx)
         .await?;
         sqlx::query(
-            "INSERT INTO cadastre.parcel_draft_attribute (parcel_id, property_number, property_type, plot, block, location, plan_number, lga, \
+            "INSERT INTO cadastre.parcel_draft_attribute (parcel_id, property_number, property_type, plot, block, location, layout, area_name, plan_number, lga, \
                 parcel_name, area_unit, surveyor_general, status, lrs_id) \
-             SELECT $2, property_number, property_type, plot, block, location, plan_number, lga, parcel_name, area_unit, surveyor_general, status, lrs_id \
+             SELECT $2, property_number, property_type, plot, block, location, layout, area_name, plan_number, lga, parcel_name, area_unit, surveyor_general, status, lrs_id \
              FROM cadastre.parcel_draft_attribute WHERE parcel_id = $1",
         )
         .bind(parcel_id)
@@ -274,19 +274,20 @@ where
 {
     sqlx::query(
         "INSERT INTO cadastre.parcel_draft_attribute \
-           (parcel_id, property_number, property_type, plot, block, location, plan_number, lga, parcel_name, area_unit, surveyor_general, status, lrs_id) \
-         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13) \
+           (parcel_id, property_number, property_type, plot, block, location, plan_number, lga, parcel_name, area_unit, surveyor_general, status, lrs_id, layout, area_name) \
+         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15) \
          ON CONFLICT (parcel_id) DO UPDATE SET \
            property_number = EXCLUDED.property_number, property_type = EXCLUDED.property_type, \
            plot = EXCLUDED.plot, block = EXCLUDED.block, location = EXCLUDED.location, \
            plan_number = EXCLUDED.plan_number, lga = EXCLUDED.lga, parcel_name = EXCLUDED.parcel_name, \
            area_unit = EXCLUDED.area_unit, surveyor_general = EXCLUDED.surveyor_general, \
-           status = EXCLUDED.status, lrs_id = EXCLUDED.lrs_id, updated_at = now()",
+           status = EXCLUDED.status, lrs_id = EXCLUDED.lrs_id, layout = EXCLUDED.layout, area_name = EXCLUDED.area_name, updated_at = now()",
     )
     .bind(parcel_id)
     .bind(&attrs.property_number).bind(&attrs.property_type).bind(&attrs.plot).bind(&attrs.block)
     .bind(&attrs.location).bind(&attrs.plan_number).bind(&attrs.lga).bind(&attrs.parcel_name)
     .bind(attrs.area_unit).bind(&attrs.surveyor_general).bind(&attrs.status).bind(&attrs.lrs_id)
+    .bind(&attrs.layout).bind(&attrs.area_name)
     .execute(conn)
     .await?;
     Ok(())
@@ -301,7 +302,7 @@ pub async fn get_parcel_attributes(
     Path(id): Path<Uuid>,
 ) -> ApiResult<Json<serde_json::Value>> {
     let row = sqlx::query(
-        "SELECT property_number, property_type, plot, block, location, plan_number, lga, \
+        "SELECT property_number, property_type, plot, block, location, layout, area_name, plan_number, lga, \
                 parcel_name, area_unit, surveyor_general, status, lrs_id \
          FROM cadastre.parcel_draft_attribute WHERE parcel_id = $1",
     )
@@ -315,6 +316,8 @@ pub async fn get_parcel_attributes(
             "plot": r.get::<Option<String>, _>("plot"),
             "block": r.get::<Option<String>, _>("block"),
             "location": r.get::<Option<String>, _>("location"),
+            "layout": r.get::<Option<String>, _>("layout"),
+            "area_name": r.get::<Option<String>, _>("area_name"),
             "plan_number": r.get::<Option<String>, _>("plan_number"),
             "lga": r.get::<Option<String>, _>("lga"),
             "parcel_name": r.get::<Option<String>, _>("parcel_name"),
@@ -414,7 +417,7 @@ pub async fn cut_job_parcel(
 
     // Carry the original draft's captured attributes onto each piece.
     let attrs: Option<ParcelAttributesInput> = sqlx::query(
-        "SELECT property_number, property_type, plot, block, location, plan_number, lga, \
+        "SELECT property_number, property_type, plot, block, location, layout, area_name, plan_number, lga, \
                 parcel_name, area_unit, surveyor_general, status, lrs_id \
          FROM cadastre.parcel_draft_attribute WHERE parcel_id = $1",
     )
@@ -423,7 +426,7 @@ pub async fn cut_job_parcel(
     .await?
     .map(|r| ParcelAttributesInput {
         property_number: r.get("property_number"), property_type: r.get("property_type"),
-        plot: r.get("plot"), block: r.get("block"), location: r.get("location"),
+        plot: r.get("plot"), block: r.get("block"), location: r.get("location"), layout: r.get("layout"), area_name: r.get("area_name"),
         plan_number: r.get("plan_number"), lga: r.get("lga"), parcel_name: r.get("parcel_name"),
         area_unit: r.get("area_unit"), surveyor_general: r.get("surveyor_general"),
         status: r.get("status"), lrs_id: r.get("lrs_id"),

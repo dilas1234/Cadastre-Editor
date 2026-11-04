@@ -1216,7 +1216,7 @@ async fn job_editing_follows_job_area_and_commit_rules() {
     // Update Parcel Attribute on a draft (the property document), carried into its record at commit.
     let prop = format!("PLT{}", b);
     let (st, r) = send(&app, "PUT", &format!("/api/v1/parcels/{}/attributes", d1["id"].as_str().unwrap()), None,
-        Some(json!({"property_number": prop, "plot": "12", "status": "Active"}))).await;
+        Some(json!({"property_number": prop, "plot": "12", "status": "Active", "location": "Jos - Bukuru Metropolis", "layout": "Bukuru Lowcost", "area_name": "A new area name"}))).await;
     assert_eq!(st, StatusCode::OK, "{r}");
 
     // Edit Vertices on a saved draft: moved inside the area is saved, outside is refused with
@@ -1292,6 +1292,10 @@ async fn job_editing_follows_job_area_and_commit_rules() {
         .bind(c["parcel_numbers"].as_array().unwrap().iter().map(|v| v.as_str().unwrap().to_string()).collect::<Vec<_>>())
         .fetch_one(&pool).await.unwrap();
     assert!(rec.0 >= 1_000_000_000, "a new record's OBJECTID never clashes with Aumentum's: {}", rec.0);
+    let places: (Option<String>, Option<String>, Option<String>) = sqlx::query_as("SELECT location, layout, area_name FROM cadastre.parcel_attribute WHERE object_id = $1")
+        .bind(rec.0).fetch_one(&pool).await.unwrap();
+    assert_eq!(places, (Some("Jos - Bukuru Metropolis".into()), Some("Bukuru Lowcost".into()), Some("A new area name".into())),
+        "Location, Layout and Area (a Registry name or a new one) are kept with the committed parcel");
     assert_eq!((rec.1, rec.2, rec.3, rec.4), (Some(prop.clone()), Some("12".into()), Some("0".into()), Some(0)),
         "captured attributes, Aumentum's status code 0 (Active), not linked until the Registry links it");
     let cut: bool = sqlx::query_scalar("SELECT bool_and(a.parcel_area = trunc(ST_Area(p.geom)::numeric, 2)::float8) FROM cadastre.parcel_attribute a JOIN cadastre.parcel p ON p.parcel_number = a.upin WHERE a.upin = ANY($1)")
@@ -1934,10 +1938,10 @@ impl FakeRegistry {
                         let closed = body.contains("TXNCLOSED");
                         let num = if closed { "TXNCLOSED" } else { "PLS777" };
                         ok(scalar_xml(&[vec!["10000000777", num, if closed { "transaction_completed" } else { "transaction_lodged" }, if closed { "Completed" } else { "Active" }]]))
-                    } else if body.contains("s.SpatialDate1, z.Label, y.Label from com.landsystems.lrs.model.Transaction") {
+                    } else if body.contains("s.SpatialDate1, z.Label, y.Label, pa.Label from com.landsystems.lrs.model.Transaction") {
                         // The transaction's properties, with the property's location (zone) and layout.
                         let u = prop_upin.lock().unwrap().clone().unwrap_or_default();
-                        ok(scalar_xml(&[vec!["10000000555", &su, &u, "PL777", "", "B7", "", "Jos - Bukuru Metropolis", ""]]))
+                        ok(scalar_xml(&[vec!["10000000555", &su, &u, "PL777", "", "B7", "", "Jos - Bukuru Metropolis", "", ""]]))
                     } else if body.contains("model.IncomingDocument d where d.Transaction.id = 10000000777") {
                         // The plans already filed in PLS777 (a resend marks them as replaced).
                         ok(scalar_xml(&[vec!["10000000901"]]))

@@ -419,3 +419,9 @@ table.legs tr.selrow td { background: #fff6cf; }
 .orthoCoords { width: 100%; margin: 2px 0 6px; }
 .orthoCoords th { width: 80px; text-align: left; color: #555; font-weight: normal; }
 .orthoCoords td { font-family: Consolas, "DejaVu Sans Mono", monospace; }
+
+/* Editable dropdowns (Location, Layout, Area): pick from the Registry list or type a new name */
+.combo { flex: 1; min-width: 0; display: flex; }
+.combo .comboIn { flex: 1; min-width: 0; }
+.combo .comboBtn { width: 20px; border: 1px solid #acacac; border-left: 0; background: linear-gradient(#f0f0f0, #e5e5e5); padding: 0; cursor: pointer; }
+.combo .comboIn::-webkit-calendar-picker-indicator { display: none !important; }

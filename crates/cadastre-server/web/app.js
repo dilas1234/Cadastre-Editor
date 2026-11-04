@@ -2573,8 +2573,22 @@ async function parcelAttrDialog(opts = {}) {
     const sel = (key, opts, val) => { const s = h("select", { style: "flex:1;min-width:0" }, ...opts.map((o) => h("option", { selected: o === (val || "") }, o))); f[key] = s; return s; };
     // A Registry list as a dropdown. A value already on the parcel that is not in the list (the
     // codes 1 to 4 Aumentum stored) is kept and shown as it is; with no list, a text box.
-    // Location: every place the Registry knows — its 4 zones, then its areas and layouts — typed
-    // to search (e.g. "Bukuru"); free text stays possible, and Aumentum's codes 1 to 4 are kept.
+    // Location (the Registry's 4 zones), Layout and Area: dropdowns of the Registry's lists that also
+    // take a new name (type it). Pre-filled from the Registry property; Aumentum's codes 1 to 4 kept.
+    const placeCombo = (key, listKey, val) => {
+      const list = places[listKey] || [];
+      const id = "places-" + key;
+      const dl = h("datalist", { id }, ...list.map((x) => h("option", { value: x.label })));
+      const i = h("input", { list: id, value: val || "", class: "comboIn", autocomplete: "off",
+        placeholder: list.length ? `Choose or type (${list.length.toLocaleString()} in the Registry)` : "Type",
+        title: places.stale ? `Registry list from ${String(places.fetched_at || "").slice(0, 10)} (the Registry could not be reached)` : "Choose from the Registry's list, or type a new name" });
+      const open = h("button", { type: "button", class: "comboBtn", title: "Show the list", tabindex: "-1", onclick: () => {
+        const keep = i.value; i.value = ""; i.focus(); try { i.showPicker?.(); } catch { /* not supported */ }
+        i.addEventListener("blur", () => { if (!i.value) i.value = keep; }, { once: true });
+      } }, "▾");
+      f[key] = i;
+      return h("span", { class: "combo" }, i, open, dl);
+    };
     const placeSearch = (key, val) => {
       const lists = [["location", "Zone"], ["property_area", "Area"], ["layout_type", "Layout"]];
       const id = "places-" + key;
@@ -2605,7 +2619,9 @@ async function parcelAttrDialog(opts = {}) {
       row("Property Type:", sel("property_type", PROPERTY_TYPES, pv("property_type", link.property_type || "Land Parcel"))),
       row("Property Number:", txt("property_number", pv("property_number", link.property_number || jobNo))),
       row("Plot:", txt("plot", pv("plot", link.plot || ""))),
-      row("Location:", placeSearch("location", pv("location", regProp?.location || ""))),
+      row("Location:", placeCombo("location", "location", pv("location", regProp?.location || ""))),
+      row("Layout:", placeCombo("layout", "layout_type", pv("layout", regProp?.layout || ""))),
+      row("Area:", placeCombo("area_name", "property_area", pv("area_name", regProp?.area || ""))),
       row("Plan Number:", txt("plan_number", pv("plan_number", link.plan_number || ""))),
       row("LGA:", sel("lga", ["", ...PLATEAU_LGAS], pv("lga", link.lga || ""))),
       row("Status:", sel("status", PARCEL_STATUSES, pv("status", "Active"))),
@@ -2623,7 +2639,7 @@ async function parcelAttrDialog(opts = {}) {
 
     const collect = () => {
       const o = {};
-      for (const k of ["parcel_name", "block", "property_type", "property_number", "plot", "location", "plan_number", "lga", "status", "surveyor_general", "lrs_id"]) {
+      for (const k of ["parcel_name", "block", "property_type", "property_number", "plot", "location", "layout", "area_name", "plan_number", "lga", "status", "surveyor_general", "lrs_id"]) {
         const v = (f[k]?.value || "").trim(); if (v) o[k] = v;
       }
       return o;

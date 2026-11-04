@@ -209,7 +209,7 @@ pub async fn correct(State(state): State<AppState>, user: AuthUser, Path(id): Pa
         .bind(pid).bind(&added).fetch_all(&mut *tx).await?;
     let _ = posted_at;
     let attr = sqlx::query(
-        "SELECT object_id, property_number, property_type, plot, block, location, plan_number, lga, parcel_name, area_unit, surveyor_general \
+        "SELECT object_id, property_number, property_type, plot, block, location, plan_number, lga, parcel_name, area_unit, surveyor_general, layout, area_name \
          FROM cadastre.parcel_attribute WHERE upin = $1 AND parcel_id = $2 AND object_id >= 1000000000")
         .bind(&upin).bind(pid).fetch_optional(&mut *tx).await?;
     let commit_task: i32 = sqlx::query_scalar(
@@ -219,15 +219,16 @@ pub async fn correct(State(state): State<AppState>, user: AuthUser, Path(id): Pa
         .ok_or_else(|| AppError::Conflict("this job type has no commit task".into()))?;
     if let Some(a) = &attr {
         sqlx::query(
-            "INSERT INTO cadastre.parcel_draft_attribute (parcel_id, property_number, property_type, plot, block, location, plan_number, lga, parcel_name, area_unit, surveyor_general, status) \
-             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, 'Active') \
+            "INSERT INTO cadastre.parcel_draft_attribute (parcel_id, property_number, property_type, plot, block, location, plan_number, lga, parcel_name, area_unit, surveyor_general, status, layout, area_name) \
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, 'Active', $12, $13) \
              ON CONFLICT (parcel_id) DO UPDATE SET property_number = EXCLUDED.property_number, property_type = EXCLUDED.property_type, plot = EXCLUDED.plot, \
                block = EXCLUDED.block, location = EXCLUDED.location, plan_number = EXCLUDED.plan_number, lga = EXCLUDED.lga, parcel_name = EXCLUDED.parcel_name, \
-               area_unit = EXCLUDED.area_unit, surveyor_general = EXCLUDED.surveyor_general")
+               area_unit = EXCLUDED.area_unit, surveyor_general = EXCLUDED.surveyor_general, layout = EXCLUDED.layout, area_name = EXCLUDED.area_name")
             .bind(pid).bind(a.get::<Option<String>, _>("property_number")).bind(a.get::<Option<String>, _>("property_type"))
             .bind(a.get::<Option<String>, _>("plot")).bind(a.get::<Option<String>, _>("block")).bind(a.get::<Option<String>, _>("location"))
             .bind(a.get::<Option<String>, _>("plan_number")).bind(a.get::<Option<String>, _>("lga")).bind(a.get::<Option<String>, _>("parcel_name"))
             .bind(a.get::<Option<i16>, _>("area_unit")).bind(a.get::<Option<String>, _>("surveyor_general"))
+            .bind(a.get::<Option<String>, _>("layout")).bind(a.get::<Option<String>, _>("area_name"))
             .execute(&mut *tx).await?;
         sqlx::query("DELETE FROM cadastre.parcel_attribute WHERE object_id = $1").bind(a.get::<i32, _>("object_id")).execute(&mut *tx).await?;
     }
