@@ -96,7 +96,8 @@ pub async fn list(State(state): State<AppState>, Query(q): Query<CompletedQuery>
             "parcels": parcels,
             "plan": r.get::<Option<Value>, _>("plan"),
             "confirmation": r.get::<Option<Value>, _>("confirmation"),
-            "can_correct": mine && r.get::<Option<uuid::Uuid>, _>("cadastre_job_id").is_some(),
+            // Aumentum's jobs too: their parcels are corrected in the file's job here (correct-aumentum).
+            "can_correct": !mine || r.get::<Option<uuid::Uuid>, _>("cadastre_job_id").is_some(),
         })
     }).collect();
     let mut registry_error: Option<String> = None;
@@ -121,22 +122,29 @@ async fn registry_details(jobs: &mut [Value]) -> Result<(), String> {
     let props = session.query(&format!(
         "select t.TransactionNumber, s.SuID, s.Refnum, s.Upin, s.SpatialDate1 from com.landsystems.lrs.model.Transaction t join t.Properties l join l.SpatialUnits s \
          where t.TransactionNumber in ({list}) and l.EndLifespanVersion is null and s.EndLifespanVersion is null"), 2000).await;
+    let open = session.query(&format!(
+        "select t.TransactionNumber, ph.ProcessName, ph.TaskDescription, ph.TaskCreate from com.landsystems.lrs.model.ProcessHistory ph, com.landsystems.lrs.model.Transaction t \
+         where ph.TransactionId = t.Id and ph.TaskComplete is null and t.TransactionNumber in ({list})"), 2000).await;
     session.end().await;
     let status = status.map_err(|e| e.to_string())?;
     let props = props.unwrap_or_default();
+    let open = open.unwrap_or_default();
     for j in jobs.iter_mut() {
         let Some(t) = j["transaction_number"].as_str().map(|t| t.trim().to_uppercase()) else { continue };
         let st = status.iter().find(|r| r.len() >= 2 && r[0].trim().eq_ignore_ascii_case(&t)).map(|r| r[1].trim().to_string());
         let pn = j["property_number"].as_str().unwrap_or("").to_uppercase();
         let mine: Vec<&Vec<String>> = props.iter().filter(|r| r.len() >= 5 && r[0].trim().eq_ignore_ascii_case(&t)).collect();
         let p = mine.iter().find(|r| r[2].trim().eq_ignore_ascii_case(&pn)).or(mine.first());
+        let stages: Vec<Value> = open.iter().filter(|r| r.len() >= 4 && r[0].trim().eq_ignore_ascii_case(&t))
+            .map(|r| json!({ "workflow": r[1].trim(), "stage": r[2].trim(), "since": crate::lrs::parse_datetime(&r[3]).map(|d| d.format("%Y-%m-%dT%H:%M:%SZ").to_string()) })).collect();
         j["registry"] = json!({
+            "stages": stages,
             "found": st.is_some(),
             "status": st,
             "property": p.map(|r| r[1].trim().to_string()),
             "refnum": p.map(|r| r[2].trim().to_string()).filter(|s| !s.is_empty()),
             "upin": p.map(|r| r[3].trim().to_string()).filter(|s| !s.is_empty()),
-            "linked_at": p.and_then(|r| crate::lrs::parse_datetime(&r[4])).map(|d| d.format("%Y-%m-%dT%H:%M:%S").to_string()),
+            "linked_at": p.and_then(|r| crate::lrs::parse_datetime(&r[4])).map(|d| d.format("%Y-%m-%dT%H:%M:%SZ").to_string()),
         });
     }
     Ok(())
@@ -255,4 +263,138 @@ pub async fn correct(State(state): State<AppState>, user: AuthUser, Path(id): Pa
         "upin": upin, "parcel_id": pid, "reopened_at_task": commit_task,
         "beacons": beacons.iter().map(|(_, n, e, nn)| json!({ "number": n, "easting": e, "northing": nn })).collect::<Vec<_>>(),
     })))
+}
+
+#[derive(Debug, Deserialize, ToSchema)]
+pub struct CorrectAumentumRequest {
+    /// The parcel committed in Aumentum.
+    pub upin: String,
+    /// Why (recorded with the job).
+    pub reason: String,
+}
+
+/// Correct a parcel committed in Aumentum (it has no job here): the file's job is opened on its
+/// Active Registry transaction (the open one, or a new Job-<file number>), and the parcel goes back
+/// to a draft of that job at its commit task, keeping its UPIN; its attribute record moves to the
+/// draft (the old record is kept in the audit). The re-commit gives the same UPIN. Refused when
+/// the parcel is linked in the Registry (unlink there first) or has mutation lineage.
+#[utoipa::path(post, path = "/api/v1/wf/correct-aumentum", tag = "wf", request_body = CorrectAumentumRequest,
+    responses((status = 200), (status = 404, description = "No such committed parcel"), (status = 409, description = "Linked, lineage, committed here, or no Active transaction")))]
+pub async fn correct_aumentum(State(state): State<AppState>, user: AuthUser, Json(req): Json<CorrectAumentumRequest>) -> ApiResult<Json<Value>> {
+    let actor = crate::routes::wf::resolve_actor(&state, &user).await?;
+    let upin = req.upin.trim().to_uppercase();
+    let reason = req.reason.trim().to_string();
+    if reason.is_empty() {
+        return Err(AppError::BadRequest("say why the parcel is corrected".into()));
+    }
+    let p = sqlx::query("SELECT id, job_id FROM cadastre.parcel WHERE parcel_number = $1 AND status = 'posted'")
+        .bind(&upin).fetch_optional(&state.pool).await?.ok_or_else(|| AppError::NotFound(format!("{upin} is not a committed parcel")))?;
+    let (pid, own_job): (uuid::Uuid, Option<uuid::Uuid>) = (p.get(0), p.get(1));
+    if own_job.is_some() {
+        return Err(AppError::Conflict(format!("{upin} was committed in this Cadastre: use Correct on its job")));
+    }
+    let attr = sqlx::query(
+        "SELECT a.object_id, row_to_json(a)::jsonb AS rec, a.property_number, a.lrs_id, a.linkage_status FROM cadastre.parcel_attribute a \
+         WHERE a.upin = $1 AND (a.status = '0' OR a.status IS NULL) ORDER BY a.object_id DESC LIMIT 1")
+        .bind(&upin).fetch_optional(&state.pool).await?
+        .ok_or_else(|| AppError::Conflict(format!("{upin} has no current attribute record")))?;
+    if attr.get::<Option<String>, _>("lrs_id").is_some() || attr.get::<Option<i16>, _>("linkage_status") == Some(1)
+        || sqlx::query_scalar::<_, bool>("SELECT EXISTS (SELECT 1 FROM cadastre.registry_property WHERE upin = $1)").bind(&upin).fetch_one(&state.pool).await? {
+        return Err(AppError::Conflict(format!("{upin} is linked to the Registry: unlink it there first")));
+    }
+    let lineage: i64 = sqlx::query_scalar("SELECT count(*) FROM cadastre.parcel_lineage WHERE parcel_id = $1 OR parent_id = $1 OR upin = $2 OR parent_upin = $2")
+        .bind(pid).bind(&upin).fetch_one(&state.pool).await?;
+    if lineage > 0 {
+        return Err(AppError::Conflict(format!("{upin} has mutation lineage (split, merge …): correct it with a new mutation job")));
+    }
+    let file = attr.get::<Option<String>, _>("property_number").map(|f| f.split_whitespace().collect::<String>().to_uppercase()).filter(|f| !f.is_empty())
+        .ok_or_else(|| AppError::Conflict(format!("{upin} has no file number on its attributes: its Registry file is not known")))?;
+    let file = crate::routes::registry::ident("file number", &file)?;
+    // The file's Active transaction in the Registry; the Registry must not hold this UPIN.
+    let cfg = crate::routes::registry::config()?;
+    let session = crate::lrs::Session::start(&cfg).await.map_err(|e| AppError::Conflict(format!("the Registry (10.10.10.5) cannot be reached: {e}")))?;
+    let rows = session.query(&format!(
+        "select t.TransactionNumber, ts.Code, s.Upin from com.landsystems.lrs.model.Transaction t join t.TransactionStatus ts \
+         join t.Properties l join l.SpatialUnits s where upper(s.Refnum) = '{file}' and l.EndLifespanVersion is null and s.EndLifespanVersion is null \
+         order by t.TransactionNumber desc"), 50).await;
+    session.end().await;
+    let rows = rows.map_err(|e| AppError::Conflict(format!("the Registry (10.10.10.5) could not be read: {e}")))?;
+    if rows.iter().any(|r| r.get(2).is_some_and(|u| u.trim().eq_ignore_ascii_case(&upin))) {
+        return Err(AppError::Conflict(format!("{upin} is linked in the Registry to {file}: unlink it there first")));
+    }
+    let txn = rows.iter().find(|r| r.get(1).is_some_and(|c| c.trim() == "transaction_lodged")).map(|r| r[0].trim().to_string())
+        .ok_or_else(|| AppError::Conflict(format!("{file} has no Active transaction in the Registry: the file's job cannot be opened")))?;
+    // The file's open job, or a new one.
+    let open: Option<(i32, Option<String>)> = sqlx::query_as("SELECT j.id, j.name FROM cadastre.wf_job_instance j JOIN cadastre.wf_job_status s ON s.code = j.status \
+                                       WHERE j.lrs_transaction_number = $1 AND s.is_open ORDER BY j.id DESC LIMIT 1")
+        .bind(&txn).fetch_optional(&state.pool).await?;
+    let (job, name, created) = match open {
+        Some((id, n)) => (id, n.unwrap_or_default(), false),
+        None => { let (id, n) = crate::routes::registry::create_file_job(&state.pool, &actor.label, &txn, Some(&file), "wf.correct-aumentum").await?; (id, n, true) }
+    };
+    let result = reopen_aumentum(&state, &actor.label, job, pid, &upin, &attr, &reason, &txn, created).await;
+    if result.is_err() && created {
+        let _ = sqlx::query("DELETE FROM cadastre.wf_job_instance WHERE id = $1").bind(job).execute(&state.pool).await;
+    }
+    let commit_task = result?;
+    Ok(Json(json!({ "upin": upin, "parcel_id": pid, "job_instance_id": job, "job_name": name, "created": created, "transaction_number": txn, "reopened_at_task": commit_task, "beacons": [] })))
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn reopen_aumentum(state: &AppState, actor: &str, job: i32, pid: uuid::Uuid, upin: &str, attr: &sqlx::postgres::PgRow, reason: &str, txn: &str, created: bool) -> ApiResult<i32> {
+    let mut tx = state.pool.begin().await?;
+    let w = sqlx::query("SELECT job_type_id, cadastre_job_id, status FROM cadastre.wf_job_instance WHERE id = $1 FOR UPDATE").bind(job).fetch_one(&mut *tx).await?;
+    let (job_type, cjob, was): (i32, Option<uuid::Uuid>, i16) = (w.get(0), w.get(1), w.get(2));
+    let cjob = match cjob {
+        Some(c) => c,
+        None => {
+            let c: uuid::Uuid = sqlx::query_scalar(
+                "INSERT INTO cadastre.job (reference, job_type, title, created_by, updated_by, current_stage_id, status) \
+                 SELECT 'WF-' || w.id, 'aumentum:' || jt.name, w.name, $2, $2, s.id, s.code \
+                 FROM cadastre.wf_job_instance w JOIN cadastre.wf_job_type jt ON jt.id = w.job_type_id, cadastre.workflow_stage s \
+                 WHERE w.id = $1 AND s.is_initial RETURNING id")
+                .bind(job).bind(actor).fetch_one(&mut *tx).await?;
+            sqlx::query("UPDATE cadastre.wf_job_instance SET cadastre_job_id = $2, updated = now()::timestamp WHERE id = $1").bind(job).bind(c).execute(&mut *tx).await?;
+            c
+        }
+    };
+    let commit_task: i32 = sqlx::query_scalar(
+        "SELECT f.task_id FROM cadastre.wf_task_flow f JOIN cadastre.wf_task_step ts ON ts.task_id = f.task_id JOIN cadastre.wf_step s ON s.id = ts.step_id \
+         WHERE f.job_type_id = $1 AND EXISTS (SELECT 1 FROM unnest(s.commands) c WHERE upper(c) = upper($2)) ORDER BY f.task_id LIMIT 1")
+        .bind(job_type).bind(crate::routes::wf::COMMIT_TOOL).fetch_optional(&mut *tx).await?
+        .ok_or_else(|| AppError::Conflict("the file's job type has no commit task".into()))?;
+    let rec: Value = attr.get("rec");
+    let t = |k: &str| rec.get(k).and_then(|v| v.as_str()).map(str::to_string);
+    sqlx::query(
+        "INSERT INTO cadastre.parcel_draft_attribute (parcel_id, property_number, property_type, plot, block, location, plan_number, lga, parcel_name, area_unit, surveyor_general, status, layout, area_name) \
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, 'Active', $12, $13) \
+         ON CONFLICT (parcel_id) DO UPDATE SET property_number = EXCLUDED.property_number, property_type = EXCLUDED.property_type, plot = EXCLUDED.plot, \
+           block = EXCLUDED.block, location = EXCLUDED.location, plan_number = EXCLUDED.plan_number, lga = EXCLUDED.lga, parcel_name = EXCLUDED.parcel_name, \
+           area_unit = EXCLUDED.area_unit, surveyor_general = EXCLUDED.surveyor_general, layout = EXCLUDED.layout, area_name = EXCLUDED.area_name")
+        .bind(pid).bind(t("property_number")).bind(t("property_type")).bind(t("plot")).bind(t("block")).bind(t("location"))
+        .bind(t("plan_number")).bind(t("lga")).bind(t("parcel_name")).bind(rec.get("area_unit").and_then(|v| v.as_i64()).map(|v| v as i16))
+        .bind(t("surveyor_general")).bind(t("layout")).bind(t("area_name"))
+        .execute(&mut *tx).await?;
+    sqlx::query("DELETE FROM cadastre.parcel_attribute WHERE object_id = $1").bind(attr.get::<i32, _>("object_id")).execute(&mut *tx).await?;
+    // Back to a draft of the file's job that keeps its UPIN (the ledger already holds it).
+    sqlx::query("UPDATE cadastre.parcel SET status = 'draft', posted_at = NULL, job_id = $2, updated_at = now() WHERE id = $1")
+        .bind(pid).bind(cjob).execute(&mut *tx).await?;
+    sqlx::query("UPDATE cadastre.wf_task_instance SET ended = now()::timestamp, comment = coalesce(comment, 'moved to the commit task for a correction') \
+                 WHERE job_instance_id = $1 AND ended IS NULL AND task_id <> $2").bind(job).bind(commit_task).execute(&mut *tx).await?;
+    let at_commit: bool = sqlx::query_scalar("SELECT EXISTS (SELECT 1 FROM cadastre.wf_task_instance WHERE job_instance_id = $1 AND task_id = $2 AND ended IS NULL)")
+        .bind(job).bind(commit_task).fetch_one(&mut *tx).await?;
+    if !at_commit {
+        let sid: Option<i32> = crate::routes::wf::default_assignee(&mut tx, commit_task).await?;
+        sqlx::query("INSERT INTO cadastre.wf_task_instance (job_instance_id, job_type_id, task_id, sid, assigned, started) VALUES ($1, $2, $3, $4, now()::timestamp, now()::timestamp)")
+            .bind(job).bind(job_type).bind(commit_task).bind(sid).execute(&mut *tx).await?;
+    }
+    sqlx::query("UPDATE cadastre.wf_job_instance SET status = 2, ended = NULL, current_task_id = $2, updated = now()::timestamp WHERE id = $1")
+        .bind(job).bind(commit_task).execute(&mut *tx).await?;
+    audit::append(&mut tx, actor, "wf_reopened_for_correction", "wf_job_instance", Some(&job.to_string()), json!({
+        "upin": upin, "parcel_id": pid, "reason": reason, "was_status": was, "reopened_at_task": commit_task,
+        "committed_in": "aumentum", "transaction_number": txn, "job_created": created,
+        "beacons_removed": [], "aumentum_attribute_record": rec,
+    })).await?;
+    tx.commit().await?;
+    Ok(commit_task)
 }

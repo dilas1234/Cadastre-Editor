@@ -710,8 +710,8 @@ pub async fn parcel_points(State(state): State<AppState>, Query(q): Query<Parcel
     let legs = crate::report::parcel_legs(&state.pool, &upin).await?;
     let job: Option<i32> = row.get("job_instance_id");
     let (linked, lineage): (bool, bool) = (row.get::<Option<bool>, _>("linked").unwrap_or(false), row.get::<Option<bool>, _>("lineage").unwrap_or(false));
-    let why_not = if job.is_none() { Some("it was committed in Aumentum: correct it with a mutation job (re-survey)") }
-        else if linked { Some("it is linked in the Registry: unlink it there first") }
+    // A parcel committed in Aumentum (no job here) is corrected in its file's job (correct-aumentum).
+    let why_not = if linked { Some("it is linked in the Registry: unlink it there first") }
         else if lineage { Some("it has split / merge history: correct it with a mutation job") }
         else { None };
     Ok(Json(serde_json::json!({
@@ -721,6 +721,7 @@ pub async fn parcel_points(State(state): State<AppState>, Query(q): Query<Parcel
         "job_instance_id": job,
         "job_name": row.get::<Option<String>, _>("job_name"),
         "can_correct": why_not.is_none(),
+        "committed_in": if job.is_none() { "aumentum" } else { "cadastre" },
         "why_not": why_not,
         "points": legs.iter().map(|l| serde_json::json!({
             "beacon": l.from, "easting": (l.from_e * 1000.0).round() / 1000.0, "northing": (l.from_n * 1000.0).round() / 1000.0,

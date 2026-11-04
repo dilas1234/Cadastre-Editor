@@ -1350,6 +1350,15 @@ async fn job_editing_follows_job_area_and_commit_rules() {
     assert_eq!(pillar, 1, "the shared pillar (not added by the commit) is never removed by Correct");
     let job_status: i16 = sqlx::query_scalar("SELECT status FROM cadastre.wf_job_instance WHERE id = $1").bind(id as i32).fetch_one(&pool).await.unwrap();
     assert_eq!(job_status, 3, "completed again");
+    // History, read only: with no Registry configured here, the Cadastre part still comes back
+    // (job, steps, commits by the picked staff member) and the Registry part says it can't be shown.
+    let (st, hist) = send(&app, "GET", &format!("/api/v1/registry/history?job={id}"), None, None).await;
+    assert_eq!(st, StatusCode::OK, "{hist}");
+    let kinds: Vec<&str> = hist["cadastre"].as_array().unwrap().iter().filter_map(|e| e["kind"].as_str()).collect();
+    assert!(kinds.contains(&"job_created") && kinds.contains(&"task") && kinds.contains(&"wf_commit"), "{kinds:?}");
+    assert!(hist["cadastre"].as_array().unwrap().iter().any(|e| e["kind"] == "wf_commit" && e["by"] == staff_name.as_str()), "the commit shows who committed");
+    assert!(hist["cadastre"].as_array().unwrap().iter().all(|e| e["at"].is_null() || e["at"].as_str().unwrap().contains('+') || e["at"].as_str().unwrap().ends_with('Z')),
+        "every time carries its time zone: {hist}");
     // The rest of this test goes on editing the same job: open it again directly.
     sqlx::query("UPDATE cadastre.wf_job_instance SET status = 2, ended = NULL WHERE id = $1").bind(id as i32).execute(&pool).await.unwrap();
     let (_, found) = send(&app, "GET", &format!("/api/v1/parcels/search?number={prop}"), None, None).await;
@@ -2024,6 +2033,7 @@ async fn registry_write_back_like_aumentum() {
     assert!(saves[0].contains("<lrs:className>com.landsystems.lrs.model.Parcel</lrs:className><lrs:status>modified</lrs:status>"));
     assert!(saves[0].contains("<lrs:name>Id</lrs:name><lrs:value>10000000555</lrs:value>"));
     assert!(saves[0].contains(&format!("<lrs:name>upin</lrs:name><lrs:value>{upin}</lrs:value>")));
+    assert!(saves[0].contains("<lrs:name>SpatialDate1</lrs:name><lrs:value>20"), "the link date is written, as Map → Connect stamps it: {}", saves[0]);
     assert!(saves[0].contains("wsse:UsernameToken") && saves[0].contains("TICKET-1"), "the ticket rides in the WS-Security header");
     let rec: (Option<String>, Option<String>, Option<String>, Option<String>, Option<i16>, Option<String>) = sqlx::query_as(
         "SELECT lrs_id, property_number, plot, block, linkage_status, linkage_date FROM cadastre.parcel_attribute WHERE upin = $1")
@@ -2032,6 +2042,29 @@ async fn registry_write_back_like_aumentum() {
         "a new attribute record; LinkageFields: LRSID, PropertyNumber, Block (plotNumber is no property column: skipped)");
     let (st, r) = send(&app, "POST", "/api/v1/registry/link", None, Some(link.clone())).await;
     assert_eq!(st, StatusCode::CONFLICT, "already linked: {r}");
+
+    // A UPIN typed into a Registry property (no link date): the snapshot recognises it and the
+    // Cadastre side is marked linked; a UPIN on two properties is left for link problems.
+    let typed = format!("PLT{n:09}");
+    sqlx::query("INSERT INTO cadastre.parcel (parcel_number, geom, computed_area, status) VALUES ($1, ST_MakeEnvelope(3100, 9100000, 3120, 9100020, 32632), 400, 'posted')")
+        .bind(&typed).execute(&pool).await.unwrap();
+    sqlx::query("INSERT INTO cadastre.parcel_attribute (object_id, upin, status, linkage_status) VALUES (nextval('cadastre.parcel_attribute_objectid_seq'), $1, '0', 0)")
+        .bind(&typed).execute(&pool).await.unwrap();
+    sqlx::query("INSERT INTO cadastre.registry_property (su_id, upin, refnum) VALUES ($1, $2, 'PL778') ON CONFLICT (su_id) DO UPDATE SET upin = EXCLUDED.upin")
+        .bind(format!("SUT{n}")).bind(&typed).execute(&pool).await.unwrap();
+    let twice = format!("PLD{n:09}");
+    for k in ["A", "B"] {
+        sqlx::query("INSERT INTO cadastre.registry_property (su_id, upin) VALUES ($1, $2) ON CONFLICT (su_id) DO UPDATE SET upin = EXCLUDED.upin")
+            .bind(format!("SUD{n}{k}")).bind(&twice).execute(&pool).await.unwrap();
+    }
+    let mut conn = pool.acquire().await.unwrap();
+    let recognised = cadastre_server::registry_sync::recognise_links(&mut conn).await.unwrap();
+    assert!(recognised >= 1, "the typed UPIN is recognised");
+    let rec: (Option<String>, Option<i16>, Option<String>, Option<String>) = sqlx::query_as("SELECT lrs_id, linkage_status, property_number, linkage_date FROM cadastre.parcel_attribute WHERE upin = $1")
+        .bind(&typed).fetch_one(&pool).await.unwrap();
+    assert_eq!(rec, (Some(format!("SUT{n}")), Some(1), Some("PL778".into()), None), "linked on the Cadastre side; no link date invented");
+    let (_, probs) = send(&app, "GET", "/api/v1/registry/link-problems", None, None).await;
+    assert!(probs["several_properties"].as_array().unwrap().iter().any(|p| p["upin"] == twice.as_str()), "a UPIN on two properties is a link problem: {probs}");
     let (_, lst) = send(&app, "GET", "/api/v1/registry/links?days=2", None, None).await;
     let mine = lst.as_array().unwrap().iter().find(|l| l["upin"] == upin.as_str()).expect("the link is listed").clone();
     assert_eq!((mine["made_in"].as_str(), mine["linked_now"].as_bool()), (Some("cadastre"), Some(true)));
