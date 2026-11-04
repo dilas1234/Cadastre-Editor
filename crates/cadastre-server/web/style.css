@@ -425,3 +425,10 @@ table.legs tr.selrow td { background: #fff6cf; }
 .combo .comboIn { flex: 1; min-width: 0; }
 .combo .comboBtn { width: 20px; border: 1px solid #acacac; border-left: 0; background: linear-gradient(#f0f0f0, #e5e5e5); padding: 0; cursor: pointer; }
 .combo .comboIn::-webkit-calendar-picker-indicator { display: none !important; }
+
+/* Committed by: staff picker */
+.staffPick { position: relative; margin-top: 3px; }
+.staffList { position: absolute; left: 0; right: 0; top: 24px; z-index: 20; background: #fff; border: 1px solid #9ab; box-shadow: 0 3px 10px rgba(0,0,0,.2); max-height: 220px; overflow: auto; }
+.staffRow { padding: 4px 7px; cursor: pointer; }
+.staffRow:hover { background: var(--hover); }
+.staffRow.add { color: #1a5fb4; border-top: 1px solid #eee; font-weight: 600; }

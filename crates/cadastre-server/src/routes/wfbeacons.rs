@@ -46,6 +46,9 @@ pub struct WfCommitRequest {
     /// The staff member committing (recorded in the audit log with the commit).
     #[serde(default)]
     pub staff_name: Option<String>,
+    /// Their user id (cadastre.principal), when picked from the users list.
+    #[serde(default)]
+    pub staff_sid: Option<i32>,
 }
 
 #[derive(Debug, Clone)]

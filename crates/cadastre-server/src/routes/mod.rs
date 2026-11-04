@@ -50,7 +50,7 @@ pub fn router(state: AppState) -> Router {
         .route("/api/v1/auth/config", get(me::auth_config))
         // Aumentum workflow engine (Phase 2)
         .route("/api/v1/wf/definitions", get(wf::definitions))
-        .route("/api/v1/wf/principals", get(wf::principals))
+        .route("/api/v1/wf/principals", get(wf::principals).post(wf::add_principal))
         .route("/api/v1/wf/jobs", get(wf::list_jobs).post(wf::create_job))
         .route("/api/v1/wf/jobs/{id}", get(wf::get_job))
         .route("/api/v1/wf/jobs/{id}/advance", post(wf::advance))

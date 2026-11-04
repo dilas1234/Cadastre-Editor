@@ -4451,14 +4451,87 @@ async function wfEditAction(method, path, done, body) {
 // fabric beacon keep its number. A point list (ID Easting Northing per line, as Trimble Business
 // Center prints it) can be pasted to fill the numbers of the corners at those coordinates.
 // opts.submit(beacons): post the numbers some other way (Post Parcel & Finish Job) instead of /commit.
-// The staff member committing: asked at every commit and recorded in the audit log with it.
-// Remembered on this PC (it can be changed each time).
-const staffKey = "cad.staffName";
-function lastStaff() { try { return localStorage.getItem(staffKey) || ""; } catch { return ""; } }
-function keepStaff(v) { try { localStorage.setItem(staffKey, v); } catch { /* storage unavailable */ } }
+// Committed by: picked from the users list (search by name or login), or added when the person is
+// not in it; recorded in the audit log with the commit (name and user id). The last pick is
+// remembered on this PC.
+const staffKey = "cad.staff";
+function lastStaff() { try { return JSON.parse(localStorage.getItem(staffKey) || "null"); } catch { return null; } }
+function keepStaff(v) { try { localStorage.setItem(staffKey, JSON.stringify(v)); } catch { /* storage unavailable */ } }
+let staffUsers = null;
+async function loadStaffUsers(force) {
+  if (!staffUsers || force) {
+    try { staffUsers = (await api("/api/v1/wf/principals")).filter((p) => p.is_user && !p.is_locked); } catch { staffUsers = staffUsers || []; }
+  }
+  return staffUsers;
+}
+const normName = (s) => String(s || "").toLowerCase().replace(/[^a-z0-9 ]+/g, " ").replace(/\s+/g, " ").trim();
+// Users whose name is close to a typed one (same words in another order, initials, one letter off).
+function similarUsers(name) {
+  const t = normName(name); if (!t) return [];
+  const tw = t.split(" ");
+  const close = (a, b) => { if (Math.abs(a.length - b.length) > 1) return false; let i = 0, j = 0, d = 0; while (i < a.length && j < b.length) { if (a[i] === b[j]) { i++; j++; } else { d++; if (d > 1) return false; if (a.length > b.length) i++; else if (b.length > a.length) j++; else { i++; j++; } } } return d + (a.length - i) + (b.length - j) <= 1; };
+  return (staffUsers || []).filter((u) => {
+    const n = normName(u.name || u.code); const nw = n.split(" ");
+    if (n === t || close(n, t)) return true;
+    const shared = tw.filter((w) => w.length > 2 && nw.some((x) => x === w || close(x, w))).length;
+    return shared >= Math.min(2, tw.length);
+  }).slice(0, 5);
+}
+// The picker: a search box with the matching users below, and "Add new staff" at the end.
+function staffPicker() {
+  const last = lastStaff();
+  const st = { sel: last && last.sid ? last : null };
+  const inp = h("input", { class: "tinput", value: st.sel ? st.sel.name : "", placeholder: "Search staff by name or login", autocomplete: "off", style: "width:100%" });
+  const list = h("div", { class: "staffList hidden" });
+  const note = h("div", { class: "muted", style: "font-size:11px;margin-top:2px" }, st.sel ? `Selected: ${st.sel.name} (${st.sel.code})` : "Pick yourself from the list, or add your name.");
+  const pick = (u) => { st.sel = { sid: u.sid, name: u.name || u.code, code: u.code }; inp.value = st.sel.name; note.textContent = `Selected: ${st.sel.name} (${st.sel.code})`; list.classList.add("hidden"); };
+  const addNew = async () => {
+    const name = inp.value.trim().replace(/\s+/g, " ");
+    if (name.length < 3) { note.textContent = "Type the full name first."; inp.focus(); return; }
+    const sim = similarUsers(name);
+    for (const u of sim) {
+      if (await uiConfirm(`Did you mean ${u.name} (${u.code})? They are already a user.`, { title: "Add new staff", ok: `Yes, ${u.name}`, cancel: "No, someone else" })) { pick(u); return; }
+    }
+    const code = await uiPrompt(`Add ${name} as a new staff member.\nLogin (letters and digits):`, (name.split(" ").length > 1 ? name[0] + name.split(" ").pop() : name).toLowerCase().replace(/[^a-z0-9]/g, ""), { title: "Add new staff", ok: "Add" });
+    if (code === null) return;
+    try {
+      const u = await api("/api/v1/wf/principals", { method: "POST", body: { name, code } });
+      await loadStaffUsers(true); pick(u); notify(`${u.name} added to the users (${u.code}).`);
+    } catch (e) { uiAlert("Adding the staff member failed: " + e.message); }
+  };
+  const render = () => {
+    const q = normName(inp.value);
+    const users = (staffUsers || []).filter((u) => !q || normName(`${u.name || ""} ${u.code}`).includes(q)).slice(0, 8);
+    list.innerHTML = "";
+    for (const u of users) list.append(h("div", { class: "staffRow", onmousedown: (e) => { e.preventDefault(); pick(u); } }, h("b", {}, u.name || u.code), h("span", { class: "muted" }, ` (${u.code})`)));
+    if (inp.value.trim() && !users.some((u) => normName(u.name) === q)) list.append(h("div", { class: "staffRow add", onmousedown: (e) => { e.preventDefault(); list.classList.add("hidden"); addNew(); } }, `➕ Add new staff: ${inp.value.trim()}`));
+    if (!users.length && !inp.value.trim()) list.append(h("div", { class: "staffRow muted" }, "No users loaded."));
+    list.classList.toggle("hidden", !list.children.length);
+  };
+  inp.addEventListener("input", () => { st.sel = null; note.textContent = "Pick from the list, or add a new staff member."; render(); });
+  inp.addEventListener("focus", () => loadStaffUsers().then(render));
+  inp.addEventListener("blur", () => setTimeout(() => list.classList.add("hidden"), 150));
+  inp.addEventListener("keydown", (e) => { if (e.key === "Escape") list.classList.add("hidden"); });
+  loadStaffUsers();
+  return {
+    el: h("div", { class: "staffPick" }, inp, list, note),
+    focus: () => inp.focus(),
+    // The picked user; a typed name that is exactly a user's is taken as that user.
+    get: () => {
+      if (st.sel) return st.sel;
+      const q = normName(inp.value); const u = q && (staffUsers || []).find((x) => normName(x.name) === q || x.code.toLowerCase() === q);
+      if (u) { pick(u); return st.sel; }
+      return null;
+    },
+  };
+}
 async function askStaff() {
-  const v = await uiPrompt("Committed by (staff name), recorded in the audit log:", lastStaff(), { title: "Commit", ok: "Commit" });
-  const name = (v || "").trim(); if (name) keepStaff(name); return name || null;
+  const p = staffPicker();
+  const ok = await uiDialog({ title: "Commit", message: h("div", {}, h("p", {}, h("b", {}, "Committed by"), " (recorded in the audit log):"), p.el), kind: "question", width: 440,
+    buttons: [{ label: "Commit", value: true, primary: true }, { label: "Cancel", value: false, cancel: true }] });
+  if (!ok) return null;
+  const s = p.get(); if (!s) { await uiAlert("Pick the staff member from the list (or add them) to commit."); return null; }
+  keepStaff(s); return s;
 }
 async function wfCommitDialog(opts = {}) {
   const id = wf.editing?.job_instance_id; if (!id) { status("Choose Work On This Job first."); return; }
@@ -4471,7 +4544,7 @@ async function wfCommitDialog(opts = {}) {
     if (!(await uiConfirm(`Commit the retirement of ${ret.flatMap((m) => m.parents).join(", ")}?`, { ok: "Commit" }))) return;
     const staff = await askStaff(); if (!staff) return;
     try {
-      const r = await api(`/api/v1/wf/jobs/${id}/commit`, { method: "POST", body: { beacons: [], staff_name: staff } });
+      const r = await api(`/api/v1/wf/jobs/${id}/commit`, { method: "POST", body: { beacons: [], staff_name: staff.name, staff_sid: staff.sid } });
       wf.editing = r.editing; wf.selEditing = wf.editing; await Promise.all([loadParcels(false), loadDrafts()]); loadHistory();
       notify(`Retired: ${r.retired.join(", ")}.`); wf.detail = await api("/api/v1/wf/jobs/" + id); await wfRefreshEditing(); renderWorkflow();
     } catch (e) { notify("Commit failed: " + e.message, "err"); }
@@ -4513,14 +4586,13 @@ async function wfCommitDialog(opts = {}) {
     msg.style.color = unmatched.length ? "#b06000" : "#060";
     msg.textContent = `Filled ${filled} corner(s).` + (unmatched.length ? ` Not a corner of these parcels: ${unmatched.join(", ")}.` : "");
   } }, "Fill from point list");
-  const staffIn = h("input", { class: "tinput", value: lastStaff(), placeholder: "Your name", style: "flex:1;min-width:0" });
-  staffIn.addEventListener("keydown", (ev) => { if (ev.key === "Enter") commitBtn.click(); });
+  const staffP = staffPicker();
   const commitBtn = h("button", { class: "btn", onclick: async () => {
     const beacons = pts.filter((p) => !p.beacon_number).map((p) => ({ easting: p.easting, northing: p.northing, number: inputs.get(p.point).value.trim() }));
     const blank = pts.filter((p) => !p.beacon_number && !inputs.get(p.point).value.trim()).map((p) => p.point);
     if (blank.length) { msg.style.color = "#b00"; msg.textContent = `Enter the beacon number of point(s) ${blank.join(", ")}.`; inputs.get(blank[0]).focus(); return; }
-    const staff = staffIn.value.trim();
-    if (!staff) { msg.style.color = "#b00"; msg.textContent = "Enter your name (Committed by): it is recorded in the audit log."; staffIn.focus(); return; }
+    const staff = staffP.get();
+    if (!staff) { msg.style.color = "#b00"; msg.textContent = "Committed by: pick the staff member from the list, or add them (it is recorded in the audit log)."; staffP.focus(); return; }
     keepStaff(staff);
     commitBtn.disabled = true; msg.style.color = ""; msg.textContent = "Committing…";
     if (opts.submit) {
@@ -4529,7 +4601,7 @@ async function wfCommitDialog(opts = {}) {
       return;
     }
     try {
-      const r = await api(`/api/v1/wf/jobs/${id}/commit`, { method: "POST", body: { beacons, staff_name: staff } });
+      const r = await api(`/api/v1/wf/jobs/${id}/commit`, { method: "POST", body: { beacons, staff_name: staff.name, staff_sid: staff.sid } });
       w.remove(); src()?.setData(empty());
       wf.editing = r.editing; wf.selEditing = wf.editing;
       await Promise.all([loadParcels(false), loadBeacons(), loadDrafts()]); showJobArea();
@@ -4559,7 +4631,7 @@ async function wfCommitDialog(opts = {}) {
     upinLine,
     h("p", { class: "muted", style: "margin:0 0 6px" }, `${pts.length} corner point(s), numbered on the map. Type each beacon number from the surveyor's point list.`),
     h("div", { style: "max-height:320px;overflow:auto" }, t), paste, h("div", { class: "frow" }, fill),
-    h("div", { class: "frow", style: "margin-top:6px" }, h("label", { style: "min-width:150px" }, h("b", {}, "Committed by (staff name):")), staffIn), msg,
+    h("div", { style: "margin-top:6px" }, h("b", {}, "Committed by:"), staffP.el), msg,
     h("div", { class: "frow", style: "justify-content:flex-end" }, commitBtn, h("button", { class: "btn", onclick: () => { w.remove(); src()?.setData(empty()); } }, "Cancel"))),
     { id: "commitWin", width: 440 });
   redraw();
@@ -4638,7 +4710,7 @@ async function wfFinishJob(j, opts = {}) {
 async function wfFinishPost(j, beacons, staff) {
   if (wf.busy) return; wf.busy = true;
   try {
-    const r = await api(`/api/v1/wf/jobs/${j.id}/finish`, { method: "POST", body: { complete: true, beacons, staff_name: staff } });
+    const r = await api(`/api/v1/wf/jobs/${j.id}/finish`, { method: "POST", body: { complete: true, beacons, staff_name: staff?.name, staff_sid: staff?.sid } });
     const nums = (r.parcel_numbers || []).join(", ") || "(none)";
     status(r.completed ? `Done — ${nums} posted; job completed.` : `${nums} posted.`);
     await loadParcels(false); await loadDrafts(); showJobArea();

@@ -1331,11 +1331,20 @@ async fn job_editing_follows_job_area_and_commit_rules() {
             && (b["northing"].as_f64().unwrap() - p["northing"].as_f64().unwrap()).abs() < 0.002).map(|b| b["number"].clone()).unwrap();
         json!({"easting": p["easting"], "northing": p["northing"], "number": n})
     }).collect();
-    let (st, c2) = send(&app, "POST", &format!("/api/v1/wf/jobs/{id}/commit"), None, Some(json!({"beacons": retyped, "staff_name": "  Ngozi   Dung "}))).await;
+    // Committed by: a staff member added to the users list (numbered from 1,000,000), then picked.
+    let staff_name = format!("Ngozi Dung {tag}");
+    let (st, u) = send(&app, "POST", "/api/v1/wf/principals", None, Some(json!({"name": format!("  {staff_name} ")}))).await;
+    assert_eq!(st, StatusCode::CREATED, "{u}");
+    let sid = u["sid"].as_i64().unwrap();
+    assert!(sid > 1_000_000, "new users never meet Aumentum's numbers: {u}");
+    assert!(u["code"].as_str().unwrap().starts_with('n'), "login made from the name: {u}");
+    let (st, r) = send(&app, "POST", "/api/v1/wf/principals", None, Some(json!({"name": staff_name.to_uppercase()}))).await;
+    assert_eq!(st, StatusCode::CONFLICT, "the same person twice: {r}");
+    let (st, c2) = send(&app, "POST", &format!("/api/v1/wf/jobs/{id}/commit"), None, Some(json!({"beacons": retyped, "staff_sid": sid, "staff_name": "ignored when a user is picked"}))).await;
     assert_eq!(st, StatusCode::OK, "{c2}");
-    let who: String = sqlx::query_scalar("SELECT actor FROM cadastre.audit_log WHERE entity = 'wf_job_instance' AND entity_id = $1 AND action = 'wf_commit' ORDER BY id DESC LIMIT 1")
+    let (who, psid): (String, Option<i64>) = sqlx::query_as("SELECT actor, (payload->>'staff_sid')::bigint FROM cadastre.audit_log WHERE entity = 'wf_job_instance' AND entity_id = $1 AND action = 'wf_commit' ORDER BY id DESC LIMIT 1")
         .bind(id.to_string()).fetch_one(&pool).await.unwrap();
-    assert_eq!(who, "Ngozi Dung", "the staff name typed at commit is who the commit is recorded under");
+    assert_eq!((who.as_str(), psid), (staff_name.as_str(), Some(sid)), "the commit is recorded under the picked user (name and id)");
     assert_eq!(c2["parcel_numbers"], json!([fix]), "committed again with the same UPIN");
     let pillar: i64 = sqlx::query_scalar("SELECT count(*) FROM cadastre.beacon WHERE number = $1").bind(format!("{tag}X")).fetch_one(&pool).await.unwrap();
     assert_eq!(pillar, 1, "the shared pillar (not added by the commit) is never removed by Correct");
