@@ -159,7 +159,7 @@ pub async fn reconcile_now(State(state): State<AppState>, _user: AuthUser) -> Ap
     registry_sync::reconcile_and_record(&state.pool, &cfg).await.map(Json).map_err(AppError::UnprocessableEntity)
 }
 
-fn config() -> ApiResult<LrsConfig> {
+pub(crate) fn config() -> ApiResult<LrsConfig> {
     LrsConfig::from_env().ok_or_else(|| AppError::Conflict("the Registry connection is not configured on this server".into()))
 }
 
@@ -196,6 +196,15 @@ pub struct RegistryPropertyDto {
     pub lot: Option<String>,
     pub block: Option<String>,
     pub linked_at: Option<String>,
+    /// The property's location (Registry dictionary `location`, e.g. "Jos - Bukuru Metropolis").
+    #[serde(default)]
+    pub location: Option<String>,
+    /// The property's layout (Registry dictionary `layout_type`).
+    #[serde(default)]
+    pub layout: Option<String>,
+    /// The property's area (Registry dictionary `property_area`).
+    #[serde(default)]
+    pub area: Option<String>,
 }
 
 #[derive(Debug, Serialize, ToSchema)]
@@ -219,8 +228,9 @@ pub(crate) async fn load_transaction(session: &Session, number: &str) -> ApiResu
     let Some(t) = t.into_iter().find(|r| r.len() >= 4) else { return Ok(None) };
     let props = session
         .query(&format!(
-            "select s.Id, s.SuID, s.Upin, s.Refnum, s.LotNumber, s.BlockNumber, s.SpatialDate1 from com.landsystems.lrs.model.Transaction t \
-             join t.Properties l join l.SpatialUnits s where t.TransactionNumber = '{number}' and l.EndLifespanVersion is null and s.EndLifespanVersion is null"
+            "select s.Id, s.SuID, s.Upin, s.Refnum, s.LotNumber, s.BlockNumber, s.SpatialDate1, z.Label, y.Label, pa.Label from com.landsystems.lrs.model.Transaction t \
+             join t.Properties l join l.SpatialUnits s left join s.Zone z left join s.Layout y left join s.PropertyArea pa \
+             where t.TransactionNumber = '{number}' and l.EndLifespanVersion is null and s.EndLifespanVersion is null"
         ), 500)
         .await
         .map_err(registry_err)?;
@@ -237,11 +247,62 @@ pub(crate) async fn load_transaction(session: &Session, number: &str) -> ApiResu
         properties: props.iter().filter(|r| r.len() >= 7).map(|r| RegistryPropertyDto {
             id: r[0].trim().to_string(), su_id: r[1].trim().to_string(), upin: o(&r[2]), refnum: o(&r[3]),
             lot: o(&r[4]), block: o(&r[5]), linked_at: lrs::parse_datetime(&r[6]).map(|d| d.format("%Y-%m-%dT%H:%M:%S").to_string()),
+            location: r.get(7).and_then(o), layout: r.get(8).and_then(o), area: r.get(9).and_then(o),
         }).collect(),
     }))
 }
 
 /// A Registry transaction: its status and properties (read live from the Registry).
+/// The Registry's place lists for the parcel form: `location` (e.g. "Jos - Bukuru Metropolis"),
+/// `layout_type` and `property_area`, read from the Registry's dictionary (read-only). A copy is kept
+/// (`registry.lookups`) and refreshed when older than a day, so the form still works when the
+/// Registry cannot be reached (`stale` is then true and `error` says why).
+#[utoipa::path(get, path = "/api/v1/registry/lookups", tag = "registry", responses((status = 200)))]
+pub async fn lookups(State(state): State<AppState>) -> ApiResult<Json<serde_json::Value>> {
+    const KEY: &str = "registry.lookups";
+    let cached: Option<serde_json::Value> = sqlx::query_scalar::<_, String>("SELECT value FROM cadastre.app_setting WHERE key = $1")
+        .bind(KEY).fetch_optional(&state.pool).await?.and_then(|v| serde_json::from_str(&v).ok());
+    let fresh = cached.as_ref()
+        .and_then(|c| c.get("fetched_at")).and_then(|v| v.as_str())
+        .and_then(|t| chrono::DateTime::parse_from_rfc3339(t).ok())
+        .is_some_and(|t| chrono::Utc::now().signed_duration_since(t) < chrono::Duration::hours(24));
+    if fresh {
+        return Ok(Json(cached.unwrap_or_default()));
+    }
+    let read = async {
+        let cfg = config()?;
+        let session = Session::start(&cfg).await.map_err(registry_err)?;
+        let rows = session.query(
+            "select d.Id, d.Code, d.Label, d.Category from com.landsystems.lrs.model.Dictionary d \
+             where d.Category in ('location', 'layout_type', 'property_area') and d.EndLifespanVersion is null \
+             order by d.Category, d.SortOrder, d.Label", 5000).await;
+        session.end().await;
+        rows.map_err(registry_err)
+    }.await;
+    match read {
+        Ok(rows) => {
+            let mut lists: std::collections::BTreeMap<String, Vec<serde_json::Value>> = ["location", "layout_type", "property_area"].iter().map(|k| (k.to_string(), Vec::new())).collect();
+            for r in rows.iter().filter(|r| r.len() >= 4) {
+                let label = r[2].trim();
+                if label.is_empty() { continue; }
+                if let Some(l) = lists.get_mut(r[3].trim()) {
+                    l.push(serde_json::json!({ "id": r[0].trim(), "code": r[1].trim(), "label": label }));
+                }
+            }
+            let mut out = serde_json::json!({ "fetched_at": chrono::Utc::now().to_rfc3339(), "stale": false });
+            for (k, v) in lists { out[k] = serde_json::Value::Array(v); }
+            sqlx::query("INSERT INTO cadastre.app_setting (key, value, source, updated_by) VALUES ($1, $2, 'registry', 'registry-lookups') \
+                         ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value, updated_by = EXCLUDED.updated_by, updated_at = now()")
+                .bind(KEY).bind(out.to_string()).execute(&state.pool).await?;
+            Ok(Json(out))
+        }
+        Err(e) => match cached {
+            Some(mut c) => { c["stale"] = true.into(); c["error"] = e.to_string().into(); Ok(Json(c)) }
+            None => Err(AppError::Conflict(format!("The Registry's place lists could not be read ({e}) and no copy is kept yet."))),
+        },
+    }
+}
+
 #[utoipa::path(get, path = "/api/v1/registry/transactions/{number}", tag = "registry",
     params(("number" = String, Path, description = "Transaction number, e.g. PLS000138648")),
     responses((status = 200, body = RegistryTransactionDto), (status = 404, description = "No such transaction"), (status = 422, description = "The Registry could not be read")))]
@@ -452,7 +513,8 @@ pub async fn send_plan(State(state): State<AppState>, user: AuthUser, Path(id): 
     }
     let txn = ident("transaction number", &txn)?;
     let sent_before: Option<chrono::DateTime<chrono::Utc>> = sqlx::query_scalar(
-        "SELECT max(created_at) FROM cadastre.audit_log WHERE entity = 'wf_job_instance' AND entity_id = $1 AND action = 'registry_plan_sent' AND payload->>'transaction_number' = $2")
+        "SELECT max(s.created_at) FROM cadastre.audit_log s WHERE s.entity = 'wf_job_instance' AND s.entity_id = $1 AND s.action = 'registry_plan_sent' AND s.payload->>'transaction_number' = $2 \
+           AND s.id > COALESCE((SELECT max(w.id) FROM cadastre.audit_log w WHERE w.entity = 'wf_job_instance' AND w.entity_id = $1 AND w.action = 'registry_plan_withdrawn'), 0)")
         .bind(id.to_string()).bind(&txn).fetch_one(&state.pool).await?;
     if let (Some(at), false) = (sent_before, req.resend) {
         return Err(AppError::Conflict(format!("the plan was already sent to {txn} ({} UTC). To correct it, use Resend corrected plan.", at.format("%Y-%m-%d %H:%M"))));
@@ -511,6 +573,62 @@ pub async fn send_plan(State(state): State<AppState>, user: AuthUser, Path(id): 
     tx.commit().await?;
     Ok(Json(serde_json::json!({ "transaction_number": t.transaction_number, "file_name": sent_name, "document_type": doc_type,
         "resend": resend, "replaced": replaced, "replace_note": replace_note })))
+}
+
+#[derive(Debug, Deserialize, ToSchema)]
+pub struct WithdrawPlanRequest {
+    /// Why the plan is withdrawn (recorded in the Registry document and the audit log).
+    pub reason: String,
+}
+
+/// Withdraw a job's title deed plan: the plan documents in the job's Registry transaction are
+/// marked "WITHDRAWN" (nothing is deleted in the Registry, as with a resend's "REPLACED"), and the
+/// saved title deed form is cleared. The parcel and its UPIN stay. A new plan can then be sent.
+#[utoipa::path(post, path = "/api/v1/wf/jobs/{id}/registry/withdraw-plan", tag = "registry", params(("id" = i32, Path, description = "Job instance id")),
+    request_body = WithdrawPlanRequest, responses((status = 200), (status = 409, description = "No plan sent, or writing turned off")))]
+pub async fn withdraw_plan(State(state): State<AppState>, user: AuthUser, Path(id): Path<i32>, Json(req): Json<WithdrawPlanRequest>) -> ApiResult<Json<serde_json::Value>> {
+    let actor = crate::routes::wf::resolve_actor(&state, &user).await?;
+    let reason = req.reason.trim().to_string();
+    if reason.is_empty() {
+        return Err(AppError::BadRequest("say why the plan is withdrawn".into()));
+    }
+    let txn: Option<String> = sqlx::query_scalar("SELECT lrs_transaction_number FROM cadastre.wf_job_instance WHERE id = $1").bind(id)
+        .fetch_optional(&state.pool).await?.ok_or_else(|| AppError::NotFound(format!("job instance {id}")))?;
+    let txn = ident("transaction number", txn.as_deref().map(str::trim).unwrap_or(""))?;
+    let cfg = write_config()?;
+    let doc_type = registry_sync::setting(&state.pool, "aumentum.Integration.SurveyPlanFromMC").await?.unwrap_or_else(|| "sd_titledeedPlan".into());
+    let now = chrono::Local::now();
+    let note: String = format!("Survey Plan - WITHDRAWN {} ({})", now.format("%d-%m-%Y %H:%M"), reason).chars().take(240).collect();
+    let session = Session::start(&cfg).await.map_err(registry_err)?;
+    let result = async {
+        let t = load_transaction(&session, &txn).await?
+            .ok_or_else(|| AppError::NotFound(format!("Cannot retrieve information of the Transaction. Transaction number:'{txn}'.")))?;
+        let ids = plan_documents(&session, t.id, &doc_type).await
+            .map_err(|e| AppError::Conflict(format!("the plans in {txn} could not be looked up in the Registry ({e}); nothing was changed")))?;
+        if ids.is_empty() {
+            return Err(AppError::Conflict(format!("there is no title deed plan in {txn} to withdraw")));
+        }
+        let (mut marked, mut failed) = (Vec::new(), Vec::new());
+        for d in ids {
+            match session.save_entity(t.id, &lrs::entity_xml("IncomingDocument", &[("Id", Some(&d)), ("Comments", Some(&note))])).await {
+                Ok(()) => marked.push(d),
+                Err(e) => failed.push(format!("{d}: {e}")),
+            }
+        }
+        Ok::<_, AppError>((t, marked, failed))
+    }.await;
+    session.end().await;
+    let (t, marked, failed) = result?;
+    if marked.is_empty() {
+        return Err(AppError::Conflict(format!("the plan could not be marked as withdrawn in the Registry: {}", failed.join("; "))));
+    }
+    let mut tx = state.pool.begin().await?;
+    let cleared = sqlx::query("DELETE FROM cadastre.title_deed_plan WHERE wf_job_instance_id = $1").bind(id).execute(&mut *tx).await?.rows_affected();
+    audit::append(&mut tx, &actor.label, "registry_plan_withdrawn", "wf_job_instance", Some(&id.to_string()), serde_json::json!({
+        "transaction_number": t.transaction_number, "reason": reason, "documents": marked, "failed": failed, "comments": note, "forms_cleared": cleared,
+    })).await?;
+    tx.commit().await?;
+    Ok(Json(serde_json::json!({ "transaction_number": t.transaction_number, "withdrawn": marked, "failed": failed, "forms_cleared": cleared })))
 }
 
 /// Plans this Cadastre has sent for a job (audit), newest first.

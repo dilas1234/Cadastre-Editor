@@ -505,6 +505,64 @@ pub async fn principals(State(state): State<AppState>) -> ApiResult<Json<Vec<WfP
     Ok(Json(rows.iter().map(|r| WfPrincipalDto { sid: r.get("sid"), code: r.get("code"), name: r.get("name"), is_user: r.get("is_user"), is_locked: r.get("is_locked"), os_account: r.get("os_account") }).collect()))
 }
 
+#[derive(Deserialize, ToSchema)]
+pub struct NewStaffRequest {
+    /// Full name, e.g. "Grace Pam".
+    pub name: String,
+    /// Login; made from the name when empty (e.g. "gpam").
+    #[serde(default)]
+    pub code: Option<String>,
+}
+
+/// A login made from a name: first initial + last name, letters only ("Grace Pam" -> "gpam").
+pub fn login_from_name(name: &str) -> String {
+    let words: Vec<String> = name.split_whitespace().map(|w| w.chars().filter(|c| c.is_ascii_alphanumeric()).collect::<String>().to_lowercase()).filter(|w| !w.is_empty()).collect();
+    match words.as_slice() {
+        [] => "user".into(),
+        [one] => one.clone(),
+        [first, .., last] => format!("{}{last}", &first[..1]),
+    }
+}
+
+/// Add a staff member to the users list (from Committed by, when they are not in it yet). New
+/// users are numbered from 1,000,000 up, so a reload of Aumentum's users never meets them. An
+/// existing user with the same name or login is refused (pick them instead).
+#[utoipa::path(post, path = "/api/v1/wf/principals", tag = "wf", request_body = NewStaffRequest,
+    responses((status = 201, body = WfPrincipalDto), (status = 409, description = "Already a user")))]
+pub async fn add_principal(State(state): State<AppState>, user: AuthUser, Json(req): Json<NewStaffRequest>) -> ApiResult<(axum::http::StatusCode, Json<WfPrincipalDto>)> {
+    let actor = resolve_actor(&state, &user).await?;
+    let name = req.name.split_whitespace().collect::<Vec<_>>().join(" ");
+    if name.len() < 3 {
+        return Err(AppError::BadRequest("type the staff member's full name".into()));
+    }
+    let mut tx = state.pool.begin().await?;
+    sqlx::query("SELECT pg_advisory_xact_lock(4207011)").execute(&mut *tx).await?;
+    let same: Option<(i32, String, Option<String>)> = sqlx::query_as("SELECT sid, code, name FROM cadastre.principal WHERE is_user AND lower(COALESCE(name, '')) = lower($1) LIMIT 1")
+        .bind(&name).fetch_optional(&mut *tx).await?;
+    if let Some((_, code, n)) = same {
+        return Err(AppError::Conflict(format!("{} is already a user ({code}): pick them from the list", n.unwrap_or_default())));
+    }
+    let wanted = req.code.as_deref().map(str::trim).filter(|c| !c.is_empty()).map(|c| c.to_lowercase()).unwrap_or_else(|| login_from_name(&name));
+    if !wanted.chars().all(|c| c.is_ascii_alphanumeric() || c == '.' || c == '_' || c == '-') {
+        return Err(AppError::BadRequest("the login may use letters, digits, . _ and - only".into()));
+    }
+    let mut code = wanted.clone();
+    for n in 2..100 {
+        let taken: bool = sqlx::query_scalar("SELECT EXISTS (SELECT 1 FROM cadastre.principal WHERE lower(code) = lower($1))").bind(&code).fetch_one(&mut *tx).await?;
+        if !taken { break; }
+        if req.code.as_deref().is_some_and(|c| !c.trim().is_empty()) {
+            return Err(AppError::Conflict(format!("the login {code} is taken")));
+        }
+        code = format!("{wanted}{n}");
+    }
+    let sid: i32 = sqlx::query_scalar("SELECT GREATEST(1000000, COALESCE(max(sid), 0)) + 1 FROM cadastre.principal").fetch_one(&mut *tx).await?;
+    sqlx::query("INSERT INTO cadastre.principal (sid, code, name, description, is_user, is_locked, is_system) VALUES ($1, $2, $3, 'Added in the Cadastre (Committed by)', true, false, false)")
+        .bind(sid).bind(&code).bind(&name).execute(&mut *tx).await?;
+    audit::append(&mut tx, &actor.label, "principal_added", "principal", Some(&sid.to_string()), json!({ "sid": sid, "code": code, "name": name })).await?;
+    tx.commit().await?;
+    Ok((axum::http::StatusCode::CREATED, Json(WfPrincipalDto { sid, code, name: Some(name), is_user: true, is_locked: false, os_account: None })))
+}
+
 // ---------------------------------------------------------------------------------------------
 // Actions
 // ---------------------------------------------------------------------------------------------
@@ -769,6 +827,12 @@ pub struct WfFinishBody {
     /// Beacon numbers for the new corners (as for Commit Parcels).
     #[serde(default)]
     pub beacons: Vec<crate::routes::wfbeacons::WfBeaconNumber>,
+    /// The staff member committing (recorded in the audit log with the commit).
+    #[serde(default)]
+    pub staff_name: Option<String>,
+    /// Their user id (cadastre.principal), when picked from the users list.
+    #[serde(default)]
+    pub staff_sid: Option<i32>,
 }
 #[derive(Serialize, ToSchema)]
 pub struct WfFinishDto {
@@ -1036,13 +1100,27 @@ pub async fn commit(State(state): State<AppState>, user: AuthUser, Path(id): Pat
         serde_json::from_slice(&body).map_err(|e| AppError::BadRequest(format!("invalid commit request: {e}")))?
     };
     let actor = resolve_actor(&state, &user).await?;
+    // The system check again at commit (overlaps here and in Aumentum, drop point, title, transaction):
+    // the land may have been taken since the sketch was checked.
+    let check = crate::routes::precheck::run(&state, id, &[], None).await?;
+    if !check.ok {
+        return Err(AppError::Conflict(format!("System check failed, nothing was committed. {}", crate::routes::precheck::failures(&check))));
+    }
     let mut tx = state.pool.begin().await?;
     let cur = lock_open_job(&mut tx, id, &actor).await?;
     if !is_commit_task(&mut tx, cur).await? {
         return Err(AppError::Conflict("parcels are committed at the job's commit task (e.g. Commit Parcel)".into()));
     }
     let c = commit_drafts(&mut tx, id, &req).await?;
-    audit::append(&mut tx, &actor.label, "wf_commit", "wf_job_instance", Some(&id.to_string()), json!({ "parcel_numbers": c.numbers, "beacons_added": c.beacons_added, "retired": c.retired })).await?;
+    let staff = staff_of(&state.pool, req.staff_sid, req.staff_name.as_deref()).await?;
+    let who = committed_by(staff.as_deref(), &actor.label);
+    audit::append(&mut tx, &who, "wf_commit", "wf_job_instance", Some(&id.to_string()), json!({ "parcel_numbers": c.numbers, "beacons_added": c.beacons_added, "retired": c.retired, "staff_name": staff, "staff_sid": req.staff_sid, "login": actor.label })).await?;
+    // A commit is the end of digitising: the job is completed (Correct reopens it).
+    let job_type_id: i32 = sqlx::query_scalar("SELECT job_type_id FROM cadastre.wf_job_instance WHERE id = $1").bind(id).fetch_one(&mut *tx).await?;
+    let (edges, end_task) = graph(&state.pool, job_type_id).await?;
+    if let Some(cur) = cur {
+        complete_after_commit(&mut tx, id, job_type_id, cur, &edges, end_task, &who, None).await?;
+    }
     tx.commit().await?;
     Ok(Json(WfCommitDto { parcel_numbers: c.numbers, beacons_added: c.beacons_added, retired: c.retired, editing: editing_info(&state, id).await? }))
 }
@@ -1094,6 +1172,60 @@ struct Committed {
 
 
 /// The job type's commit task: the task in its graph whose steps carry the Commit Parcel tool.
+/// The staff member picked at commit: their name from the users list when a user id is given.
+pub(crate) async fn staff_of(pool: &sqlx::PgPool, sid: Option<i32>, typed: Option<&str>) -> ApiResult<Option<String>> {
+    let Some(sid) = sid else { return Ok(typed.map(str::to_string)) };
+    let name: Option<(Option<String>, String, bool, bool)> = sqlx::query_as("SELECT name, code, is_user, is_locked FROM cadastre.principal WHERE sid = $1")
+        .bind(sid).fetch_optional(pool).await?;
+    match name {
+        Some((n, code, true, false)) => Ok(Some(n.filter(|n| !n.trim().is_empty()).unwrap_or(code))),
+        Some((_, code, _, true)) => Err(AppError::Conflict(format!("the user {code} is locked"))),
+        _ => Err(AppError::BadRequest(format!("no user {sid}"))),
+    }
+}
+
+/// Who a commit is recorded under: the staff name typed at commit (with the login when there is
+/// one), else the signed-in user.
+pub(crate) fn committed_by(staff: Option<&str>, login: &str) -> String {
+    match staff.map(|s| s.split_whitespace().collect::<Vec<_>>().join(" ")).filter(|s| !s.is_empty()) {
+        Some(s) if login.is_empty() || login == "dev" || login.eq_ignore_ascii_case(&s) => s.chars().take(80).collect(),
+        Some(s) => format!("{} ({login})", s.chars().take(80).collect::<String>()),
+        None => login.to_string(),
+    }
+}
+
+/// After a commit: walk the job on to its end task and complete it. A committed job is the end of
+/// digitising (PLAGIS); the title deed plan is made on the completed job, and Correct reopens it.
+/// Returns whether the job was completed and the tasks passed on the way.
+#[allow(clippy::too_many_arguments)]
+async fn complete_after_commit(
+    tx: &mut sqlx::PgConnection, id: i32, job_type_id: i32, mut current: i32, edges: &[Edge], end_task: Option<i32>, actor: &str, comment: Option<&str>,
+) -> ApiResult<(bool, Vec<i32>)> {
+    let mut passed = Vec::new();
+    if let Some(goal) = end_task.filter(|&g| !wfengine::can_complete(edges, end_task, current) && g != current) {
+        if let Some(path) = wfengine::path_to(edges, current, goal) {
+            for next in path {
+                close_open_task(&mut *tx, id, current, None).await?;
+                let assignee = default_assignee(&mut *tx, next).await?;
+                open_next_task(&mut *tx, id, job_type_id, next, assignee).await?;
+                audit::append(&mut *tx, actor, "wf_advance", "wf_job_instance", Some(&id.to_string()), json!({ "from_task": current, "to_task": next, "fast_track": true })).await?;
+                passed.push(next);
+                current = next;
+            }
+        }
+    }
+    if wfengine::can_complete(edges, end_task, current) {
+        close_open_task(&mut *tx, id, current, comment).await?;
+        sqlx::query("UPDATE cadastre.wf_job_instance SET status = 3, ended = now()::timestamp, updated = now()::timestamp WHERE id = $1")
+            .bind(id)
+            .execute(&mut *tx)
+            .await?;
+        audit::append(&mut *tx, actor, "wf_complete", "wf_job_instance", Some(&id.to_string()), json!({ "from_task": current, "fast_track": true })).await?;
+        return Ok((true, passed));
+    }
+    Ok((false, passed))
+}
+
 async fn commit_task_of(conn: &mut sqlx::PgConnection, job_type_id: i32) -> ApiResult<Option<i32>> {
     Ok(sqlx::query_scalar(
         "SELECT f.task_id FROM cadastre.wf_task_flow f \
@@ -1141,6 +1273,11 @@ async fn open_next_task(conn: &mut sqlx::PgConnection, id: i32, job_type_id: i32
 pub async fn finish(State(state): State<AppState>, user: AuthUser, Path(id): Path<i32>, Json(req): Json<WfFinishBody>) -> ApiResult<Json<WfFinishDto>> {
     let actor = resolve_actor(&state, &user).await?;
     let complete = req.complete.unwrap_or(true);
+    // Post & Finish commits too: the same system check first.
+    let check = crate::routes::precheck::run(&state, id, &[], None).await?;
+    if !check.ok {
+        return Err(AppError::Conflict(format!("System check failed, nothing was committed. {}", crate::routes::precheck::failures(&check))));
+    }
     let mut tx = state.pool.begin().await?;
     let row = sqlx::query(
         "SELECT j.job_type_id, j.current_task_id, s.is_open FROM cadastre.wf_job_instance j \
@@ -1195,35 +1332,19 @@ pub async fn finish(State(state): State<AppState>, user: AuthUser, Path(id): Pat
     if !wfengine::may_act(&task_permitted(&mut tx, current).await?, &actor.sids, actor.admin) {
         return Err(AppError::Forbidden(format!("{} may not commit this job", actor.label)));
     }
-    let c = commit_drafts(&mut tx, id, &crate::routes::wfbeacons::WfCommitRequest { beacons: req.beacons.clone() }).await?;
+    let c = commit_drafts(&mut tx, id, &crate::routes::wfbeacons::WfCommitRequest { beacons: req.beacons.clone(), staff_name: req.staff_name.clone(), staff_sid: req.staff_sid }).await?;
     let numbers = c.numbers;
-    audit::append(&mut tx, &actor.label, "wf_commit", "wf_job_instance", Some(&id.to_string()), json!({ "parcel_numbers": numbers, "beacons_added": c.beacons_added, "retired": c.retired, "fast_track": true })).await?;
+    let staff = staff_of(&state.pool, req.staff_sid, req.staff_name.as_deref()).await?;
+    let who = committed_by(staff.as_deref(), &actor.label);
+    audit::append(&mut tx, &who, "wf_commit", "wf_job_instance", Some(&id.to_string()), json!({ "parcel_numbers": numbers, "beacons_added": c.beacons_added, "retired": c.retired, "fast_track": true, "staff_name": staff, "staff_sid": req.staff_sid, "login": actor.label })).await?;
 
     // Carry on to the end task and complete. Best-effort: the parcels are already posted, so a
     // restricted downstream task simply leaves the job open there rather than failing the post.
     let mut completed = false;
     if complete {
-        if let Some(goal) = end_task.filter(|&g| !wfengine::can_complete(&edges, end_task, current) && g != current) {
-            if let Some(path) = wfengine::path_to(&edges, current, goal) {
-                for next in path {
-                    close_open_task(&mut tx, id, current, None).await?;
-                    let assignee = default_assignee(&mut tx, next).await?;
-                    open_next_task(&mut tx, id, job_type_id, next, assignee).await?;
-                    audit::append(&mut tx, &actor.label, "wf_advance", "wf_job_instance", Some(&id.to_string()), json!({ "from_task": current, "to_task": next, "fast_track": true })).await?;
-                    passed.push(next);
-                    current = next;
-                }
-            }
-        }
-        if wfengine::can_complete(&edges, end_task, current) {
-            close_open_task(&mut tx, id, current, req.comment.as_deref()).await?;
-            sqlx::query("UPDATE cadastre.wf_job_instance SET status = 3, ended = now()::timestamp, updated = now()::timestamp WHERE id = $1")
-                .bind(id)
-                .execute(&mut *tx)
-                .await?;
-            audit::append(&mut tx, &actor.label, "wf_complete", "wf_job_instance", Some(&id.to_string()), json!({ "from_task": current, "fast_track": true })).await?;
-            completed = true;
-        }
+        let (done, more) = complete_after_commit(&mut tx, id, job_type_id, current, &edges, end_task, &who, req.comment.as_deref()).await?;
+        completed = done;
+        passed.extend(more);
     }
 
     tx.commit().await?;

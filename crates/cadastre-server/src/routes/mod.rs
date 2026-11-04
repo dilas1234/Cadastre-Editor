@@ -3,6 +3,7 @@
 pub mod audit;
 pub mod beacons;
 pub mod catalog;
+pub mod completed;
 pub mod editor;
 pub mod fci;
 pub mod fabric;
@@ -15,6 +16,7 @@ pub mod mcservice;
 pub mod me;
 pub mod mutations;
 pub mod parcels;
+pub mod precheck;
 pub mod promote;
 pub mod titledeed;
 pub mod registry;
@@ -48,7 +50,7 @@ pub fn router(state: AppState) -> Router {
         .route("/api/v1/auth/config", get(me::auth_config))
         // Aumentum workflow engine (Phase 2)
         .route("/api/v1/wf/definitions", get(wf::definitions))
-        .route("/api/v1/wf/principals", get(wf::principals))
+        .route("/api/v1/wf/principals", get(wf::principals).post(wf::add_principal))
         .route("/api/v1/wf/jobs", get(wf::list_jobs).post(wf::create_job))
         .route("/api/v1/wf/jobs/{id}", get(wf::get_job))
         .route("/api/v1/wf/jobs/{id}/advance", post(wf::advance))
@@ -56,6 +58,12 @@ pub fn router(state: AppState) -> Router {
         .route("/api/v1/wf/jobs/{id}/hold", post(wf::hold))
         .route("/api/v1/wf/jobs/{id}/editing", get(wf::get_editing).post(wf::start_editing))
         .route("/api/v1/wf/jobs/{id}/editing/corners", get(wfbeacons::corners))
+        .route("/api/v1/wf/jobs/{id}/precheck", post(precheck::precheck))
+        .route("/api/v1/wf/completed", get(completed::list))
+        .route("/api/v1/wf/jobs/{id}/correct", post(completed::correct))
+        .route("/api/v1/wf/jobs/{id}/registry/withdraw-plan", post(registry::withdraw_plan))
+        .route("/api/v1/wf/jobs/{id}/registry-confirmation", get(precheck::last_confirmation).post(precheck::confirm))
+        .route("/api/v1/beacons/identify", post(wfbeacons::identify))
         .route("/api/v1/wf/jobs/{id}/area", put(wf::put_area).delete(wf::delete_area))
         .route("/api/v1/wf/jobs/{id}/area/{action}", post(wf::area_action))
         .route("/api/v1/wf/jobs/{id}/discard", post(wf::discard))
@@ -97,6 +105,9 @@ pub fn router(state: AppState) -> Router {
         .route("/api/v1/beacons/{id}", get(beacons::get_beacon))
         .route("/api/v1/parcels", get(parcels::list_parcels))
         .route("/api/v1/parcels/search", get(parcels::search_parcels))
+        .route("/api/v1/parcels/metadata", get(parcels::parcel_metadata))
+        .route("/api/v1/parcels/overlaps", post(parcels::sketch_overlaps))
+        .route("/api/v1/parcels/points", get(parcels::parcel_points))
         .route("/api/v1/parcels/lineage", get(mutations::lineage))
         .route("/api/v1/wf/jobs/{id}/mutations", get(mutations::list).post(mutations::create))
         .route("/api/v1/wf/jobs/{id}/mutations/{group}", delete(mutations::cancel))
@@ -115,6 +126,7 @@ pub fn router(state: AppState) -> Router {
         .route("/api/v1/registry/reconcile", post(registry::reconcile_now))
         .route("/api/v1/registry/upin-watch", post(registry::upin_watch_now))
         .route("/api/v1/registry/find", get(registry::find))
+        .route("/api/v1/registry/lookups", get(registry::lookups))
         .route("/api/v1/registry/parcels/{upin}/work", get(registry::parcel_work))
         .route("/api/v1/registry/start-digitising", post(registry::start_digitising))
         .route("/api/v1/registry/transactions/{number}", get(registry::transaction))

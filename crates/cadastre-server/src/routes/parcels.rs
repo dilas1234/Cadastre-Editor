@@ -227,9 +227,9 @@ pub async fn separate_job_parcel(
         .execute(&mut *tx)
         .await?;
         sqlx::query(
-            "INSERT INTO cadastre.parcel_draft_attribute (parcel_id, property_number, property_type, plot, block, location, plan_number, lga, \
+            "INSERT INTO cadastre.parcel_draft_attribute (parcel_id, property_number, property_type, plot, block, location, layout, area_name, plan_number, lga, \
                 parcel_name, area_unit, surveyor_general, status, lrs_id) \
-             SELECT $2, property_number, property_type, plot, block, location, plan_number, lga, parcel_name, area_unit, surveyor_general, status, lrs_id \
+             SELECT $2, property_number, property_type, plot, block, location, layout, area_name, plan_number, lga, parcel_name, area_unit, surveyor_general, status, lrs_id \
              FROM cadastre.parcel_draft_attribute WHERE parcel_id = $1",
         )
         .bind(parcel_id)
@@ -274,19 +274,20 @@ where
 {
     sqlx::query(
         "INSERT INTO cadastre.parcel_draft_attribute \
-           (parcel_id, property_number, property_type, plot, block, location, plan_number, lga, parcel_name, area_unit, surveyor_general, status, lrs_id) \
-         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13) \
+           (parcel_id, property_number, property_type, plot, block, location, plan_number, lga, parcel_name, area_unit, surveyor_general, status, lrs_id, layout, area_name) \
+         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15) \
          ON CONFLICT (parcel_id) DO UPDATE SET \
            property_number = EXCLUDED.property_number, property_type = EXCLUDED.property_type, \
            plot = EXCLUDED.plot, block = EXCLUDED.block, location = EXCLUDED.location, \
            plan_number = EXCLUDED.plan_number, lga = EXCLUDED.lga, parcel_name = EXCLUDED.parcel_name, \
            area_unit = EXCLUDED.area_unit, surveyor_general = EXCLUDED.surveyor_general, \
-           status = EXCLUDED.status, lrs_id = EXCLUDED.lrs_id, updated_at = now()",
+           status = EXCLUDED.status, lrs_id = EXCLUDED.lrs_id, layout = EXCLUDED.layout, area_name = EXCLUDED.area_name, updated_at = now()",
     )
     .bind(parcel_id)
     .bind(&attrs.property_number).bind(&attrs.property_type).bind(&attrs.plot).bind(&attrs.block)
     .bind(&attrs.location).bind(&attrs.plan_number).bind(&attrs.lga).bind(&attrs.parcel_name)
     .bind(attrs.area_unit).bind(&attrs.surveyor_general).bind(&attrs.status).bind(&attrs.lrs_id)
+    .bind(&attrs.layout).bind(&attrs.area_name)
     .execute(conn)
     .await?;
     Ok(())
@@ -301,7 +302,7 @@ pub async fn get_parcel_attributes(
     Path(id): Path<Uuid>,
 ) -> ApiResult<Json<serde_json::Value>> {
     let row = sqlx::query(
-        "SELECT property_number, property_type, plot, block, location, plan_number, lga, \
+        "SELECT property_number, property_type, plot, block, location, layout, area_name, plan_number, lga, \
                 parcel_name, area_unit, surveyor_general, status, lrs_id \
          FROM cadastre.parcel_draft_attribute WHERE parcel_id = $1",
     )
@@ -315,6 +316,8 @@ pub async fn get_parcel_attributes(
             "plot": r.get::<Option<String>, _>("plot"),
             "block": r.get::<Option<String>, _>("block"),
             "location": r.get::<Option<String>, _>("location"),
+            "layout": r.get::<Option<String>, _>("layout"),
+            "area_name": r.get::<Option<String>, _>("area_name"),
             "plan_number": r.get::<Option<String>, _>("plan_number"),
             "lga": r.get::<Option<String>, _>("lga"),
             "parcel_name": r.get::<Option<String>, _>("parcel_name"),
@@ -414,7 +417,7 @@ pub async fn cut_job_parcel(
 
     // Carry the original draft's captured attributes onto each piece.
     let attrs: Option<ParcelAttributesInput> = sqlx::query(
-        "SELECT property_number, property_type, plot, block, location, plan_number, lga, \
+        "SELECT property_number, property_type, plot, block, location, layout, area_name, plan_number, lga, \
                 parcel_name, area_unit, surveyor_general, status, lrs_id \
          FROM cadastre.parcel_draft_attribute WHERE parcel_id = $1",
     )
@@ -423,7 +426,7 @@ pub async fn cut_job_parcel(
     .await?
     .map(|r| ParcelAttributesInput {
         property_number: r.get("property_number"), property_type: r.get("property_type"),
-        plot: r.get("plot"), block: r.get("block"), location: r.get("location"),
+        plot: r.get("plot"), block: r.get("block"), location: r.get("location"), layout: r.get("layout"), area_name: r.get("area_name"),
         plan_number: r.get("plan_number"), lga: r.get("lga"), parcel_name: r.get("parcel_name"),
         area_unit: r.get("area_unit"), surveyor_general: r.get("surveyor_general"),
         status: r.get("status"), lrs_id: r.get("lrs_id"),
@@ -552,4 +555,176 @@ fn parse_bbox(s: &str) -> ApiResult<(f64, f64, f64, f64)> {
             "bbox must be 'minx,miny,maxx,maxy'".to_string(),
         )),
     }
+}
+
+#[derive(Debug, Deserialize, utoipa::IntoParams)]
+pub struct ParcelMetadataQuery {
+    /// UPINs, comma-separated (at most 200).
+    #[serde(default)]
+    pub upins: String,
+    /// Workflow job instances, comma-separated: their committed parcels are added.
+    #[serde(default)]
+    pub jobs: String,
+}
+
+/// When and by whom each parcel was committed, its job, and when and to which Registry property it
+/// was linked: the metadata Find, Identify and the Registry file search show with a parcel.
+/// Parcels brought over from Aumentum carry Aumentum's creation date (`committed_in` = "aumentum").
+#[utoipa::path(get, path = "/api/v1/parcels/metadata", tag = "parcels", params(ParcelMetadataQuery), responses((status = 200)))]
+pub async fn parcel_metadata(State(state): State<AppState>, Query(q): Query<ParcelMetadataQuery>) -> ApiResult<Json<Vec<serde_json::Value>>> {
+    let mut upins: Vec<String> = q.upins.split(',').map(|u| u.trim().to_uppercase()).filter(|u| !u.is_empty()).take(200).collect();
+    let jobs: Vec<i32> = q.jobs.split(',').filter_map(|j| j.trim().parse().ok()).take(50).collect();
+    if !jobs.is_empty() {
+        let more: Vec<String> = sqlx::query_scalar(
+            "SELECT p.parcel_number FROM cadastre.wf_job_instance w JOIN cadastre.parcel p ON p.job_id = w.cadastre_job_id \
+             WHERE w.id = ANY($1) AND p.status = 'posted' AND p.parcel_number IS NOT NULL ORDER BY p.posted_at")
+            .bind(&jobs).fetch_all(&state.pool).await?;
+        for u in more { if !upins.contains(&u) && upins.len() < 200 { upins.push(u); } }
+    }
+    if upins.is_empty() {
+        return Ok(Json(Vec::new()));
+    }
+    let rows = sqlx::query(
+        "SELECT u.upin, p.status, p.posted_at, pa.creation_date, \
+                (SELECT a.actor FROM cadastre.audit_log a WHERE a.action = 'wf_commit' AND a.payload->'parcel_numbers' ? u.upin ORDER BY a.id DESC LIMIT 1) AS committed_by, \
+                w.id AS job_instance_id, w.name AS job_name, \
+                pa.linkage_status, pa.linkage_date, pa.lrs_id, pa.property_number, \
+                (SELECT COALESCE(l.payload->>'linked_at', to_char(l.created_at AT TIME ZONE 'UTC', 'YYYY-MM-DD\"T\"HH24:MI:SS\"Z\"')) FROM cadastre.audit_log l \
+                  WHERE l.entity = 'registry_link' AND l.entity_id = u.upin AND l.action IN ('registry_link_synced', 'registry_link_made', 'registry_map_update') \
+                  ORDER BY l.id DESC LIMIT 1) AS link_event \
+         FROM unnest($1::text[]) AS u(upin) \
+         LEFT JOIN LATERAL (SELECT * FROM cadastre.parcel x WHERE x.parcel_number = u.upin ORDER BY (x.status = 'posted') DESC, x.updated_at DESC LIMIT 1) p ON true \
+         LEFT JOIN LATERAL (SELECT id, name FROM cadastre.wf_job_instance wj WHERE p.job_id IS NOT NULL AND wj.cadastre_job_id = p.job_id ORDER BY wj.id DESC LIMIT 1) w ON true \
+         LEFT JOIN LATERAL (SELECT * FROM cadastre.parcel_attribute y WHERE y.upin = u.upin ORDER BY (y.status = '0') DESC NULLS LAST, y.object_id DESC LIMIT 1) pa ON true",
+    )
+    .bind(&upins)
+    .fetch_all(&state.pool)
+    .await?;
+    let iso = |t: Option<chrono::DateTime<chrono::Utc>>| t.map(|t| t.to_rfc3339_opts(chrono::SecondsFormat::Secs, true));
+    Ok(Json(rows.iter().map(|r| {
+        let posted: Option<chrono::DateTime<chrono::Utc>> = r.get("posted_at");
+        let created: Option<chrono::NaiveDateTime> = r.get("creation_date");
+        let linked = r.get::<Option<i16>, _>("linkage_status").map(i32::from) == Some(1);
+        let link_event: Option<String> = r.get("link_event");
+        let linkage_date: Option<String> = r.get("linkage_date");
+        serde_json::json!({
+            "upin": r.get::<String, _>("upin"),
+            "status": r.get::<Option<String>, _>("status"),
+            "committed_at": iso(posted).or_else(|| created.map(|c| c.format("%Y-%m-%dT%H:%M:%S").to_string())),
+            "committed_in": if posted.is_some() && r.get::<Option<String>, _>("committed_by").is_some() { "cadastre" } else if posted.is_some() || created.is_some() { "aumentum" } else { "" },
+            "committed_by": r.get::<Option<String>, _>("committed_by"),
+            "job_instance_id": r.get::<Option<i32>, _>("job_instance_id"),
+            "job_name": r.get::<Option<String>, _>("job_name"),
+            "linked": linked,
+            "linked_at": if linked { link_event.or(linkage_date) } else { None },
+            "lrs_id": r.get::<Option<String>, _>("lrs_id"),
+            "property_number": r.get::<Option<String>, _>("property_number"),
+        })
+    }).collect()))
+}
+
+#[derive(Debug, Deserialize, utoipa::ToSchema)]
+pub struct SketchOverlapRequest {
+    /// The sketch (UTM 32N metres, ring order, no closing repeat).
+    pub vertices: Vec<[f64; 2]>,
+    /// A draft being reshaped (not checked against itself).
+    #[serde(default)]
+    pub editing_id: Option<Uuid>,
+}
+
+/// For the Orthophoto window, as the digitiser sketches: the committed parcels the sketch
+/// overlaps (with the overlapping area as GeoJSON in WGS 84, to shade red), whether the plot's
+/// position is already digitised, and whether a title exists on the land (a parcel there linked
+/// to a Registry property). This Cadastre's fabric only, so it answers at once; the System Check
+/// adds Aumentum's live parcels and the Registry before anything is saved.
+#[utoipa::path(post, path = "/api/v1/parcels/overlaps", tag = "parcels", request_body = SketchOverlapRequest, responses((status = 200)))]
+pub async fn sketch_overlaps(State(state): State<AppState>, Json(req): Json<SketchOverlapRequest>) -> ApiResult<Json<serde_json::Value>> {
+    if req.vertices.len() < 3 {
+        return Ok(Json(serde_json::json!({ "free": true, "overlaps": [], "at_point": [], "titled": [] })));
+    }
+    if req.vertices.len() > 2000 || req.vertices.iter().flatten().any(|v| !v.is_finite()) {
+        return Err(AppError::BadRequest("vertices must be numbers (UTM 32N metres)".into()));
+    }
+    let mut ring: Vec<[f64; 2]> = req.vertices.clone();
+    ring.push(req.vertices[0]);
+    let shape = serde_json::json!({ "type": "Polygon", "coordinates": [ring] }).to_string();
+    let rows = sqlx::query(
+        "WITH s AS (SELECT ST_MakeValid(ST_SetSRID(ST_GeomFromGeoJSON($1), 32632)) AS g), \
+              pt AS (SELECT ST_PointOnSurface(g) AS p FROM s) \
+         SELECT p.parcel_number, ST_Area(ST_Intersection(p.geom, s.g)) AS a, \
+                ST_AsGeoJSON(ST_Transform(ST_Intersection(p.geom, s.g), 4326), 7)::json AS geom, \
+                ST_Contains(p.geom, (SELECT p FROM pt)) AS at_point, \
+                COALESCE(r.su_id, x.lrs_id) AS su_id, COALESCE(r.refnum, x.property_number) AS refnum, \
+                (r.su_id IS NOT NULL OR x.lrs_id IS NOT NULL) AS titled \
+         FROM s JOIN cadastre.parcel p ON p.status = 'posted' AND p.geom && s.g AND ST_Intersects(p.geom, s.g) \
+         LEFT JOIN cadastre.registry_property r ON r.upin = p.parcel_number \
+         LEFT JOIN LATERAL (SELECT lrs_id, property_number FROM cadastre.parcel_attribute y WHERE y.upin = p.parcel_number AND y.linkage_status = 1 \
+                            AND (y.status = '0' OR y.status IS NULL) LIMIT 1) x ON true \
+         WHERE ($2::uuid IS NULL OR p.id <> $2) \
+         ORDER BY a DESC LIMIT 30",
+    )
+    .bind(&shape)
+    .bind(req.editing_id)
+    .fetch_all(&state.pool)
+    .await?;
+    let mut overlaps = Vec::new();
+    let (mut at_point, mut titled) = (Vec::new(), Vec::new());
+    for r in &rows {
+        let upin: Option<String> = r.get("parcel_number");
+        let a: f64 = r.get::<Option<f64>, _>("a").unwrap_or(0.0);
+        if r.get::<Option<bool>, _>("at_point").unwrap_or(false) { at_point.push(upin.clone()); }
+        if a <= 0.01 { continue; }
+        if r.get::<Option<bool>, _>("titled").unwrap_or(false) {
+            titled.push(serde_json::json!({ "upin": upin, "su_id": r.get::<Option<String>, _>("su_id"), "refnum": r.get::<Option<String>, _>("refnum") }));
+        }
+        overlaps.push(serde_json::json!({ "upin": upin, "area_m2": (a * 100.0).floor() / 100.0, "geometry": r.get::<Option<serde_json::Value>, _>("geom") }));
+    }
+    Ok(Json(serde_json::json!({ "free": overlaps.is_empty() && at_point.is_empty(), "overlaps": overlaps, "at_point": at_point, "titled": titled })))
+}
+
+#[derive(Debug, Deserialize, utoipa::IntoParams)]
+pub struct ParcelPointsQuery {
+    /// The committed parcel's UPIN.
+    pub upin: String,
+}
+
+/// A committed parcel's point list (right-click → Point List / Show Beacons): each corner's beacon
+/// (or P-number), coordinates, and the bearing and distance to the next corner, with the area; and
+/// whether it can be corrected here (Correct & Recommit) or, if not, why.
+#[utoipa::path(get, path = "/api/v1/parcels/points", tag = "parcels", params(ParcelPointsQuery), responses((status = 200), (status = 404)))]
+pub async fn parcel_points(State(state): State<AppState>, Query(q): Query<ParcelPointsQuery>) -> ApiResult<Json<serde_json::Value>> {
+    let upin = q.upin.trim().to_uppercase();
+    let row = sqlx::query(
+        "SELECT p.id, p.job_id, p.posted_at, trunc(ST_Area(p.geom)::numeric, 2)::float8 AS area, \
+                (SELECT w.id FROM cadastre.wf_job_instance w WHERE p.job_id IS NOT NULL AND w.cadastre_job_id = p.job_id ORDER BY w.id DESC LIMIT 1) AS job_instance_id, \
+                (SELECT w.name FROM cadastre.wf_job_instance w WHERE p.job_id IS NOT NULL AND w.cadastre_job_id = p.job_id ORDER BY w.id DESC LIMIT 1) AS job_name, \
+                EXISTS (SELECT 1 FROM cadastre.parcel_attribute a WHERE a.upin = p.parcel_number AND (a.linkage_status = 1 OR a.lrs_id IS NOT NULL)) \
+                  OR EXISTS (SELECT 1 FROM cadastre.registry_property r WHERE r.upin = p.parcel_number) AS linked, \
+                EXISTS (SELECT 1 FROM cadastre.parcel_lineage l WHERE l.parcel_id = p.id OR l.parent_id = p.id OR l.upin = p.parcel_number OR l.parent_upin = p.parcel_number) AS lineage \
+         FROM cadastre.parcel p WHERE p.parcel_number = $1 AND p.status = 'posted' LIMIT 1",
+    )
+    .bind(&upin)
+    .fetch_optional(&state.pool)
+    .await?
+    .ok_or_else(|| AppError::NotFound(format!("{upin} is not a committed parcel")))?;
+    let legs = crate::report::parcel_legs(&state.pool, &upin).await?;
+    let job: Option<i32> = row.get("job_instance_id");
+    let (linked, lineage): (bool, bool) = (row.get::<Option<bool>, _>("linked").unwrap_or(false), row.get::<Option<bool>, _>("lineage").unwrap_or(false));
+    let why_not = if job.is_none() { Some("it was committed in Aumentum: correct it with a mutation job (re-survey)") }
+        else if linked { Some("it is linked in the Registry: unlink it there first") }
+        else if lineage { Some("it has split / merge history: correct it with a mutation job") }
+        else { None };
+    Ok(Json(serde_json::json!({
+        "upin": upin,
+        "area_m2": row.get::<Option<f64>, _>("area"),
+        "committed_at": row.get::<Option<chrono::DateTime<chrono::Utc>>, _>("posted_at").map(|t| t.to_rfc3339()),
+        "job_instance_id": job,
+        "job_name": row.get::<Option<String>, _>("job_name"),
+        "can_correct": why_not.is_none(),
+        "why_not": why_not,
+        "points": legs.iter().map(|l| serde_json::json!({
+            "beacon": l.from, "easting": (l.from_e * 1000.0).round() / 1000.0, "northing": (l.from_n * 1000.0).round() / 1000.0,
+            "to": l.to, "distance": (l.distance * 1000.0).round() / 1000.0, "bearing": l.bearing,
+        })).collect::<Vec<_>>(),
+    })))
 }

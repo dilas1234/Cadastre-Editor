@@ -86,7 +86,7 @@ async function authLogin() {
 }
 function authLogout() {
   const id = auth.cfg?.enabled ? auth.cfg : null;
-  try { sessionStorage.removeItem("cad.tokens"); } catch { /* ignore */ }
+  try { sessionStorage.removeItem("cad.tokens"); sessionStorage.removeItem("cad.session"); } catch { /* ignore */ }
   if (id) location.assign(`${id.issuer}/protocol/openid-connect/logout?` + new URLSearchParams({ client_id: id.client_id, post_logout_redirect_uri: authRedirectUri() }));
 }
 async function initAuth() {
@@ -108,7 +108,7 @@ async function initAuth() {
 }
 const authReady = initAuth().catch((e) => {
   const msg = "Sign-in could not start: " + e.message;
-  setTimeout(() => { try { status(msg); } catch { /* status bar not built yet */ } alert(msg); }, 0);
+  setTimeout(() => { try { status(msg); } catch { /* status bar not built yet */ } uiAlert(msg); }, 0);
   throw e;
 });
 const authHeaders = () => (auth.token ? { authorization: `Bearer ${auth.token}` } : {});
@@ -127,6 +127,26 @@ async function api(path, opts = {}) {
   return data;
 }
 const fmt3 = (v) => Number(v).toFixed(3);
+// Date and time as PLAGIS reads them: 03/11/2026 16:47 (day first, 24-hour, this PC's time zone).
+function fmtDT(iso) {
+  if (!iso) return "";
+  const d = new Date(String(iso).includes("T") || /[zZ+]/.test(iso) ? iso : String(iso).replace(" ", "T"));
+  if (isNaN(d)) return String(iso);
+  const p = (n) => String(n).padStart(2, "0");
+  return `${p(d.getDate())}/${p(d.getMonth() + 1)}/${d.getFullYear()} ${p(d.getHours())}:${p(d.getMinutes())}`;
+}
+// A date-only value (yyyy-mm-dd, as the Registry's link date is kept) shown day first.
+const fmtD = (s) => (/^\d{4}-\d{2}-\d{2}$/.test(String(s || "")) ? String(s).split("-").reverse().join("/") : fmtDT(s));
+// Parcel metadata (committed when / by whom / in which job; linked when / to what), by UPIN.
+async function parcelMeta({ upins = [], jobs = [] } = {}) {
+  const q = new URLSearchParams(); if (upins.length) q.set("upins", upins.join(",")); if (jobs.length) q.set("jobs", jobs.join(","));
+  if (!upins.length && !jobs.length) return [];
+  try { return await api("/api/v1/parcels/metadata?" + q); } catch { return []; }
+}
+const metaCommitted = (m) => !m || !m.committed_at ? "—"
+  : m.committed_in === "aumentum" ? `${fmtDT(m.committed_at)} (Aumentum)`
+  : `${fmtDT(m.committed_at)}${m.committed_by ? " by " + m.committed_by : ""}`;
+const metaLinked = (m) => !m ? "—" : m.linked ? `${m.linked_at ? fmtD(m.linked_at) : "yes"}${m.lrs_id ? " → " + m.lrs_id : ""}` : "Not linked";
 const status = (msg) => { $("statusMsg").textContent = msg || ""; };
 // A message that cannot be missed (the status bar is easy to overlook): shown over the map for a
 // few seconds, and also written to the status bar.
@@ -340,6 +360,7 @@ map.once("style.load", async () => {
   await Promise.all([loadParcels(true), loadBeacons(), loadJobs()]);
   renderGraphics();
   buildTOC(); buildCatalog();
+  await restoreSession();
   pushHistory();
 });
 
@@ -942,7 +963,7 @@ async function addRasterLayer(node) {
   status(`Adding ${name}…`);
   let info;
   try { info = await api(`/api/v1/catalog/raster/info?folder=${folder}&path=${encodeURIComponent(path)}`); }
-  catch (e) { status(`Could not read ${name}: ${e.message}`); alert(`Could not read ${name}:\n${e.message}`); return; }
+  catch (e) { status(`Could not read ${name}: ${e.message}`); uiAlert(`Could not read ${name}:\n${e.message}`); return; }
   const crs = resolveCrs(info.epsg);
   const code = crs.code;
   const toLLc = (x, y) => (code === "EPSG:4326" ? [x, y] : proj4(code, "EPSG:4326", [x, y]));
@@ -976,7 +997,7 @@ async function addShapefileLayer(node) {
   status(`Adding ${name}…`);
   let d;
   try { d = await api(`/api/v1/catalog/shapefile?folder=${folder}&path=${encodeURIComponent(path)}`); }
-  catch (e) { status(`Could not read ${name}: ${e.message}`); alert(`Could not read ${name}:\n${e.message}`); return; }
+  catch (e) { status(`Could not read ${name}: ${e.message}`); uiAlert(`Could not read ${name}:\n${e.message}`); return; }
   const feats = (d.geojson && d.geojson.features) || [];
   if (!feats.length) { status(`${name} has no features to draw.`); return; }
   const crs = resolveCrs(d.epsg);
@@ -1038,17 +1059,20 @@ function buildTocTools() {
   const views = [["drawing", "listDrawing", "List By Drawing Order"], ["source", "listSource", "List By Source"],
     ["visibility", "listVisibility", "List By Visibility"], ["selection", "listSelection", "List By Selection"]];
   for (const [v, ic, tip] of views) {
-    const b = h("span", { class: `tb${state.tocView === v && !tasksOpen() && !wfOpen() && !regOpen() ? " active" : ""}`, title: tip, html: icon(ic) });
-    b.onclick = () => { state.tocView = v; showRegistry(false); showWorkflow(false); showTasks(false); buildTocTools(); buildTOC(); };
+    const b = h("span", { class: `tb${state.tocView === v && !tasksOpen() && !wfOpen() && !regOpen() && !doneOpen() ? " active" : ""}`, title: tip, html: icon(ic) });
+    b.onclick = () => { state.tocView = v; showCompleted(false); showRegistry(false); showWorkflow(false); showTasks(false); buildTocTools(); buildTOC(); };
     t.append(b);
   }
   t.append(h("span", { class: "tsep" }));
-  const tasksBtn = h("span", { class: `tb${tasksOpen() && !wfOpen() && !regOpen() ? " active" : ""}`, title: "Tasks", html: icon("tasks") });
-  tasksBtn.onclick = () => { showRegistry(false); showWorkflow(false); showTasks(true); buildTocTools(); };
+  const tasksBtn = h("span", { class: `tb${tasksOpen() && !wfOpen() && !regOpen() && !doneOpen() ? " active" : ""}`, title: "Tasks", html: icon("tasks") });
+  tasksBtn.onclick = () => { showCompleted(false); showRegistry(false); showWorkflow(false); showTasks(true); buildTocTools(); };
   t.append(tasksBtn);
   const wfBtn = h("span", { class: `tb${wfOpen() ? " active" : ""}`, title: "Workflow (job instances)", html: icon("jobOpen") });
   wfBtn.onclick = () => openWorkflow();
   t.append(wfBtn);
+  const doneBtn = h("span", { class: `tb${doneOpen() ? " active" : ""}`, title: "Completed jobs (digitised; plan, Registry, Correct)", html: icon("jobApprove") });
+  doneBtn.onclick = () => openCompleted();
+  t.append(doneBtn);
   // Registry links: their own tab, apart from the workflow.
   const waiting = registryWaiting();
   const regBtn = h("span", { class: `tb${regOpen() ? " active" : ""}`, title: "Registry — links from the Aumentum Registry" + (waiting ? ` (${waiting} waiting for a job)` : ""), html: icon("registry"), style: "position:relative" });
@@ -1059,6 +1083,7 @@ function buildTocTools() {
 }
 const tasksOpen = () => !$("tasksBody").classList.contains("hidden");
 function showTasks(on) {
+  if (on) $("doneBody")?.classList.add("hidden");
   $("tasksBody").classList.toggle("hidden", !on); $("tocBody").classList.toggle("hidden", on);
   document.querySelector("#tocPane .hscroll").classList.toggle("hidden", on);
 }
@@ -1195,6 +1220,10 @@ function editDraftAt(pt) {
   if (!f) { status("Edit tool: click one of the job's draft parcels to edit its corners."); return; }
   const d = state.drafts.features.find((x) => String(x.properties.id) === String(f.properties.id));
   if (!d) return;
+  editDraftFeature(d);
+}
+function editDraftFeature(d) {
+  if (!edit.active) startEditing("editVertex");
   const ring = d.geometry.type === "MultiPolygon" ? d.geometry.coordinates[0][0] : d.geometry.coordinates[0];
   selectTemplate("parcel");
   edit.verts = ring.slice(0, -1).map(([x, y]) => toUTM(x, y).map((v) => Math.round(v * 1000) / 1000));
@@ -1213,7 +1242,16 @@ map.on("dblclick", (e) => {
 map.on("contextmenu", (e) => {
   if (edit.active && state.tool === "sketch") { e.preventDefault(); absoluteXYDialog(e.lngLat); }
 });
-map.on("contextmenu", (e) => { if (state.tool !== "sketch" && parcelAt(e.point)) { e.preventDefault(); parcelMenu(e); } });
+map.on("contextmenu", (e) => {
+  if (state.tool === "sketch") return;
+  if (parcelAt(e.point)) { e.preventDefault(); parcelMenu(e); return; }
+  const d = draftAt(e.point); if (d) { e.preventDefault(); draftMenu(d, e); }
+});
+function draftAt(point) {
+  const layers = ["drafts-fill"].filter((l) => map.getLayer(l)); if (!layers.length) return null;
+  const f = map.queryRenderedFeatures([[point.x - 3, point.y - 3], [point.x + 3, point.y + 3]], { layers })[0];
+  return f ? state.drafts.features.find((x) => String(x.properties.id) === String(f.properties.id)) || null : null;
+}
 function parcelAt(point) {
   const layers = ["parcels-fill"].filter((l) => map.getLayer(l));
   const f = layers.length ? map.queryRenderedFeatures(point, { layers })[0] : null;
@@ -1231,25 +1269,150 @@ function parcelMenu(e) {
     { label: "Zoom To Parcel", icon: "fullExtent", action: () => registryZoom(upin) },
     { label: "Registry File…", icon: "registry", action: () => startEditParcel(upin, true) },
     "-",
+    beaconLabels.upin === upin ? { label: "Hide Beacons", action: () => hideBeacons() } : { label: "Show Beacons", action: () => showParcelBeacons(upin) },
+    { label: "Point List…", action: () => pointListWindow(upin) },
+    { label: "Correct & Recommit…", icon: "editor", action: () => correctAndRecommit(upin) },
+    "-",
     { label: "Parcel Lineage…", action: () => lineageOfSelection() },
   ], ev.clientX, ev.clientY);
 }
+// A draft parcel of the job: its beacons, its point list, or edit its corners.
+function draftMenu(d, e) {
+  const ev = e.originalEvent; const key = "draft:" + d.properties.id;
+  contextMenu([
+    { label: "Edit Corners (point list)", icon: "editor", action: () => editDraftFeature(d) },
+    beaconLabels.upin === key ? { label: "Hide Beacons", action: () => hideBeacons() } : { label: "Show Beacons", action: () => showDraftBeacons(d) },
+    { label: "Point List…", action: () => pointListWindow(null, d) },
+  ], ev.clientX, ev.clientY);
+}
+
+/* =====================================================================================
+ * Beacons and the point list of a parcel (right-click): see each corner's beacon on the map,
+ * open the point list (beacon, Easting, Northing, bearing and distance to the next corner), and
+ * Correct & Recommit a parcel committed here (reopened as a draft keeping its UPIN, straight into
+ * the sketch with its point list and the Orthophoto; then Finish → Verify → Check → Attributes →
+ * Commit as usual).
+ * ===================================================================================== */
+const beaconLabels = { upin: null };
+function setBeaconLabels(key, pts) {
+  // Drawn as on the survey plan: red boundary, + at each corner with its beacon number, and along
+  // each side the distance on one side of the line and the bearing (degrees and minutes) on the other.
+  if (!map.getSource("beacon-labels")) {
+    if (!map.hasImage("plan-plus")) map.addImage("plan-plus", crossImage("#c62828", 13));
+    map.addSource("beacon-labels", { type: "geojson", data: empty() });
+    map.addLayer({ id: "beacon-legs-line", type: "line", source: "beacon-labels", filter: ["==", "$type", "LineString"], paint: { "line-color": "#e53935", "line-width": 2 } });
+    map.addLayer({ id: "beacon-labels-pt", type: "symbol", source: "beacon-labels", filter: ["==", "$type", "Point"],
+      layout: { "icon-image": "plan-plus", "icon-allow-overlap": true,
+        "text-field": ["get", "label"], "text-font": ["OpenSans-Regular"], "text-size": 13, "text-offset": [0.7, -0.7], "text-anchor": "bottom-left", "text-allow-overlap": true },
+      paint: { "text-color": "#111", "text-halo-color": "rgba(255,255,255,.92)", "text-halo-width": 2 } });
+    const along = (field, dy) => ({ type: "symbol", source: "beacon-labels", filter: ["==", "$type", "LineString"],
+      layout: { "text-field": ["get", field], "text-font": ["OpenSans-Regular"], "text-size": 12, "symbol-placement": "line-center", "text-keep-upright": true,
+        "text-offset": [0, dy], "text-allow-overlap": true, "text-ignore-placement": true },
+      paint: { "text-color": "#111", "text-halo-color": "rgba(255,255,255,.92)", "text-halo-width": 2 } });
+    map.addLayer({ id: "beacon-legs-dist", ...along("distance", -0.85) });
+    map.addLayer({ id: "beacon-legs-brg", ...along("bearing", 0.85) });
+  }
+  // Bearing as the plan writes it: whole degrees and minutes (128° 01').
+  const planBearing = (b) => {
+    const m = String(b || "").match(/(\d+)°\s*(\d+)'\s*(\d+(?:\.\d+)?)?/);
+    if (!m) return String(b || "");
+    let d = +m[1], mi = +m[2] + Math.round((+(m[3] || 0)) / 60);
+    if (mi >= 60) { mi -= 60; d = (d + 1) % 360; }
+    return `${d}° ${String(mi).padStart(2, "0")}'`;
+  };
+  const corners = pts.map((p) => ({ type: "Feature", properties: { label: p.beacon }, geometry: { type: "Point", coordinates: toLL(p.easting, p.northing) } }));
+  const legs = pts.map((p, i) => {
+    const q = pts[(i + 1) % pts.length];
+    return { type: "Feature", properties: { distance: `${Number(p.distance).toFixed(2)}m`, bearing: planBearing(p.bearing) },
+      geometry: { type: "LineString", coordinates: [toLL(p.easting, p.northing), toLL(q.easting, q.northing)] } };
+  });
+  map.getSource("beacon-labels").setData({ type: "FeatureCollection", features: [...legs, ...corners] });
+  beaconLabels.upin = key;
+}
+function hideBeacons() { map.getSource("beacon-labels")?.setData(empty()); beaconLabels.upin = null; status("Beacons hidden."); }
+window.addEventListener("keydown", (e) => { if (e.key === "Escape" && beaconLabels.upin && !document.querySelector(".uiModalBack")) hideBeacons(); });
+async function showParcelBeacons(upin) {
+  let d; try { d = await api("/api/v1/parcels/points?upin=" + encodeURIComponent(upin)); } catch (e) { uiAlert(e.message); return; }
+  setBeaconLabels(upin, d.points); status(`${upin}: ${d.points.length} beacons with bearings and distances (right-click → Hide Beacons, or Esc).`);
+}
+// A draft's corners: its own ring, named as Verify Points names them.
+async function draftPoints(d) {
+  const ring = (d.geometry.type === "MultiPolygon" ? d.geometry.coordinates[0][0] : d.geometry.coordinates[0]).slice(0, -1).map(([x, y]) => toUTM(x, y));
+  let ids = []; try { ids = await identifyVertices(ring); } catch { /* names unknown */ }
+  let k = 0;
+  return ring.map(([e, n], i) => {
+    const id = ids[i]; const nx = ring[(i + 1) % ring.length];
+    const typed = pointIds.get(ptKey(e, n));
+    const beacon = id?.source === "beacon" ? id.beacon_number : typed || `P${++k}`;
+    const dist = Math.hypot(nx[0] - e, nx[1] - n);
+    let az = Math.atan2(nx[0] - e, nx[1] - n) * 180 / Math.PI; if (az < 0) az += 360;
+    const dd = Math.floor(az), mm = Math.floor((az - dd) * 60), ss = Math.round(((az - dd) * 60 - mm) * 60);
+    return { beacon, easting: e, northing: n, distance: dist, bearing: `${dd}°${String(mm).padStart(2, "0")}'${String(ss).padStart(2, "0")}"` };
+  });
+}
+async function showDraftBeacons(d) { const pts = await draftPoints(d); setBeaconLabels("draft:" + d.properties.id, pts); status(`Draft parcel: ${pts.length} corners shown (Esc hides them).`); }
+async function pointListWindow(upin, draft) {
+  let data;
+  if (upin) { try { data = await api("/api/v1/parcels/points?upin=" + encodeURIComponent(upin)); } catch (e) { uiAlert(e.message); return; } }
+  else data = { upin: null, points: await draftPoints(draft), area_m2: featureAreaM2(draft), can_correct: false };
+  const pts = data.points;
+  const tbl = h("table", { class: "verifyTbl" }, h("tr", {}, h("th", {}, "#"), h("th", {}, "Beacon"), h("th", {}, "Easting"), h("th", {}, "Northing"), h("th", {}, "Bearing"), h("th", {}, "Distance (m)")));
+  pts.forEach((p, i) => {
+    const tr = h("tr", { title: "Zoom to this corner" }, h("td", { class: "n" }, String(i + 1)), h("td", {}, h("b", {}, p.beacon)), h("td", {}, fmt3(p.easting)), h("td", {}, fmt3(p.northing)),
+      h("td", {}, p.bearing), h("td", { class: "n" }, Number(p.distance).toFixed(2)));
+    tr.onclick = () => { map.easeTo({ center: toLL(p.easting, p.northing), zoom: Math.max(map.getZoom(), 19) }); tbl.querySelectorAll("tr.selrow").forEach((r) => r.classList.remove("selrow")); tr.classList.add("selrow"); };
+    tbl.append(tr);
+  });
+  const listText = pts.map((p) => `${p.beacon} ${fmt3(p.easting)} ${fmt3(p.northing)}`).join("\n");
+  const title = upin ? `Point List — ${upin}` : "Point List — draft parcel";
+  floatWindow(title, h("div", {},
+    h("p", { class: "muted", style: "margin:0 0 4px" }, `${pts.length} corners · area ${area2(data.area_m2)} m²${data.job_name ? " · " + data.job_name : ""}${data.committed_at ? " · committed " + fmtDT(data.committed_at) : ""}`),
+    h("div", { class: "verifyWrap" }, tbl),
+    h("div", { class: "frow", style: "margin-top:6px;flex-wrap:wrap;gap:4px" },
+      h("button", { class: "btn", title: "Beacon Easting Northing, one per line (the surveyor's format)", onclick: async (ev) => {
+        try { await navigator.clipboard.writeText(listText); ev.target.textContent = "Copied"; } catch { status("Select the table to copy it."); } } }, "Copy list"),
+      h("button", { class: "btn", onclick: () => upin ? showParcelBeacons(upin) : showDraftBeacons(draft) }, "Show Beacons"),
+      upin ? h("button", { class: "btn btnPrimary", title: data.can_correct ? "Reopen as a draft (same UPIN), fix the points, commit again" : data.why_not, disabled: !data.can_correct,
+        onclick: () => correctAndRecommit(upin) }, "Correct & Recommit…") : null,
+      upin && !data.can_correct ? h("span", { class: "muted", style: "font-size:11px" }, `Correct here: no, ${data.why_not}.`) : null)),
+    { id: "pointListWin", width: 560 });
+}
+async function correctAndRecommit(upin) {
+  let d; try { d = await api("/api/v1/parcels/points?upin=" + encodeURIComponent(upin)); } catch (e) { uiAlert(e.message); return; }
+  if (!d.can_correct) { await uiAlert(`${upin} cannot be corrected here: ${d.why_not}.`, { title: "Correct & Recommit", kind: "warn" }); return; }
+  const reason = await uiPrompt(`Correct ${upin} (${d.job_name || "job " + d.job_instance_id})?\n\nThe job is reopened with ${upin} back as a draft that keeps its UPIN, and its points open for correction. Then Finish Sketch, check, save the attributes and commit again. Reason:`, "", { title: "Correct & Recommit", ok: "Reopen and correct" });
+  if (!reason || !reason.trim()) return;
+  let r;
+  try { r = await api(`/api/v1/wf/jobs/${d.job_instance_id}/correct`, { method: "POST", body: { upin, reason: reason.trim() } }); }
+  catch (e) { uiAlert("Correct refused: " + e.message); return; }
+  for (const b of r.beacons || []) rememberPointId(b.easting, b.northing, b.number);
+  // Keep the numbers of beacons shared with neighbours too (they stay in the fabric and are matched again).
+  for (const p of d.points) if (!/^P\d+$/.test(p.beacon)) rememberPointId(p.easting, p.northing, p.beacon);
+  $("pointListWin")?.remove(); hideBeacons(); done.loaded = false;
+  await wfResume(d.job_instance_id);
+  await loadDrafts(); await loadParcels(false);
+  const draft = state.drafts.features.find((x) => String(x.properties.id) === String(r.parcel_id));
+  if (!draft) { notify(`${upin} is a draft again; open the job and use the Edit tool on it.`, "warn"); return; }
+  editDraftFeature(draft); setTool("editVertex");
+  orthoSketchChanged();
+  notify(`${upin} is a draft again (it keeps its UPIN). Correct the points (drag, or retype in Edit Sketch Properties), then Finish Sketch.`);
+}
 async function startEditParcel(upin, fileOnly) {
   let w;
-  try { w = await api(`/api/v1/registry/parcels/${encodeURIComponent(upin)}/work`); } catch (e) { alert(e.message); return; }
-  if (fileOnly) { if (w.transaction_number) regFind(w.transaction_number); else alert(`${upin} has no Registry file (transaction) yet.`); return; }
+  try { w = await api(`/api/v1/registry/parcels/${encodeURIComponent(upin)}/work`); } catch (e) { uiAlert(e.message); return; }
+  if (fileOnly) { if (w.transaction_number) regFind(w.transaction_number); else uiAlert(`${upin} has no Registry file (transaction) yet.`); return; }
   // Not linked yet: the title deed work does not need the link. Find the parcel's file in the
   // Registry (read-only) and start its job there (Start digitising).
   if (!w.linked && !w.job_instance_id) {
     if (w.property_number) { regFind(w.property_number); notify(`${upin} is not linked in the Registry yet. Its file ${w.property_number} is shown under Registry → Find file: Start digitising opens the title deed job.`); return; }
-    alert(`${upin} is not linked in the Registry and has no file number on its attributes.\nFind its file under Registry → Find file (PL… or PLS…) and choose Start digitising.`); return;
+    uiAlert(`${upin} is not linked in the Registry and has no file number on its attributes.\nFind its file under Registry → Find file (PL… or PLS…) and choose Start digitising.`); return;
   }
   let job = w.job_instance_id;
   if (!job) {
-    if (!w.transaction_number) { alert(`${upin} is linked (${w.su_id}), but its Registry transaction is not known here. Find the file under Registry → Find file.`); return; }
-    if (!confirm(`No open job for ${w.transaction_number}. Start the title deed job (Job-${w.property_number || upin})?`)) return;
+    if (!w.transaction_number) { uiAlert(`${upin} is linked (${w.su_id}), but its Registry transaction is not known here. Find the file under Registry → Find file.`); return; }
+    if (!(await uiConfirm(`No open job for ${w.transaction_number}. Start the title deed job (Job-${w.property_number || upin})?`))) return;
     try { job = (await api("/api/v1/registry/start-digitising", { method: "POST", body: { transaction_number: w.transaction_number, property_number: w.property_number } })).job_instance_id; }
-    catch (e) { alert(e.message); return; }
+    catch (e) { uiAlert(e.message); return; }
   }
   await openWorkflow(); await wfSelect(job);
   try { await wfWorkOn(job); } catch (e) { notify(e.message, "err"); }
@@ -1303,7 +1466,15 @@ function identifyAt(e) {
   for (const f of feats) {
     const p = f.properties;
     const rows = Object.entries(p).filter(([k]) => k !== "id").map(([k, v]) => h("tr", {}, h("th", {}, k), h("td", {}, v == null || v === "null" ? "<Null>" : String(v))));
-    body.append(h("h4", { style: "margin:8px 0 3px" }, names[f.layer.id]), h("table", {}, ...rows));
+    const tbl = h("table", {}, ...rows);
+    body.append(h("h4", { style: "margin:8px 0 3px" }, names[f.layer.id]), tbl);
+    if ((f.layer.id === "parcels-fill" || f.layer.id === "history-fill") && p.parcel_number) {
+      parcelMeta({ upins: [p.parcel_number] }).then(([m]) => {
+        if (!m) return;
+        tbl.append(h("tr", {}, h("th", {}, "Committed"), h("td", {}, metaCommitted(m) + (m.job_name ? ` (${m.job_name})` : ""))),
+          h("tr", {}, h("th", {}, "Linked"), h("td", {}, metaLinked(m))));
+      });
+    }
     if ((f.layer.id === "parcels-fill" || f.layer.id === "history-fill") && p.parcel_number)
       body.append(h("div", { class: "frow" }, h("button", { class: "btn", onclick: () => lineageWindow(p.parcel_number) }, "Lineage…")));
   }
@@ -1411,13 +1582,20 @@ function findDialog() {
       } else map.getSource("found")?.setData(empty());
       if (missing.length && terms.length > 1) results.append(h("div", { style: "margin-top:6px;color:#b00" }, `Not found: ${missing.join(", ")}`));
       if (parcels.length) {
-        const t = h("table", {}, h("tr", {}, h("th", {}, "Parcel"), h("th", {}, "Status"), h("th", {}, "Area (m²)")));
+        const t = h("table", {}, h("tr", {}, h("th", {}, "Parcel"), h("th", {}, "Status"), h("th", {}, "Area (m²)"), h("th", {}, "Committed"), h("th", {}, "Linked")));
+        const metaCells = new Map();
         for (const p of parcels.slice(0, 200)) {
           const area = p.computed_area ?? p.stated_area;
-          const tr = h("tr", { style: "cursor:pointer", title: "Zoom to parcel" }, h("td", {}, p.parcel_number || "(unposted)"), h("td", {}, p.status), h("td", {}, area2(area)));
+          const cc = h("td", { class: "muted" }, "…"), lc = h("td", { class: "muted" }, "…");
+          if (p.parcel_number) metaCells.set(p.parcel_number, [cc, lc]); else { cc.textContent = "—"; lc.textContent = "—"; }
+          const tr = h("tr", { style: "cursor:pointer", title: "Zoom to parcel" }, h("td", {}, p.parcel_number || "(unposted)"), h("td", {}, p.status), h("td", {}, area2(area)), cc, lc);
           tr.onclick = () => goToResult(p);
           t.append(tr);
         }
+        parcelMeta({ upins: [...metaCells.keys()] }).then((list) => {
+          for (const m of list) { const c = metaCells.get(m.upin); if (!c) continue; c[0].textContent = metaCommitted(m); c[1].textContent = metaLinked(m); c[0].classList.remove("muted"); c[1].classList.remove("muted"); }
+          for (const [, c] of metaCells) for (const td of c) if (td.textContent === "…") td.textContent = "—";
+        });
         results.append(h("div", { class: "muted", style: "margin-top:6px" }, `${parcels.length} parcel(s)${parcels.length > 200 ? " (first 200 shown)" : ""} — click a row to zoom`), t);
         if (!beacons.length) { if (parcels.length === 1) goToResult(parcels[0]); else selectFeatures(parcels.map((p) => p.id)); }
       }
@@ -1453,8 +1631,8 @@ function copyCenterXY() {
 
 // bookmarks
 function saveBookmarks() { localStorage.setItem("cad.bookmarks", JSON.stringify(state.bookmarks)); }
-function createBookmark() {
-  const name = prompt("Bookmark Name:", `Bookmark ${state.bookmarks.length + 1}`); if (!name) return;
+async function createBookmark() {
+  const name = await uiPrompt("Bookmark Name:", `Bookmark ${state.bookmarks.length + 1}`); if (!name) return;
   state.bookmarks.push({ name, bounds: map.getBounds().toArray() }); saveBookmarks(); status(`Bookmark "${name}" created`);
 }
 function manageBookmarks() {
@@ -1466,10 +1644,87 @@ function manageBookmarks() {
     if (!state.bookmarks.length) list.append(h("tr", {}, h("td", { colspan: 2, class: "muted" }, "No bookmarks yet.")));
   };
   render();
-  floatWindow("Bookmarks Manager", h("div", {}, list, h("div", { class: "frow" }, h("button", { class: "btn", onclick: () => { createBookmark(); render(); } }, "New…"))), { width: 320 });
+  floatWindow("Bookmarks Manager", h("div", {}, list, h("div", { class: "frow" }, h("button", { class: "btn", onclick: async () => { await createBookmark(); render(); } }, "New…"))), { width: 320 });
 }
 
 // floating windows
+/* =====================================================================================
+ * In-page dialogs: one modal in the editor's own style instead of the browser's alert / confirm /
+ * prompt (which look foreign, cannot be styled, and on some browsers offer "prevent this page
+ * from creating more dialogs"). Each returns a promise:
+ *   await uiAlert("Saved.")                    -> undefined
+ *   if (!(await uiConfirm("Delete it?"))) ...  -> true / false
+ *   const v = await uiPrompt("Name:", "x")     -> the text, or null when cancelled
+ * Enter = the main button, Esc = cancel; focus stays inside the dialog; errors offer "Copy details".
+ * ===================================================================================== */
+const UI_ICON = { info: "i", warn: "!", error: "✕", question: "?" };
+function uiDialog({ title = APP, message = "", kind = "info", buttons = [{ label: "OK", value: true, primary: true, cancel: true }], input = null, details = null, width = 420 } = {}) {
+  return new Promise((resolve) => {
+    const before = document.activeElement;
+    const text = typeof message === "string" ? message : "";
+    const msg = typeof message === "string"
+      ? h("div", { class: "uiMsg" }, ...message.split("\n").map((line) => h("p", {}, line)))
+      : h("div", { class: "uiMsg" }, message);
+    const inp = input ? h(input.multiline ? "textarea" : "input", { class: "uiInput", value: input.value ?? "", placeholder: input.placeholder || null, rows: input.multiline ? 4 : null }) : null;
+    if (inp && input.multiline) inp.value = input.value ?? "";
+    const back = h("div", { class: "uiModalBack" });
+    let done = false;
+    const finish = (v) => {
+      if (done) return; done = true;
+      document.removeEventListener("keydown", onKey, true);
+      back.remove();
+      try { before?.focus?.(); } catch { /* element gone */ }
+      resolve(v === uiDialog.INPUT ? inp.value : v);
+    };
+    const btns = buttons.map((b) => h("button", { class: `btn${b.primary ? " btnPrimary" : ""}`, onclick: () => finish(b.value) }, b.label));
+    const copyText = [title, text, details || ""].filter(Boolean).join("\n");
+    const copy = (kind === "error" || details)
+      ? h("button", { class: "btn uiCopy", title: "Copy the message, to send to support", onclick: async (ev) => {
+          try { await navigator.clipboard.writeText(copyText); ev.target.textContent = "Copied"; } catch { ev.target.textContent = "Select and copy the text"; }
+        } }, "Copy details")
+      : null;
+    const box = h("div", { class: `uiModal ${kind}`, role: kind === "error" || kind === "warn" ? "alertdialog" : "dialog", "aria-modal": "true", "aria-label": title, style: `width:min(${width}px, calc(100vw - 32px))` },
+      h("div", { class: "uiHead" }, h("span", {}, title), h("span", { class: "fx", title: "Close", onclick: () => finish(cancelValue()) }, "✕")),
+      h("div", { class: "uiBody" }, h("span", { class: `uiIcon ${kind}`, "aria-hidden": "true" }, UI_ICON[kind] || "i"),
+        h("div", { class: "uiMain" }, msg, details ? h("pre", { class: "uiDetails" }, details) : null, inp)),
+      h("div", { class: "uiButtons" }, copy, ...btns));
+    back.append(box);
+    function cancelValue() { const c = buttons.find((b) => b.cancel); return c ? c.value : undefined; }
+    function onKey(ev) {
+      if (ev.key === "Escape") { ev.preventDefault(); ev.stopPropagation(); finish(cancelValue()); return; }
+      if (ev.key === "Enter" && !(ev.target && ev.target.tagName === "TEXTAREA") && !(ev.target && ev.target.tagName === "BUTTON")) {
+        ev.preventDefault(); ev.stopPropagation();
+        const p = buttons.find((b) => b.primary) || buttons[0]; finish(p.value); return;
+      }
+      if (ev.key === "Tab") { // keep focus inside the dialog
+        const f = [...box.querySelectorAll("input,textarea,button")].filter((x) => !x.disabled);
+        if (!f.length) return;
+        const i = f.indexOf(document.activeElement);
+        if (ev.shiftKey && i <= 0) { ev.preventDefault(); f[f.length - 1].focus(); }
+        else if (!ev.shiftKey && i === f.length - 1) { ev.preventDefault(); f[0].focus(); }
+      }
+      ev.stopPropagation(); // the map's shortcuts stay quiet while a dialog is open
+    }
+    document.addEventListener("keydown", onKey, true);
+    document.body.append(back);
+    setTimeout(() => { if (inp) { inp.focus(); inp.select?.(); } else (btns.find((_, i) => buttons[i].primary) || btns[0])?.focus(); }, 0);
+  });
+}
+uiDialog.INPUT = Symbol("input");
+// An alert's look follows its words: failures read as errors, the rest as information.
+const uiKind = (m) => (/\b(fail|failed|error|could not|cannot|can't|not saved|refused|invalid)\b/i.test(String(m)) ? "error" : "info");
+function uiAlert(message, opts = {}) {
+  return uiDialog({ title: opts.title || APP, message: String(message ?? ""), kind: opts.kind || uiKind(message), details: opts.details || null,
+    buttons: [{ label: "OK", value: undefined, primary: true, cancel: true }] });
+}
+function uiConfirm(message, opts = {}) {
+  return uiDialog({ title: opts.title || APP, message: String(message ?? ""), kind: opts.kind || "question",
+    buttons: [{ label: opts.ok || "OK", value: true, primary: true }, { label: opts.cancel || "Cancel", value: false, cancel: true }] });
+}
+function uiPrompt(message, value = "", opts = {}) {
+  return uiDialog({ title: opts.title || APP, message: String(message ?? ""), kind: "question", input: { value, placeholder: opts.placeholder, multiline: opts.multiline },
+    buttons: [{ label: opts.ok || "OK", value: uiDialog.INPUT, primary: true }, { label: "Cancel", value: null, cancel: true }] });
+}
 function floatWindow(title, body, { id, width = 300 } = {}) {
   if (id) $(id)?.remove();
   const w = h("div", { class: "float", id: id || null, style: `width:${width}px` });
@@ -1844,17 +2099,17 @@ async function doTransition(action) {
     const j = await api(`/api/v1/jobs/${state.job.id}/transition`, { method: "POST", body: { action } });
     Object.assign(state.job, j); const i = state.jobs.findIndex((x) => x.id === j.id); if (i >= 0) state.jobs[i] = j;
     renderJobBox(); renderTask(); buildCatalog(); status(`Job ${j.reference} is now ${j.status}`);
-  } catch (e) { alert(`${action} failed: ${e.message}`); }
+  } catch (e) { uiAlert(`${action} failed: ${e.message}`); }
 }
 async function postJob() {
   if (!state.job) return;
-  if (state.job.status !== POSTABLE_STAGE) { alert(`Only ${POSTABLE_STAGE} jobs can be posted (this job is ${state.job.status}).`); return; }
+  if (state.job.status !== POSTABLE_STAGE) { uiAlert(`Only ${POSTABLE_STAGE} jobs can be posted (this job is ${state.job.status}).`); return; }
   try {
     const res = await api(`/api/v1/jobs/${state.job.id}/post`, { method: "POST" });
     status(`Posted ${res.posted} parcel(s): ${res.parcel_numbers.join(", ")}`);
     await Promise.all([loadDrafts(), loadParcels(false)]); renderTask();
     floatWindow("Post Job", h("div", {}, h("p", {}, `Posted ${res.posted} parcel(s).`), h("div", {}, res.parcel_numbers.join(", ") || "—")), { width: 300 });
-  } catch (e) { alert("Post failed: " + e.message); }
+  } catch (e) { uiAlert("Post failed: " + e.message); }
 }
 function openPdf(kind) { if (state.job) window.open(`/api/v1/jobs/${state.job.id}/${kind === "siteplan" ? "siteplan" : "report"}.pdf`, "_blank"); }
 function newJobDialog() {
@@ -1868,12 +2123,12 @@ function newJobDialog() {
       try {
         const j = await api("/api/v1/jobs", { method: "POST", body: { reference: ref.value.trim(), job_type: type.value, title: title.value.trim() || null } });
         state.jobs.unshift(j); renderJobBox(); $("jobBox").value = j.id; await selectJob(j.id); w.remove();
-      } catch (e) { alert("Create job failed: " + e.message); }
+      } catch (e) { uiAlert("Create job failed: " + e.message); }
     } }, "OK"), h("button", { class: "btn", onclick: () => w.remove() }, "Cancel"))), { id: "newJobWin", width: 330 });
 }
 async function validateFabric() {
   const fs = (state.selection.size ? selectedFC() : state.drafts).features;
-  if (!fs.length) { alert("Select parcels, or choose a Job Area with draft parcels, to validate."); return; }
+  if (!fs.length) { uiAlert("Select parcels, or choose a Job Area with draft parcels, to validate."); return; }
   const rings = fs.map((f) => {
     const g = f.geometry; const ring = (g.type === "MultiPolygon" ? g.coordinates[0][0] : g.coordinates[0]);
     return ring.slice(0, -1).map(([x, y]) => { const [E, N] = toUTM(x, y); return { x: E, y: N }; });
@@ -1881,7 +2136,7 @@ async function validateFabric() {
   try {
     const r = await api("/api/v1/fabric/validate", { method: "POST", body: { parcels: rings } });
     floatWindow("Validate Fabric", h("pre", { style: "white-space:pre-wrap;margin:0" }, JSON.stringify(r, null, 2)), { width: 420 });
-  } catch (e) { alert("Validation failed: " + e.message); }
+  } catch (e) { uiAlert("Validation failed: " + e.message); }
 }
 
 // ---- Tasks wizard ----
@@ -1998,7 +2253,7 @@ async function finishTask() {
     status(`Saved draft parcel to ${state.job.reference} — ready for the next. ${draftNextStep()}`); wfRefreshEditing();
     await loadDrafts(); buildCatalog();
     resetTraverse(); renderTask(); // stay in survey mode for the next parcel
-  } catch (e) { alert("Save failed: " + e.message); }
+  } catch (e) { uiAlert("Save failed: " + e.message); }
 }
 function jobPicker() {
   const sel = h("select", { style: "flex:1;min-width:0", onchange: async (e) => { $("jobBox").value = e.target.value; await selectJob(e.target.value); } },
@@ -2102,9 +2357,9 @@ function startEditing(tool = "sketch") {
   updateEditorButtons();
   status("Editing started — pick a template in Create Features, then click the map to add vertices (double-click to finish).");
 }
-function stopEditing() {
-  if (edit.verts.length && !confirm("You have an unfinished sketch. Discard it and stop editing?")) return;
-  edit.active = false; clearSketch();
+async function stopEditing() {
+  if (edit.verts.length && !(await uiConfirm("You have an unfinished sketch. Discard it and stop editing?", { ok: "Discard", kind: "warn" }))) return;
+  edit.active = false; clearSketch(); orthoClose();
   $("createFeaturesWin")?.remove(); $("sketchPropsWin")?.remove();
   setTool("pan"); updateEditorButtons(); status("Editing stopped.");
 }
@@ -2155,8 +2410,9 @@ function drawSketch() {
   if (edit.geomType !== "point" && ll.length >= 2) feats.push({ type: "Feature", geometry: { type: "LineString", coordinates: ll } });
   ll.forEach((c, i) => feats.push({ type: "Feature", properties: { idx: i, sel: i === edit.sel || (edit.sel < 0 && i === ll.length - 1) }, geometry: { type: "Point", coordinates: c } }));
   map.getSource("sketch")?.setData({ type: "FeatureCollection", features: feats });
+  orthoSketchChanged();
 }
-function clearSketch() { edit.verts = []; edit.sel = -1; edit.editingId = null; edit.splitMode = false; edit.trace = null; map.getSource("sketch")?.setData(empty()); }
+function clearSketch() { edit.verts = []; edit.sel = -1; edit.editingId = null; edit.splitMode = false; edit.trace = null; map.getSource("sketch")?.setData(empty()); orthoSketchChanged(); }
 function canFinishSketch() { const n = edit.verts.length; return edit.splitMode ? n >= 2 : edit.geomType === "polygon" ? n >= 3 : edit.geomType === "line" ? n >= 2 : n >= 1; }
 async function finishSketch() {
   if (!canFinishSketch()) { status(`Add ${edit.geomType === "polygon" ? "at least 3" : edit.geomType === "line" ? "at least 2" : "a"} vertex(es) before finishing.`); return; }
@@ -2167,14 +2423,196 @@ async function finishSketch() {
   else saveSketchLine();
 }
 async function saveSketchJobArea() {
-  if (!wf.editing) { alert("Open a job in the Workflow tab and choose Work On This Job before drawing its job area."); return; }
+  if (!wf.editing) { uiAlert("Open a job in the Workflow tab and choose Work On This Job before drawing its job area."); return; }
   const utm = edit.verts.slice();
   try {
     wf.editing = await api(`/api/v1/wf/jobs/${wf.editing.job_instance_id}/area`, { method: "PUT", body: { geometry: { type: "Polygon", coordinates: [[...utm, utm[0]]] } } });
     showJobArea(); clearSketch(); refreshSketchProps(); updateEditorButtons(); zoomToUTMRing(utm);
     selectTemplate("parcel"); notify(`Job area saved (${Math.round(wf.editing.area_m2 || 0).toLocaleString()} m²). Parcels for this job must be drawn inside it.`);
     renderWorkflow();
-  } catch (e) { alert("Saving the job area failed: " + e.message); }
+  } catch (e) { uiAlert("Saving the job area failed: " + e.message); }
+}
+// Digitize Parcel (Construct Parcel / Create Parcel steps). The points typed or pasted for the job
+// area are the parcel's corners from the survey plan, so they are not asked for again: an empty
+// sketch starts from the job area's points (beacon numbers that came with them are kept by
+// coordinates), and the digitiser checks them and presses Finish Sketch. Not when the job already
+// has a draft parcel, nor from the box the editor makes itself when no job area was drawn.
+function isAutoJobArea(g) {
+  const ring = g?.coordinates?.[0] || [];
+  const pts = ring.slice(0, -1);
+  if (pts.length !== 4) return false;
+  return pts.every((p, i) => { const q = pts[(i + 1) % 4]; return Math.abs(p[0] - q[0]) < 0.001 || Math.abs(p[1] - q[1]) < 0.001; });
+}
+function digitizeParcel() {
+  selectTemplate("parcel");
+  if (!edit.active) startEditing("sketch"); else setTool("sketch");
+  if (wf.editing) setTimeout(() => { if (!$("orthoWin")) orthoOpen(); else orthoSketchChanged(); }, 0);
+  const area = wf.editing?.area_utm;
+  if (edit.verts.length || !area || (wf.editing?.drafts || 0) > 0) {
+    if ((wf.editing?.drafts || 0) > 0) status("The job already has a draft parcel: click it with the Edit tool to change it, or sketch another.");
+    return;
+  }
+  if (isAutoJobArea(area)) { status("Click the parcel's corners on the map (the job area was made automatically, so there are no plan points to load)."); return; }
+  const ring = (area.coordinates?.[0] || []).slice(0, -1).map((c) => [c[0], c[1]]);
+  if (ring.length < 3) return;
+  edit.verts = ring; edit.sel = ring.length - 1; edit.editingId = null;
+  afterVertexChange(); showSketchExtent(true);
+  const named = ring.filter(([e, n]) => pointIds.get(ptKey(e, n))).length;
+  notify(`Loaded the ${ring.length} points you entered for the job area${named ? ` (${named} with beacon numbers)` : ""}. Check them, then Finish Sketch.`);
+}
+/* =====================================================================================
+ * Orthophoto window: the actual view of the plot being digitised (as the old Cadastre's
+ * "autophoto"). A close-up on the satellite imagery with the sketch (or job area) outline, a
+ * crosshair whose position is shown in Lat/Long, UTM 32N and MGRS, neighbouring parcels, overlaps
+ * shaded red, and a badge: plot free / overlaps / title exists (this Cadastre's fabric, at once;
+ * the System Check adds Aumentum and the Registry). A viewer only: nothing is saved or attached.
+ * ===================================================================================== */
+// MGRS (UTM zone 32, Plateau State), 1 m: e.g. 32PMR 93285 90339.
+function mgrs(lng, lat) {
+  const [E, N] = toUTM(lng, lat);
+  const zone = 32, set = zone % 6 || 6;
+  const band = "CDEFGHJKLMNPQRSTUVWX"[Math.max(0, Math.min(19, Math.floor((lat + 80) / 8)))];
+  const col = ["ABCDEFGH", "JKLMNPQR", "STUVWXYZ"][(set - 1) % 3][Math.floor(E / 100000) - 1] || "?";
+  const rows = "ABCDEFGHJKLMNPQRSTUV";
+  const row = rows[(Math.floor(N / 100000) + (set % 2 === 0 ? 5 : 0)) % 20];
+  const p5 = (v) => String(Math.round(v % 100000) % 100000).padStart(5, "0");
+  return `${zone}${band}${col}${row} ${p5(E)} ${p5(N)}`;
+}
+const ortho = { map: null, timer: null, seq: 0, fitted: "", status: null };
+function orthoOpen() {
+  ortho.map?.remove(); ortho.map = null; ortho.fitted = "";
+  const box = h("div", { class: "orthoMap" });
+  const cross = h("div", { class: "orthoCross" });
+  const badge = h("div", { class: "orthoBadge muted" }, "Checking the land…");
+  const coords = h("table", { class: "orthoCoords" });
+  const finishBtn = h("button", { class: "btn btnPrimary", onclick: () => finishSketch() }, "Finish Sketch");
+  const body = h("div", {}, h("div", { class: "orthoWrap" }, box, cross), badge, coords,
+    h("div", { class: "frow", style: "flex-wrap:wrap;gap:4px" },
+      h("button", { class: "btn", title: "Copy the crosshair's coordinates", onclick: async (ev) => {
+        try { await navigator.clipboard.writeText(coords.innerText.replace(/\t/g, " ")); ev.target.textContent = "Copied"; setTimeout(() => (ev.target.textContent = "Copy"), 1500); }
+        catch { status("Select the coordinates and copy them."); } } }, "Copy"),
+      h("button", { class: "btn", title: "Google's satellite view of this exact spot (new tab)", onclick: () => {
+        const c = ortho.map?.getCenter(); if (!c) return;
+        window.open(`https://www.google.com/maps/@?api=1&map_action=map&center=${c.lat.toFixed(7)},${c.lng.toFixed(7)}&zoom=20&basemap=satellite`, "_blank", "noopener");
+      } }, "Open in Google Maps"),
+      h("button", { class: "btn", onclick: () => { ortho.fitted = ""; orthoUpdate(); } }, "Centre on plot"),
+      finishBtn));
+  floatWindow("Orthophoto — actual view of the plot", body, { id: "orthoWin", width: 460 });
+  const w = $("orthoWin"); const r = $("mapFrame").getBoundingClientRect();
+  w?.querySelector(".fhead .fx")?.addEventListener("click", () => { ortho.map?.remove(); ortho.map = null; ortho.dismissed = true; });
+  if (w) { w.style.left = Math.max(r.left + 8, r.right - 470) + "px"; w.style.top = (r.top + 8) + "px"; }
+  const m = new maplibregl.Map({
+    container: box, attributionControl: { compact: true }, maxZoom: 21, boxZoom: false, doubleClickZoom: true,
+    style: { version: 8, glyphs: "/editor/vendor/fonts/{fontstack}/{range}.pbf",
+      sources: { imagery: { type: "raster", tiles: [IMAGERY], tileSize: 256, maxzoom: 18, attribution: "Imagery © Esri" } },
+      layers: [{ id: "imagery", type: "raster", source: "imagery" }] },
+    center: map.getCenter(), zoom: Math.max(map.getZoom(), 17),
+  });
+  ortho.map = m; ortho.coords = coords; ortho.badge = badge; ortho.finishBtn = finishBtn;
+  m.on("load", () => {
+    m.addSource("nb", { type: "geojson", data: state.parcels || empty() });
+    m.addLayer({ id: "nb-line", type: "line", source: "nb", paint: { "line-color": "#ffd23f", "line-width": 1.4 } });
+    m.addSource("area", { type: "geojson", data: empty() });
+    m.addLayer({ id: "area-line", type: "line", source: "area", paint: { "line-color": "#ffffff", "line-width": 1.5, "line-dasharray": [3, 2] } });
+    m.addSource("ov", { type: "geojson", data: empty() });
+    m.addLayer({ id: "ov-fill", type: "fill", source: "ov", paint: { "fill-color": "#ff1f1f", "fill-opacity": 0.45 } });
+    m.addSource("sk", { type: "geojson", data: empty() });
+    m.addLayer({ id: "sk-line", type: "line", source: "sk", paint: { "line-color": "#00e5ff", "line-width": 2.5 } });
+    m.addLayer({ id: "sk-pt", type: "circle", source: "sk", filter: ["==", "$type", "Point"], paint: { "circle-radius": 3.5, "circle-color": "#00e5ff", "circle-stroke-color": "#003", "circle-stroke-width": 1 } });
+    orthoUpdate();
+  });
+  m.on("move", orthoCoords);
+  orthoCoords();
+}
+function orthoCoords() {
+  const m = ortho.map; if (!m || !ortho.coords) return;
+  const c = m.getCenter(); const [E, N] = toUTM(c.lng, c.lat);
+  ortho.coords.innerHTML = "";
+  ortho.coords.append(
+    h("tr", {}, h("th", {}, "Lat Long"), h("td", {}, `${c.lat.toFixed(7)}  ${c.lng.toFixed(7)}`)),
+    h("tr", {}, h("th", {}, "UTM 32N"), h("td", {}, `${E.toFixed(3)}E  ${N.toFixed(3)}N`)),
+    h("tr", {}, h("th", {}, "MGRS"), h("td", {}, mgrs(c.lng, c.lat))));
+}
+// The outline to show and check: the sketch, else the job area.
+function orthoRing() {
+  if (edit.verts.length >= 3 && edit.geomType === "polygon") return edit.verts.map((v) => v.slice());
+  const a = wf.editing?.area_utm?.coordinates?.[0];
+  return a && a.length >= 4 ? a.slice(0, -1).map((c) => [c[0], c[1]]) : null;
+}
+function orthoClose() { ortho.map?.remove(); ortho.map = null; $("orthoWin")?.remove(); ortho.dismissed = false; }
+function orthoSketchChanged() {
+  // It appears by itself while a parcel is being sketched (however the sketch was started), unless
+  // the digitiser closed it for this sketch.
+  if (!$("orthoWin") && edit.active && edit.template === "parcel" && edit.geomType === "polygon" && edit.verts.length && !ortho.dismissed) {
+    setTimeout(() => { if (!$("orthoWin")) orthoOpen(); }, 0);
+    return;
+  }
+  if (!$("orthoWin") || !ortho.map) return;
+  clearTimeout(ortho.timer); ortho.timer = setTimeout(orthoUpdate, 400);
+}
+async function orthoUpdate() {
+  const m = ortho.map; if (!m || !$("orthoWin") || !m.getSource("sk")) return;
+  if (ortho.finishBtn) ortho.finishBtn.disabled = !(edit.active && canFinishSketch());
+  const ll = edit.verts.map(([e, n]) => toLL(e, n));
+  const feats = ll.map((c) => ({ type: "Feature", geometry: { type: "Point", coordinates: c }, properties: {} }));
+  if (ll.length >= 2) feats.push({ type: "Feature", geometry: { type: "LineString", coordinates: edit.geomType === "polygon" && ll.length >= 3 ? [...ll, ll[0]] : ll }, properties: {} });
+  m.getSource("sk").setData({ type: "FeatureCollection", features: feats });
+  const area = wf.editing?.area_utm?.coordinates?.[0];
+  m.getSource("area").setData(area ? { type: "FeatureCollection", features: [{ type: "Feature", properties: {}, geometry: { type: "LineString", coordinates: area.map(([e, n]) => toLL(e, n)) } }] } : empty());
+  const ring = orthoRing();
+  const key = ring ? vertsKey(ring) : "";
+  if (ring && ortho.fitted !== key) {
+    const lls = ring.map(([e, n]) => toLL(e, n));
+    const b = lls.reduce((bb, c) => [[Math.min(bb[0][0], c[0]), Math.min(bb[0][1], c[1])], [Math.max(bb[1][0], c[0]), Math.max(bb[1][1], c[1])]], [[Infinity, Infinity], [-Infinity, -Infinity]]);
+    m.fitBounds(b, { padding: 60, maxZoom: 20, animate: false }); ortho.fitted = key;
+  }
+  if (!ring) { ortho.badge.className = "orthoBadge muted"; ortho.badge.textContent = "Sketch the parcel (or load the job area's points) to check the land."; m.getSource("ov").setData(empty()); return; }
+  const seq = ++ortho.seq;
+  let r;
+  try { r = await api("/api/v1/parcels/overlaps", { method: "POST", body: { vertices: ring, editing_id: edit.editingId || null } }); }
+  catch (e) { if (seq === ortho.seq) { ortho.badge.className = "orthoBadge muted"; ortho.badge.textContent = "The land could not be checked: " + e.message; } return; }
+  if (seq !== ortho.seq || !m.getSource("ov")) return;
+  m.getSource("ov").setData({ type: "FeatureCollection", features: r.overlaps.filter((o) => o.geometry).map((o) => ({ type: "Feature", geometry: o.geometry, properties: { upin: o.upin } })) });
+  if (r.titled.length) {
+    ortho.badge.className = "orthoBadge bad";
+    ortho.badge.textContent = "✕ Title exists on this land: " + r.titled.map((t) => `${t.upin}${t.su_id ? " → " + t.su_id : ""}${t.refnum ? " (" + t.refnum + ")" : ""}`).join("; ");
+  } else if (r.overlaps.length || r.at_point.length) {
+    ortho.badge.className = "orthoBadge bad";
+    ortho.badge.textContent = "✕ " + (r.overlaps.length ? "Overlaps " + r.overlaps.map((o) => `${o.upin} (${area2(o.area_m2)} m²)`).join(", ") : "Already digitised: " + r.at_point.join(", "));
+  } else {
+    ortho.badge.className = "orthoBadge ok";
+    ortho.badge.textContent = "✔ Plot free: no overlap and no title in this Cadastre (Aumentum and the Registry are checked at Finish).";
+  }
+}
+
+// Digitising done (the commit completed the job): a clean start for the next job. The edit session
+// ends (nothing is left to save), the editing windows close, the job is no longer worked on, and
+// the map shows the Table Of Contents, zoomed to the parcel just committed.
+async function goHome(upins = []) {
+  edit.active = false; clearSketch(); orthoClose();
+  if (beaconLabels.upin) hideBeacons();
+  ["createFeaturesWin", "sketchPropsWin", "commitWin", "pointListWin", "parcelAttrWin", "stepToolsWin"].forEach((id) => $(id)?.remove());
+  setTool("pan"); updateEditorButtons();
+  wf.editing = null; showJobArea();
+  state.job = null; renderJobBox(); try { await loadDrafts(); } catch { /* the job is closed */ }
+  showCompleted(false); showRegistry(false); showWorkflow(false); showTasks(false);
+  if ($("tocPane").classList.contains("hidden")) togglePane("tocPane");
+  buildTocTools(); buildTOC(); renderTask();
+  if (upins[0]) { try { await registryZoom(upins[0]); } catch { /* zoom is a convenience */ } }
+  saveSession();
+  status(upins.length ? `Digitising complete: ${upins.join(", ")} committed. Ready for the next job.` : "Ready for the next job.");
+}
+
+// Straight on to the commit of the job being worked on (from the attribute form): the Commit window
+// when the job is at its commit task, else Post & Finish (which walks it there). Same windows, same
+// rules (beacon numbers, staff name, the System Check again on the server).
+async function commitWorkedJob() {
+  const id = wf.editing?.job_instance_id; if (!id) return;
+  await wfRefreshEditing();
+  if (wf.editing?.is_commit_task) { await wfCommitDialog(); return; }
+  let j = wf.detail?.job && wf.detail.job.id === id ? wf.detail.job : null;
+  if (!j) { try { j = (await api("/api/v1/wf/jobs/" + id)).job; } catch (e) { uiAlert(e.message); return; } }
+  await wfFinishJob(j, { skipConfirm: true });
 }
 // The bounding box of a set of UTM vertices, expanded by `margin` metres, as a closed ring.
 function bboxRingUTM(verts, margin) {
@@ -2200,11 +2638,15 @@ async function ensureJobArea(utm) {
       status("Job area reopened for editing.");
     }
     return true;
-  } catch (e) { alert("Could not prepare the job area: " + e.message); return false; }
+  } catch (e) { uiAlert("Could not prepare the job area: " + e.message); return false; }
 }
 async function saveSketchParcel() {
-  if (!state.job) { alert("Choose a Job Area first — a digitized parcel is saved as a draft under a job."); return; }
+  if (!state.job) { uiAlert("Choose a Job Area first — a digitized parcel is saved as a draft under a job."); return; }
   const utm = edit.verts.slice();
+  // Verify Points: the digitiser checks every corner (beacon, coordinates) before anything is saved.
+  if (!(await verifyPoints(utm))) { status("Back to the sketch: adjust the corners, then Finish Sketch again."); return; }
+  // System check before the next stage: nothing goes on to attributes and commit on taken land.
+  if (!(await runPrecheck(utm))) { status("Back to the sketch: the system check did not pass."); return; }
   if (!(await ensureJobArea(utm))) return; // keep the sketch so nothing is lost
   // Finish Sketch saves the shape at once (nothing to confirm, nothing lost if the attribute form
   // is closed); the Update Parcel Attribute form then opens on the saved draft.
@@ -2215,21 +2657,25 @@ async function saveSketchParcel() {
     saved = editingId
       ? await api(`/api/v1/jobs/${state.job.id}/parcels/${editingId}`, { method: "PUT", body: { geometry, stated_area: null } })
       : await api(`/api/v1/jobs/${state.job.id}/parcels`, { method: "POST", body: { geometry, stated_area: null } });
-  } catch (e) { alert("Save failed: " + e.message + "\nThe sketch is kept: correct it and Finish Sketch again."); return; }
+  } catch (e) { uiAlert("Save failed: " + e.message + "\nThe sketch is kept: correct it and Finish Sketch again."); return; }
   const id = saved && saved.id ? saved.id : editingId;
   if (!state.job.reference.startsWith("WF-")) notify(`Parcel saved to ${state.job.reference}, which is not a workflow job. To work as in Aumentum, open the job in the Workflow panel and choose Work On This Job.`, "warn");
   else notify(`${editingId ? "Draft parcel updated" : "Parcel saved as a draft"} in ${state.job.reference}. ${draftNextStep()}`);
   zoomToUTMRing(utm);
-  clearSketch(); refreshSketchProps(); updateEditorButtons();
+  clearSketch(); orthoClose(); refreshSketchProps(); updateEditorButtons();
   try { await loadDrafts(); buildCatalog(); wfRefreshEditing(); renderWorkflow(); } catch { /* the draft is saved; the view refreshes later */ }
   // Attributes: the values already captured on this draft, else the job's Registry defaults.
   let prefill = {};
   if (id) { try { prefill = await api(`/api/v1/parcels/${id}/attributes`); } catch { prefill = {}; } }
   const attrs = await parcelAttrDialog({ prefill, parcelId: id, areaM2: saved && saved.computed_area != null ? Number(saved.computed_area) : sketchArea,
-    title: "Update Parcel Attribute", saveLabel: "Save attributes" });
-  if (!attrs || !Object.keys(attrs).length || !id) return; // closed: the shape stays saved
-  try { await api(`/api/v1/parcels/${id}/attributes`, { method: "PUT", body: attrs }); status("Parcel attributes saved."); }
-  catch (e) { alert("The parcel is saved, but its attributes were not: " + e.message + "\nUse Update Parcel Attribute to enter them again."); }
+    title: "Update Parcel Attribute", saveLabel: "Save attributes", commitLabel: wf.editing ? "Save & Commit…" : null });
+  if (!attrs || !id) return; // closed: the shape stays saved
+  const goCommit = !!attrs.__commit; delete attrs.__commit;
+  if (Object.keys(attrs).length) {
+    try { await api(`/api/v1/parcels/${id}/attributes`, { method: "PUT", body: attrs }); status("Parcel attributes saved."); }
+    catch (e) { uiAlert("The parcel is saved, but its attributes were not: " + e.message + "\nUse Update Parcel Attribute to enter them again."); return; }
+  }
+  if (goCommit) await commitWorkedJob();
 }
 // Property-document capture shown on Finish Sketch (parcel). Resolves to the attributes object
 // (possibly empty), or null if cancelled. Prefills the Registry link + property fields from the
@@ -2250,26 +2696,86 @@ function sketchAreaM2() {
 // The ArcMap/Aumentum "Update Parcel Attribute" form (General + Survey tabs), shown on Finish
 // Sketch. Resolves to the attributes object (possibly empty), or null if cancelled. Prefills the
 // Registry link + property fields from the job's linkage. The UPIN is assigned at commit.
+// The Registry's place lists (Location, Layout, Area), kept by the server; loaded once per page.
+let placeLists = null;
+async function loadPlaceLists() {
+  if (placeLists && !placeLists.error) return placeLists;
+  try { placeLists = await api("/api/v1/registry/lookups"); }
+  catch (e) { placeLists = { location: [], layout_type: [], property_area: [], error: e.message }; }
+  return placeLists;
+}
+// The job's Registry property (its location / layout), when the job belongs to a transaction.
+async function jobRegistryProperty(txn, propertyNumber) {
+  if (!txn) return null;
+  try {
+    const t = await api("/api/v1/registry/transactions/" + encodeURIComponent(txn));
+    const ps = t.properties || [];
+    return ps.find((p) => propertyNumber && (p.refnum || "").toUpperCase() === propertyNumber.toUpperCase()) || ps[0] || null;
+  } catch { return null; }
+}
 async function parcelAttrDialog(opts = {}) {
   let link = {};
   if (wf.editing && wf.editing.job_instance_id) {
     try { link = await api(`/api/v1/wf/jobs/${wf.editing.job_instance_id}/linkage`); } catch { link = {}; }
   }
+  const [places, regProp] = await Promise.all([loadPlaceLists(), jobRegistryProperty(link.lrs_transaction_number, link.property_number)]);
   const jobNo = link.property_number || link.lrs_transaction_number || (state.job && state.job.reference) || "";
   const areaM2 = opts.areaM2 !== undefined ? opts.areaM2 : sketchAreaM2();
   // Values already captured on the draft (editing) take precedence over the job's linkage defaults.
   const pf = opts.prefill || {};
   const pv = (k, d) => (pf[k] != null && pf[k] !== "" ? pf[k] : d);
-  // Aumentum names a job's parcels PCL1, PCL2, … (93% of its records): suggest the next one.
+  // Parcel Name: the property number (PLAGIS), e.g. PL67363; with several parcels in the job,
+  // PL67363-1, PL67363-2, … Without a property number, Aumentum's PCL1, PCL2, …
   const drafts = (state.drafts && state.drafts.features) || [];
   const at = opts.parcelId ? drafts.findIndex((x) => x.properties.id === opts.parcelId) : -1;
-  const pclDefault = "PCL" + (at >= 0 ? at + 1 : drafts.length + 1);
+  const nth = at >= 0 ? at + 1 : drafts.length + 1;
+  const many = drafts.length > 1 || (at < 0 && drafts.length >= 1);
+  const propNo = (link.property_number || regProp?.refnum || "").trim();
+  const pclDefault = propNo ? (many ? `${propNo}-${nth}` : propNo) : "PCL" + nth;
   return new Promise((resolve) => {
     const f = {};
     const row = (label, ctrl) => h("div", { class: "frow" }, h("label", {}, label), ctrl);
     const ro = (label, val) => row(label, h("span", { class: "roval" }, val));
     const txt = (key, val) => { const i = h("input", { value: val || "", style: "flex:1;min-width:0" }); f[key] = i; return i; };
     const sel = (key, opts, val) => { const s = h("select", { style: "flex:1;min-width:0" }, ...opts.map((o) => h("option", { selected: o === (val || "") }, o))); f[key] = s; return s; };
+    // A Registry list as a dropdown. A value already on the parcel that is not in the list (the
+    // codes 1 to 4 Aumentum stored) is kept and shown as it is; with no list, a text box.
+    // Location (the Registry's 4 zones), Layout and Area: dropdowns of the Registry's lists that also
+    // take a new name (type it). Pre-filled from the Registry property; Aumentum's codes 1 to 4 kept.
+    const placeCombo = (key, listKey, val) => {
+      const list = places[listKey] || [];
+      const id = "places-" + key;
+      const dl = h("datalist", { id }, ...list.map((x) => h("option", { value: x.label })));
+      const i = h("input", { list: id, value: val || "", class: "comboIn", autocomplete: "off",
+        placeholder: list.length ? `Choose or type (${list.length.toLocaleString()} in the Registry)` : "Type",
+        title: places.stale ? `Registry list from ${String(places.fetched_at || "").slice(0, 10)} (the Registry could not be reached)` : "Choose from the Registry's list, or type a new name" });
+      const open = h("button", { type: "button", class: "comboBtn", title: "Show the list", tabindex: "-1", onclick: () => {
+        const keep = i.value; i.value = ""; i.focus(); try { i.showPicker?.(); } catch { /* not supported */ }
+        i.addEventListener("blur", () => { if (!i.value) i.value = keep; }, { once: true });
+      } }, "▾");
+      f[key] = i;
+      return h("span", { class: "combo" }, i, open, dl);
+    };
+    const placeSearch = (key, val) => {
+      const lists = [["location", "Zone"], ["property_area", "Area"], ["layout_type", "Layout"]];
+      const id = "places-" + key;
+      const dl = h("datalist", { id }, ...lists.flatMap(([k, kind]) => (places[k] || []).map((x) => h("option", { value: x.label, label: kind }))));
+      const n = lists.reduce((t, [k]) => t + (places[k] || []).length, 0);
+      const i = h("input", { list: id, value: val || "", style: "flex:1;min-width:0", autocomplete: "off",
+        placeholder: n ? `Type to search ${n.toLocaleString()} Registry places` : "Location",
+        title: places.stale ? `Registry list from ${String(places.fetched_at || "").slice(0, 10)} (the Registry could not be reached)` : "From the Registry: zones, areas and layouts" });
+      f[key] = i;
+      return h("span", { style: "flex:1;min-width:0;display:flex" }, i, dl);
+    };
+    const placeSelect = (key, list, val) => {
+      if (!list || !list.length) return txt(key, val);
+      const labels = list.map((x) => x.label);
+      const s = h("select", { style: "flex:1;min-width:0", title: places.stale ? `Registry list from ${String(places.fetched_at || "").slice(0, 10)} (the Registry could not be reached)` : "From the Registry" },
+        h("option", { value: "" }, ""),
+        val && !labels.includes(val) ? h("option", { value: val, selected: true }, /^\d+$/.test(val) ? `${val} (Aumentum code)` : val) : null,
+        ...labels.map((l) => h("option", { value: l, selected: l === val }, l)));
+      f[key] = s; return s;
+    };
 
     const general = h("div", {},
       ro("UPIN:", "— assigned on commit —"),
@@ -2280,7 +2786,9 @@ async function parcelAttrDialog(opts = {}) {
       row("Property Type:", sel("property_type", PROPERTY_TYPES, pv("property_type", link.property_type || "Land Parcel"))),
       row("Property Number:", txt("property_number", pv("property_number", link.property_number || jobNo))),
       row("Plot:", txt("plot", pv("plot", link.plot || ""))),
-      row("Location:", txt("location", pv("location", ""))),
+      row("Location:", placeCombo("location", "location", pv("location", regProp?.location || ""))),
+      row("Layout:", placeCombo("layout", "layout_type", pv("layout", regProp?.layout || ""))),
+      row("Area:", placeCombo("area_name", "property_area", pv("area_name", regProp?.area || ""))),
       row("Plan Number:", txt("plan_number", pv("plan_number", link.plan_number || ""))),
       row("LGA:", sel("lga", ["", ...PLATEAU_LGAS], pv("lga", link.lga || ""))),
       row("Status:", sel("status", PARCEL_STATUSES, pv("status", "Active"))),
@@ -2298,13 +2806,14 @@ async function parcelAttrDialog(opts = {}) {
 
     const collect = () => {
       const o = {};
-      for (const k of ["parcel_name", "block", "property_type", "property_number", "plot", "location", "plan_number", "lga", "status", "surveyor_general", "lrs_id"]) {
+      for (const k of ["parcel_name", "block", "property_type", "property_number", "plot", "location", "layout", "area_name", "plan_number", "lga", "status", "surveyor_general", "lrs_id"]) {
         const v = (f[k]?.value || "").trim(); if (v) o[k] = v;
       }
       return o;
     };
     const w = floatWindow(opts.title || "Update Parcel Attribute", h("div", {}, h("div", { class: "attrTabs" }, tabG, tabS), general, survey,
       h("div", { class: "taskNav" },
+        opts.commitLabel ? h("button", { class: "btn btnPrimary", title: "Save the attributes, then commit the job's parcel(s)", onclick: () => { w.remove(); resolve({ ...collect(), __commit: true }); } }, opts.commitLabel) : null,
         h("button", { class: "btn", onclick: () => { w.remove(); resolve(collect()); } }, opts.saveLabel || "Save parcel"),
         h("button", { class: "btn", onclick: () => { w.remove(); resolve(null); } }, "Cancel"))),
       { id: "parcelAttrWin", width: 340 });
@@ -2313,13 +2822,13 @@ async function parcelAttrDialog(opts = {}) {
 }
 async function saveSketchPoint() {
   const [E, N] = edit.verts[0];
-  const number = prompt("Control point number:", "");
+  const number = await uiPrompt("Control point number:", "");
   if (number == null || !number.trim()) return;
   try {
     await api("/api/v1/beacons", { method: "POST", body: { number: number.trim(), easting: E, northing: N, is_control: true } });
     status(`Control point ${number.trim()} created at ${E.toFixed(3)} ${N.toFixed(3)}.`);
     await loadBeacons(); clearSketch(); refreshSketchProps(); updateEditorButtons();
-  } catch (e) { alert("Create point failed: " + e.message); }
+  } catch (e) { uiAlert("Create point failed: " + e.message); }
 }
 function saveSketchLine() {
   const ll = edit.verts.map(([e, n]) => toLL(e, n));
@@ -2430,15 +2939,15 @@ function drawCut() {
 function clearCut() { edit.cut = []; if (edit.verts.length) drawSketch(); else map.getSource("sketch")?.setData(empty()); }
 async function finishCut() {
   if (edit.cut.length < 2) { status("Draw a line across the parcel (two or more points)."); return; }
-  if (!state.job) { alert("Open a job (Work On This Job) before cutting its draft parcels."); return; }
+  if (!state.job) { uiAlert("Open a job (Work On This Job) before cutting its draft parcels."); return; }
   const target = draftForCut(edit.cut);
-  if (!target) { alert("The cut line must cross one of the job's draft parcels."); clearCut(); return; }
+  if (!target) { uiAlert("The cut line must cross one of the job's draft parcels."); clearCut(); return; }
   const line = { type: "LineString", coordinates: edit.cut.slice() };
   try {
     const parts = await api(`/api/v1/jobs/${state.job.id}/parcels/${target}/cut`, { method: "POST", body: { line } });
     status(`Parcel cut into ${parts.length} parts.`);
     await loadDrafts(); buildCatalog(); wfRefreshEditing();
-  } catch (e) { alert("Cut failed: " + e.message); }
+  } catch (e) { uiAlert("Cut failed: " + e.message); }
   clearCut();
 }
 // The job draft the cut line crosses: the first whose polygon contains a point sampled along the line.
@@ -2488,7 +2997,7 @@ async function editDraftAttributes(id) {
   const attrs = await parcelAttrDialog({ prefill, parcelId: id, areaM2, title: "Update Parcel Attribute", saveLabel: "Save attributes" });
   if (attrs === null) return;
   try { await api(`/api/v1/parcels/${id}/attributes`, { method: "PUT", body: attrs }); status("Parcel attributes updated."); }
-  catch (e) { alert("Update failed: " + e.message); }
+  catch (e) { uiAlert("Update failed: " + e.message); }
 }
 // Area (m², UTM 32N) of a polygon feature (lng/lat), via the shoelace formula on its outer ring.
 function featureAreaM2(f) {
@@ -2557,20 +3066,160 @@ function openCreateFeatures() {
   floatWindow("Create Features", h("div", {}, h("div", { class: "cfHdr" }, "Create Features"), search, tlist, ctools, jobLine), { id: "createFeaturesWin", width: 240 });
 }
 
+// --- Corner identification: what each sketched corner is (fabric beacon, shared corner, new) ---
+// Asked of the server after each change (debounced), so the corner list shows beacon numbers as
+// the digitiser clicks; Verify Points asks again before saving.
+const sketchIdent = { key: "", list: [], timer: null };
+const vertsKey = (verts) => verts.map(([e, n]) => `${e.toFixed(3)},${n.toFixed(3)}`).join(";");
+async function identifyVertices(verts) {
+  if (!verts.length) return [];
+  return api("/api/v1/beacons/identify", { method: "POST", body: { vertices: verts.map(([e, n]) => [e, n]) } });
+}
+function scheduleIdentify() {
+  const key = vertsKey(edit.verts);
+  if (key === sketchIdent.key) return;
+  clearTimeout(sketchIdent.timer);
+  sketchIdent.timer = setTimeout(async () => {
+    const verts = edit.verts.map((v) => v.slice());
+    try {
+      const list = await identifyVertices(verts);
+      if (vertsKey(edit.verts) !== vertsKey(verts)) return; // the sketch moved on meanwhile
+      sketchIdent.key = vertsKey(verts); sketchIdent.list = list; refreshSketchProps();
+    } catch { /* the list stays without beacon names; Verify Points asks again */ }
+  }, 350);
+}
+// How a corner is shown: its beacon number, the committed parcel it shares, or a number typed
+// for it (kept by coordinates), else a temporary P-number.
+function cornerLabel(id, newIndex) {
+  if (!id) return "";
+  if (id.source === "beacon") return id.beacon_number;
+  const typed = pointIds.get(ptKey(id.easting, id.northing));
+  if (typed) return typed;
+  if (id.source === "shared") return `corner of ${id.shared_with[0]}`;
+  return `P${newIndex}`;
+}
+const CORNER_SOURCE = { beacon: "Existing beacon", shared: "Shared corner", new: "New point" };
+// Verify Points (before attributes): every corner, its beacon, coordinates, where it came from and
+// the distance to the next corner. New points can be numbered here (from the surveyor's plan);
+// those numbers fill the Beacon Numbers window at commit. Resolves true to go on, false to go back.
+async function verifyPoints(utm) {
+  let ids;
+  try { ids = await identifyVertices(utm); }
+  catch (e) { await uiAlert("The corners could not be checked: " + e.message + "\nThe sketch is kept; try Finish Sketch again."); return false; }
+  let k = 0;
+  const inputs = [];
+  const tbl = h("table", { class: "verifyTbl" },
+    h("tr", {}, h("th", {}, "#"), h("th", {}, "Beacon"), h("th", {}, "Easting"), h("th", {}, "Northing"), h("th", {}, "Source"), h("th", {}, "To next (m)")));
+  ids.forEach((id, i) => {
+    const isNew = id.source !== "beacon";
+    const label = cornerLabel(id, isNew && !pointIds.get(ptKey(id.easting, id.northing)) ? ++k : 0);
+    const cell = isNew
+      ? h("input", { class: "uiInput", style: "margin:0;width:118px", value: pointIds.get(ptKey(id.easting, id.northing)) || "", placeholder: label })
+      : h("b", {}, label);
+    if (isNew) inputs.push([id, cell]);
+    const src = id.source === "shared" ? `Shared corner (${id.shared_with.join(", ")})` : CORNER_SOURCE[id.source];
+    const tr = h("tr", { class: `src-${id.source}`, title: "Show this corner on the map" },
+      h("td", { class: "n" }, String(i + 1)), h("td", {}, cell), h("td", {}, fmt3(id.easting)), h("td", {}, fmt3(id.northing)),
+      h("td", {}, src, id.offset_m ? h("span", { class: "muted" }, ` ${(id.offset_m * 100).toFixed(1)} cm`) : null), h("td", { class: "n" }, id.next_distance_m.toFixed(2)));
+    tr.addEventListener("click", (ev) => {
+      if (ev.target.tagName === "INPUT") return;
+      edit.sel = i; drawSketch(); map.easeTo({ center: toLL(id.easting, id.northing), zoom: Math.max(map.getZoom(), 19) });
+      tbl.querySelectorAll("tr.selrow").forEach((r) => r.classList.remove("selrow")); tr.classList.add("selrow");
+    });
+    tbl.append(tr);
+  });
+  const counts = ["beacon", "shared", "new"].map((s) => [s, ids.filter((x) => x.source === s).length]).filter(([, n]) => n)
+    .map(([s, n]) => `${n} ${CORNER_SOURCE[s].toLowerCase()}${n > 1 ? "s" : ""}`).join(", ");
+  const body = h("div", {},
+    h("p", {}, h("b", {}, `${ids.length} corners`), `: ${counts}. Area ${area2(sketchAreaM2())} m².`),
+    h("p", { class: "muted" }, "Check each corner against the survey plan. Click a row to see it on the map. Type the plan's beacon number for a new point if you have it (it can also be entered at commit)."),
+    h("div", { class: "verifyWrap" }, tbl));
+  const ok = await uiDialog({ title: "Verify Points", message: body, kind: "info", width: 720,
+    buttons: [{ label: "Back to sketch", value: false, cancel: true }, { label: "Confirm points", value: true, primary: true }] });
+  if (!ok) return false;
+  for (const [id, inp] of inputs) { const v = inp.value.trim().toUpperCase(); if (v) rememberPointId(id.easting, id.northing, v); }
+  return true;
+}
+
+// --- System check (before the next stage, and again at commit on the server) ---
+// Overlaps here and in Aumentum, the drop point (is the plot free?), a title on the land, and the
+// Registry transaction. A failure sends the digitiser back to the sketch; warnings need a reason,
+// which is recorded. Resolves true to go on.
+const CHECK_MARK = { pass: "✔", warn: "!", fail: "✕", skipped: "–" };
+function precheckTable(report) {
+  return h("table", { class: "verifyTbl checkTbl" },
+    ...report.items.map((i) => h("tr", { class: `chk-${i.result}` },
+      h("td", { class: "chkIcon" }, CHECK_MARK[i.result] || "?"), h("td", {}, h("b", {}, i.label)), h("td", { style: "white-space:normal" }, i.detail))));
+}
+async function runPrecheck(utm) {
+  if (!wf.editing?.job_instance_id) return true; // not a workflow job: the commit rules still apply
+  const id = wf.editing.job_instance_id;
+  status("System check: overlaps here and in Aumentum, drop point, title on the land, Registry transaction…");
+  const wait = h("div", { class: "toast" }, "Running the system check…"); document.body.append(wait);
+  let report;
+  try { report = await api(`/api/v1/wf/jobs/${id}/precheck`, { method: "POST", body: { vertices: utm, editing_id: edit.editingId || null } }); }
+  catch (e) { wait.remove(); await uiAlert("The system check could not run: " + e.message + "\nThe sketch is kept; try Finish Sketch again."); return false; }
+  wait.remove();
+  if (report.ok && !report.warnings) { notify("System check passed: the plot is free, no overlap, no title on the land."); return true; }
+  const fails = report.items.filter((i) => i.result === "fail").length;
+  const body = h("div", {},
+    h("p", {}, report.ok ? "The system check found warnings. Look at them before going on." : h("b", {}, `The system check failed (${fails} problem${fails > 1 ? "s" : ""}). Nothing can be committed on this land.`)),
+    h("div", { class: "verifyWrap" }, precheckTable(report)));
+  const buttons = report.ok
+    ? [{ label: "Back to sketch", value: false, cancel: true }, { label: "Continue…", value: true, primary: true }]
+    : [{ label: "Back to sketch", value: false, cancel: true, primary: true }];
+  const go = await uiDialog({ title: "System Check", message: body, kind: report.ok ? "warn" : "error", width: 720, buttons });
+  if (!go || !report.ok) return false;
+  const reason = await uiPrompt("Why go on despite the warnings? (recorded with the job)", "", { title: "System Check" });
+  if (!reason || !reason.trim()) return false;
+  try { await api(`/api/v1/wf/jobs/${id}/precheck`, { method: "POST", body: { vertices: utm, editing_id: edit.editingId || null, acknowledge: reason.trim() } }); }
+  catch (e) { await uiAlert("Going on was refused: " + e.message); return false; }
+  return true;
+}
+
+// --- Confirmation from the Registry (10.10.10.5) after a commit ---
+// Read back, read-only: the committed parcels readable by the Registry, the job the Registry finds
+// for its transaction, the transaction, the property and the Registry's job record. Kept on the job;
+// Re-check asks again (e.g. when the Registry was down, or after the admin linked).
+async function registryConfirmDialog(jobId, opts = {}) {
+  for (;;) {
+    const wait = h("div", { class: "toast" }, "Asking the Registry (10.10.10.5)…"); document.body.append(wait);
+    let c;
+    try { c = await api(`/api/v1/wf/jobs/${jobId}/registry-confirmation`, { method: "POST" }); }
+    catch (e) { wait.remove(); await uiAlert("The Registry confirmation could not run: " + e.message); return; }
+    wait.remove();
+    const when = fmtDT(c.checked_at);
+    const body = h("div", {},
+      opts.headline ? h("p", {}, h("b", {}, opts.headline)) : null,
+      h("p", {}, c.ok ? h("b", { style: "color:#138a2a" }, "Confirmed by the Registry.") : h("b", { style: "color:#c62020" }, "Not confirmed: see the crosses below."),
+        ` Checked ${when}${c.checked_by ? " by " + c.checked_by : ""}.`),
+      h("div", { class: "verifyWrap" }, precheckTable(c)));
+    const again = await uiDialog({ title: "Registry Confirmation", message: body, kind: c.ok ? "info" : "error", width: 720,
+      buttons: [{ label: "Re-check", value: true }, { label: "Close", value: false, primary: true, cancel: true }] });
+    if (!again) return c;
+  }
+}
+
 // --- Edit Sketch Properties window (live X/Y vertex table) ---
 function openSketchProps() {
-  const tbl = h("table", { class: "legs" }, h("tr", {}, h("th", {}, "#"), h("th", {}, "X (Easting)"), h("th", {}, "Y (Northing)"), h("th", {}, "")));
+  const tbl = h("table", { class: "legs" }, h("tr", {}, h("th", {}, "#"), h("th", {}, "Beacon"), h("th", {}, "X (Easting)"), h("th", {}, "Y (Northing)"), h("th", {}, "")));
+  const known = sketchIdent.key === vertsKey(edit.verts) ? sketchIdent.list : null;
+  let newNo = 0;
   edit.verts.forEach(([E, N], i) => {
+    const id = known && known[i];
+    const bcell = h("td", { class: id ? `src-${id.source}` : "muted", title: id ? (id.source === "shared" ? `Shared corner (${id.shared_with.join(", ")})` : CORNER_SOURCE[id.source]) : "Checking…" },
+      id ? cornerLabel(id, id.source !== "beacon" && !pointIds.get(ptKey(id.easting, id.northing)) ? ++newNo : 0) : "…");
     const x = h("input", { type: "number", step: "0.001", value: E.toFixed(3), style: "width:92px" });
     const y = h("input", { type: "number", step: "0.001", value: N.toFixed(3), style: "width:92px" });
     x.oninput = () => { const v = parseFloat(x.value); if (isFinite(v)) { edit.verts[i][0] = v; drawSketch(); } };
     y.oninput = () => { const v = parseFloat(y.value); if (isFinite(v)) { edit.verts[i][1] = v; drawSketch(); } };
-    const tr = h("tr", { class: i === edit.sel ? "selrow" : "" }, h("td", { class: "n" }, String(i + 1)), h("td", {}, x), h("td", {}, y),
+    const tr = h("tr", { class: i === edit.sel ? "selrow" : "" }, h("td", { class: "n" }, String(i + 1)), bcell, h("td", {}, x), h("td", {}, y),
       h("td", {}, h("button", { title: "Delete vertex", onclick: () => { edit.verts.splice(i, 1); edit.sel = Math.min(edit.sel, edit.verts.length - 1); drawSketch(); openSketchProps(); updateEditorButtons(); } }, "✕")));
     tr.addEventListener("click", (ev) => { if (!/INPUT|BUTTON/.test(ev.target.tagName)) { edit.sel = i; drawSketch(); openSketchProps(); } });
     tbl.append(tr);
   });
-  if (!edit.verts.length) tbl.append(h("tr", {}, h("td", { colspan: 4, class: "muted" }, "No points yet: click the map, or type / paste coordinates below.")));
+  if (!edit.verts.length) tbl.append(h("tr", {}, h("td", { colspan: 5, class: "muted" }, "No points yet: click the corners on the map. Beacons and shared corners are recognised as you click.")));
+  scheduleIdentify();
   // Typing points: Easting/Northing, a beacon number (its coordinates), or a pasted point list.
   const addPts = (pts) => {
     if (!edit.active) startEditing("sketch"); // typing can start the edit session (Che)
@@ -2611,26 +3260,35 @@ function openSketchProps() {
     if (!pts.length) { status("No coordinates found in the pasted text."); return; }
     addPts(pts); status(`Added ${pts.length} point(s).`);
   };
+  // Digitising needs no point list: corners come from the map clicks. Typing or pasting
+  // coordinates (COGO, a surveyor's list) stays one click away; the choice is remembered.
+  let showEntry = false; try { showEntry = localStorage.getItem("cad.sketchEntry") === "1"; } catch { /* storage unavailable */ }
+  const entry = h("div", { class: showEntry ? "" : "hidden" },
+    h("div", { class: "frow" }, xIn, yIn, h("button", { class: "btn", style: "min-width:0", onclick: addXY }, "Add")),
+    h("div", { class: "frow" }, bIn, h("button", { class: "btn", style: "min-width:0", onclick: addBeacon }, "Add beacon")),
+    paste, h("div", { class: "frow" }, h("button", { class: "btn", onclick: addPasted }, "Add pasted points")));
+  const entryToggle = h("a", { href: "#", class: "linkish", style: "display:inline-block;margin:6px 0 2px", onclick: (ev) => {
+    ev.preventDefault(); const on = entry.classList.toggle("hidden") === false;
+    try { localStorage.setItem("cad.sketchEntry", on ? "1" : "0"); } catch { /* storage unavailable */ }
+    ev.target.textContent = on ? "Hide coordinate entry" : "Type / paste coordinates…";
+  } }, showEntry ? "Hide coordinate entry" : "Type / paste coordinates…");
   const body = h("div", {},
     h("div", { class: "muted" }, `${edit.editingId ? "Editing draft parcel — " : ""}${edit.template === "jobArea" ? "job area" : edit.geomType} sketch — ${edit.verts.length} vertex(es), WGS 84 / UTM 32N metres`),
     h("div", { style: "max-height:260px;overflow:auto" }, tbl),
-    h("div", { class: "cfHdr", style: "margin-top:6px" }, "Add points"),
-    h("div", { class: "frow" }, xIn, yIn, h("button", { class: "btn", style: "min-width:0", onclick: addXY }, "Add")),
-    h("div", { class: "frow" }, bIn, h("button", { class: "btn", style: "min-width:0", onclick: addBeacon }, "Add beacon")),
-    paste, h("div", { class: "frow" }, h("button", { class: "btn", onclick: addPasted }, "Add pasted points")),
+    entryToggle, entry,
     h("div", { class: "taskNav" },
       h("button", { class: "btn", disabled: !canFinishSketch(), onclick: finishSketch }, edit.editingId ? "Save Changes" : "Finish Sketch"),
       h("button", { class: "btn", disabled: !edit.verts.length, onclick: deleteSketch }, edit.editingId ? "Cancel Edit" : "Delete Sketch"),
       edit.editingId ? h("button", { class: "btn", onclick: deleteDraftBeingEdited }, "Delete Parcel") : null));
-  floatWindow("Edit Sketch Properties", body, { id: "sketchPropsWin", width: 340 });
+  floatWindow("Edit Sketch Properties", body, { id: "sketchPropsWin", width: 430 });
 }
 function refreshSketchProps() { if ($("sketchPropsWin")) openSketchProps(); }
 async function deleteDraftBeingEdited() {
-  if (!edit.editingId || !state.job || !confirm("Delete this draft parcel from the job?")) return;
+  if (!edit.editingId || !state.job || !(await uiConfirm("Delete this draft parcel from the job?", { ok: "Delete", kind: "warn" }))) return;
   try {
     await api(`/api/v1/jobs/${state.job.id}/parcels/${edit.editingId}`, { method: "DELETE" });
     clearSketch(); await loadDrafts(); wfRefreshEditing(); refreshSketchProps(); updateEditorButtons(); status("Draft parcel deleted.");
-  } catch (e) { alert("Delete failed: " + e.message); }
+  } catch (e) { uiAlert("Delete failed: " + e.message); }
 }
 
 /* =====================================================================================
@@ -2818,7 +3476,7 @@ function connectionLineDialog() {
 // Donut Parcel / Parcel Separation: the current sketch is applied to a draft parcel clicked next.
 let pickDraftMode = null;
 function startPickDraft(mode) {
-  if (!state.job) { alert("Choose the job first (Workflow → Work On This Job)."); return; }
+  if (!state.job) { uiAlert("Choose the job first (Workflow → Work On This Job)."); return; }
   pickDraftMode = mode; setTool("pickDraft");
   status(mode === "donut" ? "Create Donut Parcel: click the draft parcel the sketch is a hole in." : "Parcel Separation: click the draft parcel the sketched line separates.");
 }
@@ -2841,7 +3499,7 @@ async function pickDraftAt(pt) {
 }
 // Create Parcel by FCI: a polygon feature class (shapefile) becomes the job's draft parcels.
 function fciDialog() {
-  if (!state.job) { alert("Choose the job first (Workflow → Work On This Job)."); return; }
+  if (!state.job) { uiAlert("Choose the job first (Workflow → Work On This Job)."); return; }
   const node = cat.nodes.get(cat.selected);
   const catShp = node && node.folder != null && /\.shp$/i.test(node.path || "") ? node : null;
   const src = h("select", {}, catShp ? h("option", { value: "catalog" }, `Selected in the Catalog: ${catShp.name}`) : null, h("option", { value: "pc" }, "A shapefile on this PC"));
@@ -2884,7 +3542,7 @@ function fciDialog() {
 const selectedUpins = () => selectedFC().features.map((f) => f.properties.parcel_number).filter(Boolean);
 function needWorkflowJob() {
   if (wf.editing) return wf.editing.job_instance_id;
-  alert("Open the job in the Workflow panel and choose Work On This Job first."); return null;
+  uiAlert("Open the job in the Workflow panel and choose Work On This Job first."); return null;
 }
 async function afterMutation(msg) {
   clearSketch(); refreshSketchProps(); updateEditorButtons();
@@ -2905,7 +3563,7 @@ const MUTATION_LABEL = { split: "Split", merge: "Merge", resurvey: "Adjust (re-s
 function startSplitLine(kind = "split") {
   const verb = kind === "separate" ? "separate" : "split";
   const u = selectedUpins();
-  if (u.length !== 1) { alert(`Select the one parcel to ${verb} first (Select tool).`); return; }
+  if (u.length !== 1) { uiAlert(`Select the one parcel to ${verb} first (Select tool).`); return; }
   if (!needWorkflowJob()) return;
   if (!edit.active) startEditing("sketch");
   clearSketch(); selectTemplate("line"); edit.splitMode = kind; setTool("sketch"); openSketchProps();
@@ -2914,28 +3572,28 @@ function startSplitLine(kind = "split") {
 async function mutationSplit() {
   const kind = edit.splitMode === "separate" ? "separate" : "split";
   const u = selectedUpins();
-  if (u.length !== 1) { alert(`Select the one parcel to ${kind} (Select tool).`); return; }
-  if (edit.verts.length < 2) { alert("Sketch the line across the parcel first."); return; }
+  if (u.length !== 1) { uiAlert(`Select the one parcel to ${kind} (Select tool).`); return; }
+  if (edit.verts.length < 2) { uiAlert("Sketch the line across the parcel first."); return; }
   const line = { type: "LineString", coordinates: edit.verts.map((v) => [...v]) };
   edit.splitMode = false;
   await recordMutation({ kind, upins: u, line }, (r) => `${MUTATION_LABEL[kind]} of ${u[0]} recorded: ${r.drafts.length} new parcels (drafts). They replace it when the job's parcels are committed.`);
 }
 async function mutationMerge() {
   const u = selectedUpins();
-  if (u.length < 2) { alert("Select two or more neighbouring parcels to merge (Select tool, Shift-click to add)."); return; }
-  if (!confirm(`Merge ${u.join(" + ")} into one parcel?`)) return;
+  if (u.length < 2) { uiAlert("Select two or more neighbouring parcels to merge (Select tool, Shift-click to add)."); return; }
+  if (!(await uiConfirm(`Merge ${u.join(" + ")} into one parcel?`))) return;
   await recordMutation({ kind: "merge", upins: u }, `Merge of ${u.join(" + ")} recorded (a draft). It replaces them when the job's parcels are committed.`);
 }
 // Aumentum: an adjustment takes n adjacent parcels to n (each new parcel's parents: all n); a
 // free mutation X parcels to Y (reshape, separate or delete the copies). New UPINs for all.
 async function mutationResurvey() {
   const u = selectedUpins();
-  if (!u.length) { alert("Select the parcel(s) to adjust (Select tool; Shift-click to add adjacent parcels)."); return; }
+  if (!u.length) { uiAlert("Select the parcel(s) to adjust (Select tool; Shift-click to add adjacent parcels)."); return; }
   await recordMutation({ kind: "resurvey", upins: u }, `Adjustment of ${u.join(" + ")} recorded: edit the ${u.length > 1 ? "copies" : "copy"} with the Edit tool; ${u.length > 1 ? "they replace them" : `it replaces ${u[0]}`} (new UPINs) at commit.`);
 }
 async function mutationFree() {
   const u = selectedUpins();
-  if (!u.length) { alert("Select the parcel(s) for the free mutation (Select tool; Shift-click to add adjacent parcels)."); return; }
+  if (!u.length) { uiAlert("Select the parcel(s) for the free mutation (Select tool; Shift-click to add adjacent parcels)."); return; }
   await recordMutation({ kind: "free", upins: u }, `Free mutation of ${u.join(" + ")} recorded: reshape, separate or delete the copies; they replace ${u.join(" + ")} (new UPINs) at commit.`);
 }
 // Aumentum's Separation Configuration: which part keeps the parent's UPIN and attributes.
@@ -2945,7 +3603,7 @@ async function mutationKeepUpin(jobId, m, draft) {
 }
 function mutationRetire() {
   const u = selectedUpins();
-  if (!u.length) { alert("Select the parcel(s) to retire (Select tool)."); return; }
+  if (!u.length) { uiAlert("Select the parcel(s) to retire (Select tool)."); return; }
   if (!needWorkflowJob()) return;
   const reason = h("input", { placeholder: "e.g. RE-SURVEYED, overlapping, WRONGLY DONE", style: "flex:1" });
   const go = async () => { if (!reason.value.trim()) { reason.focus(); return; } w.remove(); await recordMutation({ kind: "retire", upins: u, reason: reason.value.trim() }, `Retirement of ${u.join(", ")} recorded; applied when the job is committed.`); };
@@ -2954,15 +3612,15 @@ function mutationRetire() {
     h("div", { class: "frow" }, h("label", {}, "Reason:"), reason), h("div", { class: "frow", style: "justify-content:flex-end" }, h("button", { class: "btn", onclick: go }, "Retire"))), { id: "retireWin", width: 400 });
   setTimeout(() => reason.focus(), 0);
 }
-function lineageOfSelection() {
+async function lineageOfSelection() {
   const u = selectedUpins();
   if (u.length) { lineageWindow(u[0]); return; }
-  const v = prompt("Parcel UPIN:", ""); if (v && v.trim()) lineageWindow(v.trim());
+  const v = await uiPrompt("Parcel UPIN:", ""); if (v && v.trim()) lineageWindow(v.trim());
 }
 // Lineage: where a parcel came from and what it became (Aumentum's history and mutations made here).
 async function lineageWindow(upin) {
   let d;
-  try { d = await api(`/api/v1/parcels/lineage?upin=${encodeURIComponent(upin)}`); } catch (e) { alert(e.message); return; }
+  try { d = await api(`/api/v1/parcels/lineage?upin=${encodeURIComponent(upin)}`); } catch (e) { uiAlert(e.message); return; }
   const body = h("div", {});
   const link = (u) => u ? h("a", { href: "#", onclick: (ev) => { ev.preventDefault(); lineageWindow(u); } }, u) : "?";
   const groups = new Map();
@@ -3207,7 +3865,7 @@ function drawStyle() {
     bold: $("fmtB")?.classList.contains("active"), italic: $("fmtI")?.classList.contains("active"), underline: $("fmtU")?.classList.contains("active") };
 }
 function addGraphic(g) { const id = crypto.randomUUID?.() || String(Date.now()); state.graphics.push({ id, ...drawStyle(), ...g }); renderGraphics(); return id; }
-function addTextGraphic(ll) { const text = prompt("Text:", "Text"); if (text) addGraphic({ type: "text", at: [ll.lng, ll.lat], text }); }
+async function addTextGraphic(ll) { const text = await uiPrompt("Text:", "Text"); if (text) addGraphic({ type: "text", at: [ll.lng, ll.lat], text }); }
 const gfxMarkers = [];
 function renderGraphics() {
   saveGraphics();
@@ -3252,7 +3910,7 @@ const wf = { defs: null, filter: "open", jobType: "", q: "", jobs: [], total: 0,
 };
 const wfOpen = () => !$("wfBody").classList.contains("hidden");
 function showWorkflow(on) {
-  if (on) showRegistry(false);
+  if (on) { showRegistry(false); showCompleted(false); }
   $("wfBody").classList.toggle("hidden", !on);
   if (on) { $("tasksBody").classList.add("hidden"); $("tocBody").classList.add("hidden"); document.querySelector("#tocPane .hscroll").classList.add("hidden"); }
   else if (!tasksOpen()) { $("tocBody").classList.remove("hidden"); document.querySelector("#tocPane .hscroll").classList.remove("hidden"); }
@@ -3266,6 +3924,128 @@ async function openWorkflow() {
   }
   await wfLoadJobs(true);
 }
+/* =====================================================================================
+ * Completed tab: every completed job (this editor's and Aumentum's), newest first, with its
+ * metadata — Registry transaction and property, UPIN(s), committed / linked date and time, the
+ * plan sent — and what the Registry (10.10.10.5) holds for it, read live for the page shown.
+ * A committed job is completed (the end of digitising). From here: Title deed plan, Registry
+ * confirmation, Withdraw plan (the parcel stays), and Correct (reopen with the parcel back as a
+ * draft keeping its UPIN; commit again, then resend the corrected plan).
+ * ===================================================================================== */
+const done = { q: "", source: "", jobs: [], total: 0, offset: 0, busy: false, err: "", regErr: "", loaded: false };
+const doneOpen = () => !!$("doneBody") && !$("doneBody").classList.contains("hidden");
+function showCompleted(on) {
+  const body = $("doneBody"); if (!body) return;
+  const pane = $("tocPane");
+  if (on && !done.widened && pane.getBoundingClientRect().width < 380) { done.widened = pane.style.width || "auto"; pane.style.width = "380px"; setTimeout(() => map.resize(), 0); }
+  if (!on && done.widened) { pane.style.width = done.widened === "auto" ? "" : done.widened; done.widened = null; setTimeout(() => map.resize(), 0); }
+  body.classList.toggle("hidden", !on);
+  const title = document.querySelector("#tocPane .paneHead > span");
+  if (on) {
+    if (title) title.textContent = "Completed Jobs";
+    ["wfBody", "tasksBody", "regBody", "tocBody"].forEach((id) => $(id).classList.add("hidden"));
+    document.querySelector("#tocPane .hscroll").classList.add("hidden");
+  } else if (!tasksOpen() && !wfOpen() && !regOpen()) {
+    if (title) title.textContent = "Table Of Contents";
+    $("tocBody").classList.remove("hidden"); document.querySelector("#tocPane .hscroll").classList.remove("hidden");
+  }
+}
+async function openCompleted() {
+  if ($("tocPane").classList.contains("hidden")) togglePane("tocPane");
+  showWorkflow(false); showRegistry(false); showTasks(false);
+  showCompleted(true); buildTocTools();
+  if (!done.loaded) await doneLoad(true); else renderCompleted();
+}
+async function doneLoad(reset) {
+  if (reset) { done.offset = 0; done.jobs = []; }
+  done.busy = true; done.err = ""; renderCompleted();
+  try {
+    const q = new URLSearchParams({ q: done.q, source: done.source, offset: String(done.offset), limit: "50", registry: "1" });
+    const r = await api("/api/v1/wf/completed?" + q);
+    done.jobs = done.jobs.concat(r.jobs); done.total = r.total; done.offset = done.jobs.length; done.regErr = r.registry_error || ""; done.loaded = true;
+  } catch (e) { done.err = e.message; }
+  done.busy = false; renderCompleted();
+}
+const doneParcels = (j) => (j.parcels || []).filter((p) => p && p.upin);
+function doneCard(j) {
+  const parcels = doneParcels(j);
+  const reg = j.registry;
+  const upins = parcels.map((p) => p.upin);
+  const firstUpin = upins[0] || reg?.upin || null;
+  const committedAt = parcels[0]?.committed_at || j.completed;
+  const linked = parcels.filter((p) => p.linked);
+  const plan = j.plan;
+  const planText = !plan ? "Not sent from this editor"
+    : plan.action === "registry_plan_withdrawn" ? `Withdrawn ${fmtDT(plan.at)}${plan.by ? " by " + plan.by : ""}${plan.reason ? " — " + plan.reason : ""}`
+    : `${plan.resend ? "Corrected plan resent" : "Sent"} ${fmtDT(plan.at)}${plan.by ? " by " + plan.by : ""}${plan.file ? " (" + plan.file + ")" : ""}`;
+  const regText = !reg ? (done.regErr ? "Registry not reached" : "—")
+    : !reg.found ? "Not found in the Registry"
+    : `${reg.status}; property ${reg.property || "—"}${reg.refnum ? " (" + reg.refnum + ")" : ""}${reg.upin ? `, holds ${reg.upin}` : ", no UPIN yet"}${reg.linked_at ? `, linked ${fmtDT(reg.linked_at)}` : ""}`;
+  const mine = j.source === "cadastre";
+  const actions = [];
+  if (firstUpin) actions.push(regLink("Zoom", "Zoom to the parcel", () => registryZoom(firstUpin)));
+  actions.push(regLink("Open job", "Open the job in the Workflow", async () => { await openWorkflow(); await wfSelect(j.id); }));
+  if (mine) actions.push(regLink("Registry check", "Ask the Registry whether the committed parcels are visible there", () => registryConfirmDialog(j.id)));
+  if (mine && upins.length) actions.push(regLink("Title deed plan", "Open the title deed plan (form, sheet, PDF, send)", () => titleDeedDialog(j.id, upins[0])));
+  if (mine && plan && plan.action === "registry_plan_sent") actions.push(regLink("Withdraw plan", "Mark the plan sent to the Registry as withdrawn (the parcel and UPIN stay)", () => doneWithdraw(j)));
+  if (j.can_correct && upins.length) actions.push(regLink("Correct", "Reopen the job to fix the parcel (same UPIN), then commit again and resend the plan", () => doneCorrect(j, parcels)));
+  const conf = j.confirmation;
+  return h("div", { class: "regCard " + (mine ? "job" : "gone"), title: "Double-click to zoom", ondblclick: () => firstUpin && registryZoom(firstUpin) },
+    h("div", { class: "regCardTop" }, h("span", { class: "regUpin" }, j.property_number || j.name || "#" + j.id),
+      h("span", { class: "regPill " + (mine ? "ok" : "gone") }, mine ? "Plagis editor" : "Aumentum")),
+    regStatus(linked.length ? "job" : "wait", linked.length ? `Linked: ${linked.map((p) => p.upin).join(", ")}` : upins.length ? `Committed ${upins.join(", ")} · not linked yet` : "Completed (no parcel found)"),
+    h("div", { class: "regKv" },
+      h("div", {}, h("i", {}, "Job"), `${j.name || ""} (#${j.id}) · ${j.job_type}`),
+      h("div", {}, h("i", {}, "Transaction"), j.transaction_number || "—"),
+      h("div", {}, h("i", {}, "Committed"), committedAt ? `${fmtDT(committedAt)}${j.completed_by && mine ? " by " + j.completed_by : ""}` : "—"),
+      linked.length ? h("div", {}, h("i", {}, "Linked"), linked.map((p) => `${p.upin} ${p.linked_at ? fmtD(p.linked_at) : ""}${p.lrs_id ? " → " + p.lrs_id : ""}`).join("; ")) : null,
+      h("div", {}, h("i", {}, "Plan"), planText),
+      h("div", {}, h("i", {}, "Registry"), regText),
+      conf ? h("div", {}, h("i", {}, "Confirmed"), `${conf.ok ? "✔" : "✕"} ${fmtDT(conf.at)}`) : null),
+    h("div", { class: "regCardFoot" }, h("span", { class: "regLinks" }, ...actions)));
+}
+function renderCompleted() {
+  const box = $("doneBody"); if (!box) return;
+  box.innerHTML = "";
+  const q = h("input", { class: "tinput", value: done.q, placeholder: "File, transaction or UPIN (e.g. PL68928)", style: "flex:1;min-width:0" });
+  const run = () => { done.q = q.value.trim(); doneLoad(true); };
+  q.addEventListener("keydown", (e) => e.key === "Enter" && run());
+  const src = h("select", { onchange: (e) => { done.source = e.target.value; doneLoad(true); } },
+    ...[["", "All"], ["cadastre", "Plagis editor"], ["aumentum", "Aumentum"]].map(([v, l]) => h("option", { value: v, selected: done.source === v }, l)));
+  box.append(h("div", { class: "frow", style: "margin:6px 8px 2px" }, q, h("button", { class: "btn", style: "min-width:0", onclick: run }, "Find"), src),
+    h("div", { class: "muted", style: "margin:0 8px 4px" }, done.busy && !done.jobs.length ? "Loading…" : `${done.total.toLocaleString()} completed job(s)${done.q ? ` matching “${done.q}”` : ""}, newest first`),
+    done.regErr ? h("div", { class: "muted", style: "margin:0 8px 4px;color:#a35a00" }, `Registry details not shown: ${done.regErr}`) : null,
+    done.err ? h("div", { style: "margin:0 8px 4px;color:#b00" }, done.err) : null);
+  for (const j of done.jobs) box.append(doneCard(j));
+  if (done.jobs.length < done.total) box.append(h("div", { class: "frow", style: "margin:6px 8px 10px" },
+    h("button", { class: "btn", disabled: done.busy, onclick: () => doneLoad(false) }, done.busy ? "Loading…" : `More (${(done.total - done.jobs.length).toLocaleString()} left)`)));
+}
+async function doneWithdraw(j) {
+  const reason = await uiPrompt(`Withdraw the title deed plan of ${j.property_number || j.name} from Registry transaction ${j.transaction_number}?\n\nThe plan documents in the transaction are marked WITHDRAWN (nothing is deleted in the Registry) and the saved title deed form is cleared. The parcel and its UPIN stay. Reason:`, "", { title: "Withdraw Plan", ok: "Withdraw" });
+  if (!reason || !reason.trim()) return;
+  try {
+    const r = await api(`/api/v1/wf/jobs/${j.id}/registry/withdraw-plan`, { method: "POST", body: { reason: reason.trim() } });
+    notify(`Plan withdrawn in ${r.transaction_number} (${r.withdrawn.length} document(s) marked).` + (r.failed.length ? ` Not marked: ${r.failed.join("; ")}.` : ""), r.failed.length ? "warn" : "ok");
+    await doneLoad(true);
+  } catch (e) { uiAlert("Withdraw failed: " + e.message); }
+}
+async function doneCorrect(j, parcels) {
+  let upin = parcels[0].upin;
+  if (parcels.length > 1) {
+    const pick = await uiPrompt(`Which parcel of ${j.name} to correct? (${parcels.map((p) => p.upin).join(", ")})`, upin, { title: "Correct" });
+    if (!pick) return; upin = pick.trim().toUpperCase();
+  }
+  const reason = await uiPrompt(`Correct ${upin}?\n\nThe job is reopened at its commit step with ${upin} back as a draft (it keeps this UPIN). Fix the shape, beacons or attributes, commit again, then resend the corrected plan. Refused if the parcel is linked in the Registry (unlink it there first). Reason:`, "", { title: "Correct", ok: "Reopen to correct" });
+  if (!reason || !reason.trim()) return;
+  try {
+    const r = await api(`/api/v1/wf/jobs/${j.id}/correct`, { method: "POST", body: { upin, reason: reason.trim() } });
+    for (const b of r.beacons || []) rememberPointId(b.easting, b.northing, b.number);
+    done.loaded = false;
+    await openWorkflow(); await wfSelect(j.id); await wfWorkOn(j.id);
+    notify(`${upin} is a draft of ${j.name} again (it keeps its UPIN). Fix it, then Commit; resend the corrected plan after.`);
+  } catch (e) { uiAlert("Correct refused: " + e.message); }
+}
+
 /* =====================================================================================
  * Phase 5 — Registry tab (apart from the Workflow). The server reads the Aumentum Registry every
  * minute and records each property the Registry admin links to a parcel (the parcel's link
@@ -3286,8 +4066,8 @@ function showRegistry(on) {
   $("regBody").classList.toggle("hidden", !on);
   const title = document.querySelector("#tocPane .paneHead > span");
   if (title) title.textContent = on ? "Registry" : "Table Of Contents";
-  if (on) { $("wfBody").classList.add("hidden"); $("tasksBody").classList.add("hidden"); $("tocBody").classList.add("hidden"); document.querySelector("#tocPane .hscroll").classList.add("hidden"); }
-  else if (!tasksOpen() && !wfOpen()) { $("tocBody").classList.remove("hidden"); document.querySelector("#tocPane .hscroll").classList.remove("hidden"); }
+  if (on) { showCompleted(false); $("wfBody").classList.add("hidden"); $("tasksBody").classList.add("hidden"); $("tocBody").classList.add("hidden"); document.querySelector("#tocPane .hscroll").classList.add("hidden"); }
+  else if (!tasksOpen() && !wfOpen() && !doneOpen()) { $("tocBody").classList.remove("hidden"); document.querySelector("#tocPane .hscroll").classList.remove("hidden"); }
 }
 async function openRegistry(opts = {}) {
   if ($("tocPane").classList.contains("hidden")) togglePane("tocPane");
@@ -3320,15 +4100,15 @@ async function registryZoom(upin) {
 async function registryStartJob(l) {
   const types = (wf.defs?.job_types || []).filter((t) => t.active && t.start_task_id);
   const type = types.find((t) => t.id === 9) || types[0];
-  if (!type) { alert("No active job type to start."); return; }
+  if (!type) { uiAlert("No active job type to start."); return; }
   const name = `Job-${l.property_number || l.upin}`;
-  if (!confirm(`Start a "${type.name}" job ${name} for Registry transaction ${l.transaction_number} (parcel ${l.upin})?`)) return;
+  if (!(await uiConfirm(`Start a "${type.name}" job ${name} for Registry transaction ${l.transaction_number} (parcel ${l.upin})?`, { ok: "Start job" }))) return;
   try {
     const d = await api("/api/v1/wf/jobs", { method: "POST", body: { job_type_id: type.id, name, lrs_transaction_number: l.transaction_number, comment: `Registry property ${l.su_id} linked to ${l.upin} on ${regTime(l.linked_at)}` } });
     await registryLoad(); renderRegistry(); await registryZoom(l.upin);
     status(`Job ${d.job.id} (${name}) started on "${d.job.current_task}". Open it in Workflow, choose Work On This Job, then input the survey points.`);
-    if (confirm(`Job ${name} started. Open it in the Workflow now to input the points?`)) registryOpenJob(d.job.id);
-  } catch (e) { alert(e.message); }
+    if (await uiConfirm(`Job ${name} started. Open it in the Workflow now to input the points?`, { ok: "Open job", cancel: "Not now" })) registryOpenJob(d.job.id);
+  } catch (e) { uiAlert(e.message); }
 }
 async function registryOpenJob(id) { await openWorkflow(); await wfSelect(id); }
 // --- transaction lookup, link / unlink (Aumentum LinkageManager.LinkParcel) ---
@@ -3360,7 +4140,7 @@ async function regSendPlan(fileId, fileName, resend) {
   const ask = resend
     ? `Resend the corrected plan ${asPdf} to Registry transaction ${t}?\n\nIt is filed as "Survey Plan (corrected)", and the plan sent before is marked as replaced. Nothing is deleted in the Registry.`
     : `Send the plan ${asPdf} to Registry transaction ${t}?\nIt is filed in the transaction as a Title Deed Plan (PDF).`;
-  if (!confirm(ask)) return;
+  if (!(await uiConfirm(ask, { ok: resend ? "Resend" : "Send" }))) return;
   await regRun(resend ? "Resend plan" : "Send plan", async () => {
     const r = await api(`/api/v1/wf/jobs/${reg.job.id}/registry/send-plan`, { method: "POST", body: { file_id: fileId, resend: !!resend } });
     const done = `${r.file_name} ${r.resend ? "resent (corrected)" : "sent"} to ${r.transaction_number}.`;
@@ -3499,7 +4279,7 @@ async function regFind(q) {
   reg.finding = false; renderRegistry();
 }
 async function regStartDigitising(f) {
-  if (!confirm(`Start digitising ${f.property_number || f.transaction_number}?\nA "Deed Plan Creationv2" job is created for Registry transaction ${f.transaction_number}, as the Registry created them.`)) return;
+  if (!(await uiConfirm(`Start digitising ${f.property_number || f.transaction_number}?\nA "Deed Plan Creationv2" job is created for Registry transaction ${f.transaction_number}, as the Registry created them.`, { ok: "Start digitising" }))) return;
   await regRun("Start digitising", async () => {
     const r = await api("/api/v1/registry/start-digitising", { method: "POST", body: { transaction_number: f.transaction_number, property_number: f.property_number } });
     notify(r.created ? `${r.name} created.` : `${r.name || "The job"} was already open for ${f.transaction_number}.`);
@@ -3528,11 +4308,23 @@ function regFindView(box) {
       h("div", { class: "regKv" },
         h("div", {}, h("i", {}, "Transaction"), f.transaction_number),
         h("div", {}, h("i", {}, "Property"), f.su_id || "—"),
-        h("div", {}, h("i", {}, "UPIN"), f.upin || "— (given at commit; the Registry links it)")),
+        h("div", {}, h("i", {}, "UPIN"), f.upin || "— (given at commit; the Registry links it)"),
+        regMetaRow(f)),
       h("div", { class: "regCardFoot" }, h("span", { class: "regLinks" }, regLink("Zoom", "Zoom to the parcel", () => registryZoom(f.upin), !linked)), main)));
   }
 }
 
+// Committed / linked date and time on a Registry file card (filled in when the metadata arrives).
+function regMetaRow(f) {
+  if (!f.upin && !f.job_instance_id) return null;
+  const v = h("span", { class: "muted" }, "…");
+  parcelMeta({ upins: f.upin ? [f.upin] : [], jobs: f.job_instance_id ? [f.job_instance_id] : [] }).then((list) => {
+    const m = list.find((x) => x.upin === f.upin) || list.find((x) => x.committed_at) || null;
+    v.classList.remove("muted");
+    v.textContent = !m || !m.committed_at ? "Not committed yet" : `${m.upin}: committed ${metaCommitted(m)}; linked: ${metaLinked(m)}`;
+  });
+  return h("div", {}, h("i", {}, "Committed"), v);
+}
 function regSendView(box, writes) {
   const jobId = reg.job ? reg.job.id : (wf.editing ? wf.editing.job_instance_id : wf.selected);
   if (!reg.job && jobId) { box.append(h("p", { class: "regEmpty" }, "Loading the job…")); regSetJob(jobId).then(renderRegistry); return; }
@@ -3704,6 +4496,8 @@ function wfDetailView(d) {
     box.append(ol);
   }
   if (j.is_open) box.append(wfEditingView(j, wf.selEditing));
+  else box.append(h("div", { class: "frow", style: "margin:6px 0" },
+    h("button", { class: "btn", title: "Ask the Registry (10.10.10.5) whether this job's committed parcels are visible there", onclick: () => registryConfirmDialog(j.id) }, "Registry Confirmation")));
   if (j.is_open) {
     const comment = h("textarea", { rows: 2, placeholder: "Comment for this task (optional)", style: "width:100%;box-sizing:border-box" });
     const assign = h("select", { style: "flex:1;min-width:0" }, h("option", { value: "" }, "Default assignee"),
@@ -3743,7 +4537,7 @@ async function wfAction(url, body, done) {
     wf.selEditing = await api(`/api/v1/wf/jobs/${wf.detail.job.id}/editing`).catch(() => wf.selEditing);
     if (wf.editing && wf.editing.job_instance_id === wf.detail.job.id) wf.editing = wf.selEditing;
     status(done);
-  } catch (e) { status(e.message); alert(e.message); }
+  } catch (e) { status(e.message); uiAlert(e.message); }
   finally { wf.busy = false; renderWorkflow(); }
 }
 function wfEndDialog(j) {
@@ -3770,7 +4564,7 @@ function wfNewJobDialog() {
       try {
         const d = await api("/api/v1/wf/jobs", { method: "POST", body: { job_type_id: Number(type.value), name: name.value || null, lrs_transaction_number: lrs.value || null, comment: comment.value || null } });
         w.remove(); wf.filter = "open"; wf.q = ""; await wfLoadJobs(true); wf.selected = d.job.id; wf.detail = d; renderWorkflow(); status(`Job ${d.job.id} created on "${d.job.current_task}".`);
-      } catch (e) { alert(e.message); }
+      } catch (e) { uiAlert(e.message); }
     } }, "Create"))), { id: "wfNewWin", width: 380 });
 }
 
@@ -3804,7 +4598,7 @@ async function wfWorkOn(jobId) {
     showJobArea();
     if (wf.editing.area) zoomToFC({ type: "FeatureCollection", features: [{ type: "Feature", geometry: wf.editing.area, properties: {} }] });
     status(wf.editing.area ? `Working on ${wf.detail?.job?.name || "job " + jobId}: draw parcels inside its job area, then Post Parcel & Finish.` : `Working on ${wf.detail?.job?.name || "job " + jobId}: sketch the parcel — its job area is created automatically — then Post Parcel & Finish.`);
-  } catch (e) { alert(e.message); }
+  } catch (e) { uiAlert(e.message); }
   renderWorkflow();
 }
 async function wfEditAction(method, path, done, body) {
@@ -3816,7 +4610,7 @@ async function wfEditAction(method, path, done, body) {
     else status(done);
     await loadDrafts(); showJobArea();
     wf.detail = await api("/api/v1/wf/jobs/" + id);
-  } catch (e) { alert(e.message); }
+  } catch (e) { uiAlert(e.message); }
   renderWorkflow();
 }
 // Commit Parcels: the officer types the beacon number of every corner, from the surveyor's point
@@ -3824,17 +4618,100 @@ async function wfEditAction(method, path, done, body) {
 // fabric beacon keep its number. A point list (ID Easting Northing per line, as Trimble Business
 // Center prints it) can be pasted to fill the numbers of the corners at those coordinates.
 // opts.submit(beacons): post the numbers some other way (Post Parcel & Finish Job) instead of /commit.
+// Committed by: picked from the users list (search by name or login), or added when the person is
+// not in it; recorded in the audit log with the commit (name and user id). The last pick is
+// remembered on this PC.
+const staffKey = "cad.staff";
+function lastStaff() { try { return JSON.parse(localStorage.getItem(staffKey) || "null"); } catch { return null; } }
+function keepStaff(v) { try { localStorage.setItem(staffKey, JSON.stringify(v)); } catch { /* storage unavailable */ } }
+let staffUsers = null;
+async function loadStaffUsers(force) {
+  if (!staffUsers || force) {
+    try { staffUsers = (await api("/api/v1/wf/principals")).filter((p) => p.is_user && !p.is_locked); } catch { staffUsers = staffUsers || []; }
+  }
+  return staffUsers;
+}
+const normName = (s) => String(s || "").toLowerCase().replace(/[^a-z0-9 ]+/g, " ").replace(/\s+/g, " ").trim();
+// Users whose name is close to a typed one (same words in another order, initials, one letter off).
+function similarUsers(name) {
+  const t = normName(name); if (!t) return [];
+  const tw = t.split(" ");
+  const close = (a, b) => { if (Math.abs(a.length - b.length) > 1) return false; let i = 0, j = 0, d = 0; while (i < a.length && j < b.length) { if (a[i] === b[j]) { i++; j++; } else { d++; if (d > 1) return false; if (a.length > b.length) i++; else if (b.length > a.length) j++; else { i++; j++; } } } return d + (a.length - i) + (b.length - j) <= 1; };
+  return (staffUsers || []).filter((u) => {
+    const n = normName(u.name || u.code); const nw = n.split(" ");
+    if (n === t || close(n, t)) return true;
+    const shared = tw.filter((w) => w.length > 2 && nw.some((x) => x === w || close(x, w))).length;
+    return shared >= Math.min(2, tw.length);
+  }).slice(0, 5);
+}
+// The picker: a search box with the matching users below, and "Add new staff" at the end.
+function staffPicker() {
+  const last = lastStaff();
+  const st = { sel: last && last.sid ? last : null };
+  const inp = h("input", { class: "tinput", value: st.sel ? st.sel.name : "", placeholder: "Search staff by name or login", autocomplete: "off", style: "width:100%" });
+  const list = h("div", { class: "staffList hidden" });
+  const note = h("div", { class: "muted", style: "font-size:11px;margin-top:2px" }, st.sel ? `Selected: ${st.sel.name} (${st.sel.code})` : "Pick yourself from the list, or add your name.");
+  const pick = (u) => { st.sel = { sid: u.sid, name: u.name || u.code, code: u.code }; inp.value = st.sel.name; note.textContent = `Selected: ${st.sel.name} (${st.sel.code})`; list.classList.add("hidden"); };
+  const addNew = async () => {
+    const name = inp.value.trim().replace(/\s+/g, " ");
+    if (name.length < 3) { note.textContent = "Type the full name first."; inp.focus(); return; }
+    const sim = similarUsers(name);
+    for (const u of sim) {
+      if (await uiConfirm(`Did you mean ${u.name} (${u.code})? They are already a user.`, { title: "Add new staff", ok: `Yes, ${u.name}`, cancel: "No, someone else" })) { pick(u); return; }
+    }
+    const code = await uiPrompt(`Add ${name} as a new staff member.\nLogin (letters and digits):`, (name.split(" ").length > 1 ? name[0] + name.split(" ").pop() : name).toLowerCase().replace(/[^a-z0-9]/g, ""), { title: "Add new staff", ok: "Add" });
+    if (code === null) return;
+    try {
+      const u = await api("/api/v1/wf/principals", { method: "POST", body: { name, code } });
+      await loadStaffUsers(true); pick(u); notify(`${u.name} added to the users (${u.code}).`);
+    } catch (e) { uiAlert("Adding the staff member failed: " + e.message); }
+  };
+  const render = () => {
+    const q = normName(inp.value);
+    const users = (staffUsers || []).filter((u) => !q || normName(`${u.name || ""} ${u.code}`).includes(q)).slice(0, 8);
+    list.innerHTML = "";
+    for (const u of users) list.append(h("div", { class: "staffRow", onmousedown: (e) => { e.preventDefault(); pick(u); } }, h("b", {}, u.name || u.code), h("span", { class: "muted" }, ` (${u.code})`)));
+    if (inp.value.trim() && !users.some((u) => normName(u.name) === q)) list.append(h("div", { class: "staffRow add", onmousedown: (e) => { e.preventDefault(); list.classList.add("hidden"); addNew(); } }, `➕ Add new staff: ${inp.value.trim()}`));
+    if (!users.length && !inp.value.trim()) list.append(h("div", { class: "staffRow muted" }, "No users loaded."));
+    list.classList.toggle("hidden", !list.children.length);
+  };
+  inp.addEventListener("input", () => { st.sel = null; note.textContent = "Pick from the list, or add a new staff member."; render(); });
+  inp.addEventListener("focus", () => loadStaffUsers().then(render));
+  inp.addEventListener("blur", () => setTimeout(() => list.classList.add("hidden"), 150));
+  inp.addEventListener("keydown", (e) => { if (e.key === "Escape") list.classList.add("hidden"); });
+  loadStaffUsers();
+  return {
+    el: h("div", { class: "staffPick" }, inp, list, note),
+    focus: () => inp.focus(),
+    // The picked user; a typed name that is exactly a user's is taken as that user.
+    get: () => {
+      if (st.sel) return st.sel;
+      const q = normName(inp.value); const u = q && (staffUsers || []).find((x) => normName(x.name) === q || x.code.toLowerCase() === q);
+      if (u) { pick(u); return st.sel; }
+      return null;
+    },
+  };
+}
+async function askStaff() {
+  const p = staffPicker();
+  const ok = await uiDialog({ title: "Commit", message: h("div", {}, h("p", {}, h("b", {}, "Committed by"), " (recorded in the audit log):"), p.el), kind: "question", width: 440,
+    buttons: [{ label: "Commit", value: true, primary: true }, { label: "Cancel", value: false, cancel: true }] });
+  if (!ok) return null;
+  const s = p.get(); if (!s) { await uiAlert("Pick the staff member from the list (or add them) to commit."); return null; }
+  keepStaff(s); return s;
+}
 async function wfCommitDialog(opts = {}) {
   const id = wf.editing?.job_instance_id; if (!id) { status("Choose Work On This Job first."); return; }
   let pts;
-  try { pts = await api(`/api/v1/wf/jobs/${id}/editing/corners`); } catch (e) { alert(e.message); return; }
-  if (!pts.length && opts.submit) { try { await opts.submit([]); } catch (e) { alert(e.message); } return; }
+  try { pts = await api(`/api/v1/wf/jobs/${id}/editing/corners`); } catch (e) { uiAlert(e.message); return; }
+  if (!pts.length && opts.submit) { const staff = await askStaff(); if (!staff) return; try { await opts.submit([], staff); } catch (e) { uiAlert(e.message); } return; }
   if (!pts.length) {
     const ret = (wf.mutations || []).filter((m) => m.kind === "retire");
-    if (!ret.length) { alert("The job has no draft parcels to commit."); return; }
-    if (!confirm(`Commit the retirement of ${ret.flatMap((m) => m.parents).join(", ")}?`)) return;
+    if (!ret.length) { uiAlert("The job has no draft parcels to commit."); return; }
+    if (!(await uiConfirm(`Commit the retirement of ${ret.flatMap((m) => m.parents).join(", ")}?`, { ok: "Commit" }))) return;
+    const staff = await askStaff(); if (!staff) return;
     try {
-      const r = await api(`/api/v1/wf/jobs/${id}/commit`, { method: "POST", body: { beacons: [] } });
+      const r = await api(`/api/v1/wf/jobs/${id}/commit`, { method: "POST", body: { beacons: [], staff_name: staff.name, staff_sid: staff.sid } });
       wf.editing = r.editing; wf.selEditing = wf.editing; await Promise.all([loadParcels(false), loadDrafts()]); loadHistory();
       notify(`Retired: ${r.retired.join(", ")}.`); wf.detail = await api("/api/v1/wf/jobs/" + id); await wfRefreshEditing(); renderWorkflow();
     } catch (e) { notify("Commit failed: " + e.message, "err"); }
@@ -3876,24 +4753,30 @@ async function wfCommitDialog(opts = {}) {
     msg.style.color = unmatched.length ? "#b06000" : "#060";
     msg.textContent = `Filled ${filled} corner(s).` + (unmatched.length ? ` Not a corner of these parcels: ${unmatched.join(", ")}.` : "");
   } }, "Fill from point list");
+  const staffP = staffPicker();
   const commitBtn = h("button", { class: "btn", onclick: async () => {
     const beacons = pts.filter((p) => !p.beacon_number).map((p) => ({ easting: p.easting, northing: p.northing, number: inputs.get(p.point).value.trim() }));
     const blank = pts.filter((p) => !p.beacon_number && !inputs.get(p.point).value.trim()).map((p) => p.point);
     if (blank.length) { msg.style.color = "#b00"; msg.textContent = `Enter the beacon number of point(s) ${blank.join(", ")}.`; inputs.get(blank[0]).focus(); return; }
+    const staff = staffP.get();
+    if (!staff) { msg.style.color = "#b00"; msg.textContent = "Committed by: pick the staff member from the list, or add them (it is recorded in the audit log)."; staffP.focus(); return; }
+    keepStaff(staff);
     commitBtn.disabled = true; msg.style.color = ""; msg.textContent = "Committing…";
     if (opts.submit) {
-      try { await opts.submit(beacons); w.remove(); src()?.setData(empty()); }
+      try { await opts.submit(beacons, staff); w.remove(); src()?.setData(empty()); }
       catch (e) { commitBtn.disabled = false; msg.style.color = "#b00"; msg.textContent = e.message; }
       return;
     }
     try {
-      const r = await api(`/api/v1/wf/jobs/${id}/commit`, { method: "POST", body: { beacons } });
+      const r = await api(`/api/v1/wf/jobs/${id}/commit`, { method: "POST", body: { beacons, staff_name: staff.name, staff_sid: staff.sid } });
       w.remove(); src()?.setData(empty());
       wf.editing = r.editing; wf.selEditing = wf.editing;
       await Promise.all([loadParcels(false), loadBeacons(), loadDrafts()]); showJobArea();
       notify(`Committed ${r.parcel_numbers.length} parcel(s): ${r.parcel_numbers.join(", ")}; ${r.beacons_added.length} beacon(s) added.` + (r.retired?.length ? ` Replaced / retired: ${r.retired.join(", ")}.` : ""));
       loadHistory(); await wfRefreshEditing();
       wf.detail = await api("/api/v1/wf/jobs/" + id); renderWorkflow();
+      if (r.parcel_numbers.length) await registryConfirmDialog(id, { headline: `Committed: ${r.parcel_numbers.join(", ")}.` });
+      if (wf.detail?.job && !wf.detail.job.is_open) await goHome(r.parcel_numbers);
     } catch (e) { commitBtn.disabled = false; msg.style.color = "#b00"; msg.textContent = e.message; }
   } }, opts.label || "Commit");
   // The UPIN(s) this commit will give, and whether Aumentum was asked (parallel run). Advisory.
@@ -3915,7 +4798,8 @@ async function wfCommitDialog(opts = {}) {
   const w = floatWindow(opts.title || "Commit Parcels — Beacon Numbers", h("div", {},
     upinLine,
     h("p", { class: "muted", style: "margin:0 0 6px" }, `${pts.length} corner point(s), numbered on the map. Type each beacon number from the surveyor's point list.`),
-    h("div", { style: "max-height:320px;overflow:auto" }, t), paste, h("div", { class: "frow" }, fill), msg,
+    h("div", { style: "max-height:320px;overflow:auto" }, t), paste, h("div", { class: "frow" }, fill),
+    h("div", { style: "margin-top:6px" }, h("b", {}, "Committed by:"), staffP.el), msg,
     h("div", { class: "frow", style: "justify-content:flex-end" }, commitBtn, h("button", { class: "btn", onclick: () => { w.remove(); src()?.setData(empty()); } }, "Cancel"))),
     { id: "commitWin", width: 440 });
   redraw();
@@ -3936,6 +4820,7 @@ function wfEditingView(j, e) {
   const working = wf.editing && wf.editing.job_instance_id === j.id;
   if (!working) {
     sec.append(h("div", { class: "frow" }, h("button", { class: "btn", onclick: () => wfWorkOn(j.id) }, "Work On This Job"),
+      h("button", { class: "btn", title: "Ask the Registry (10.10.10.5) whether this job's committed parcels are visible there", onclick: () => registryConfirmDialog(j.id) }, "Registry Confirmation"),
       h("span", { class: "muted" }, e?.drafts ? `${e.drafts} draft parcel(s)` : e?.area ? "Job area defined" : "")));
     return sec;
   }
@@ -3944,9 +4829,11 @@ function wfEditingView(j, e) {
   sec.append(h("div", { class: "frow", style: "flex-wrap:wrap" },
     h("button", { class: "btn", onclick: wfDrawJobArea }, ed.area ? "Edit Job Area" : "Create Job Area"),
     ed.area ? h("button", { class: "btn", onclick: () => wfEditAction("POST", `/area/${ed.area_status === "closed" ? "reopen" : "close"}`, ed.area_status === "closed" ? "Job area reopened." : "Job area closed.") }, ed.area_status === "closed" ? "Reopen Job Area" : "Close Job Area") : null,
-    ed.area ? h("button", { class: "btn", onclick: () => { if (confirm("Delete the job area?")) wfEditAction("DELETE", "/area", "Job area deleted."); } }, "Delete Job Area") : null,
-    h("button", { class: "btn", disabled: !ed.drafts, onclick: () => { if (confirm(`Discard the job's ${ed.drafts} uncommitted parcel(s)?`)) wfEditAction("POST", "/discard", "Draft parcels discarded."); } }, "Discard Changes"),
+    ed.area ? h("button", { class: "btn", onclick: async () => { if (await uiConfirm("Delete the job area?", { ok: "Delete", kind: "warn" })) wfEditAction("DELETE", "/area", "Job area deleted."); } }, "Delete Job Area") : null,
+    h("button", { class: "btn", disabled: !ed.drafts, onclick: async () => { if (await uiConfirm(`Discard the job's ${ed.drafts} uncommitted parcel(s)?`, { ok: "Discard", kind: "warn" })) wfEditAction("POST", "/discard", "Draft parcels discarded."); } }, "Discard Changes"),
     h("button", { class: "btn", onclick: async () => { await loadDrafts(); await wfSelect(j.id); status("Reloaded from the fabric."); } }, "Reload"),
+    h("button", { class: "btn", title: "Ask the Registry (10.10.10.5) whether this job's committed parcels are visible there", onclick: () => registryConfirmDialog(j.id) }, "Registry Confirmation"),
+    h("button", { class: "btn", title: "The actual view of the plot on the satellite imagery, with overlaps and titles", onclick: orthoOpen }, "Orthophoto"),
     ed.is_commit_task ? h("button", { class: "btn", disabled: !ed.drafts && !(wf.mutations || []).length, title: "Give the job's draft parcels their UPINs and add them to the fabric", onclick: () => wfCommitDialog() }, "Commit Parcels…") : null));
   // Mutations recorded in the job (Phase 4), applied when the parcels are committed.
   if ((wf.mutations || []).length) {
@@ -3958,8 +4845,8 @@ function wfEditingView(j, e) {
         ...m.drafts.map((d, i) => { const f = state.drafts.features.find((x) => String(x.properties.id) === String(d));
           return h("option", { value: d, selected: m.keeps_upin === d }, `part ${i + 1} keeps ${m.parents[0]}${f && f.properties.computed_area ? ` (${area2(f.properties.computed_area)} m²)` : ""}`); })) : null;
       ul.append(h("li", {}, what, " ", keep, " ", h("button", { class: "btn", style: "min-width:0;padding:0 6px", title: "Cancel this mutation (its draft parcels are removed)", onclick: async () => {
-        if (!confirm(`Cancel: ${what}?`)) return;
-        try { await api(`/api/v1/wf/jobs/${ed.job_instance_id}/mutations/${m.group}`, { method: "DELETE" }); await afterMutation("Mutation cancelled."); } catch (e) { alert(e.message); }
+        if (!(await uiConfirm(`Cancel: ${what}?`, { ok: "Cancel it", cancel: "Keep", kind: "warn" }))) return;
+        try { await api(`/api/v1/wf/jobs/${ed.job_instance_id}/mutations/${m.group}`, { method: "DELETE" }); await afterMutation("Mutation cancelled."); } catch (e) { uiAlert(e.message); }
       } }, "Cancel")));
     }
     sec.append(h("div", { class: "wfSub", style: "margin-top:6px" }, "Mutations (applied at commit)"), ul);
@@ -3978,24 +4865,25 @@ async function wfFinishCurrent() {
   const id = wf.editing?.job_instance_id;
   if (!id) { status("Work on a job (Workflow pane) before posting."); return; }
   let job = wf.detail && wf.detail.job && wf.detail.job.id === id ? wf.detail.job : null;
-  if (!job) { try { job = (await api("/api/v1/wf/jobs/" + id)).job; } catch (e) { alert(e.message); return; } }
+  if (!job) { try { job = (await api("/api/v1/wf/jobs/" + id)).job; } catch (e) { uiAlert(e.message); return; } }
   await wfFinishJob(job);
 }
-async function wfFinishJob(j) {
+async function wfFinishJob(j, opts = {}) {
   const ed = wf.editing;
   if (!ed || !ed.drafts) { status("Draw a parcel first."); return; }
-  if (!confirm(`Post ${ed.drafts} parcel(s) and finish job ${j.name || "#" + j.id}?\nThis allocates the official UPIN(s) and completes the workflow.`)) return;
+  if (!opts.skipConfirm && !(await uiConfirm(`Post ${ed.drafts} parcel(s) and finish job ${j.name || "#" + j.id}?\nThis allocates the official UPIN(s) and completes the workflow.`, { ok: "Post & Finish" }))) return;
   // The new corners' beacon numbers first, as for Commit Parcels.
-  await wfCommitDialog({ title: "Post Parcel & Finish Job — Beacon Numbers", label: "Post & Finish", submit: (beacons) => wfFinishPost(j, beacons) });
+  await wfCommitDialog({ title: "Post Parcel & Finish Job — Beacon Numbers", label: "Post & Finish", submit: (beacons, staff) => wfFinishPost(j, beacons, staff) });
 }
-async function wfFinishPost(j, beacons) {
+async function wfFinishPost(j, beacons, staff) {
   if (wf.busy) return; wf.busy = true;
   try {
-    const r = await api(`/api/v1/wf/jobs/${j.id}/finish`, { method: "POST", body: { complete: true, beacons } });
+    const r = await api(`/api/v1/wf/jobs/${j.id}/finish`, { method: "POST", body: { complete: true, beacons, staff_name: staff?.name, staff_sid: staff?.sid } });
     const nums = (r.parcel_numbers || []).join(", ") || "(none)";
     status(r.completed ? `Done — ${nums} posted; job completed.` : `${nums} posted.`);
-    alert(`Parcel posted.\nUPIN: ${nums}\n${r.completed ? "Job completed." : "Job now at: " + (r.job?.current_task || "—")}`);
     await loadParcels(false); await loadDrafts(); showJobArea();
+    const confirmed = registryConfirmDialog(j.id, { headline: `Parcel posted. UPIN: ${nums}. ${r.completed ? "Job completed." : "Job now at: " + (r.job?.current_task || "—")}` });
+    if (r.completed) confirmed.then(() => goHome(r.parcel_numbers || []));
     wf.detail = await api("/api/v1/wf/jobs/" + j.id);
     wf.selEditing = await api(`/api/v1/wf/jobs/${j.id}/editing`).catch(() => wf.selEditing);
     if (wf.editing && wf.editing.job_instance_id === j.id) wf.editing = wf.selEditing;
@@ -4046,7 +4934,7 @@ const TD_SCALES = [250, 500, 750, 1000, 1250, 1500, 2000, 2500, 3000, 4000, 5000
 async function titleDeedDialog(jobId, upin) {
   let d;
   try { d = await api(`/api/v1/wf/jobs/${jobId}/titledeed` + (upin ? `?upin=${encodeURIComponent(upin)}` : "")); }
-  catch (e) { alert("Title deed plan: " + e.message); return; }
+  catch (e) { uiAlert("Title deed plan: " + e.message); return; }
   const p = d.plan, f = p.fields;
   const inp = (key, ph) => h("input", { value: f[key] || "", placeholder: ph || "", style: "width:100%;box-sizing:border-box", "data-k": key });
   const row = (label, el) => h("div", { class: "frow" }, h("label", { style: "min-width:120px" }, label), el);
@@ -4186,7 +5074,7 @@ async function titleDeedDialog(jobId, upin) {
     try {
       const svg = await sheet();
       const w = window.open("", "_blank");
-      if (!w) { alert("Allow pop-ups for this site to preview the plan."); return; }
+      if (!w) { uiAlert("Allow pop-ups for this site to preview the plan."); return; }
       w.document.write(`<!doctype html><html><head><title>Title Deed Plan ${p.upin}</title><style>@page{size:A4;margin:0}body{margin:0;background:#888}
         .page{width:210mm;height:297mm;margin:10px auto;background:#fff;box-shadow:0 0 6px #000}.bar{text-align:center;padding:8px;font:14px sans-serif}
         @media print{body{background:#fff}.page{margin:0;box-shadow:none}.bar{display:none}}</style></head><body>
@@ -4260,10 +5148,10 @@ function wfStepAction(s) {
     case 1007: return { run: needJob(() => openTask("survey")), tip: "Enter the survey (COGO traverse)" };
     // Aumentum's Construct Parcel / Create Parcel steps carry several tools: offer exactly those.
     case 1019: return { run: needJob(() => stepTools("Construct Parcel", [
-      ["Digitize Parcel (Sketch)", () => { edit.template = "parcel"; startEditing("sketch"); selectTemplate("parcel"); }],
+      ["Digitize Parcel (Sketch)", digitizeParcel], ["Orthophoto (actual view of the plot)", orthoOpen],
       ["Import Feature Class…", fciDialog], ["COGO Tools (survey entry)…", () => openTask("survey")], ["Computation Tools (35)…", openComputeTools]])), tip: "Construct the parcel: digitize, import a feature class, or COGO" };
     case 3: return { run: needJob(() => stepTools("Create Parcel", [
-      ["Digitize Parcel (Sketch)", () => { edit.template = "parcel"; startEditing("sketch"); selectTemplate("parcel"); }],
+      ["Digitize Parcel (Sketch)", digitizeParcel],
       ["COGO Tools (survey entry)…", () => openTask("survey")], ["Create Connection Line…", connectionLineDialog], ["Create Multi Point Line…", multiPointLineDialog],
       ["Create Donut Parcel (sketch the hole, then click the parcel)", () => startPickDraft("donut")], ["Parcel Separation (sketch the line, then click the parcel)", () => startPickDraft("separate")],
       ["Move Point…", movePointDialog], ["Point Attributes…", pointAttributesDialog], ["List Control Points…", listControlPoints]])), tip: "Create the parcel with Aumentum's computation tools" };
@@ -4310,7 +5198,7 @@ function wfFilesView(j) {
       const r = await fetch(`/api/v1/wf/jobs/${j.id}/files?name=${encodeURIComponent(file.name)}`, { method: "POST", body: file, headers: { "content-type": "application/octet-stream", ...authHeaders() } });
       if (!r.ok) throw new Error((await r.json().catch(() => ({}))).message || r.statusText);
       status(`${file.name} attached.`); await wfSelect(j.id);
-    } catch (e) { alert("Attaching failed: " + e.message); }
+    } catch (e) { uiAlert("Attaching failed: " + e.message); }
   };
   sec.append(h("div", { class: "frow" }, h("label", {}, "Attach file:"), input));
   return sec;
@@ -4351,12 +5239,12 @@ async function notificationsWindow() {
 const adm = { tab: "users", data: null, settings: [], sel: null };
 async function adminWindow() {
   try { [adm.data, adm.settings] = await Promise.all([api("/api/v1/admin/security"), api("/api/v1/admin/settings")]); if (!wf.defs) wf.defs = await api("/api/v1/wf/definitions"); }
-  catch (e) { alert(e.message); return; }
+  catch (e) { uiAlert(e.message); return; }
   floatWindow("Administration", h("div", { id: "admBody" }), { id: "admWin", width: 700 });
   renderAdmin();
 }
 async function admChange(body) {
-  try { adm.data = await api("/api/v1/admin/change", { method: "POST", body }); renderAdmin(); status("Saved."); } catch (e) { alert(e.message); }
+  try { adm.data = await api("/api/v1/admin/change", { method: "POST", body }); renderAdmin(); status("Saved."); } catch (e) { uiAlert(e.message); }
 }
 function renderAdmin() {
   const root = $("admBody"); if (!root) return; root.innerHTML = "";
@@ -4390,7 +5278,7 @@ function renderAdmin() {
       const add = h("select", {}, h("option", { value: "" }, "+ add…"), ...P.filter((p) => !perms.some(([, s]) => s === p.sid)).map((p) => h("option", { value: p.sid }, p.name || p.code)));
       add.onchange = () => add.value && admChange({ kind: "task_permission", task_id: t.id, sid: Number(add.value), add: true });
       tb.append(h("tr", {}, h("td", {}, t.name), h("td", {}, ...perms.map(([, sid, def]) => h("span", { class: "wfPill " + (def ? "done" : "ended"), style: "display:inline-block;margin:1px", title: "Click to remove; double-click to make default" ,
-        onclick: () => confirm(`Remove ${name(sid)} from "${t.name}"?`) && admChange({ kind: "task_permission", task_id: t.id, sid, add: false }),
+        onclick: async () => (await uiConfirm(`Remove ${name(sid)} from "${t.name}"?`, { ok: "Remove", kind: "warn" })) && admChange({ kind: "task_permission", task_id: t.id, sid, add: false }),
         ondblclick: (e) => { e.stopPropagation(); admChange({ kind: "task_permission", task_id: t.id, sid, add: true, is_default: !def }); } }, (def ? "★ " : "") + name(sid)))), h("td", {}, add)));
     }
     body.append(tb);
@@ -4405,7 +5293,7 @@ function renderAdmin() {
     const tb = h("table", { class: "wfHist" }, h("tr", {}, h("th", {}, "Setting"), h("th", {}, "Value"), h("th", {}, "Source")));
     for (const st of adm.settings) {
       const inp = h("input", { value: st.value ?? "", style: "width:260px", type: /pass|secret/i.test(st.key) ? "password" : "text" });
-      inp.onchange = async () => { try { adm.settings = await api("/api/v1/admin/settings", { method: "PUT", body: { key: st.key, value: inp.value } }); status(`${st.key} saved.`); renderAdmin(); } catch (e) { alert(e.message); } };
+      inp.onchange = async () => { try { adm.settings = await api("/api/v1/admin/settings", { method: "PUT", body: { key: st.key, value: inp.value } }); status(`${st.key} saved.`); renderAdmin(); } catch (e) { uiAlert(e.message); } };
       tb.append(h("tr", {}, h("td", {}, st.key), h("td", {}, inp), h("td", {}, st.source || "")));
     }
     const k = h("input", { placeholder: "e.g. mail.smtp_password", style: "width:220px" }), v = h("input", { style: "width:220px" });
@@ -4436,7 +5324,95 @@ const CAT_DRAG_TYPE = "text/cad-item";
   });
 });
 
+/* =====================================================================================
+ * Page refresh keeps the work: the map view, the open panel, the workflow job being worked on, the
+ * selected job and filters, the Registry lookup, the tool and an unfinished sketch are kept for this
+ * browser tab (sessionStorage, so two tabs on different jobs do not overwrite each other) and put
+ * back after sign-in and the first data load. Signing out forgets them. Nothing is saved until the
+ * restore has finished, so a refresh during start-up cannot overwrite the saved work with a blank page.
+ * ===================================================================================== */
+const SESSION_KEY = "cad.session";
+const SESSION_TOOLS = ["pan", "zoomIn", "zoomOut", "select", "selectEl", "identify", "measure"];
+const savedSession = (() => { try { const s = JSON.parse(sessionStorage.getItem(SESSION_KEY) || "null"); return s && s.v === 1 ? s : null; } catch { return null; } })();
+let sessionRestored = false;
+function snapshotSession() {
+  const c = map.getCenter();
+  return {
+    v: 1, at: Date.now(),
+    view: { center: [c.lng, c.lat], zoom: map.getZoom(), bearing: map.getBearing(), pitch: map.getPitch() },
+    panel: regOpen() ? "registry" : wfOpen() ? "workflow" : doneOpen() ? "completed" : tasksOpen() ? "tasks" : "toc",
+    done: { q: done.q, source: done.source },
+    tocVisible: !$("tocPane").classList.contains("hidden"),
+    tocView: state.tocView,
+    wf: { selected: wf.selected, filter: wf.filter, jobType: wf.jobType, q: wf.q, working: wf.editing?.job_instance_id || null },
+    reg: { view: reg.view, txnNo: reg.txn ? reg.txnNo : "" },
+    job: state.job?.id || null,
+    tool: state.tool,
+    edit: edit.active && edit.verts.length ? { template: edit.template, construction: edit.construction, verts: edit.verts, editingId: edit.editingId } : null,
+  };
+}
+function saveSession() {
+  if (!sessionRestored) return;
+  try { sessionStorage.setItem(SESSION_KEY, JSON.stringify(snapshotSession())); } catch { /* storage unavailable */ }
+}
+window.addEventListener("pagehide", saveSession);
+window.addEventListener("beforeunload", saveSession);
+document.addEventListener("visibilitychange", () => { if (document.visibilityState === "hidden") saveSession(); });
+setInterval(saveSession, 5000); // also survives a crash or a closed laptop lid
+function jumpToSavedView(v) {
+  if (!v || !Array.isArray(v.center) || !v.center.every(Number.isFinite) || !Number.isFinite(v.zoom)) return false;
+  map.jumpTo({ center: v.center, zoom: v.zoom, bearing: v.bearing || 0, pitch: v.pitch || 0 });
+  return true;
+}
+// Pick the worked-on job back up without creating anything (GET, unlike Work On's POST) and
+// without moving the map (the saved view is put back afterwards).
+async function wfResume(jobId) {
+  const ed = await api(`/api/v1/wf/jobs/${jobId}/editing`);
+  if (!ed?.cadastre_job_id) return false;
+  try { const d = await api("/api/v1/wf/jobs/" + jobId); if (d.job && !d.job.is_open) return false; } catch { /* resume anyway */ }
+  wf.editing = ed; wf.selEditing = ed;
+  const job = await api(`/api/v1/jobs/${ed.cadastre_job_id}`);
+  if (!state.jobs.some((x) => x.id === job.id)) state.jobs.unshift(job);
+  renderJobBox(); $("jobBox").value = job.id; await selectJob(job.id);
+  showJobArea();
+  return true;
+}
+async function restoreSession() {
+  const s = savedSession;
+  const step = async (what, fn) => { try { await fn(); } catch (e) { console.warn(`Restore ${what}:`, e); } };
+  try {
+    if (!s) return;
+    const notes = [];
+    if (s.tocVisible === false && !$("tocPane").classList.contains("hidden")) togglePane("tocPane");
+    if (s.tocView && s.tocView !== state.tocView) { state.tocView = s.tocView; buildTocTools(); buildTOC(); }
+    if (s.wf) { wf.filter = s.wf.filter ?? wf.filter; wf.jobType = s.wf.jobType ?? wf.jobType; wf.q = s.wf.q ?? wf.q; }
+    if (s.wf?.working) await step("job", async () => { if (await wfResume(s.wf.working)) notes.push(`working on job ${s.wf.working}`); });
+    else if (s.job && state.jobs.some((j) => j.id === s.job)) await step("job", async () => { renderJobBox(); $("jobBox").value = s.job; await selectJob(s.job); });
+    if (s.panel === "workflow") await step("workflow", async () => { await openWorkflow(); if (s.wf?.selected) await wfSelect(s.wf.selected); });
+    else if (s.panel === "registry") await step("registry", () => openRegistry({ view: s.reg?.view, txn: s.reg?.txnNo || undefined }));
+    else if (s.panel === "tasks") { showTasks(true); buildTocTools(); }
+    else if (s.panel === "completed") await step("completed", () => { if (s.done) { done.q = s.done.q || ""; done.source = s.done.source || ""; } return openCompleted(); });
+    if (s.edit && (s.edit.verts || []).length) await step("sketch", () => {
+      selectTemplate(s.edit.template || edit.template);
+      startEditing("sketch");
+      if (s.edit.construction) edit.construction = s.edit.construction;
+      const verts = (s.edit.verts || []).filter((v) => Array.isArray(v) && v.length >= 2 && v.every(Number.isFinite));
+      if (verts.length) {
+        edit.verts = verts.map((v) => [v[0], v[1]]); edit.sel = edit.verts.length - 1; edit.editingId = s.edit.editingId || null;
+        afterVertexChange();
+        notes.push(`unfinished sketch (${verts.length} vertices)`);
+      }
+    });
+    else if (SESSION_TOOLS.includes(s.tool)) setTool(s.tool);
+    jumpToSavedView(s.view); // last: the steps above may have zoomed elsewhere
+    if (notes.length) notify("Restored after refresh: " + notes.join(", ") + ".");
+  } finally {
+    sessionRestored = true;
+  }
+}
+
 initialDeepLink = initialViewFromURL(); // apply /editor?center=E,N&scale=N before any data arrives
+if (!initialDeepLink && savedSession && jumpToSavedView(savedSession.view)) initialDeepLink = true; // refresh: no fit to all parcels
 buildMenus(); buildToolbars(); buildTocTools(); buildTOC(); renderTask(); buildCatalog(); updateNavButtons(); updateScaleBox(); updateEditorButtons();
 loadCatalogRoots();
 loadCatalogDatabases();
