@@ -5,7 +5,8 @@
 //!   (centre), title no. / address / L.G. area / area and UPIN in red (right), holder (centre);
 //! * frame: the parcel to scale, a cross at each beacon with its number, on each side the bearing
 //!   (degrees at one end, minutes at the other) and the distance, the file no. and area in the
-//!   middle, an optional access road (dashed, parallel to one side), grid values at the frame;
+//!   middle, access roads (dashed, parallel to chosen sides), grid values at the frame's lower
+//!   corners and a tick on its edges every 100 mm of paper (so the ground step follows the scale);
 //! * footer: WGS 1984 co-ordinates of the first beacon, surveyed by / survey date / sheet no. /
 //!   prepared by (left), the computation note and plotted / checked by (centre), the
 //!   Surveyor-General's signature and date lines (right).
@@ -60,10 +61,9 @@ pub struct PlanFields {
     /// along. Two roads on neighbouring sides meet in a junction at their shared beacon.
     pub road_sides: Vec<usize>,
     pub road_label: Option<String>,
-    /// The co-ordinate cross: lines through one beacon labelled with its Easting and Northing.
-    /// `None` = on.
+    /// The grid values and ticks on the frame (Easting / Northing, see `GRID_MM`). `None` = on.
     pub grid: Option<bool>,
-    /// The beacon (corner index in the plan's order) the cross goes through; `None` = the first.
+    /// No longer used (the beacon of an earlier co-ordinate cross); kept so saved forms read.
     pub grid_corner: Option<usize>,
 }
 
@@ -112,6 +112,12 @@ const RED: &str = "#c00000";
 const LINE: &str = "#8b2f2f";
 /// A white outline under labels that may cross a line (beacon numbers, bearings, the road).
 const HALO: &str = r##"stroke="#fff" stroke-width="0.7" paint-order="stroke""##;
+/// A side shorter than this on paper (mm) has no room for its bearing and distance: they are
+/// written in the frame's lower-left corner instead ("N9998V - N9997V = 282°27'@3.78m").
+const SHORT_SIDE_MM: f64 = 12.0;
+/// The grid step on paper, from the frame's lower-left corner: on the ground this is the scale's
+/// tenth in metres (50 m at 1:500, as PL65487's 484781 → 484831).
+const GRID_MM: f64 = 100.0;
 
 /// Put a ring in the plan's order: clockwise, starting at the westernmost corner (south-most on a
 /// tie). A closing vertex equal to the first, and repeated vertices, are dropped.
@@ -220,8 +226,12 @@ pub fn render_svg(d: &PlanData) -> String {
     let (minx, maxx) = corners.iter().fold((f64::MAX, f64::MIN), |(a, b), c| (a.min(c.e), b.max(c.e)));
     let (miny, maxy) = corners.iter().fold((f64::MAX, f64::MIN), |(a, b), c| (a.min(c.n), b.max(c.n)));
     let (ce, cn) = ((minx + maxx) / 2.0, (miny + maxy) / 2.0);
-    let (fx, fy) = ((FRAME.0 + FRAME.2) / 2.0, (FRAME.1 + FRAME.3) / 2.0);
-    let paper = |e: f64, n: f64| (fx + (e - ce) * k, fy - (n - cn) * k);
+    // The parcel is centred in the frame, to the nearest metre: the frame's lower-left corner sits
+    // on a whole-metre Easting and Northing, so the grid values printed from it are exact.
+    let (x0, y0, x1, y1) = FRAME;
+    let e_left = (ce - (x1 - x0) / 2.0 / k).round();
+    let n_bottom = (cn - (y1 - y0) / 2.0 / k).round();
+    let paper = |e: f64, n: f64| (x0 + (e - e_left) * k, y1 - (n - n_bottom) * k);
 
     let mut s = String::new();
     let _ = writeln!(s, r#"<svg xmlns="http://www.w3.org/2000/svg" width="210mm" height="297mm" viewBox="0 0 210 297" font-family="Arial, Helvetica, sans-serif">"#);
@@ -246,9 +256,10 @@ pub fn render_svg(d: &PlanData) -> String {
     text(&mut s, bx, by + 4.2, 2.2, "middle", "", "0");
     text(&mut s, bx + bw, by + 4.2, 2.2, "middle", "", &format!("{} m", bar_m));
 
-    // North arrow.
-    let _ = writeln!(s, r##"<line x1="105" y1="14" x2="105" y2="36" stroke="#000" stroke-width="0.35"/><line x1="99" y1="27" x2="111" y2="27" stroke="#000" stroke-width="0.35"/><path d="M105 12 L103 17 L107 17 Z" fill="#000"/>"##);
-    text(&mut s, 105.0, 11.0, 3.0, "middle", r#"font-weight="bold""#, "N");
+    // North arrow, top centre: the shaft doubled down to its cross, "U.N." either side of the tip.
+    let _ = writeln!(s, r##"<g stroke="#000" stroke-width="0.3"><line x1="105" y1="7" x2="105" y2="46"/><line x1="104.4" y1="16.5" x2="104.4" y2="34.5"/><line x1="105.6" y1="16.5" x2="105.6" y2="34.5"/><line x1="97.5" y1="22" x2="112.5" y2="22"/><line x1="98.5" y1="23.2" x2="111.5" y2="23.2"/></g><path d="M105 6 L104 9 L106 9 Z" fill="#000"/>"##);
+    text(&mut s, 104.2, 14.0, 3.0, "end", r#"font-weight="bold""#, "U.");
+    text(&mut s, 105.8, 14.0, 3.0, "start", r#"font-weight="bold""#, "N.");
 
     // Header, right.
     let rx = 160.0;
@@ -257,19 +268,34 @@ pub fn render_svg(d: &PlanData) -> String {
     text(&mut s, rx, 23.0, 3.0, "middle", r#"font-weight="bold""#, &up(&f.address));
     let lga = up(&f.lga);
     text(&mut s, rx, 28.0, 3.0, "middle", r#"font-weight="bold""#, &if lga.is_empty() { String::new() } else { format!("{lga} L.G. AREA") });
-    text(&mut s, rx, 33.0, 3.0, "middle", &format!(r#"font-weight="bold" fill="{RED}""#), &format!("AREA {} SQUARE METERS", area2(d.area_m2)));
+    text(&mut s, rx, 33.0, 3.0, "middle", &format!(r#"font-weight="bold" fill="{RED}""#), &area_line(d.area_m2));
     text(&mut s, rx, 38.0, 3.0, "middle", &format!(r#"font-weight="bold" fill="{RED}""#), &format!("UPIN {}", esc(&d.upin)));
     text(&mut s, 105.0, 52.0, 3.4, "middle", r#"font-weight="bold""#, &format!("HOLDER: {}", up(&f.holder)));
 
-    // Frame and grid values (the ground co-ordinates of its lower-left corner).
-    let (x0, y0, x1, y1) = FRAME;
+    // Frame and grid: as on the printed plans, the ground co-ordinates of the lower-left corner
+    // (Easting under it, Northing beside the lower-right corner), then a tick on each edge every
+    // `GRID_MM` of paper, labelled outside the frame, in the survey's co-ordinates (UTM).
     let _ = writeln!(s, r##"<rect x="{x0}" y="{y0}" width="{}" height="{}" fill="none" stroke="#1f3f8f" stroke-width="0.5"/>"##, x1 - x0, y1 - y0);
-    let grid_on = f.grid.unwrap_or(true) && !corners.is_empty();
-    if !grid_on {
-        let e_left = ce + (x0 - fx) / k;
-        let n_bottom = cn - (y1 - fy) / k;
-        text(&mut s, x0, y1 + 3.0, 2.0, "start", "", &format!("{:.0}", e_left));
-        let _ = writeln!(s, r#"<text x="{:.2}" y="{:.2}" font-size="2" text-anchor="start" transform="rotate(-90 {:.2} {:.2})">{:.0}</text>"#, x1 + 3.0, y1, x1 + 3.0, y1, n_bottom);
+    if f.grid.unwrap_or(true) && !corners.is_empty() {
+        let upward = |s: &mut String, x: f64, y: f64, anchor: &str, label: &str| {
+            let _ = writeln!(s, r#"<text x="{x:.2}" y="{y:.2}" font-size="2" text-anchor="{anchor}" transform="rotate(-90 {x:.2} {y:.2})">{label}</text>"#);
+        };
+        text(&mut s, x0, y1 + 3.0, 2.0, "start", "", &format!("{e_left:.0} mE"));
+        upward(&mut s, x1 + 2.8, y1, "start", &format!("{n_bottom:.0} mN"));
+        for i in 1..=((x1 - x0) / GRID_MM) as u32 {
+            let gx = x0 + i as f64 * GRID_MM;
+            let label = format!("{:.0} mE", e_left + i as f64 * GRID_MM / k);
+            let _ = writeln!(s, r##"<g stroke="#1f3f8f" stroke-width="0.3"><line x1="{gx:.2}" y1="{y0}" x2="{gx:.2}" y2="{:.2}"/><line x1="{gx:.2}" y1="{y1}" x2="{gx:.2}" y2="{:.2}"/></g>"##, y0 + 3.0, y1 - 3.0);
+            text(&mut s, gx, y0 - 1.2, 2.0, "middle", "", &label);
+            text(&mut s, gx, y1 + 3.0, 2.0, "middle", "", &label);
+        }
+        for i in 1..=((y1 - y0) / GRID_MM) as u32 {
+            let gy = y1 - i as f64 * GRID_MM;
+            let label = format!("{:.0} mN", n_bottom + i as f64 * GRID_MM / k);
+            let _ = writeln!(s, r##"<g stroke="#1f3f8f" stroke-width="0.3"><line x1="{x0}" y1="{gy:.2}" x2="{:.2}" y2="{gy:.2}"/><line x1="{x1}" y1="{gy:.2}" x2="{:.2}" y2="{gy:.2}"/></g>"##, x0 + 3.0, x1 - 3.0);
+            upward(&mut s, x0 - 1.2, gy, "middle", &label);
+            upward(&mut s, x1 + 2.8, gy, "middle", &label);
+        }
     }
 
     // Access road: two dashed lines parallel to the chosen side, outside the parcel.
@@ -342,36 +368,19 @@ pub fn render_svg(d: &PlanData) -> String {
         along(&mut s, m, (m.0 + r.u.0 * r.len, m.1 + r.u.1 * r.len), 0.5, 0.0, 2.8, &label);
     }
 
-    // Co-ordinate cross: blue lines through the chosen beacon, out to the frame on the sides away
-    // from the parcel, labelled with the beacon's Easting and Northing.
-    if grid_on {
-        let gi = f.grid_corner.filter(|&i| i < corners.len()).unwrap_or(0);
-        let (q, c) = (p[gi], &corners[gi]);
-        let down = q.1 >= pcy; // the vertical line runs away from the parcel
-        let right = q.0 >= pcx;
-        let (vy_end, hx_end) = (if down { y1 - 2.0 } else { y0 + 2.0 }, if right { x1 - 2.0 } else { x0 + 2.0 });
-        let (vy_back, hx_back) = (if down { q.1 - 6.0 } else { q.1 + 6.0 }, if right { q.0 - 6.0 } else { q.0 + 6.0 });
-        let _ = writeln!(s, r##"<g stroke="#1f3f8f" stroke-width="0.3"><line x1="{:.2}" y1="{vy_back:.2}" x2="{:.2}" y2="{vy_end:.2}"/><line x1="{hx_back:.2}" y1="{:.2}" x2="{hx_end:.2}" y2="{:.2}"/></g>"##, q.0, q.0, q.1, q.1);
-        // Easting along the vertical line (reading upward), Northing along the horizontal one.
-        let (ex, ey) = (q.0 - 1.2, vy_end + if down { -1.0 } else { 1.0 });
-        let e_anchor = if down { "start" } else { "end" };
-        let _ = writeln!(s, r##"<text x="{ex:.2}" y="{ey:.2}" font-size="2.6" text-anchor="{e_anchor}" fill="#1f3f8f" {HALO} transform="rotate(-90 {ex:.2} {ey:.2})">{:.3}mE</text>"##, c.e);
-        let (nx_, ny_) = (hx_end + if right { -1.0 } else { 1.0 }, q.1 - 1.2);
-        let n_anchor = if right { "end" } else { "start" };
-        let _ = writeln!(s, r##"<text x="{nx_:.2}" y="{ny_:.2}" font-size="2.6" text-anchor="{n_anchor}" fill="#1f3f8f" {HALO}>{:.3}mN</text>"##, c.n);
-    }
-
     // Parcel, beacons, bearings and distances.
     if p.len() >= 2 {
         let pts: String = p.iter().map(|q| format!("{:.2},{:.2}", q.0, q.1)).collect::<Vec<_>>().join(" ");
         let _ = writeln!(s, r#"<polygon points="{pts}" fill="none" stroke="{LINE}" stroke-width="0.45"/>"#);
     }
+    let mut short: Vec<String> = Vec::new();
     for i in 0..p.len() {
         let (a, b) = (p[i], p[(i + 1) % p.len()]);
         if p.len() < 2 || (i == p.len() - 1 && p.len() == 2) {
             break;
         }
         let (deg, min) = bearing_dm(&corners[i], &corners[(i + 1) % corners.len()]);
+        let paper_len = ((b.0 - a.0).powi(2) + (b.1 - a.1).powi(2)).sqrt();
         let dist = ((corners[(i + 1) % corners.len()].e - corners[i].e).powi(2) + (corners[(i + 1) % corners.len()].n - corners[i].n).powi(2)).sqrt();
         // Outside the parcel = away from its centre.
         let (mx, my) = ((a.0 + b.0) / 2.0, (a.1 + b.1) / 2.0);
@@ -383,6 +392,10 @@ pub fn render_svg(d: &PlanData) -> String {
         // minutes at the other end.
         let reads_from_a = if dx.abs() > 1e-6 { dx > 0.0 } else { a.1 < b.1 };
         let (t_deg, t_min) = if reads_from_a { (0.2, 0.8) } else { (0.8, 0.2) };
+        if paper_len < SHORT_SIDE_MM && p.len() >= 3 {
+            short.push(format!("{} - {} = {deg}°{min:02}'@{dist:.2}m", esc(&corners[i].name), esc(&corners[(i + 1) % corners.len()].name)));
+            continue;
+        }
         along(&mut s, a, b, t_deg, out, 2.6, &format!("{deg}°"));
         along(&mut s, a, b, t_min, out, 2.6, &format!("{min:02}'"));
         along(&mut s, a, b, 0.5, -out, 2.6, &format!("{dist:.2}m"));
@@ -397,7 +410,12 @@ pub fn render_svg(d: &PlanData) -> String {
     }
     let file_no = if f.plan_no.as_deref().unwrap_or("").is_empty() { title_no.clone() } else { up(&f.plan_no) };
     text(&mut s, pcx, pcy - 0.8, 2.6, "middle", "", &file_no);
-    text(&mut s, pcx, pcy + 2.8, 2.6, "middle", "", &format!("{} Sq.m", area2(d.area_m2)));
+    text(&mut s, pcx, pcy + 2.8, 2.6, "middle", "", &format!("{} Sq.m", area3(d.area_m2)));
+
+    // Short sides, bottom-left inside the frame (the last one lowest).
+    for (j, line) in short.iter().rev().enumerate() {
+        text(&mut s, FRAME.0 + 2.0, FRAME.3 - 2.5 - j as f64 * 4.0, 2.6, "start", "", line);
+    }
 
     // Footer.
     let fx0 = 12.0;
@@ -429,11 +447,21 @@ pub fn render_svg(d: &PlanData) -> String {
     s
 }
 
-/// The plan's area: cut to 2 decimals, never rounded up (903.198 → "903.19"), as the parcel
-/// attribute record stores it (`trunc(ST_Area, 2)`). The small epsilon keeps 903.19 itself from
-/// becoming 903.18 through floating-point noise.
-pub fn area2(m2: f64) -> String {
-    format!("{:.2}", (m2 * 100.0 + 1e-7).floor() / 100.0)
+/// The area line of the header: square metres below one hectare, hectares from there up (4
+/// decimals, the whole square metre, cut like `area3`).
+fn area_line(m2: f64) -> String {
+    if m2 < 10_000.0 {
+        format!("AREA {} SQUARE METERS", area3(m2))
+    } else {
+        format!("AREA {:.4} HECTARES", (m2 + 1e-7).floor() / 10_000.0)
+    }
+}
+
+/// The plan's area: cut to 3 decimals, never rounded up (903.1976 → "903.197"), as the printed
+/// plans give it (528.215). The small epsilon keeps 903.197 itself from becoming 903.196 through
+/// floating-point noise.
+pub fn area3(m2: f64) -> String {
+    format!("{:.3}", (m2 * 1000.0 + 1e-7).floor() / 1000.0)
 }
 
 #[cfg(test)]
@@ -481,9 +509,9 @@ mod tests {
         let mut fields = PlanFields { plan_no: Some("PL68061".into()), holder: Some("Sa'ad Abubakar".into()), lga: Some("Jos South".into()),
             road_side: Some(3), corner_names: vec![Some("H7255M".into()), None, Some("Q0210M".into())], ..Default::default() };
         let svg = render_svg(&PlanData { upin: "PL000000023268".into(), area_m2: 249.489, corners: c.clone(), fields: fields.clone() });
-        for want in ["TITLE NO. PL68061", "HOLDER: SA&#39;AD ABUBAKAR", "JOS SOUTH L.G. AREA", "AREA 249.48 SQUARE METERS", "UPIN PL000000023268",
+        for want in ["TITLE NO. PL68061", "HOLDER: SA&#39;AD ABUBAKAR", "JOS SOUTH L.G. AREA", "AREA 249.489 SQUARE METERS", "UPIN PL000000023268",
                      "Scale = 1:250", "WGS 1984 Co-ordinates of H7255M", "N: 1082927.804m", "E: 484903.293m", "SHEET NO. 484 - 1082",
-                     ">Q0210M<", ">Q0209M<", ">30°<", ">50'<", ">16.08m<", "Access Road", "249.48 Sq.m", "SURVEYOR-GENERAL"] {
+                     ">Q0210M<", ">Q0209M<", ">30°<", ">50'<", ">16.08m<", "Access Road", "249.489 Sq.m", "SURVEYOR-GENERAL"] {
             let want = want.replace("&#39;", "'");
             assert!(svg.contains(&want), "missing {want}");
         }
@@ -520,24 +548,58 @@ mod tests {
     }
 
     #[test]
-    fn roads_on_two_sides_and_the_coordinate_cross() {
+    fn roads_on_two_sides_and_the_grid_ticks() {
         let c = pl68374();
         assert_eq!(c[0].name, "N9994V");
         // West side (N9998V → N9994V, side 4) and south side (N9996V → N9997V, side 2), as the photo.
-        let fields = PlanFields { road_sides: vec![4, 2], road_label: Some("ACCESS ROAD".into()), grid_corner: Some(2), ..Default::default() };
+        let fields = PlanFields { road_sides: vec![4, 2], road_label: Some("ACCESS ROAD".into()), ..Default::default() };
         let svg = render_svg(&PlanData { upin: "PL000000023480".into(), area_m2: 902.203, corners: c.clone(), fields: fields.clone() });
         assert_eq!(svg.matches(">ACCESS ROAD<").count(), 2, "one label per road");
         assert!(svg.matches("stroke-dasharray=\"2.5 1.5\"").count() >= 4, "two lines per road");
-        assert!(svg.contains(">495182.474mE<") && svg.contains(">1092408.984mN<"), "the cross is at N9996V");
+        assert!(svg.contains(" mE<") && svg.contains(" mN<"));
         assert!(svg.contains("SHEET NO. 494 - 1082"));
-        // Grid off: no cross; the frame values come back.
+        // Grid off: no ticks, no values.
         let svg = render_svg(&PlanData { upin: "PL000000023480".into(), area_m2: 902.203, corners: c.clone(), fields: PlanFields { grid: Some(false), ..fields } });
-        assert!(!svg.contains("mE<"));
+        assert!(!svg.contains(" mE<") && !svg.contains(" mN<"));
         // A form saved before road_sides keeps its one road.
         let legacy = PlanFields { road_side: Some(3), ..Default::default() };
         assert_eq!(legacy.roads(), vec![3]);
         let svg = render_svg(&PlanData { upin: "X".into(), area_m2: 1.0, corners: c, fields: legacy });
         assert_eq!(svg.matches(">Access Road<").count(), 1);
+    }
+
+    #[test]
+    fn the_grid_steps_with_the_scale_from_the_frames_corner() {
+        let at = |scale| render_svg(&PlanData { upin: "X".into(), area_m2: 902.203, corners: pl68374(), fields: PlanFields { scale: Some(scale), ..Default::default() } });
+        // 1:500: the frame is 93 m wide; the corner value, then a tick 50 m on, top and bottom.
+        let svg = at(500);
+        assert_eq!(svg.matches(">495116 mE<").count(), 1, "lower-left corner");
+        assert_eq!(svg.matches(">495166 mE<").count(), 2, "top and bottom");
+        // 1:1000: the same 100 mm of paper is 100 m on the ground.
+        let svg = at(1000);
+        assert_eq!(svg.matches(">495070 mE<").count(), 1);
+        assert_eq!(svg.matches(">495170 mE<").count(), 2);
+        // The Northing likewise: one corner value, a tick on the left and right edges.
+        let n: Vec<i64> = svg.match_indices(" mN<").map(|(i, _)| svg[..i].rsplit('>').next().unwrap().parse().unwrap()).collect();
+        assert_eq!(n.len(), 3);
+        assert_eq!((n[1] - n[0], n[2] - n[0]), (100, 100));
+    }
+
+    #[test]
+    fn the_header_area_is_in_hectares_from_10000_square_metres() {
+        assert_eq!(area_line(9_999.999), "AREA 9999.999 SQUARE METERS");
+        assert_eq!(area_line(10_000.0), "AREA 1.0000 HECTARES");
+        assert_eq!(area_line(25_437.9), "AREA 2.5437 HECTARES");
+    }
+
+    #[test]
+    fn a_short_side_is_written_in_the_corner_not_on_the_drawing() {
+        // PL68374 at 1:500: N9997V → N9998V is 3.78 m (7.6 mm on paper), as its printed plan.
+        let fields = PlanFields { scale: Some(500), ..Default::default() };
+        let svg = render_svg(&PlanData { upin: "X".into(), area_m2: 902.203, corners: pl68374(), fields });
+        assert!(svg.contains(">N9997V - N9998V = 282°27'@3.78m<"));
+        assert!(!svg.contains(">3.78m<") && !svg.contains(">282°<"), "not on the side itself");
+        assert!(svg.contains(">29.30m<") && svg.contains(">25.53m<"), "the long sides keep theirs");
     }
 
     #[test]
@@ -551,9 +613,9 @@ mod tests {
 
     #[test]
     fn plan_area_is_cut_not_rounded() {
-        assert_eq!(super::area2(903.1976520011156), "903.19");
-        assert_eq!(super::area2(249.489), "249.48");
-        assert_eq!(super::area2(903.19), "903.19");
-        assert_eq!(super::area2(100.0), "100.00");
+        assert_eq!(super::area3(903.1976520011156), "903.197");
+        assert_eq!(super::area3(249.4899), "249.489");
+        assert_eq!(super::area3(528.215), "528.215");
+        assert_eq!(super::area3(100.0), "100.000");
     }
 }

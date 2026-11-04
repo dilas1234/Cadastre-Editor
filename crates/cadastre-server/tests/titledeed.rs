@@ -120,7 +120,7 @@ async fn a_jobs_title_deed_plan_prefills_saves_and_prints() {
     let (st, _, svg) = send(&router, "GET", &format!("/api/v1/wf/jobs/{job}/titledeed.svg"), None).await;
     assert_eq!(st, StatusCode::OK);
     for want in ["TITLE NO. PLTD1", "HOLDER: TEST HOLDER", "SURVEYED BY: Test Surveys Ltd", "Scale = 1:500", &format!("UPIN {upin}"),
-                 "AREA 200.00 SQUARE METERS", ">TD1<", ">TD4<", "WGS 1984 Co-ordinates of TD1", "Access Road", ">0°<", ">90°<", ">20.00m<", ">10.00m<"] {
+                 "AREA 200.000 SQUARE METERS", ">TD1<", ">TD4<", "WGS 1984 Co-ordinates of TD1", "Access Road", ">0°<", ">90°<", ">20.00m<", ">10.00m<"] {
         assert!(svg.contains(want), "the sheet lacks {want}");
     }
 

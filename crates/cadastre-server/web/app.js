@@ -4022,10 +4022,9 @@ async function titleDeedDialog(jobId, upin) {
   const roadLabels = p.corners.map((c, i) => h("span", {}, sideText(i)));
   const road = h("div", { style: "width:100%;max-height:90px;overflow:auto" },
     ...p.corners.map((c, i) => h("label", { style: "display:block;white-space:nowrap" }, roadBoxes[i], " ", roadLabels[i])));
-  // Co-ordinate cross: lines through one beacon with its Easting / Northing, on or off.
+  // Grid: ticks on the frame edges at the whole-metre Easting / Northing, on or off.
   const gridOn = h("input", { type: "checkbox", checked: f.grid !== false });
-  const gridAt = h("select", { style: "flex:1" }, ...p.corners.map((c, i) => h("option", { value: i, selected: (f.grid_corner ?? 0) === i }, `at ${nameOf(i)}`)));
-  const grid = h("div", { style: "display:flex;gap:6px;align-items:center;width:100%" }, h("label", { style: "white-space:nowrap" }, gridOn, " Show"), gridAt);
+  const grid = h("label", { style: "white-space:nowrap" }, gridOn, " Show grid ticks on the frame edges");
   const roadLabel = inp("road_label", "Access Road");
   const reg = d.registry === "ok" ? h("span", { style: "color:#060" }, "Prefilled from the Registry (read only) and the parcel record.")
     : d.registry === "off" ? h("span", { class: "muted" }, "Registry not configured on this server: type the holder and survey details.")
@@ -4048,7 +4047,7 @@ async function titleDeedDialog(jobId, upin) {
     out.road_side = null;
     out.road_sides = roadBoxes.flatMap((b, i) => (b.checked ? [i] : []));
     out.grid = gridOn.checked;
-    out.grid_corner = Number(gridAt.value);
+    out.grid_corner = null;
     out.road_label = roadLabel.value.trim() || null;
     return out;
   };
@@ -4096,13 +4095,13 @@ async function titleDeedDialog(jobId, upin) {
     ...d.upins.map((u) => h("option", { value: u, selected: u === p.upin }, u)))) : null;
   const w = floatWindow(`Title Deed Plan — ${p.upin}`, h("div", {},
     h("div", { style: "margin-bottom:6px" }, reg),
-    h("div", { class: "muted", style: "margin-bottom:6px" }, `Area ${area2(p.area_m2)} m² · ${n} beacons, clockwise from the westernmost`),
+    h("div", { class: "muted", style: "margin-bottom:6px" }, `Area ${(Math.floor(p.area_m2 * 1000 + 1e-7) / 1000).toFixed(3)} m² · ${n} beacons, clockwise from the westernmost`),
     pick,
     row("Title no.:", fields.title_no), row("Plan no.:", fields.plan_no), row("Tracing no.:", fields.tracing_no),
     row("Region:", fields.region), row("Location:", fields.location), row("Address:", fields.address), row("L.G. area:", lga),
     row("Holder:", fields.holder), row("Surveyed by:", fields.surveyed_by), row("Survey date:", fields.survey_date),
     row("Plotted by:", fields.plotted_by), row("Checked by:", fields.checked_by), row("Surveyor-General:", fields.surveyor_general),
-    row("Prepared by:", fields.prepared_by), row("Scale:", scale), row("Access roads:", road), row("Road label:", roadLabel), row("Co-ordinate grid:", grid),
+    row("Prepared by:", fields.prepared_by), row("Scale:", scale), row("Access roads:", road), row("Road label:", roadLabel), row("Grid:", grid),
     h("div", { class: "cfHdr", style: "margin-top:6px" }, "Beacon numbers" + (missing ? ` — ${missing} to type (not in the fabric)` : "")),
     h("div", { style: "max-height:180px;overflow:auto" }, ct),
     msg,
@@ -4114,7 +4113,6 @@ async function titleDeedDialog(jobId, upin) {
     { id: "titleDeedWin", width: 470 });
   for (const x of names) x.addEventListener("input", () => {
     roadLabels.forEach((l, i) => { l.textContent = sideText(i); });
-    [...gridAt.options].forEach((o, i) => { o.textContent = `at ${nameOf(i)}`; });
   });
 }
 
