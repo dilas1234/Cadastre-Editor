@@ -1286,19 +1286,30 @@ const beaconLabels = { upin: null };
 function setBeaconLabels(key, pts) {
   if (!map.getSource("beacon-labels")) {
     map.addSource("beacon-labels", { type: "geojson", data: empty() });
-    map.addLayer({ id: "beacon-labels-pt", type: "circle", source: "beacon-labels", paint: { "circle-radius": 4.5, "circle-color": "#ffeb3b", "circle-stroke-color": "#b00", "circle-stroke-width": 1.5 } });
-    map.addLayer({ id: "beacon-labels-txt", type: "symbol", source: "beacon-labels",
+    map.addLayer({ id: "beacon-labels-pt", type: "circle", source: "beacon-labels", filter: ["==", "$type", "Point"], paint: { "circle-radius": 4.5, "circle-color": "#ffeb3b", "circle-stroke-color": "#b00", "circle-stroke-width": 1.5 } });
+    map.addLayer({ id: "beacon-labels-txt", type: "symbol", source: "beacon-labels", filter: ["==", "$type", "Point"],
       layout: { "text-field": ["get", "label"], "text-font": ["OpenSans-Regular"], "text-size": 13, "text-offset": [0.8, -0.8], "text-anchor": "bottom-left", "text-allow-overlap": true },
       paint: { "text-color": "#fff", "text-halo-color": "#b00", "text-halo-width": 2 } });
+    // Each side: its bearing and distance along the line, as on the survey plan.
+    map.addLayer({ id: "beacon-legs-line", type: "line", source: "beacon-labels", filter: ["==", "$type", "LineString"], paint: { "line-color": "#ffeb3b", "line-width": 1.5 } }, "beacon-labels-pt");
+    map.addLayer({ id: "beacon-legs-txt", type: "symbol", source: "beacon-labels", filter: ["==", "$type", "LineString"],
+      layout: { "text-field": ["get", "label"], "text-font": ["OpenSans-Regular"], "text-size": 12, "symbol-placement": "line-center", "text-keep-upright": true,
+        "text-offset": [0, -0.9], "text-allow-overlap": true, "text-ignore-placement": true },
+      paint: { "text-color": "#fff", "text-halo-color": "#1a3a6b", "text-halo-width": 2 } });
   }
-  map.getSource("beacon-labels").setData({ type: "FeatureCollection", features: pts.map((p) => ({ type: "Feature", properties: { label: p.beacon }, geometry: { type: "Point", coordinates: toLL(p.easting, p.northing) } })) });
+  const corners = pts.map((p) => ({ type: "Feature", properties: { label: p.beacon }, geometry: { type: "Point", coordinates: toLL(p.easting, p.northing) } }));
+  const legs = pts.map((p, i) => {
+    const q = pts[(i + 1) % pts.length];
+    return { type: "Feature", properties: { label: `${p.bearing}   ${Number(p.distance).toFixed(2)} m` }, geometry: { type: "LineString", coordinates: [toLL(p.easting, p.northing), toLL(q.easting, q.northing)] } };
+  });
+  map.getSource("beacon-labels").setData({ type: "FeatureCollection", features: [...legs, ...corners] });
   beaconLabels.upin = key;
 }
 function hideBeacons() { map.getSource("beacon-labels")?.setData(empty()); beaconLabels.upin = null; status("Beacons hidden."); }
 window.addEventListener("keydown", (e) => { if (e.key === "Escape" && beaconLabels.upin && !document.querySelector(".uiModalBack")) hideBeacons(); });
 async function showParcelBeacons(upin) {
   let d; try { d = await api("/api/v1/parcels/points?upin=" + encodeURIComponent(upin)); } catch (e) { uiAlert(e.message); return; }
-  setBeaconLabels(upin, d.points); status(`${upin}: ${d.points.length} beacons shown (right-click → Hide Beacons, or Esc).`);
+  setBeaconLabels(upin, d.points); status(`${upin}: ${d.points.length} beacons with bearings and distances (right-click → Hide Beacons, or Esc).`);
 }
 // A draft's corners: its own ring, named as Verify Points names them.
 async function draftPoints(d) {
