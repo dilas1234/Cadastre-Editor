@@ -2574,6 +2574,24 @@ async function orthoUpdate() {
   }
 }
 
+// Digitising done (the commit completed the job): a clean start for the next job. The edit session
+// ends (nothing is left to save), the editing windows close, the job is no longer worked on, and
+// the map shows the Table Of Contents, zoomed to the parcel just committed.
+async function goHome(upins = []) {
+  edit.active = false; clearSketch(); orthoClose();
+  if (beaconLabels.upin) hideBeacons();
+  ["createFeaturesWin", "sketchPropsWin", "commitWin", "pointListWin", "parcelAttrWin", "stepToolsWin"].forEach((id) => $(id)?.remove());
+  setTool("pan"); updateEditorButtons();
+  wf.editing = null; showJobArea();
+  state.job = null; renderJobBox(); try { await loadDrafts(); } catch { /* the job is closed */ }
+  showCompleted(false); showRegistry(false); showWorkflow(false); showTasks(false);
+  if ($("tocPane").classList.contains("hidden")) togglePane("tocPane");
+  buildTocTools(); buildTOC(); renderTask();
+  if (upins[0]) { try { await registryZoom(upins[0]); } catch { /* zoom is a convenience */ } }
+  saveSession();
+  status(upins.length ? `Digitising complete: ${upins.join(", ")} committed. Ready for the next job.` : "Ready for the next job.");
+}
+
 // Straight on to the commit of the job being worked on (from the attribute form): the Commit window
 // when the job is at its commit task, else Post & Finish (which walks it there). Same windows, same
 // rules (beacon numbers, staff name, the System Check again on the server).
@@ -4746,7 +4764,8 @@ async function wfCommitDialog(opts = {}) {
       notify(`Committed ${r.parcel_numbers.length} parcel(s): ${r.parcel_numbers.join(", ")}; ${r.beacons_added.length} beacon(s) added.` + (r.retired?.length ? ` Replaced / retired: ${r.retired.join(", ")}.` : ""));
       loadHistory(); await wfRefreshEditing();
       wf.detail = await api("/api/v1/wf/jobs/" + id); renderWorkflow();
-      if (r.parcel_numbers.length) registryConfirmDialog(id, { headline: `Committed: ${r.parcel_numbers.join(", ")}.` });
+      if (r.parcel_numbers.length) await registryConfirmDialog(id, { headline: `Committed: ${r.parcel_numbers.join(", ")}.` });
+      if (wf.detail?.job && !wf.detail.job.is_open) await goHome(r.parcel_numbers);
     } catch (e) { commitBtn.disabled = false; msg.style.color = "#b00"; msg.textContent = e.message; }
   } }, opts.label || "Commit");
   // The UPIN(s) this commit will give, and whether Aumentum was asked (parallel run). Advisory.
@@ -4852,7 +4871,8 @@ async function wfFinishPost(j, beacons, staff) {
     const nums = (r.parcel_numbers || []).join(", ") || "(none)";
     status(r.completed ? `Done — ${nums} posted; job completed.` : `${nums} posted.`);
     await loadParcels(false); await loadDrafts(); showJobArea();
-    registryConfirmDialog(j.id, { headline: `Parcel posted. UPIN: ${nums}. ${r.completed ? "Job completed." : "Job now at: " + (r.job?.current_task || "—")}` });
+    const confirmed = registryConfirmDialog(j.id, { headline: `Parcel posted. UPIN: ${nums}. ${r.completed ? "Job completed." : "Job now at: " + (r.job?.current_task || "—")}` });
+    if (r.completed) confirmed.then(() => goHome(r.parcel_numbers || []));
     wf.detail = await api("/api/v1/wf/jobs/" + j.id);
     wf.selEditing = await api(`/api/v1/wf/jobs/${j.id}/editing`).catch(() => wf.selEditing);
     if (wf.editing && wf.editing.job_instance_id === j.id) wf.editing = wf.selEditing;
@@ -5176,7 +5196,7 @@ function snapshotSession() {
     reg: { view: reg.view, txnNo: reg.txn ? reg.txnNo : "" },
     job: state.job?.id || null,
     tool: state.tool,
-    edit: edit.active ? { template: edit.template, construction: edit.construction, verts: edit.verts, editingId: edit.editingId } : null,
+    edit: edit.active && edit.verts.length ? { template: edit.template, construction: edit.construction, verts: edit.verts, editingId: edit.editingId } : null,
   };
 }
 function saveSession() {
@@ -5197,6 +5217,7 @@ function jumpToSavedView(v) {
 async function wfResume(jobId) {
   const ed = await api(`/api/v1/wf/jobs/${jobId}/editing`);
   if (!ed?.cadastre_job_id) return false;
+  try { const d = await api("/api/v1/wf/jobs/" + jobId); if (d.job && !d.job.is_open) return false; } catch { /* resume anyway */ }
   wf.editing = ed; wf.selEditing = ed;
   const job = await api(`/api/v1/jobs/${ed.cadastre_job_id}`);
   if (!state.jobs.some((x) => x.id === job.id)) state.jobs.unshift(job);
@@ -5219,7 +5240,7 @@ async function restoreSession() {
     else if (s.panel === "registry") await step("registry", () => openRegistry({ view: s.reg?.view, txn: s.reg?.txnNo || undefined }));
     else if (s.panel === "tasks") { showTasks(true); buildTocTools(); }
     else if (s.panel === "completed") await step("completed", () => { if (s.done) { done.q = s.done.q || ""; done.source = s.done.source || ""; } return openCompleted(); });
-    if (s.edit) await step("sketch", () => {
+    if (s.edit && (s.edit.verts || []).length) await step("sketch", () => {
       selectTemplate(s.edit.template || edit.template);
       startEditing("sketch");
       if (s.edit.construction) edit.construction = s.edit.construction;
