@@ -178,6 +178,37 @@ const PARCEL_STROKE = "#b22222"; // Aumentum's dark-red parcel outline
 const IMAGERY = "https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}";
 const POSTABLE_STAGE = "approved"; // server only posts approved jobs
 
+/* =====================================================================================
+ * Views per unit (no access control yet: a view only hides what a unit does not need; the
+ * server's rules apply in every view). The view is remembered on this PC; ?view=… in the address
+ * sets it too. Only the Sysadmin view shows the switch; a tab switched from Sysadmin keeps the
+ * switch so the administrator can come back.
+ * ===================================================================================== */
+const VIEWS = {
+  sysadmin: { label: "Sysadmin", path: "/sys-editor", all: true, panel: null },
+  digitising: { label: "Digitising", path: "/digitising", features: ["digitise", "edit", "workflow", "registry", "tasks", "completed"], panel: "workflow" },
+  titledeed: { label: "Title Deed", path: "/title-deed", features: ["titledeed", "workflow", "registry", "completed"], panel: "queue" },
+  reporting: { label: "Reporting & Chat", path: "/reporting", features: ["completed", "reports"], panel: "completed" },
+};
+const VIEW_FOR = { digitise: "Digitising", edit: "Digitising", titledeed: "Title Deed", admin: "Sysadmin", reports: "Reporting & Chat" };
+// The view comes from the address each unit is given: /digitising, /title-deed, /reporting, and
+// /sys-editor for the system administrator.
+const currentView = (() => {
+  const path = location.pathname.replace(/\/+$/, "");
+  return Object.keys(VIEWS).find((k) => VIEWS[k].path === path) || "digitising";
+})();
+const viewDef = VIEWS[currentView];
+const can = (feature) => !!viewDef.all || (viewDef.features || []).includes(feature);
+let adminTab = false; try { adminTab = currentView === "sysadmin" || sessionStorage.getItem("cad.adminSwitch") === "1"; } catch { /* storage */ }
+function switchView(v) {
+  if (!VIEWS[v]) return;
+  try { sessionStorage.setItem("cad.adminSwitch", "1"); } catch { /* storage */ }
+  try { saveSession(); } catch { /* not ready */ }
+  location.href = VIEWS[v].path + location.search;
+}
+document.body.classList.add("view-" + currentView);
+document.title = `PLAGIS CADASTRE Editor — ${viewDef.label}`;
+
 const state = {
   me: null, jobs: [], workflow: { stages: [], transitions: [] }, job: null,
   tool: "pan", selection: new Set(), focusParcel: null,
@@ -361,6 +392,15 @@ map.once("style.load", async () => {
   renderGraphics();
   buildTOC(); buildCatalog();
   await restoreSession();
+  // A unit's view opens on its own panel (unless a refresh put another one back).
+  const restored = savedSession?.panel && savedSession.panel !== "toc";
+  if (!restored && viewDef.panel) {
+    try {
+      if (viewDef.panel === "workflow") await openWorkflow();
+      else if (viewDef.panel === "queue") { done.source = "queue"; await openCompleted(); }
+      else if (viewDef.panel === "completed") await openCompleted();
+    } catch (e) { console.warn("view panel", e); }
+  }
   pushHistory();
 });
 
@@ -419,7 +459,7 @@ function zoomToFC(fc, opts = {}, regionOnly = false) {
 // No in-page title bar: the browser window/tab title carries it, as the native window title did.
 function setTitle() {
   const who = state.me ? ` - Connected as ${state.me.username}` : "";
-  document.title = `${REGION} - ${APP}${who}`;
+  document.title = `${viewDef.label} - ${APP}${who}`;
 }
 api("/api/v1/me").then((me) => { state.me = me; setTitle(); }).catch(() => setTitle());
 setTitle();
@@ -514,7 +554,7 @@ const MENUS = () => ({
     { label: "Workflow (Job Instances)", icon: "jobOpen", action: () => openWorkflow() },
     { label: "Productivity Report…", action: () => productivityWindow() },
     { label: "Notifications…", action: () => notificationsWindow() },
-    { label: "Administration…", action: () => adminWindow() },
+    can("admin") ? { label: "Administration…", action: () => adminWindow() } : null,
     { label: "Create Features", icon: "createFeatures", action: () => (edit.active ? openCreateFeatures() : startEditing()) },
     { label: "Editor Toolbar", checked: () => !toolbarHidden("tb-editor"), action: () => toggleToolbar("tb-editor") },
     { label: "Identify", icon: "identify", action: () => setTool("identify") },
@@ -527,7 +567,9 @@ const MENUS = () => ({
 });
 function buildMenus() {
   const bar = $("menubar"); bar.innerHTML = "";
-  for (const name of Object.keys(MENUS())) {
+  const menus = MENUS();
+  for (const name of Object.keys(menus)) {
+    if (name === "Geoprocessing" && !can("edit")) continue;
     const m = h("div", { class: "menu" }, name);
     m.addEventListener("mousedown", (ev) => {
       if (ev.target.closest(".menuList")) return;
@@ -538,10 +580,23 @@ function buildMenus() {
     m.addEventListener("mouseenter", () => { if (bar.querySelector(".menu.open") && !m.classList.contains("open")) { closeMenus(); openMenu(m, name); } });
     bar.append(m);
   }
+  // The current view, and the switch (Sysadmin, or a tab switched from it).
+  const vb = h("div", { class: "viewBadge" + (adminTab ? " canSwitch" : ""), title: adminTab ? "Switch to another view" : `This unit's view (${location.origin}${viewDef.path})` }, `View: ${viewDef.label}`, adminTab ? " ▾" : "");
+  if (adminTab) vb.addEventListener("mousedown", (ev) => {
+    ev.stopPropagation(); closeMenus();
+    const r = vb.getBoundingClientRect();
+    contextMenu([...Object.entries(VIEWS).map(([k, v]) => ({ label: `${k === currentView ? "✓ " : ""}${v.label}   ${v.path}`, action: () => switchView(k) })), "-",
+      { label: "Copy the units' addresses", action: async () => {
+        const t = Object.values(VIEWS).map((v) => `${v.label}: ${location.origin}${v.path}`).join("\n");
+        try { await navigator.clipboard.writeText(t); notify("Addresses copied."); } catch { uiAlert(t, { title: "Addresses" }); }
+      } }], r.left, r.bottom);
+  });
+  bar.append(vb);
 }
 function menuList(items) {
   const list = h("div", { class: "menuList" });
   for (const it of items) {
+    if (it == null) continue;
     if (it === "-") { list.append(h("div", { class: "msep" })); continue; }
     const dis = isChecked(it.disabled);
     const row = h("div", { class: `mi${dis ? " disabled" : ""}${it.checked && isChecked(it.checked) ? " checked" : ""}` },
@@ -684,6 +739,8 @@ function buildToolbars() {
     if (def.right) tb.style.marginLeft = "auto";
     if (def.indent) tb.style.marginLeft = "clamp(0px, calc(24vw - 10px), 372px)";
     if (hidden.includes(def.id)) tb.classList.add("hidden");
+    if ((def.id === "tb-editor" || def.id === "tb-drawing") && !can("edit")) tb.classList.add("hidden");
+    if (def.id === "tb-cadastre" && !can("digitise") && !can("titledeed")) tb.classList.add("hidden");
     for (const it of def.items) tb.append(toolbarItem(it));
     tb.append(h("span", { class: "chev" }, "▾"));
     $(`tbrow${def.row}`).append(tb);
@@ -1064,21 +1121,23 @@ function buildTocTools() {
     t.append(b);
   }
   t.append(h("span", { class: "tsep" }));
+  if (can("tasks")) {
   const tasksBtn = h("span", { class: `tb${tasksOpen() && !wfOpen() && !regOpen() && !doneOpen() ? " active" : ""}`, title: "Tasks", html: icon("tasks") });
   tasksBtn.onclick = () => { showCompleted(false); showRegistry(false); showWorkflow(false); showTasks(true); buildTocTools(); };
   t.append(tasksBtn);
+  }
   const wfBtn = h("span", { class: `tb${wfOpen() ? " active" : ""}`, title: "Workflow (job instances)", html: icon("jobOpen") });
   wfBtn.onclick = () => openWorkflow();
-  t.append(wfBtn);
+  if (can("workflow")) t.append(wfBtn);
   const doneBtn = h("span", { class: `tb${doneOpen() ? " active" : ""}`, title: "Completed jobs (digitised; plan, Registry, Correct)", html: icon("jobApprove") });
   doneBtn.onclick = () => openCompleted();
-  t.append(doneBtn);
+  if (can("completed")) t.append(doneBtn);
   // Registry links: their own tab, apart from the workflow.
   const waiting = registryWaiting();
   const regBtn = h("span", { class: `tb${regOpen() ? " active" : ""}`, title: "Registry — links from the Aumentum Registry" + (waiting ? ` (${waiting} waiting for a job)` : ""), html: icon("registry"), style: "position:relative" });
   if (waiting) regBtn.append(h("span", { class: "regBadge" }, String(waiting)));
   regBtn.onclick = () => openRegistry();
-  t.append(regBtn);
+  if (can("registry")) t.append(regBtn);
   t.append(h("span", { class: "tb", title: "Options…", html: icon("options"), onclick: () => tocOptions() }));
 }
 const tasksOpen = () => !$("tasksBody").classList.contains("hidden");
@@ -1265,13 +1324,13 @@ function parcelMenu(e) {
   const ev = e.originalEvent;
   selectFeatures([f.properties.id], false);
   contextMenu([
-    { label: `Start edit — title deed (${upin})`, icon: "editor", action: () => startEditParcel(upin) },
+    can("titledeed") ? { label: `Start edit — title deed (${upin})`, icon: "editor", action: () => startEditParcel(upin) } : null,
     { label: "Zoom To Parcel", icon: "fullExtent", action: () => registryZoom(upin) },
     { label: "Registry File…", icon: "registry", action: () => startEditParcel(upin, true) },
     "-",
     beaconLabels.upin === upin ? { label: "Hide Beacons", action: () => hideBeacons() } : { label: "Show Beacons", action: () => showParcelBeacons(upin) },
     { label: "Point List…", action: () => pointListWindow(upin) },
-    { label: "Correct & Recommit…", icon: "editor", action: () => correctAndRecommit(upin) },
+    can("digitise") ? { label: "Correct & Recommit…", icon: "editor", action: () => correctAndRecommit(upin) } : null,
     { label: "History…", action: () => historyWindow({ upin, title: upin }) },
     "-",
     { label: "Parcel Lineage…", action: () => lineageOfSelection() },
@@ -1281,7 +1340,7 @@ function parcelMenu(e) {
 function draftMenu(d, e) {
   const ev = e.originalEvent; const key = "draft:" + d.properties.id;
   contextMenu([
-    { label: "Edit Corners (point list)", icon: "editor", action: () => editDraftFeature(d) },
+    can("digitise") ? { label: "Edit Corners (point list)", icon: "editor", action: () => editDraftFeature(d) } : null,
     beaconLabels.upin === key ? { label: "Hide Beacons", action: () => hideBeacons() } : { label: "Show Beacons", action: () => showDraftBeacons(d) },
     { label: "Point List…", action: () => pointListWindow(null, d) },
   ], ev.clientX, ev.clientY);
@@ -1381,11 +1440,15 @@ async function pointListWindow(upin, draft) {
 async function correctAndRecommit(upin) {
   let d; try { d = await api("/api/v1/parcels/points?upin=" + encodeURIComponent(upin)); } catch (e) { uiAlert(e.message); return; }
   if (!d.can_correct) { await uiAlert(`${upin} cannot be corrected here: ${d.why_not}.`, { title: "Correct & Recommit", kind: "warn" }); return; }
-  const reason = await uiPrompt(`Correct ${upin} (${d.job_name || "job " + d.job_instance_id})?\n\nThe job is reopened with ${upin} back as a draft that keeps its UPIN, and its points open for correction. Then Finish Sketch, check, save the attributes and commit again. Reason:`, "", { title: "Correct & Recommit", ok: "Reopen and correct" });
+  const aum = d.committed_in === "aumentum";
+  const reason = await uiPrompt(aum
+    ? `Correct ${upin}?\n\nIt was committed in Aumentum. Its file's job is opened here (the open one, or a new Job-<file number> on its Active Registry transaction) with ${upin} back as a draft that keeps its UPIN, and its points open for correction. Then Finish Sketch, check, save the attributes and commit again. The correction is in the file's history. Reason:`
+    : `Correct ${upin} (${d.job_name || "job " + d.job_instance_id})?\n\nThe job is reopened with ${upin} back as a draft that keeps its UPIN, and its points open for correction. Then Finish Sketch, check, save the attributes and commit again. Reason:`, "", { title: "Correct & Recommit", ok: "Reopen and correct" });
   if (!reason || !reason.trim()) return;
   let r;
-  try { r = await api(`/api/v1/wf/jobs/${d.job_instance_id}/correct`, { method: "POST", body: { upin, reason: reason.trim() } }); }
+  try { r = await api(aum ? "/api/v1/wf/correct-aumentum" : `/api/v1/wf/jobs/${d.job_instance_id}/correct`, { method: "POST", body: { upin, reason: reason.trim() } }); }
   catch (e) { uiAlert("Correct refused: " + e.message); return; }
+  if (aum) { d.job_instance_id = r.job_instance_id; notify(`${upin}: ${r.created ? "new job" : "the file's open job"} ${r.job_name} (${r.transaction_number}).`); }
   for (const b of r.beacons || []) rememberPointId(b.easting, b.northing, b.number);
   // Keep the numbers of beacons shared with neighbours too (they stay in the fabric and are matched again).
   for (const p of d.points) if (!/^P\d+$/.test(p.beacon)) rememberPointId(p.easting, p.northing, p.beacon);
@@ -1402,17 +1465,17 @@ async function startEditParcel(upin, fileOnly) {
   let w;
   try { w = await api(`/api/v1/registry/parcels/${encodeURIComponent(upin)}/work`); } catch (e) { uiAlert(e.message); return; }
   if (fileOnly) { if (w.transaction_number) regFind(w.transaction_number); else uiAlert(`${upin} has no Registry file (transaction) yet.`); return; }
-  // Not linked yet: the title deed work does not need the link. Find the parcel's file in the
-  // Registry (read-only) and start its job there (Start digitising).
+  // Digitised but not linked yet: Aumentum's flow, the Registry admin links it at Raise Title
+  // Deed Plan; then it is in the title deed queue. It is not digitised again.
   if (!w.linked && !w.job_instance_id) {
-    if (w.property_number) { regFind(w.property_number); notify(`${upin} is not linked in the Registry yet. Its file ${w.property_number} is shown under Registry → Find file: Start digitising opens the title deed job.`); return; }
-    uiAlert(`${upin} is not linked in the Registry and has no file number on its attributes.\nFind its file under Registry → Find file (PL… or PLS…) and choose Start digitising.`); return;
+    uiAlert(`${upin} is digitised${w.property_number ? ` (file ${w.property_number})` : ""}, but not linked in the Registry yet.\nThe Registry admin links it when the file reaches Raise Title Deed Plan; it then shows in the title deed queue (Completed tab).`);
+    return;
   }
   let job = w.job_instance_id;
   if (!job) {
     if (!w.transaction_number) { uiAlert(`${upin} is linked (${w.su_id}), but its Registry transaction is not known here. Find the file under Registry → Find file.`); return; }
     if (!(await uiConfirm(`No open job for ${w.transaction_number}. Start the title deed job (Job-${w.property_number || upin})?`))) return;
-    try { job = (await api("/api/v1/registry/start-digitising", { method: "POST", body: { transaction_number: w.transaction_number, property_number: w.property_number } })).job_instance_id; }
+    try { job = (await api("/api/v1/registry/start-digitising", { method: "POST", body: { transaction_number: w.transaction_number, property_number: w.property_number, title_deed: true } })).job_instance_id; }
     catch (e) { uiAlert(e.message); return; }
   }
   await openWorkflow(); await wfSelect(job);
@@ -4031,7 +4094,7 @@ function queueCard(f) {
   const plan = f.plan ? `${f.plan.action === "registry_plan_withdrawn" ? "Withdrawn" : "Sent"} ${fmtDT(f.plan.at)}` : "Not sent from this editor";
   const actions = [];
   if (f.in_cadastre) actions.push(regLink("Zoom", "Zoom to the parcel", () => registryZoom(f.upin)));
-  actions.push(regLink("Title deed plan", "Open (or start) the file's title deed job and its plan", async () => {
+  if (can("titledeed")) actions.push(regLink("Title deed plan", "Open (or start) the file's title deed job and its plan", async () => {
     if (f.job_instance_id && f.job_open) { await openWorkflow(); await wfSelect(f.job_instance_id); titleDeedDialog(f.job_instance_id, f.upin); }
     else startEditParcel(f.upin);
   }, !f.in_cadastre));
@@ -4081,10 +4144,10 @@ function doneCard(j) {
   actions.push(regLink("Open job", "Open the job in the Workflow", async () => { await openWorkflow(); await wfSelect(j.id); }));
   actions.push(regLink("History", "The file's Registry stages and this Cadastre's events", () => historyWindow({ job: j.id, txn: j.transaction_number, title: j.property_number || j.name })));
   if (mine) actions.push(regLink("Registry check", "Ask the Registry whether the committed parcels are visible there", () => registryConfirmDialog(j.id)));
-  if (mine && upins.length) actions.push(regLink("Title deed plan", "Open the title deed plan (form, sheet, PDF, send)", () => titleDeedDialog(j.id, upins[0])));
-  if (mine && plan && plan.action === "registry_plan_sent") actions.push(regLink("Withdraw plan", "Mark the plan sent to the Registry as withdrawn (the parcel and UPIN stay)", () => doneWithdraw(j)));
-  if (mine && upins.length && parcels.some((p) => !p.linked) && j.transaction_number) actions.push(regLink("Link now", "Write the UPIN and link date onto the Registry file (as on commit)", () => doneLinkNow(j)));
-  if (j.can_correct && upins.length) actions.push(regLink("Correct", "Reopen the job to fix the parcel (same UPIN), then commit again and resend the plan", () => doneCorrect(j, parcels)));
+  if (mine && upins.length && can("titledeed")) actions.push(regLink("Title deed plan", "Open the title deed plan (form, sheet, PDF, send)", () => titleDeedDialog(j.id, upins[0])));
+  if (mine && plan && plan.action === "registry_plan_sent" && can("titledeed")) actions.push(regLink("Withdraw plan", "Mark the plan sent to the Registry as withdrawn (the parcel and UPIN stay)", () => doneWithdraw(j)));
+  if (mine && upins.length && parcels.some((p) => !p.linked) && j.transaction_number && can("admin")) actions.push(regLink("Link now", "Write the UPIN and link date onto the Registry file (as on commit)", () => doneLinkNow(j)));
+  if (j.can_correct && upins.length && can("digitise")) actions.push(regLink("Correct", "Reopen the job to fix the parcel (same UPIN), then commit again and resend the plan", () => doneCorrect(j, parcels)));
   const conf = j.confirmation;
   return h("div", { class: "regCard " + (mine ? "job" : "gone"), title: "Double-click to zoom", ondblclick: () => firstUpin && registryZoom(firstUpin) },
     h("div", { class: "regCardTop" }, h("span", { class: "regUpin" }, j.property_number || j.name || "#" + j.id),
@@ -4109,10 +4172,10 @@ function renderCompleted() {
   q.addEventListener("keydown", (e) => e.key === "Enter" && run());
   const src = h("select", { onchange: (e) => { done.source = e.target.value; doneLoad(true); } },
     ...[["queue", "Title deed queue (Registry)"], ["", "All completed"], ["cadastre", "Plagis editor"], ["aumentum", "Aumentum"]].map(([v, l]) => h("option", { value: v, selected: done.source === v }, l)));
-  box.append(h("div", { class: "frow", style: "margin:6px 8px 2px" }, q, h("button", { class: "btn", style: "min-width:0", onclick: run }, "Find"), src),
+  box.append(...[h("div", { class: "frow", style: "margin:6px 8px 2px" }, q, h("button", { class: "btn", style: "min-width:0", onclick: run }, "Find"), src),
     done.source === "queue" ? null : h("div", { class: "muted", style: "margin:0 8px 4px" }, done.busy && !done.jobs.length ? "Loading…" : `${done.total.toLocaleString()} completed job(s)${done.q ? ` matching “${done.q}”` : ""}, newest first`),
     done.regErr && done.source !== "queue" ? h("div", { class: "muted", style: "margin:0 8px 4px;color:#a35a00" }, `Registry details not shown: ${done.regErr}`) : null,
-    done.err && done.source !== "queue" ? h("div", { style: "margin:0 8px 4px;color:#b00" }, done.err) : null);
+    done.err && done.source !== "queue" ? h("div", { style: "margin:0 8px 4px;color:#b00" }, done.err) : null].filter(Boolean));
   if (done.source === "queue") {
     const qv = normName(done.q);
     const all = done.queue?.files || [];
@@ -4153,6 +4216,7 @@ async function doneCorrect(j, parcels) {
     const pick = await uiPrompt(`Which parcel of ${j.name} to correct? (${parcels.map((p) => p.upin).join(", ")})`, upin, { title: "Correct" });
     if (!pick) return; upin = pick.trim().toUpperCase();
   }
+  if (j.source === "aumentum") { await correctAndRecommit(upin); done.loaded = false; return; }
   const reason = await uiPrompt(`Correct ${upin}?\n\nThe job is reopened at its commit step with ${upin} back as a draft (it keeps this UPIN). Fix the shape, beacons or attributes, commit again, then resend the corrected plan. Refused if the parcel is linked in the Registry (unlink it there first). Reason:`, "", { title: "Correct", ok: "Reopen to correct" });
   if (!reason || !reason.trim()) return;
   try {
@@ -4215,19 +4279,6 @@ async function registryZoom(upin) {
 }
 // A job for the transaction, as the Registry created them in Aumentum: job type 9 "Deed Plan
 // Creationv2", named Job-<property number>, carrying the transaction number.
-async function registryStartJob(l) {
-  const types = (wf.defs?.job_types || []).filter((t) => t.active && t.start_task_id);
-  const type = types.find((t) => t.id === 9) || types[0];
-  if (!type) { uiAlert("No active job type to start."); return; }
-  const name = `Job-${l.property_number || l.upin}`;
-  if (!(await uiConfirm(`Start a "${type.name}" job ${name} for Registry transaction ${l.transaction_number} (parcel ${l.upin})?`, { ok: "Start job" }))) return;
-  try {
-    const d = await api("/api/v1/wf/jobs", { method: "POST", body: { job_type_id: type.id, name, lrs_transaction_number: l.transaction_number, comment: `Registry property ${l.su_id} linked to ${l.upin} on ${regTime(l.linked_at)}` } });
-    await registryLoad(); renderRegistry(); await registryZoom(l.upin);
-    status(`Job ${d.job.id} (${name}) started on "${d.job.current_task}". Open it in Workflow, choose Work On This Job, then input the survey points.`);
-    if (await uiConfirm(`Job ${name} started. Open it in the Workflow now to input the points?`, { ok: "Open job", cancel: "Not now" })) registryOpenJob(d.job.id);
-  } catch (e) { uiAlert(e.message); }
-}
 async function registryOpenJob(id) { await openWorkflow(); await wfSelect(id); }
 // --- transaction lookup, link / unlink (Aumentum LinkageManager.LinkParcel) ---
 async function regLookup(no) {
@@ -4275,7 +4326,7 @@ const regDay = (iso) => {
 };
 const regClock = (iso) => (iso ? iso.slice(11, 16) : "");
 const regKind = (l) => (!l.linked_now ? "unlinked" : l.job_instance_id ? "job" : l.parcel_id ? "waiting" : "nofabric");
-const REG_KIND = { waiting: ["Waiting for a job", "wait"], job: ["Job started", "job"], unlinked: ["Unlinked in the Registry", "gone"], nofabric: ["Parcel not in the fabric", "gone"] };
+const REG_KIND = { waiting: ["Digitised, linked: no title deed job yet", "wait"], job: ["Job started", "job"], unlinked: ["Unlinked in the Registry", "gone"], nofabric: ["Parcel not in the fabric", "gone"] };
 function regPill(kind, text) { return h("span", { class: "regPill " + REG_KIND[kind][1] }, text || REG_KIND[kind][0]); }
 // A card's status line: a coloured dot and words (fits any pane width).
 function regStatus(cls, text) { return h("div", { class: "regStatus " + cls }, h("span", { class: "regStatusDot" }), text); }
@@ -4333,7 +4384,8 @@ function renderRegistry() {
 
   // Sub-tabs.
   const tab = (key, label) => h("span", { class: "regTab" + (reg.view === key ? " sel" : ""), onclick: () => { reg.view = key; renderRegistry(); } }, label);
-  body.append(h("div", { class: "regTabs" }, tab("find", "Find file"), tab("inbox", "Linked"), tab("send", "Send plan")));
+  if (reg.view === "send" && !can("titledeed")) reg.view = "find";
+  body.append(h("div", { class: "regTabs" }, tab("find", "Find file"), tab("inbox", "Linked"), can("titledeed") ? tab("send", "Send plan") : null));
 
   const scroll = h("div", { class: "regScroll" });
   body.append(scroll);
@@ -4369,7 +4421,7 @@ function regInboxList(list) {
     const d = regDay(l.linked_at);
     if (d !== day) { day = d; list.append(h("div", { class: "regDayHead" }, d)); }
     const kind = regKind(l);
-    const main = kind === "waiting" ? regIconBtn("Start job", "Start a Deed Plan job for this transaction, to input the survey points", () => registryStartJob(l), { primary: true })
+    const main = kind === "waiting" && can("titledeed") ? regIconBtn("Title deed", "Digitised and linked: open (or start) the file's title deed job", () => startEditParcel(l.upin), { primary: true })
       : kind === "job" ? regIconBtn("Open job", `Open ${l.job_name || "the job"} in the Workflow`, () => registryOpenJob(l.job_instance_id)) : null;
     const card = h("div", { class: "regCard " + REG_KIND[kind][1], title: l.parcel_id ? "Click to zoom to the parcel" : "", onclick: () => l.parcel_id && registryZoom(l.upin) },
       h("div", { class: "regCardTop" }, h("span", { class: "regUpin" }, l.upin), h("span", { class: "muted regTime" }, regClock(l.linked_at))),
@@ -4417,18 +4469,28 @@ function regFindView(box) {
   for (const f of reg.found) {
     const active = f.status_code === "transaction_lodged";
     const linked = !!f.upin;
+    const here = f.cadastre_upins || [];
+    const done = linked || here.length > 0;   // digitised: here, in Aumentum, or linked in the Registry
+    const upin = f.upin || here[0] || null;
     const main = f.job_instance_id
       ? regIconBtn("Open job", `Open ${f.job_name || "the job"} in the Workflow`, () => registryOpenJob(f.job_instance_id), { primary: true })
-      : regIconBtn("Start digitising", active ? "Create the file's job and open it" : `The transaction is ${f.status}: only Active files are digitised`, () => regStartDigitising(f), { primary: true, disabled: !active || reg.busy });
-    box.append(h("div", { class: "regCard " + (f.job_instance_id ? "job" : active ? "wait" : "gone") },
+      : done ? regIconBtn("History", "The file's Registry stages and this Cadastre's events", () => historyWindow({ txn: f.transaction_number, upin, title: f.property_number }), { primary: true })
+      : can("digitise") ? regIconBtn("Start digitising", active ? "Create the file's job and open it" : `The transaction is ${f.status}: only Active files are digitised`, () => regStartDigitising(f), { primary: true, disabled: !active || reg.busy }) : null;
+    const say = f.job_instance_id ? `Job: ${f.job_name || "#" + f.job_instance_id}`
+      : linked ? `Digitised, linked in the Registry to ${f.upin}`
+      : done ? `Digitised (UPIN ${here.join(", ")}): waiting for the Registry link at title deed`
+      : "Not digitised yet";
+    box.append(h("div", { class: "regCard " + (f.job_instance_id || done ? "job" : active ? "wait" : "gone") },
       h("div", { class: "regCardTop" }, h("span", { class: "regUpin" }, f.property_number || f.transaction_number), regTxnPill(f.status_code, f.status)),
-      regStatus(f.job_instance_id ? "job" : linked ? "job" : "wait", f.job_instance_id ? `Job: ${f.job_name || "#" + f.job_instance_id}` : linked ? `Linked in the Registry to ${f.upin}` : "Not digitised / linked yet"),
+      regStatus(f.job_instance_id || done ? "job" : "wait", say),
       h("div", { class: "regKv" },
         h("div", {}, h("i", {}, "Transaction"), f.transaction_number),
         h("div", {}, h("i", {}, "Property"), f.su_id || "—"),
-        h("div", {}, h("i", {}, "UPIN"), f.upin || "— (given at commit; the Registry links it)"),
-        regMetaRow(f)),
-      h("div", { class: "regCardFoot" }, h("span", { class: "regLinks" }, regLink("Zoom", "Zoom to the parcel", () => registryZoom(f.upin), !linked)), main)));
+        h("div", {}, h("i", {}, "UPIN"), upin ? (linked ? upin : `${here.join(", ")} (in this Cadastre; not on the Registry file yet)`) : "— (given at commit; the Registry links it at title deed)"),
+        regMetaRow({ ...f, upin })),
+      h("div", { class: "regCardFoot" }, h("span", { class: "regLinks" },
+        regLink("Zoom", "Zoom to the parcel", () => registryZoom(upin), !upin),
+        done && !f.job_instance_id && can("digitise") ? regLink("Correct", "Correct & Recommit: the parcel keeps its UPIN and its history", () => correctAndRecommit(upin)) : null), main)));
   }
 }
 
@@ -4605,7 +4667,9 @@ function wfDetailView(d) {
       const named = s.commands.filter((c) => AUM_TOOL_GUIDS[c] || !c.startsWith("{")).map(wfToolName).filter((v, i, a) => a.indexOf(v) === i);
       const builtIn = s.commands.filter((c) => c.startsWith("{") && !AUM_TOOL_GUIDS[c]).length;
       const tools = named.join(" · ") + (builtIn ? `${named.length ? " · " : ""}+ ${builtIn} ArcMap tool${builtIn > 1 ? "s" : ""}` : "");
-      const act = wfStepAction(s);
+      let act = wfStepAction(s);
+      const need = stepFeature(s.id);
+      if (need && !can(need)) act = { label: "—", tip: `Done in the ${VIEW_FOR[need]} view` };
       ol.append(h("li", {}, h("div", { class: "wfStepHead" }, h("b", {}, s.name),
           act.run ? h("button", { class: "btn wfStepBtn", title: act.tip, onclick: act.run }, act.label || "Open")
                   : h("span", { class: "muted wfStepNote", title: act.tip }, act.label)),
@@ -4937,8 +5001,8 @@ function wfDrawJobArea() {
 function wfEditingView(j, e) {
   const sec = h("div", { class: "wfEditing" }, h("div", { class: "wfSub" }, "Editing"));
   const working = wf.editing && wf.editing.job_instance_id === j.id;
-  if (!working) {
-    sec.append(h("div", { class: "frow" }, h("button", { class: "btn", onclick: () => wfWorkOn(j.id) }, "Work On This Job"),
+  if (!working || !can("digitise")) {
+    sec.append(h("div", { class: "frow" }, can("digitise") ? h("button", { class: "btn", onclick: () => wfWorkOn(j.id) }, "Work On This Job") : null,
       h("button", { class: "btn", title: "Ask the Registry (10.10.10.5) whether this job's committed parcels are visible there", onclick: () => registryConfirmDialog(j.id) }, "Registry Confirmation"),
       h("span", { class: "muted" }, e?.drafts ? `${e.drafts} draft parcel(s)` : e?.area ? "Job area defined" : "")));
     return sec;
@@ -5314,6 +5378,13 @@ async function titleDeedDialog(jobId, upin) {
   w.querySelector(".fx").addEventListener("click", () => tdShow([]));
 }
 
+// Which unit a workflow step belongs to: the title deed plan steps to Title Deed, the digitising
+// steps (job area, construct, attributes, commit, mutations…) to Digitising; search/review to both.
+function stepFeature(id) {
+  if ([1003, 1016, 1018, 1017].includes(id)) return "titledeed";
+  if ([1005, 1007, 1019, 3, 1008, 1010, 1002, 1012, 1020, 1021, 2, 1006].includes(id)) return "digitise";
+  return null;
+}
 function wfStepAction(s) {
   const jobId = wf.detail?.job?.id;
   const needJob = (fn) => async () => { if (!wf.editing || wf.editing.job_instance_id !== jobId) await wfWorkOn(jobId); fn(); };

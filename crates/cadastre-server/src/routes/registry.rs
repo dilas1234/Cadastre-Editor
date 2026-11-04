@@ -177,7 +177,7 @@ fn registry_err(e: impl std::fmt::Display) -> AppError {
 
 /// A transaction number, property id or UPIN as typed: letters, digits and '-' only (they go
 /// into the Registry's HQL, as in Aumentum's query definitions).
-fn ident(kind: &str, v: &str) -> ApiResult<String> {
+pub(crate) fn ident(kind: &str, v: &str) -> ApiResult<String> {
     let v = v.trim();
     if v.is_empty() || v.len() > 40 || !v.chars().all(|c| c.is_ascii_alphanumeric() || c == '-') {
         return Err(AppError::BadRequest(format!("invalid {kind}: {v}")));
@@ -963,6 +963,17 @@ pub struct RegistryFileDto {
     /// The open Cadastre job serving the transaction, if any.
     pub job_instance_id: Option<i32>,
     pub job_name: Option<String>,
+    /// The UPINs this Cadastre already holds for the file number (current parcels): the file is
+    /// digitised (here or in Aumentum) even when the Registry is not linked yet.
+    pub cadastre_upins: Vec<String>,
+}
+
+/// The current parcels' UPINs for a file number (PL…), in this Cadastre.
+pub(crate) async fn digitised_upins(pool: &sqlx::PgPool, file: &str) -> Result<Vec<String>, sqlx::Error> {
+    sqlx::query_scalar(
+        "SELECT DISTINCT upin FROM cadastre.parcel_attribute WHERE upin IS NOT NULL AND upin <> '' \
+           AND upper(replace(property_number, ' ', '')) = upper(replace($1, ' ', '')) AND (status = '0' OR status IS NULL) ORDER BY upin",
+    ).bind(file).fetch_all(pool).await
 }
 
 /// Find a Registry file by transaction (PLS…) or file number (PL…), read live from the Registry,
@@ -988,10 +999,11 @@ pub async fn find(State(state): State<AppState>, Query(q): Query<FindQuery>) -> 
         let job = sqlx::query("SELECT j.id, j.name FROM cadastre.wf_job_instance j JOIN cadastre.wf_job_status s ON s.code = j.status \
                                WHERE j.lrs_transaction_number = $1 AND s.is_open ORDER BY j.id DESC LIMIT 1")
             .bind(r[0].trim()).fetch_optional(&state.pool).await?;
+        let cadastre_upins = match o(&r[3]) { Some(f) => digitised_upins(&state.pool, &f).await?, None => Vec::new() };
         out.push(RegistryFileDto {
             transaction_number: r[0].trim().to_string(), status_code: r[1].trim().to_string(), status: r[2].trim().to_string(),
             property_number: o(&r[3]), su_id: o(&r[4]), upin: o(&r[5]),
-            job_instance_id: job.as_ref().map(|j| j.get("id")), job_name: job.and_then(|j| j.get("name")),
+            job_instance_id: job.as_ref().map(|j| j.get("id")), job_name: job.and_then(|j| j.get("name")), cadastre_upins,
         });
     }
     Ok(Json(out))
@@ -1002,6 +1014,11 @@ pub struct StartDigitisingRequest {
     pub transaction_number: String,
     /// The file number for the job's name (Job-PL…); read from the Registry when omitted.
     pub property_number: Option<String>,
+    /// The job is for the title deed of a file already digitised (its parcel exists). Without it
+    /// the job is for digitising, refused for a file already digitised: a re-survey goes through
+    /// Correct, so the file keeps one UPIN and its history.
+    #[serde(default)]
+    pub title_deed: bool,
 }
 
 #[derive(Debug, Serialize, ToSchema)]
@@ -1035,20 +1052,37 @@ pub async fn start_digitising(State(state): State<AppState>, user: AuthUser, Jso
         return Err(AppError::Conflict(why.clone()));
     }
     let file = req.property_number.clone().filter(|s| !s.trim().is_empty()).or_else(|| t.properties.iter().find_map(|p| p.refnum.clone()));
-    let job_type: i32 = sqlx::query_scalar("SELECT id FROM cadastre.wf_job_type WHERE active AND lower(name) = lower($1) ORDER BY id LIMIT 1")
-        .bind(registry_sync::setting(&state.pool, "registry.job_deedplan_creation").await?.unwrap_or_else(|| "Deed Plan Creationv2".into()))
-        .fetch_optional(&state.pool).await?.ok_or_else(|| AppError::Conflict("the job type Deed Plan Creationv2 is not active".into()))?;
-    let name = format!("Job-{}", file.as_deref().unwrap_or(&txn));
-    let params = format!("@LRS:[Transaction]:[TransactionNumber]={txn}");
-    let id = crate::routes::mcservice::create_job_instance(&state.pool, job_type, Some(&name), Some("Deed Plan Creationv2"), Some(&params), "1", &actor.label, "registry.start-digitising", true)
-        .await.map_err(AppError::UnprocessableEntity)?;
-    // The file's property number is what the parcels of this job carry (Update Parcel Attribute
-    // defaults to it). No LRSID: the parcel is linked only when the Registry admin links it.
-    if let Some(f) = &file {
-        sqlx::query("INSERT INTO cadastre.wf_job_linkage (wf_job_instance_id, property_number, linkage_status) VALUES ($1, $2, 0) ON CONFLICT (wf_job_instance_id) DO NOTHING")
-            .bind(id).bind(f).execute(&state.pool).await?;
+    let digitised = match &file { Some(f) => digitised_upins(&state.pool, f).await?, None => Vec::new() };
+    let registry_upins: Vec<String> = t.properties.iter().filter_map(|p| p.upin.clone()).filter(|u| !u.trim().is_empty()).collect();
+    if !req.title_deed && (!digitised.is_empty() || !registry_upins.is_empty()) {
+        let upins = if digitised.is_empty() { registry_upins } else { digitised };
+        return Err(AppError::Conflict(format!(
+            "{} is already digitised (UPIN {}). It is not digitised again: to change its parcel use Correct & Recommit (right-click the parcel, or Correct on its card), which keeps its UPIN and its history.",
+            file.as_deref().unwrap_or(&txn), upins.join(", "))));
     }
+    if req.title_deed && digitised.is_empty() {
+        return Err(AppError::Conflict(format!("{} is not digitised in this Cadastre yet: there is no parcel for its title deed.", file.as_deref().unwrap_or(&txn))));
+    }
+    let (id, name) = create_file_job(&state.pool, &actor.label, &txn, file.as_deref(), "registry.start-digitising").await?;
     Ok(Json(StartedJobDto { job_instance_id: id, name: Some(name), created: true }))
+}
+
+/// A new file job, as the Registry created them in Aumentum: "Deed Plan Creationv2", named
+/// Job-<file number>, parameters @LRS:[Transaction]:[TransactionNumber]=PLS…, with the file's
+/// property number on its linkage (no LRSID: the Registry admin links it).
+pub(crate) async fn create_file_job(pool: &sqlx::PgPool, actor: &str, txn: &str, file: Option<&str>, via: &str) -> ApiResult<(i32, String)> {
+    let job_type: i32 = sqlx::query_scalar("SELECT id FROM cadastre.wf_job_type WHERE active AND lower(name) = lower($1) ORDER BY id LIMIT 1")
+        .bind(registry_sync::setting(pool, "registry.job_deedplan_creation").await?.unwrap_or_else(|| "Deed Plan Creationv2".into()))
+        .fetch_optional(pool).await?.ok_or_else(|| AppError::Conflict("the job type Deed Plan Creationv2 is not active".into()))?;
+    let name = format!("Job-{}", file.unwrap_or(txn));
+    let params = format!("@LRS:[Transaction]:[TransactionNumber]={txn}");
+    let id = crate::routes::mcservice::create_job_instance(pool, job_type, Some(&name), Some("Deed Plan Creationv2"), Some(&params), "1", actor, via, true)
+        .await.map_err(AppError::UnprocessableEntity)?;
+    if let Some(f) = file {
+        sqlx::query("INSERT INTO cadastre.wf_job_linkage (wf_job_instance_id, property_number, linkage_status) VALUES ($1, $2, 0) ON CONFLICT (wf_job_instance_id) DO NOTHING")
+            .bind(id).bind(f).execute(pool).await?;
+    }
+    Ok((id, name))
 }
 
 #[derive(Debug, Serialize, ToSchema)]

@@ -44,7 +44,14 @@ pub fn router(state: AppState) -> Router {
         .route("/ready", get(health::ready))
         // Browser viewer + editor (Phase 7/4, FR-VIEW/FR-SUR)
         .route("/viewer", get(viewer::viewer))
-        .route("/editor", get(editor::index))
+        // One address per unit (views): the same editor, the view chosen by the address.
+        .route("/editor", get(|axum::extract::RawQuery(q): axum::extract::RawQuery| async move {
+            axum::response::Redirect::temporary(&format!("/digitising{}", q.map(|q| format!("?{q}")).unwrap_or_default()))
+        }))
+        .route("/sys-editor", get(editor::index))
+        .route("/digitising", get(editor::index))
+        .route("/title-deed", get(editor::index))
+        .route("/reporting", get(editor::index))
         .route("/editor/{*path}", get(editor::asset))
         .route("/api/v1/me", get(me::me))
         .route("/api/v1/auth/config", get(me::auth_config))
@@ -132,6 +139,7 @@ pub fn router(state: AppState) -> Router {
         .route("/api/v1/registry/history", get(registry::file_history))
         .route("/api/v1/wf/jobs/{id}/registry/link", post(registry::link_job))
         .route("/api/v1/registry/parcels/{upin}/work", get(registry::parcel_work))
+        .route("/api/v1/wf/correct-aumentum", post(completed::correct_aumentum))
         .route("/api/v1/registry/start-digitising", post(registry::start_digitising))
         .route("/api/v1/registry/transactions/{number}", get(registry::transaction))
         .route("/api/v1/registry/link", post(registry::link))
