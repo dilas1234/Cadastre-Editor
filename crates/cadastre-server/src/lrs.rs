@@ -91,6 +91,28 @@ pub(crate) struct HttpResponse {
     pub(crate) body: String,
 }
 
+/// Opens a TCP connection to an Aumentum or Registry host. When `CADASTRE_OUTBOUND_ADDR` is set
+/// (an IPv4 address of this server, e.g. `10.10.10.11`), the connection leaves from that address.
+/// Aumentum's job service reverse-resolves its caller ("No such host is known" otherwise), so the
+/// server must call from an address the LAN DNS has a name for. Loopback targets are not bound.
+pub(crate) async fn connect(host: &str, port: u16) -> std::io::Result<TcpStream> {
+    let bind = std::env::var("CADASTRE_OUTBOUND_ADDR").ok().and_then(|s| s.trim().parse::<std::net::Ipv4Addr>().ok());
+    let Some(bind) = bind else { return TcpStream::connect((host, port)).await };
+    let mut last = None;
+    for addr in tokio::net::lookup_host((host, port)).await? {
+        let std::net::SocketAddr::V4(v4) = addr else { continue };
+        let sock = tokio::net::TcpSocket::new_v4()?;
+        if !v4.ip().is_loopback() {
+            sock.bind(std::net::SocketAddr::from((bind, 0)))?;
+        }
+        match sock.connect(addr).await {
+            Ok(s) => return Ok(s),
+            Err(e) => last = Some(e),
+        }
+    }
+    Err(last.unwrap_or_else(|| std::io::Error::new(std::io::ErrorKind::NotFound, format!("no IPv4 address for {host}"))))
+}
+
 /// Minimal HTTP/1.0 request over plain TCP (the Registry serves `http://` only). HTTP/1.0 and
 /// `Connection: close` keep the response unchunked and read to EOF.
 pub(crate) async fn http(url: &str, method: &str, headers: &[(&str, String)], body: &str) -> Result<HttpResponse, LrsError> {
@@ -108,7 +130,7 @@ async fn http_bytes(url: &str, method: &str, headers: &[(&str, String)], body: &
         None => (authority, 80),
     };
     let fut = async {
-        let mut stream = TcpStream::connect((host, port)).await.map_err(|e| LrsError::Http(format!("connect {authority}: {e}")))?;
+        let mut stream = connect(host, port).await.map_err(|e| LrsError::Http(format!("connect {authority}: {e}")))?;
         let mut req = format!("{method} {path} HTTP/1.0\r\nHost: {authority}\r\nConnection: close\r\nContent-Length: {}\r\n", body.len());
         for (k, v) in headers {
             req.push_str(&format!("{k}: {v}\r\n"));
