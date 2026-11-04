@@ -4081,8 +4081,17 @@ async function titleDeedDialog(jobId, upin) {
   const featText = (x) => `${symOf(x.symbol)?.label || x.symbol}${x.label ? ` "${x.label}"` : ""}: ${x.side != null ? sideText(x.side) : "drawn on the map"}`;
   const renderFeats = () => {
     featList.replaceChildren(...feats.map((x, i) => h("div", { style: "display:flex;gap:6px;align-items:center;margin-top:3px" }, h("span", { style: "flex:1" }, featText(x)),
-      h("button", { class: "btn", onclick: () => { feats.splice(i, 1); featsChanged(); } }, "Remove"))));
+      h("button", { class: "btn", onclick: () => { feats.splice(i, 1); dropFeatureMove(i); featsChanged(); } }, "Remove"))));
     tdShow(feats);
+  };
+  // Label moves of the plan, kept by label: a removed feature's goes, the later ones shift down.
+  let moves = { ...(f.label_moves || {}) };
+  const dropFeatureMove = (i) => {
+    moves = Object.fromEntries(Object.entries(moves).flatMap(([k, v]) => {
+      const m = /^feature:(\d+)$/.exec(k);
+      if (!m || Number(m[1]) < i) return [[k, v]];
+      return Number(m[1]) === i ? [] : [[`feature:${Number(m[1]) - 1}`, v]];
+    }));
   };
   const featsChanged = () => { renderFeats(); save().catch((e) => { msg.style.color = "#900"; msg.textContent = e.message; }); };
   const addFeat = () => {
@@ -4120,6 +4129,7 @@ async function titleDeedDialog(jobId, upin) {
     out.grid_corner = null;
     out.road_label = roadLabel.value.trim() || null;
     out.features = feats;
+    out.label_moves = moves;
     return out;
   };
   const msg = h("div", { style: "min-height:1.2em;margin:4px 0" });
@@ -4127,6 +4137,49 @@ async function titleDeedDialog(jobId, upin) {
     const r = await api(`/api/v1/wf/jobs/${jobId}/titledeed`, { method: "PUT", body: { upin: p.upin, fields: collect() } });
     msg.style.color = "#060"; msg.textContent = "Saved with the job.";
     return r;
+  };
+  // Adjust labels: the sheet full size; drag a label to move it, double-click it to put it back.
+  // Only the writing moves: beacons, boundary and features stay at their co-ordinates.
+  const adjust = async () => {
+    let svg;
+    try { svg = await sheet(); } catch (e) { msg.style.color = "#900"; msg.textContent = e.message; return; }
+    const before = { ...moves };
+    const page = h("div", { html: svg, style: "width:900px;margin:0 auto 20px;background:#fff;touch-action:none;user-select:none" });
+    const close = () => ov.remove();
+    const place = (g, key) => { const m = moves[key]; if (m) g.setAttribute("transform", `translate(${m[0]} ${m[1]})`); else g.removeAttribute("transform"); };
+    const bar = h("div", { style: "position:sticky;top:0;z-index:1;display:flex;gap:8px;align-items:center;justify-content:center;padding:8px;background:#333;color:#fff;font:13px sans-serif" },
+      "Drag a label to move it. Double-click a label to put it back.",
+      h("button", { class: "btn", onclick: () => { moves = {}; page.querySelectorAll("[data-move]").forEach((g) => g.removeAttribute("transform")); } }, "Reset all"),
+      h("button", { class: "btn", onclick: () => { moves = before; close(); } }, "Cancel"),
+      h("button", { class: "btn", onclick: () => { close(); save().catch((e) => { msg.style.color = "#900"; msg.textContent = e.message; }); } }, "Done"));
+    const ov = h("div", { style: "position:fixed;inset:0;z-index:2000;overflow:auto;background:#777" }, h("style", {}, "[data-move]{cursor:move}[data-move]:hover text{fill:#06c}"), bar, page);
+    document.body.append(ov);
+    const el = page.querySelector("svg");
+    el.removeAttribute("height"); el.setAttribute("width", "100%"); el.style.display = "block";
+    let drag = null;
+    el.addEventListener("pointerdown", (e) => {
+      const g = e.target.closest("[data-move]");
+      if (!g) return;
+      const key = g.getAttribute("data-move");
+      drag = { g, key, x: e.clientX, y: e.clientY, base: moves[key] || [0, 0], mm: el.getScreenCTM().a };
+      e.preventDefault();
+    });
+    ov.addEventListener("pointermove", (e) => {
+      if (!drag) return;
+      const r = (v) => Math.round(v * 100) / 100;
+      moves[drag.key] = [r(drag.base[0] + (e.clientX - drag.x) / drag.mm), r(drag.base[1] + (e.clientY - drag.y) / drag.mm)];
+      place(drag.g, drag.key);
+    });
+    const drop = () => { drag = null; };
+    ov.addEventListener("pointerup", drop);
+    ov.addEventListener("pointercancel", drop);
+    el.addEventListener("dblclick", (e) => {
+      const g = e.target.closest("[data-move]");
+      if (!g) return;
+      const key = g.getAttribute("data-move");
+      delete moves[key];
+      place(g, key);
+    });
   };
   const sheet = async () => { await save(); return api(`/api/v1/wf/jobs/${jobId}/titledeed.svg?upin=${encodeURIComponent(p.upin)}`); };
   const preview = async () => {
@@ -4182,6 +4235,7 @@ async function titleDeedDialog(jobId, upin) {
     msg,
     h("div", { class: "frow", style: "flex-wrap:wrap;justify-content:flex-end" },
       h("button", { class: "btn", onclick: () => save().catch((e) => { msg.style.color = "#900"; msg.textContent = e.message; }) }, "Save"),
+      h("button", { class: "btn", onclick: adjust, title: "Drag beacon numbers, bearings and distances on the sheet" }, "Adjust labels"),
       h("button", { class: "btn", onclick: preview }, "Preview / Print"),
       h("button", { class: "btn", onclick: attach, title: "File the plan on the job as a PDF, for Send plan" }, "Attach as PDF"),
       h("button", { class: "btn", onclick: () => openRegistry({ job: jobId, view: "send" }) }, "Send plan…"))),

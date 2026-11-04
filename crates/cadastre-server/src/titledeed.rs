@@ -19,6 +19,7 @@
 //! so it is unit-tested without a database. The editor prints it and turns it into the JPEG that
 //! Send plan files with the Registry transaction.
 
+use std::collections::BTreeMap;
 use std::fmt::Write;
 
 use serde::{Deserialize, Serialize};
@@ -127,6 +128,9 @@ pub struct PlanFields {
     pub grid_corner: Option<usize>,
     /// Roads, water, drainage and point features added to the plan.
     pub features: Vec<PlanFeature>,
+    /// Labels the officer dragged on the sheet: by label (`data-move` on the sheet), how far it
+    /// moved on paper (mm, x right and y down). Only the writing moves, never a beacon.
+    pub label_moves: BTreeMap<String, [f64; 2]>,
 }
 
 impl PlanFields {
@@ -315,6 +319,19 @@ fn spread_labels(boxes: &mut [LabelBox]) {
     }
 }
 
+/// Open a label's group, moved as the officer placed it; `data-move` names it for the sheet's
+/// Adjust labels view. Close it with [`end_move`].
+fn begin_move(svg: &mut String, moves: &BTreeMap<String, [f64; 2]>, key: &str) {
+    match moves.get(key) {
+        Some([dx, dy]) => { let _ = writeln!(svg, r#"<g data-move="{key}" transform="translate({dx:.2} {dy:.2})">"#); }
+        None => { let _ = writeln!(svg, r#"<g data-move="{key}">"#); }
+    }
+}
+
+fn end_move(svg: &mut String) {
+    svg.push_str("</g>\n");
+}
+
 /// A line symbol along paper points.
 fn feature_line(svg: &mut String, sym: &Symbol, pts: &[(f64, f64)]) {
     let d: String = pts.iter().map(|q| format!("{:.2},{:.2}", q.0, q.1)).collect::<Vec<_>>().join(" ");
@@ -339,6 +356,7 @@ fn feature_point(svg: &mut String, sym: &Symbol, q: (f64, f64)) {
 /// The sheet as SVG.
 pub fn render_svg(d: &PlanData) -> String {
     let f = &d.fields;
+    let moves = &f.label_moves;
     let corners: Vec<Corner> = d.corners.iter().enumerate().map(|(i, c)| {
         let name = f.corner_names.get(i).cloned().flatten().filter(|s| !s.trim().is_empty()).unwrap_or_else(|| c.name.clone());
         Corner { name, ..c.clone() }
@@ -475,7 +493,7 @@ pub fn render_svg(d: &PlanData) -> String {
         }
     };
     let label = f.road_label.clone().filter(|l| !l.trim().is_empty()).unwrap_or_else(|| "Access Road".into());
-    for r in &rd {
+    for (r, side) in rd.iter().zip(&roads) {
         // Inner line, broken where a joining road comes in.
         let mut gaps = r.gaps.clone();
         gaps.sort_by(|x, y| x.0.total_cmp(&y.0));
@@ -487,14 +505,16 @@ pub fn render_svg(d: &PlanData) -> String {
         dashed(&mut s, off_pt(r, ROAD_IN), r.u, t, r.t1);
         dashed(&mut s, off_pt(r, ROAD_OUT), r.u, r.t0_out, r.t1_out);
         let m = off_pt(r, (ROAD_IN + ROAD_OUT) / 2.0);
+        begin_move(&mut s, moves, &format!("road:{side}"));
         along(&mut s, m, (m.0 + r.u.0 * r.len, m.1 + r.u.1 * r.len), 0.5, 0.0, 2.8, &label);
+        end_move(&mut s);
     }
 
     // Features from the symbol list, under the parcel, and cut at the frame: a drawn one can run
     // past it. One on a side keeps that side's length, outside the parcel.
     let _ = writeln!(s, r#"<clipPath id="planFrame"><rect x="{x0}" y="{y0}" width="{}" height="{}"/></clipPath><g clip-path="url(#planFrame)">"#, x1 - x0, y1 - y0);
     let mut on_side = vec![0u32; p.len()];
-    for feat in &f.features {
+    for (fi, feat) in f.features.iter().enumerate() {
         let Some(sym) = SYMBOLS.iter().find(|y| y.id == feat.symbol) else { continue };
         let label = feat.label.as_deref().map(str::trim).filter(|l| !l.is_empty());
         let (pts, label_off): (Vec<(f64, f64)>, f64) = match feat.side {
@@ -516,7 +536,9 @@ pub fn render_svg(d: &PlanData) -> String {
             let Some(&q) = pts.first() else { continue };
             feature_point(&mut s, sym, q);
             if let Some(l) = label {
+                begin_move(&mut s, moves, &format!("feature:{fi}"));
                 text(&mut s, q.0 + 2.2, q.1 + 0.9, 2.4, "start", HALO, &esc(l));
+                end_move(&mut s);
             }
         } else if pts.len() >= 2 {
             feature_line(&mut s, sym, &pts);
@@ -524,7 +546,9 @@ pub fn render_svg(d: &PlanData) -> String {
                 // On the longest stretch, where it has the most room.
                 let seg = |w: &&[(f64, f64)]| (w[1].0 - w[0].0).powi(2) + (w[1].1 - w[0].1).powi(2);
                 if let Some(w) = pts.windows(2).max_by(|x, y| seg(x).total_cmp(&seg(y))) {
+                    begin_move(&mut s, moves, &format!("feature:{fi}"));
                     along(&mut s, w[0], w[1], 0.5, label_off, 2.4, l);
+                    end_move(&mut s);
                 }
             }
         }
@@ -536,7 +560,7 @@ pub fn render_svg(d: &PlanData) -> String {
         let pts: String = p.iter().map(|q| format!("{:.2},{:.2}", q.0, q.1)).collect::<Vec<_>>().join(" ");
         let _ = writeln!(s, r#"<polygon points="{pts}" fill="none" stroke="{LINE}" stroke-width="0.45"/>"#);
     }
-    let mut short: Vec<String> = Vec::new();
+    let mut short: Vec<(usize, String)> = Vec::new();
     for i in 0..p.len() {
         let (a, b) = (p[i], p[(i + 1) % p.len()]);
         if p.len() < 2 || (i == p.len() - 1 && p.len() == 2) {
@@ -556,16 +580,18 @@ pub fn render_svg(d: &PlanData) -> String {
         let reads_from_a = if dx.abs() > 1e-6 { dx > 0.0 } else { a.1 < b.1 };
         let (t_deg, t_min) = if reads_from_a { (0.2, 0.8) } else { (0.8, 0.2) };
         if paper_len < SHORT_SIDE_MM && p.len() >= 3 {
-            short.push(format!("{} - {} = {deg}° {min:02}' @ {dist:.2}m", esc(&corners[i].name), esc(&corners[(i + 1) % corners.len()].name)));
+            short.push((i, format!("{} - {} = {deg}° {min:02}' @ {dist:.2}m", esc(&corners[i].name), esc(&corners[(i + 1) % corners.len()].name))));
             continue;
         }
-        along(&mut s, a, b, t_deg, out, 2.6, &format!("{deg}°"));
-        along(&mut s, a, b, t_min, out, 2.6, &format!("{min:02}'"));
-        along(&mut s, a, b, 0.5, -out, 2.6, &format!("{dist:.2}m"));
+        for (key, t, off, label) in [("degrees", t_deg, out, format!("{deg}°")), ("minutes", t_min, out, format!("{min:02}'")), ("distance", 0.5, -out, format!("{dist:.2}m"))] {
+            begin_move(&mut s, moves, &format!("{key}:{i}"));
+            along(&mut s, a, b, t, off, 2.6, &label);
+            end_move(&mut s);
+        }
     }
     let mut labels: Vec<(f64, f64, &str)> = Vec::new();
     for q in &p {
-        let _ = writeln!(s, r##"<path d="M{:.2} {:.2} l2 2 M{:.2} {:.2} l-2 2" stroke="#000" stroke-width="0.3" transform="translate(-1 -1)"/>"##, q.0 - 0.0, q.1, q.0 + 2.0, q.1);
+        let _ = writeln!(s, r##"<path d="M{:.2} {:.2} h2 M{:.2} {:.2} v2" stroke="#000" stroke-width="0.3"/>"##, q.0 - 1.0, q.1, q.0, q.1 - 1.0);
         let (vx, vy) = (q.0 - pcx, q.1 - pcy);
         let vl = (vx * vx + vy * vy).sqrt().max(1e-9);
         let (tx, ty) = (q.0 + vx / vl * 5.0, q.1 + vy / vl * 4.0 + 1.0);
@@ -578,16 +604,22 @@ pub fn render_svg(d: &PlanData) -> String {
         LabelBox { left, right: left + w, y }
     }).collect();
     spread_labels(&mut boxes);
-    for ((&(x, _, anchor), b), c) in labels.iter().zip(&boxes).zip(&corners) {
+    for (i, ((&(x, _, anchor), b), c)) in labels.iter().zip(&boxes).zip(&corners).enumerate() {
+        begin_move(&mut s, moves, &format!("beacon:{i}"));
         text(&mut s, x, b.y, BEACON_SIZE, anchor, HALO, &esc(&c.name));
+        end_move(&mut s);
     }
     let file_no = if f.plan_no.as_deref().unwrap_or("").is_empty() { title_no.clone() } else { up(&f.plan_no) };
+    begin_move(&mut s, moves, "parcel");
     text(&mut s, pcx, pcy - 0.8, 2.6, "middle", "", &file_no);
     text(&mut s, pcx, pcy + 2.8, 2.6, "middle", "", &format!("{} Sq.m", area3(d.area_m2)));
+    end_move(&mut s);
 
     // Short sides, bottom-right inside the frame (the last one lowest).
-    for (j, line) in short.iter().rev().enumerate() {
+    for (j, (i, line)) in short.iter().rev().enumerate() {
+        begin_move(&mut s, moves, &format!("short:{i}"));
         text(&mut s, FRAME.2 - 2.0, FRAME.3 - 2.5 - j as f64 * 4.0, 2.6, "end", "", line);
+        end_move(&mut s);
     }
 
     // Footer.
@@ -846,6 +878,21 @@ mod tests {
         let f: PlanFields = serde_json::from_str(r#"{"plan_no":"PL1"}"#).unwrap();
         assert!(f.features.is_empty());
         assert_eq!(SYMBOLS.iter().map(|y| y.id).collect::<std::collections::BTreeSet<_>>().len(), SYMBOLS.len(), "ids are unique");
+    }
+
+    #[test]
+    fn beacons_are_plus_marks_and_a_dragged_label_moves_but_its_beacon_does_not() {
+        let plan = |label_moves| PlanData { upin: "X".into(), area_m2: 902.203, corners: pl68374(), fields: PlanFields { scale: Some(500), label_moves, ..Default::default() } };
+        let before = render_svg(&plan(BTreeMap::new()));
+        assert_eq!(before.matches(" h2 M").count(), 5, "a + at each beacon");
+        assert!(!before.contains("l2 2"), "no x");
+        for key in ["beacon:0", "degrees:0", "minutes:0", "distance:0", "short:3", "parcel"] {
+            assert!(before.contains(&format!(r#"data-move="{key}""#)), "{key} can be dragged");
+        }
+        let after = render_svg(&plan(BTreeMap::from([("beacon:0".to_string(), [3.5, -2.0])])));
+        assert!(after.contains(r#"<g data-move="beacon:0" transform="translate(3.50 -2.00)">"#));
+        let marks = |s: &str| s.lines().filter(|l| l.contains(" h2 M") || l.contains("<polygon")).map(String::from).collect::<Vec<_>>();
+        assert_eq!(marks(&before), marks(&after), "the beacons and the boundary stay where they are");
     }
 
     #[test]

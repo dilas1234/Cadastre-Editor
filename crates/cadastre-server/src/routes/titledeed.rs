@@ -188,6 +188,7 @@ fn merge(prefill: &PlanFields, saved: &PlanFields) -> PlanFields {
         grid: saved.grid.or(prefill.grid),
         grid_corner: saved.grid_corner.or(prefill.grid_corner),
         features: saved.features.clone(),
+        label_moves: saved.label_moves.clone(),
         road_label: non_empty(saved.road_label.clone()).or_else(|| prefill.road_label.clone()) } } }
     pick!(region, location, plan_no, tracing_no, title_no, address, lga, holder, surveyed_by, survey_date, plotted_by, checked_by, surveyor_general, prepared_by)
 }
