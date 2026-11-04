@@ -168,6 +168,10 @@ pub struct ReconcileReport {
     pub unlinked: usize,
     /// This run only recorded the baseline snapshot.
     pub baseline: bool,
+    /// Parcels found linked in the Registry (the property holds their UPIN, typed or carried over,
+    /// with or without a link date) that the Cadastre did not know as linked: now marked linked.
+    #[serde(default)]
+    pub recognised: usize,
 }
 
 pub async fn setting(pool: &PgPool, key: &str) -> Result<Option<String>, sqlx::Error> {
@@ -340,11 +344,70 @@ pub async fn reconcile_with(pool: &PgPool, fresh: &HashMap<String, (Option<i64>,
         .execute(&mut *tx)
         .await
         .map_err(|e| e.to_string())?;
+    let recognised = recognise_links(&mut tx).await.map_err(|e| e.to_string())?;
     tx.commit().await.map_err(|e| e.to_string())?;
-    Ok(ReconcileReport { registry_properties: fresh.len(), unlinked, baseline })
+    Ok(ReconcileReport { registry_properties: fresh.len(), unlinked, baseline, recognised })
 }
 
 /// Read the Registry's linked properties and reconcile.
+/// A UPIN on a Registry property makes the Registry treat the file as linked (its check reads only
+/// "UPIN assigned"), whether it came from Map → Connect, was typed in, or was carried over from an
+/// earlier transaction. Mark the Cadastre side linked too (LRSID, LinkageStatus 1, property number)
+/// for every committed parcel whose UPIN exactly one current property holds and which the Cadastre
+/// did not know as linked. No link date is invented (the Registry has none for a typed UPIN); the
+/// audit records when it was recognised. A UPIN on several properties is left for link problems.
+pub async fn recognise_links(conn: &mut sqlx::PgConnection) -> Result<usize, sqlx::Error> {
+    let done: Vec<(String, String)> = sqlx::query_as(
+        "WITH holders AS (SELECT upin, min(su_id) AS su_id, min(refnum) AS refnum, count(*) AS n FROM cadastre.registry_property GROUP BY upin), \
+              one AS (SELECT h.upin, h.su_id, h.refnum FROM holders h WHERE h.n = 1 \
+                      AND EXISTS (SELECT 1 FROM cadastre.parcel p WHERE p.parcel_number = h.upin AND p.status = 'posted')) \
+         UPDATE cadastre.parcel_attribute a SET lrs_id = o.su_id, linkage_status = 1, \
+                property_number = COALESCE(NULLIF(btrim(o.refnum), ''), a.property_number), last_edit_date = now()::timestamp, updated_at = now() \
+         FROM one o WHERE a.upin = o.upin AND (a.status = '0' OR a.status IS NULL) AND a.linkage_status IS DISTINCT FROM 1 \
+         RETURNING a.upin, o.su_id",
+    )
+    .fetch_all(&mut *conn)
+    .await?;
+    if !done.is_empty() {
+        audit::append(&mut *conn, "registry-sync", "registry_links_recognised", "registry_link", None, json!({
+            "count": done.len(),
+            "note": "the Registry property holds the UPIN (typed, carried over or linked); the Cadastre side is marked linked",
+            "links": done.iter().take(5000).map(|(u, s)| json!({ "upin": u, "su_id": s })).collect::<Vec<_>>(),
+        }))
+        .await
+        .map_err(|e| sqlx::Error::Protocol(e.to_string()))?;
+    }
+    Ok(done.len())
+}
+
+/// Link problems, for checking by hand: a UPIN on several Registry properties; a UPIN on a Registry
+/// property that is not a committed parcel here; a parcel linked to another property than the one
+/// now holding its UPIN; a commit whose parcel could not be linked to its file.
+pub async fn link_problems(pool: &PgPool) -> Result<serde_json::Value, sqlx::Error> {
+    let several: Vec<(String, Vec<String>)> = sqlx::query_as(
+        "SELECT upin, array_agg(su_id ORDER BY su_id) FROM cadastre.registry_property GROUP BY upin HAVING count(*) > 1 ORDER BY upin LIMIT 500").fetch_all(pool).await?;
+    let missing: Vec<(String, String, Option<String>)> = sqlx::query_as(
+        "SELECT r.upin, r.su_id, r.refnum FROM cadastre.registry_property r \
+         WHERE NOT EXISTS (SELECT 1 FROM cadastre.parcel p WHERE p.parcel_number = r.upin AND p.status = 'posted') ORDER BY r.upin LIMIT 500").fetch_all(pool).await?;
+    let missing_total: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM cadastre.registry_property r WHERE NOT EXISTS (SELECT 1 FROM cadastre.parcel p WHERE p.parcel_number = r.upin AND p.status = 'posted')").fetch_one(pool).await?;
+    let mismatch: Vec<(String, Option<String>, String)> = sqlx::query_as(
+        "SELECT a.upin, a.lrs_id, r.su_id FROM cadastre.parcel_attribute a JOIN cadastre.registry_property r ON r.upin = a.upin \
+         WHERE a.linkage_status = 1 AND (a.status = '0' OR a.status IS NULL) AND a.lrs_id IS NOT NULL AND a.lrs_id <> r.su_id \
+           AND (SELECT count(*) FROM cadastre.registry_property x WHERE x.upin = a.upin) = 1 ORDER BY a.upin LIMIT 500").fetch_all(pool).await?;
+    let not_linked: Vec<(String, chrono::DateTime<chrono::Utc>, serde_json::Value)> = sqlx::query_as(
+        "SELECT DISTINCT ON (f.entity_id) f.entity_id, f.created_at, f.payload FROM cadastre.audit_log f \
+         WHERE f.action = 'registry_link_failed' AND NOT EXISTS (SELECT 1 FROM cadastre.parcel_attribute a WHERE a.upin = f.entity_id AND a.linkage_status = 1) \
+         ORDER BY f.entity_id, f.id DESC LIMIT 500").fetch_all(pool).await?;
+    Ok(json!({
+        "several_properties": several.iter().map(|(u, s)| json!({ "upin": u, "su_ids": s })).collect::<Vec<_>>(),
+        "not_in_cadastre": missing.iter().map(|(u, s, r)| json!({ "upin": u, "su_id": s, "refnum": r })).collect::<Vec<_>>(),
+        "not_in_cadastre_total": missing_total,
+        "linked_elsewhere": mismatch.iter().map(|(u, l, s)| json!({ "upin": u, "cadastre_lrs_id": l, "registry_su_id": s })).collect::<Vec<_>>(),
+        "commits_not_linked": not_linked.iter().map(|(u, at, p)| json!({ "upin": u, "at": at.to_rfc3339(), "transaction_number": p["transaction_number"], "reason": p["reason"] })).collect::<Vec<_>>(),
+    }))
+}
+
 pub async fn reconcile_once(pool: &PgPool, cfg: &LrsConfig) -> Result<ReconcileReport, String> {
     let session = Session::start(cfg).await.map_err(|e| e.to_string())?;
     let rows = session.query(SNAPSHOT_QUERY, 200_000).await;

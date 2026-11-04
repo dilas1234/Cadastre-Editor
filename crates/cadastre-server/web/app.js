@@ -1272,6 +1272,7 @@ function parcelMenu(e) {
     beaconLabels.upin === upin ? { label: "Hide Beacons", action: () => hideBeacons() } : { label: "Show Beacons", action: () => showParcelBeacons(upin) },
     { label: "Point List…", action: () => pointListWindow(upin) },
     { label: "Correct & Recommit…", icon: "editor", action: () => correctAndRecommit(upin) },
+    { label: "History…", action: () => historyWindow({ upin, title: upin }) },
     "-",
     { label: "Parcel Lineage…", action: () => lineageOfSelection() },
   ], ev.clientX, ev.clientY);
@@ -2585,6 +2586,13 @@ async function orthoUpdate() {
   }
 }
 
+// What happened with the Registry file right after the commit (the UPIN and link date written).
+function linkSummary(links) {
+  if (!links || !links.length) return "";
+  const ok = links.filter((l) => l.linked), bad = links.filter((l) => !l.linked);
+  return [ok.length ? `Linked to the Registry file: ${ok.map((l) => `${l.upin} → ${l.su_id}`).join(", ")}.` : "",
+    bad.length ? `Not linked: ${bad.map((l) => `${l.upin} (${l.reason})`).join("; ")}. Use Link now on the Completed tab once fixed.` : ""].filter(Boolean).join(" ");
+}
 // Digitising done (the commit completed the job): a clean start for the next job. The edit session
 // ends (nothing is left to save), the editing windows close, the job is no longer worked on, and
 // the map shows the Table Of Contents, zoomed to the parcel just committed.
@@ -3956,7 +3964,93 @@ async function openCompleted() {
   showCompleted(true); buildTocTools();
   if (!done.loaded) await doneLoad(true); else renderCompleted();
 }
+// --- File history: the Registry's stages and this Cadastre's own events, one timeline, read only ---
+function historyText(e) {
+  const d = e.detail || {};
+  switch (e.kind) {
+    case "wf_commit": return `Committed: ${(d.parcel_numbers || []).join(", ") || "—"}${d.retired && d.retired.length ? ` (replaced ${d.retired.join(", ")})` : ""}`;
+    case "registry_confirmation": return `Registry confirmation: ${d.ok ? "confirmed" : "not confirmed"}`;
+    case "registry_link_made": return `Linked to the Registry property ${d.su_id || ""}${d.how === "commit" ? " (on commit)" : ""}`;
+    case "registry_link_reverted": return `Link removed (${d.su_id || ""})`;
+    case "registry_link_synced": return `Linked in the Registry: property ${d.su_id || ""}`;
+    case "registry_unlink_synced": return "Unlinked in the Registry";
+    case "registry_link_failed": return `Could not be linked: ${d.reason || ""}`;
+    case "registry_plan_sent": return `Title deed plan ${d.resend ? "resent (corrected)" : "sent"} to the Registry: ${d.file_name || ""}`;
+    case "registry_plan_withdrawn": return `Title deed plan withdrawn: ${d.reason || ""}`;
+    case "title_deed_plan_deleted": return "Title deed plan deleted";
+    case "wf_reopened_for_correction": return `Reopened for correction (${d.upin || ""}): ${d.reason || ""}`;
+    case "wf_commit_reverted": return `Commit undone (${d.upin || ""})`;
+    case "wf_job_area_save": return "Job area saved";
+    case "precheck_acknowledged": return `System check warnings accepted: ${d.reason || ""}`;
+    case "duplicate_upin_found": return `Duplicate UPIN reported: ${d.upin || ""}`;
+    default: return e.text || e.kind.replace(/_/g, " ");
+  }
+}
+async function historyWindow(opts) {
+  const q = new URLSearchParams(); for (const k of ["txn", "job", "upin"]) if (opts[k]) q.set(k, opts[k]);
+  const body = h("div", {}, h("p", { class: "muted" }, "Reading the history…"));
+  floatWindow(`History — ${opts.title || opts.txn || opts.upin || "job " + opts.job}`, body, { id: "historyWin", width: 720 });
+  let d;
+  try { d = await api("/api/v1/registry/history?" + q); } catch (e) { body.innerHTML = ""; body.append(h("p", { style: "color:#b00" }, e.message)); return; }
+  const r = d.registry || {};
+  const rows = [];
+  for (const st of r.stages || []) rows.push({ at: st.started, src: "Registry", what: `${st.workflow} → ${st.stage_label}`, by: st.by,
+    extra: st.finished ? `finished ${fmtDT(st.finished)}${st.next ? " → " + st.next : ""}` : "open now" });
+  for (const j of r.cadastre_jobs || []) rows.push({ at: j.started, src: "Registry", what: `Cadastre job ${j.name} (#${j.job}) recorded`, by: "", extra: j.ended ? `completed ${fmtDT(j.ended)}` : "not completed" });
+  for (const e of d.cadastre || []) rows.push({ at: e.at, src: "Cadastre", what: historyText(e), by: e.by || "", extra: e.end ? `finished ${fmtDT(e.end)}` : e.note || "" });
+  rows.sort((a, b) => String(b.at || "").localeCompare(String(a.at || "")));
+  const cur = (r.current || []).map((c) => `${c.workflow} → ${c.stage_label} (since ${fmtDT(c.started)})`).join("; ");
+  const props = (r.properties || []).map((p) => p.upin ? `${p.property_number || p.su_id}: linked to ${p.upin}` : `${p.property_number || p.su_id}: not linked yet`).join("; ");
+  const tbl = h("table", { class: "verifyTbl histTbl" }, h("tr", {}, h("th", {}, "When"), h("th", {}, "Where"), h("th", {}, "What"), h("th", {}, "By"), h("th", {}, "")));
+  for (const x of rows) tbl.append(h("tr", { class: "src-" + x.src.toLowerCase() }, h("td", { style: "white-space:nowrap" }, fmtDT(x.at) || "—"),
+    h("td", {}, h("span", { class: "histSrc " + x.src.toLowerCase() }, x.src)), h("td", { style: "white-space:normal" }, x.what), h("td", {}, x.by || ""), h("td", { class: "muted", style: "white-space:normal" }, x.extra || "")));
+  const text = [`History of ${d.transaction_number || opts.upin || ""}`, cur ? `Now at: ${cur}` : "", props, ...rows.map((x) => `${fmtDT(x.at)}\t${x.src}\t${x.what}\t${x.by || ""}\t${x.extra || ""}`)].filter(Boolean).join("\n");
+  body.innerHTML = "";
+  body.append(
+    h("div", { class: "histHead" },
+      h("div", {}, h("b", {}, "File: "), d.transaction_number || "— (no Registry transaction)", d.upins && d.upins.length ? ` · UPIN ${d.upins.join(", ")}` : ""),
+      !d.transaction_number ? null
+        : !r.reachable ? h("div", { style: "color:#a35a00" }, r.error || "The Registry (10.10.10.5) can't be reached: its stages aren't shown.")
+        : r.found === false ? h("div", { class: "muted" }, "The Registry has no such transaction.")
+        : h("div", {}, h("b", {}, "Now at: "), cur || "no open stage (finished in the Registry)", h("br"), h("b", {}, "Link: "), props || "—")),
+    h("div", { class: "verifyWrap" }, tbl),
+    h("div", { class: "frow", style: "margin-top:6px;gap:4px" },
+      h("button", { class: "btn", onclick: () => historyWindow(opts) }, "Refresh"),
+      h("button", { class: "btn", onclick: async (ev) => { try { await navigator.clipboard.writeText(text); ev.target.textContent = "Copied"; } catch { status("Select the table to copy it."); } } }, "Copy")));
+}
+
+// The title deed queue: files the Registry has at Raise Title Deed Plan, linked by the Registry admin.
+async function queueLoad() {
+  done.busy = true; done.err = ""; renderCompleted();
+  try { done.queue = await api("/api/v1/registry/title-deed-queue"); done.queueLoaded = true; } catch (e) { done.err = e.message; done.queue = null; }
+  done.busy = false; renderCompleted();
+}
+function queueCard(f) {
+  const stageAge = f.stage_since ? fmtDT(f.stage_since) : "—";
+  const job = f.job_instance_id ? `#${f.job_instance_id} (${f.job_status})` : "none yet";
+  const plan = f.plan ? `${f.plan.action === "registry_plan_withdrawn" ? "Withdrawn" : "Sent"} ${fmtDT(f.plan.at)}` : "Not sent from this editor";
+  const actions = [];
+  if (f.in_cadastre) actions.push(regLink("Zoom", "Zoom to the parcel", () => registryZoom(f.upin)));
+  actions.push(regLink("Title deed plan", "Open (or start) the file's title deed job and its plan", async () => {
+    if (f.job_instance_id && f.job_open) { await openWorkflow(); await wfSelect(f.job_instance_id); titleDeedDialog(f.job_instance_id, f.upin); }
+    else startEditParcel(f.upin);
+  }, !f.in_cadastre));
+  actions.push(regLink("Point List", "Beacons, bearings and distances", () => pointListWindow(f.upin), !f.in_cadastre));
+  actions.push(regLink("History", "The file's Registry stages and this Cadastre's events", () => historyWindow({ txn: f.transaction_number, upin: f.upin, title: f.property_number })));
+  return h("div", { class: "regCard " + (f.in_cadastre ? "job" : "wait") },
+    h("div", { class: "regCardTop" }, h("span", { class: "regUpin" }, f.property_number || f.transaction_number), h("span", { class: "regPill ok" }, f.stage_label || f.stage)),
+    regStatus(f.in_cadastre ? "job" : "wait", f.in_cadastre ? `Linked to ${f.upin}` : `Linked to ${f.upin}, which is not a parcel in this Cadastre`),
+    h("div", { class: "regKv" },
+      h("div", {}, h("i", {}, "Transaction"), f.transaction_number),
+      h("div", {}, h("i", {}, "Property"), f.su_id),
+      h("div", {}, h("i", {}, "Linked"), f.linked_at ? fmtDT(f.linked_at) : "— (no link date in the Registry)"),
+      h("div", {}, h("i", {}, "At stage since"), stageAge),
+      h("div", {}, h("i", {}, "Job here"), job),
+      h("div", {}, h("i", {}, "Plan"), plan)),
+    h("div", { class: "regCardFoot" }, h("span", { class: "regLinks" }, ...actions)));
+}
 async function doneLoad(reset) {
+  if (done.source === "queue") { await queueLoad(); return; }
   if (reset) { done.offset = 0; done.jobs = []; }
   done.busy = true; done.err = ""; renderCompleted();
   try {
@@ -3985,9 +4079,11 @@ function doneCard(j) {
   const actions = [];
   if (firstUpin) actions.push(regLink("Zoom", "Zoom to the parcel", () => registryZoom(firstUpin)));
   actions.push(regLink("Open job", "Open the job in the Workflow", async () => { await openWorkflow(); await wfSelect(j.id); }));
+  actions.push(regLink("History", "The file's Registry stages and this Cadastre's events", () => historyWindow({ job: j.id, txn: j.transaction_number, title: j.property_number || j.name })));
   if (mine) actions.push(regLink("Registry check", "Ask the Registry whether the committed parcels are visible there", () => registryConfirmDialog(j.id)));
   if (mine && upins.length) actions.push(regLink("Title deed plan", "Open the title deed plan (form, sheet, PDF, send)", () => titleDeedDialog(j.id, upins[0])));
   if (mine && plan && plan.action === "registry_plan_sent") actions.push(regLink("Withdraw plan", "Mark the plan sent to the Registry as withdrawn (the parcel and UPIN stay)", () => doneWithdraw(j)));
+  if (mine && upins.length && parcels.some((p) => !p.linked) && j.transaction_number) actions.push(regLink("Link now", "Write the UPIN and link date onto the Registry file (as on commit)", () => doneLinkNow(j)));
   if (j.can_correct && upins.length) actions.push(regLink("Correct", "Reopen the job to fix the parcel (same UPIN), then commit again and resend the plan", () => doneCorrect(j, parcels)));
   const conf = j.confirmation;
   return h("div", { class: "regCard " + (mine ? "job" : "gone"), title: "Double-click to zoom", ondblclick: () => firstUpin && registryZoom(firstUpin) },
@@ -4001,6 +4097,7 @@ function doneCard(j) {
       linked.length ? h("div", {}, h("i", {}, "Linked"), linked.map((p) => `${p.upin} ${p.linked_at ? fmtD(p.linked_at) : ""}${p.lrs_id ? " → " + p.lrs_id : ""}`).join("; ")) : null,
       h("div", {}, h("i", {}, "Plan"), planText),
       h("div", {}, h("i", {}, "Registry"), regText),
+      reg && reg.stages && reg.stages.length ? h("div", {}, h("i", {}, "Registry stage"), reg.stages.map((x) => `${x.workflow} → ${x.stage} (since ${fmtDT(x.since)})`).join("; ")) : null,
       conf ? h("div", {}, h("i", {}, "Confirmed"), `${conf.ok ? "✔" : "✕"} ${fmtDT(conf.at)}`) : null),
     h("div", { class: "regCardFoot" }, h("span", { class: "regLinks" }, ...actions)));
 }
@@ -4008,17 +4105,38 @@ function renderCompleted() {
   const box = $("doneBody"); if (!box) return;
   box.innerHTML = "";
   const q = h("input", { class: "tinput", value: done.q, placeholder: "File, transaction or UPIN (e.g. PL68928)", style: "flex:1;min-width:0" });
-  const run = () => { done.q = q.value.trim(); doneLoad(true); };
+  const run = () => { done.q = q.value.trim(); if (done.source === "queue" && done.queueLoaded) renderCompleted(); else doneLoad(true); };
   q.addEventListener("keydown", (e) => e.key === "Enter" && run());
   const src = h("select", { onchange: (e) => { done.source = e.target.value; doneLoad(true); } },
-    ...[["", "All"], ["cadastre", "Plagis editor"], ["aumentum", "Aumentum"]].map(([v, l]) => h("option", { value: v, selected: done.source === v }, l)));
+    ...[["queue", "Title deed queue (Registry)"], ["", "All completed"], ["cadastre", "Plagis editor"], ["aumentum", "Aumentum"]].map(([v, l]) => h("option", { value: v, selected: done.source === v }, l)));
   box.append(h("div", { class: "frow", style: "margin:6px 8px 2px" }, q, h("button", { class: "btn", style: "min-width:0", onclick: run }, "Find"), src),
-    h("div", { class: "muted", style: "margin:0 8px 4px" }, done.busy && !done.jobs.length ? "Loading…" : `${done.total.toLocaleString()} completed job(s)${done.q ? ` matching “${done.q}”` : ""}, newest first`),
-    done.regErr ? h("div", { class: "muted", style: "margin:0 8px 4px;color:#a35a00" }, `Registry details not shown: ${done.regErr}`) : null,
-    done.err ? h("div", { style: "margin:0 8px 4px;color:#b00" }, done.err) : null);
+    done.source === "queue" ? null : h("div", { class: "muted", style: "margin:0 8px 4px" }, done.busy && !done.jobs.length ? "Loading…" : `${done.total.toLocaleString()} completed job(s)${done.q ? ` matching “${done.q}”` : ""}, newest first`),
+    done.regErr && done.source !== "queue" ? h("div", { class: "muted", style: "margin:0 8px 4px;color:#a35a00" }, `Registry details not shown: ${done.regErr}`) : null,
+    done.err && done.source !== "queue" ? h("div", { style: "margin:0 8px 4px;color:#b00" }, done.err) : null);
+  if (done.source === "queue") {
+    const qv = normName(done.q);
+    const all = done.queue?.files || [];
+    const files = all.filter((f) => !qv || normName(`${f.property_number} ${f.transaction_number} ${f.upin} ${f.su_id} ${f.stage_label}`).includes(qv));
+    box.append(h("div", { class: "muted", style: "margin:0 8px 4px" }, done.busy ? "Reading the Registry…" : done.queue
+      ? `${files.length.toLocaleString()} file(s) at Raise Title Deed Plan, linked by the Registry admin${qv ? ` matching “${done.q}”` : ""} (of ${done.queue.at_stage.toLocaleString()} at that stage) · read ${fmtDT(done.queue.read_at)}`
+      : ""));
+    if (done.err) box.append(h("div", { style: "margin:0 8px 4px;color:#b00" }, done.err));
+    for (const f of files.slice(0, 300)) box.append(queueCard(f));
+    if (files.length > 300) box.append(h("div", { class: "muted", style: "margin:6px 8px" }, `Showing 300 of ${files.length}: search to narrow.`));
+    return;
+  }
   for (const j of done.jobs) box.append(doneCard(j));
   if (done.jobs.length < done.total) box.append(h("div", { class: "frow", style: "margin:6px 8px 10px" },
     h("button", { class: "btn", disabled: done.busy, onclick: () => doneLoad(false) }, done.busy ? "Loading…" : `More (${(done.total - done.jobs.length).toLocaleString()} left)`)));
+}
+async function doneLinkNow(j) {
+  if (!(await uiConfirm(`Link ${j.property_number || j.name}'s committed parcel(s) to Registry file ${j.transaction_number}?\nThe Registry property gets the UPIN and today's link date, as Map → Connect does.`, { title: "Link now", ok: "Link" }))) return;
+  try {
+    const out = await api(`/api/v1/wf/jobs/${j.id}/registry/link`, { method: "POST", body: {} });
+    const msg = linkSummary(out);
+    notify(msg || "Nothing to link.", out.some((l) => !l.linked) ? "warn" : "ok");
+    await doneLoad(true);
+  } catch (e) { uiAlert("Link failed: " + e.message); }
 }
 async function doneWithdraw(j) {
   const reason = await uiPrompt(`Withdraw the title deed plan of ${j.property_number || j.name} from Registry transaction ${j.transaction_number}?\n\nThe plan documents in the transaction are marked WITHDRAWN (nothing is deleted in the Registry) and the saved title deed form is cleared. The parcel and its UPIN stay. Reason:`, "", { title: "Withdraw Plan", ok: "Withdraw" });
@@ -4496,8 +4614,9 @@ function wfDetailView(d) {
     box.append(ol);
   }
   if (j.is_open) box.append(wfEditingView(j, wf.selEditing));
-  else box.append(h("div", { class: "frow", style: "margin:6px 0" },
-    h("button", { class: "btn", title: "Ask the Registry (10.10.10.5) whether this job's committed parcels are visible there", onclick: () => registryConfirmDialog(j.id) }, "Registry Confirmation")));
+  else box.append(h("div", { class: "frow", style: "margin:6px 0;gap:4px" },
+    h("button", { class: "btn", title: "Ask the Registry (10.10.10.5) whether this job's committed parcels are visible there", onclick: () => registryConfirmDialog(j.id) }, "Registry Confirmation"),
+    h("button", { class: "btn", title: "The file's Registry stages and this Cadastre's events", onclick: () => historyWindow({ job: j.id, txn: j.lrs_transaction_number, title: j.name }) }, "History")));
   if (j.is_open) {
     const comment = h("textarea", { rows: 2, placeholder: "Comment for this task (optional)", style: "width:100%;box-sizing:border-box" });
     const assign = h("select", { style: "flex:1;min-width:0" }, h("option", { value: "" }, "Default assignee"),
@@ -4775,7 +4894,7 @@ async function wfCommitDialog(opts = {}) {
       notify(`Committed ${r.parcel_numbers.length} parcel(s): ${r.parcel_numbers.join(", ")}; ${r.beacons_added.length} beacon(s) added.` + (r.retired?.length ? ` Replaced / retired: ${r.retired.join(", ")}.` : ""));
       loadHistory(); await wfRefreshEditing();
       wf.detail = await api("/api/v1/wf/jobs/" + id); renderWorkflow();
-      if (r.parcel_numbers.length) await registryConfirmDialog(id, { headline: `Committed: ${r.parcel_numbers.join(", ")}.` });
+      if (r.parcel_numbers.length) await registryConfirmDialog(id, { headline: `Committed: ${r.parcel_numbers.join(", ")}. ${linkSummary(r.registry_links)}` });
       if (wf.detail?.job && !wf.detail.job.is_open) await goHome(r.parcel_numbers);
     } catch (e) { commitBtn.disabled = false; msg.style.color = "#b00"; msg.textContent = e.message; }
   } }, opts.label || "Commit");
@@ -4834,6 +4953,7 @@ function wfEditingView(j, e) {
     h("button", { class: "btn", onclick: async () => { await loadDrafts(); await wfSelect(j.id); status("Reloaded from the fabric."); } }, "Reload"),
     h("button", { class: "btn", title: "Ask the Registry (10.10.10.5) whether this job's committed parcels are visible there", onclick: () => registryConfirmDialog(j.id) }, "Registry Confirmation"),
     h("button", { class: "btn", title: "The actual view of the plot on the satellite imagery, with overlaps and titles", onclick: orthoOpen }, "Orthophoto"),
+    h("button", { class: "btn", title: "The file's Registry stages and this Cadastre's events", onclick: () => historyWindow({ job: j.id, txn: j.lrs_transaction_number, title: j.name }) }, "History"),
     ed.is_commit_task ? h("button", { class: "btn", disabled: !ed.drafts && !(wf.mutations || []).length, title: "Give the job's draft parcels their UPINs and add them to the fabric", onclick: () => wfCommitDialog() }, "Commit Parcels…") : null));
   // Mutations recorded in the job (Phase 4), applied when the parcels are committed.
   if ((wf.mutations || []).length) {
@@ -4882,7 +5002,7 @@ async function wfFinishPost(j, beacons, staff) {
     const nums = (r.parcel_numbers || []).join(", ") || "(none)";
     status(r.completed ? `Done — ${nums} posted; job completed.` : `${nums} posted.`);
     await loadParcels(false); await loadDrafts(); showJobArea();
-    const confirmed = registryConfirmDialog(j.id, { headline: `Parcel posted. UPIN: ${nums}. ${r.completed ? "Job completed." : "Job now at: " + (r.job?.current_task || "—")}` });
+    const confirmed = registryConfirmDialog(j.id, { headline: `Parcel posted. UPIN: ${nums}. ${r.completed ? "Job completed." : "Job now at: " + (r.job?.current_task || "—")} ${linkSummary(r.registry_links)}` });
     if (r.completed) confirmed.then(() => goHome(r.parcel_numbers || []));
     wf.detail = await api("/api/v1/wf/jobs/" + j.id);
     wf.selEditing = await api(`/api/v1/wf/jobs/${j.id}/editing`).catch(() => wf.selEditing);

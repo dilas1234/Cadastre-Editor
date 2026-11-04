@@ -336,6 +336,19 @@ pub async fn link(State(state): State<AppState>, user: AuthUser, Json(req): Json
     let number = ident("transaction number", &req.transaction_number)?;
     let su = ident("property id", &req.su_id)?;
     let upin = ident("UPIN", &req.upin)?.to_uppercase();
+    Ok(Json(link_parcel(&state, &actor.label, &number, Some(&su), None, &upin, "cadastre").await?))
+}
+
+/// Link a committed parcel to its Registry file's property as the Registry's own Map → Connect
+/// does: the property takes the UPIN and the link date (SpatialDate1, the Registry's clock), and the
+/// parcel takes the property's fields (LinkageFields: LRSID, property number, …), LinkageStatus 1
+/// and the link date. `su` names the property; else the one whose number is `property_number`, or
+/// the transaction's only property. Refused, with the reason, unless it is safe: the transaction is
+/// Active, the property holds no other UPIN, and no other property holds this UPIN.
+pub(crate) async fn link_parcel(state: &AppState, actor: &str, number: &str, su: Option<&str>, property_number: Option<&str>, upin: &str, how: &str)
+    -> ApiResult<RegistryPropertyDto> {
+    let number = ident("transaction number", number)?;
+    let upin = ident("UPIN", upin)?.to_uppercase();
     let cfg = write_config()?;
     let posted: bool = sqlx::query_scalar("SELECT EXISTS (SELECT 1 FROM cadastre.parcel WHERE parcel_number = $1 AND status = 'posted')").bind(&upin).fetch_one(&state.pool).await?;
     if !posted {
@@ -343,9 +356,6 @@ pub async fn link(State(state): State<AppState>, user: AuthUser, Json(req): Json
     }
     let linked: Option<String> = sqlx::query_scalar("SELECT lrs_id FROM cadastre.parcel_attribute WHERE upin = $1 AND linkage_status = 1 AND (status = '0' OR status IS NULL) LIMIT 1")
         .bind(&upin).fetch_optional(&state.pool).await?.flatten();
-    if let Some(p) = linked {
-        return Err(AppError::Conflict(format!("The parcel {upin} is already linked to the Registry property {p}.")));
-    }
     let session = Session::start(&cfg).await.map_err(registry_err)?;
     let result = async {
         let t = load_transaction(&session, &number).await?
@@ -353,37 +363,94 @@ pub async fn link(State(state): State<AppState>, user: AuthUser, Json(req): Json
         if let Some(why) = &t.refused {
             return Err(AppError::Conflict(why.clone()));
         }
-        let prop = t.properties.iter().find(|p| p.su_id.eq_ignore_ascii_case(&su)).cloned()
-            .ok_or_else(|| AppError::BadRequest(format!("{su} is not a property of {number}")))?;
+        let prop = match su {
+            Some(su) => t.properties.iter().find(|p| p.su_id.eq_ignore_ascii_case(su)).cloned()
+                .ok_or_else(|| AppError::BadRequest(format!("{su} is not a property of {number}")))?,
+            None => {
+                let by_number = property_number.map(str::trim).filter(|n| !n.is_empty())
+                    .and_then(|n| t.properties.iter().find(|p| p.refnum.as_deref().is_some_and(|r| r.eq_ignore_ascii_case(n))));
+                match (by_number, t.properties.as_slice()) {
+                    (Some(p), _) => p.clone(),
+                    (None, [only]) => only.clone(),
+                    (None, []) => return Err(AppError::Conflict(format!("{number} has no property to link to"))),
+                    (None, _) => return Err(AppError::Conflict(format!("{number} has {} properties and none is {}: link it in the Registry (Map → Connect)",
+                        t.properties.len(), property_number.unwrap_or("the job's property number")))),
+                }
+            }
+        };
         if let Some(other) = prop.upin.as_deref().filter(|u| !u.eq_ignore_ascii_case(&upin)) {
-            return Err(AppError::Conflict(format!("The Registry property {su} is already linked to {other}.")));
+            return Err(AppError::Conflict(format!("The Registry property {} is already linked to {other}.", prop.su_id)));
+        }
+        if let Some(p) = linked.as_deref() {
+            return Err(AppError::Conflict(format!("The parcel {upin} is already linked to the Registry property {p}.")));
+        }
+        // No other current property may hold this UPIN.
+        let holders = session.query(&format!(
+            "select s.SuID from com.landsystems.lrs.model.SpatialUnit s where s.Upin = '{upin}' and s.EndLifespanVersion is null"), 50).await.map_err(registry_err)?;
+        if let Some(h) = holders.iter().filter_map(|r| r.first()).map(|v| v.trim().to_string()).find(|h| !h.is_empty() && !h.eq_ignore_ascii_case(&prop.su_id)) {
+            return Err(AppError::Conflict(format!("{upin} is already held by the Registry property {h}")));
         }
         let settings = registry_sync::registry_settings(&session).await.map_err(registry_err)?;
         let (to_registry, to_parcel) = registry::parse_linkage_fields(settings.get("LinkageFields").map(String::as_str).unwrap_or("upin:UPIN;LRSID:suid,PropertyNumber:refnum,Plot:plotNumber,Block:blockNumber"));
-        // The Registry side first (Aumentum: SaveProperty per LinkageFields entry).
-        for m in &to_registry {
-            let value = if m.target.eq_ignore_ascii_case("UPIN") { Some(upin.as_str()) } else { None };
-            let Some(v) = value else { continue };
-            session.save_entity(t.id, &lrs::entity_xml("Parcel", &[("Id", Some(&prop.id)), (&m.source, Some(v))])).await.map_err(registry_err)?;
-        }
+        // The link date on the Registry's clock, as Map → Connect stamps it.
+        let registry_now = chrono::Local::now() + chrono::Duration::seconds(session.clock_offset_secs());
+        let stamp = registry_now.format("%Y-%m-%dT%H:%M:%S%.3f%:z").to_string();
+        // The Registry side first (Aumentum: SaveProperty per LinkageFields entry, plus the link date).
+        let upin_field = to_registry.iter().find(|m| m.target.eq_ignore_ascii_case("UPIN")).map(|m| m.source.clone()).unwrap_or_else(|| "upin".into());
+        session.save_entity(t.id, &lrs::entity_xml("Parcel", &[("Id", Some(&prop.id)), (&upin_field, Some(&upin)), ("SpatialDate1", Some(&stamp))]))
+            .await.map_err(registry_err)?;
         let cols = [("SuID", Some(prop.su_id.clone())), ("Refnum", prop.refnum.clone()), ("LotNumber", prop.lot.clone()), ("BlockNumber", prop.block.clone()), ("Upin", Some(upin.clone())), ("Id", Some(prop.id.clone()))];
-        let updates = registry::cadastre_link_updates(&to_parcel, &cols, chrono::Utc::now().date_naive());
-        Ok::<_, AppError>((t, prop, updates))
+        let updates = registry::cadastre_link_updates(&to_parcel, &cols, registry_now.date_naive());
+        Ok::<_, AppError>((t, prop, updates, registry_now))
     }
     .await;
     session.end().await;
-    let (t, prop, updates) = result?;
+    let (t, prop, updates, registry_now) = result?;
     let mut tx = state.pool.begin().await?;
     ensure_attribute_record(&mut tx, &upin).await?;
     registry_sync::write_attributes(&mut tx, &upin, &updates).await?;
     sqlx::query("INSERT INTO cadastre.registry_property (su_id, registry_id, upin, refnum) VALUES ($1, $2, $3, $4) ON CONFLICT (su_id) DO UPDATE SET upin = EXCLUDED.upin, registry_id = EXCLUDED.registry_id, refnum = EXCLUDED.refnum, seen_at = now()")
         .bind(&prop.su_id).bind(prop.id.parse::<i64>().ok()).bind(&upin).bind(&prop.refnum).execute(&mut *tx).await?;
-    audit::append(&mut tx, &actor.label, "registry_link_made", "registry_link", Some(&upin), serde_json::json!({
+    let linked_at = registry_now.format("%Y-%m-%dT%H:%M:%S").to_string();
+    audit::append(&mut tx, actor, "registry_link_made", "registry_link", Some(&upin), serde_json::json!({
         "su_id": prop.su_id, "transaction_number": t.transaction_number, "property_number": prop.refnum, "written": updates,
-        "linked_at": chrono::Utc::now().format("%Y-%m-%dT%H:%M:%S").to_string(), "transaction_status": t.status, "transaction_status_code": t.status_code,
+        "linked_at": linked_at, "link_date_written": true, "how": how, "transaction_status": t.status, "transaction_status_code": t.status_code,
     })).await?;
     tx.commit().await?;
-    Ok(Json(RegistryPropertyDto { upin: Some(upin), ..prop }))
+    Ok(RegistryPropertyDto { upin: Some(upin), linked_at: Some(linked_at), ..prop })
+}
+
+/// After a commit: link each committed parcel to the job's Registry file (CADASTRE_REGISTRY_LINK_ON_COMMIT,
+/// default on when writing to the Registry is allowed). The commit itself already stands; a parcel
+/// that cannot be linked is reported (and listed under link problems) instead of failing it.
+pub(crate) async fn link_after_commit(state: &AppState, actor: &str, job_instance_id: i32, upins: &[String]) -> Vec<serde_json::Value> {
+    let on = std::env::var("CADASTRE_REGISTRY_LINK_ON_COMMIT").map(|v| v.trim() != "0").unwrap_or(true);
+    if !on { return Vec::new(); }
+    link_after_commit_forced(state, actor, job_instance_id, upins).await
+}
+async fn link_after_commit_forced(state: &AppState, actor: &str, job_instance_id: i32, upins: &[String]) -> Vec<serde_json::Value> {
+    if upins.is_empty() || write_config().is_err() {
+        return Vec::new();
+    }
+    let job: Option<(Option<String>, Option<String>)> = sqlx::query_as(
+        "SELECT j.lrs_transaction_number, l.property_number FROM cadastre.wf_job_instance j LEFT JOIN cadastre.wf_job_linkage l ON l.wf_job_instance_id = j.id WHERE j.id = $1")
+        .bind(job_instance_id).fetch_optional(&state.pool).await.ok().flatten();
+    let Some((Some(txn), pn)) = job.map(|(t, p)| (t.map(|t| t.trim().to_string()).filter(|t| !t.is_empty()), p)) else { return Vec::new() };
+    let mut out = Vec::new();
+    for upin in upins {
+        match link_parcel(state, actor, &txn, None, pn.as_deref(), upin, "commit").await {
+            Ok(p) => out.push(serde_json::json!({ "upin": upin, "linked": true, "su_id": p.su_id, "property_number": p.refnum, "linked_at": p.linked_at })),
+            Err(e) => {
+                let why = match e { AppError::Conflict(m) | AppError::BadRequest(m) | AppError::NotFound(m) => m, other => other.to_string() };
+                if let Ok(mut tx) = state.pool.begin().await {
+                    if audit::append(&mut tx, actor, "registry_link_failed", "registry_link", Some(upin), serde_json::json!({
+                        "transaction_number": txn, "job_instance_id": job_instance_id, "reason": why })).await.is_ok() { let _ = tx.commit().await; }
+                }
+                out.push(serde_json::json!({ "upin": upin, "linked": false, "reason": why }));
+            }
+        }
+    }
+    out
 }
 
 /// Aumentum kept one ParcelAttributeTable record per parcel; a parcel committed here may not have
@@ -629,6 +696,234 @@ pub async fn withdraw_plan(State(state): State<AppState>, user: AuthUser, Path(i
     })).await?;
     tx.commit().await?;
     Ok(Json(serde_json::json!({ "transaction_number": t.transaction_number, "withdrawn": marked, "failed": failed, "forms_cleared": cleared })))
+}
+
+/// Link problems to check by hand (UPIN on several properties, UPIN unknown here, parcel linked
+/// elsewhere, commit not linked).
+#[utoipa::path(get, path = "/api/v1/registry/link-problems", tag = "registry", responses((status = 200)))]
+pub async fn link_problems(State(state): State<AppState>) -> ApiResult<Json<serde_json::Value>> {
+    Ok(Json(registry_sync::link_problems(&state.pool).await?))
+}
+
+#[derive(Debug, Deserialize, ToSchema)]
+pub struct LinkJobRequest {
+    /// Only this UPIN of the job (default: all its committed parcels).
+    #[serde(default)]
+    pub upin: Option<String>,
+}
+
+/// Link a job's committed parcel(s) to its Registry file now (as on commit): for a commit made
+/// before linking on commit, or one that could not be linked then.
+#[utoipa::path(post, path = "/api/v1/wf/jobs/{id}/registry/link", tag = "registry", params(("id" = i32, Path, description = "Job instance id")),
+    request_body = LinkJobRequest, responses((status = 200)))]
+pub async fn link_job(State(state): State<AppState>, user: AuthUser, Path(id): Path<i32>, Json(req): Json<LinkJobRequest>) -> ApiResult<Json<Vec<serde_json::Value>>> {
+    let actor = crate::routes::wf::resolve_actor(&state, &user).await?;
+    write_config()?;
+    let upins: Vec<String> = sqlx::query_scalar(
+        "SELECT p.parcel_number FROM cadastre.wf_job_instance w JOIN cadastre.parcel p ON p.job_id = w.cadastre_job_id \
+         WHERE w.id = $1 AND p.status = 'posted' AND p.parcel_number IS NOT NULL AND ($2::text IS NULL OR p.parcel_number = upper($2)) ORDER BY p.posted_at")
+        .bind(id).bind(req.upin.as_deref()).fetch_all(&state.pool).await?;
+    if upins.is_empty() {
+        return Err(AppError::Conflict("the job has no committed parcel to link".into()));
+    }
+    let out = link_after_commit_forced(&state, &actor.label, id, &upins).await;
+    Ok(Json(out))
+}
+
+/// The title deed queue: files the Registry has at Raise Title Deed Plan (C of O processing) whose
+/// property the Registry admin has linked (holds a UPIN), read live from the Registry, with what this
+/// Cadastre has for each (the parcel, the title deed job, the plan sent). The title deed unit works
+/// them from here; the link itself stays with the Registry admin (Aumentum's flow).
+#[utoipa::path(get, path = "/api/v1/registry/title-deed-queue", tag = "registry", responses((status = 200)))]
+pub async fn title_deed_queue(State(state): State<AppState>) -> ApiResult<Json<serde_json::Value>> {
+    let cfg = config()?;
+    let session = Session::start(&cfg).await.map_err(registry_err)?;
+    let read = async {
+        let open = session.query(
+            "select ph.TransactionId, ph.TaskName, ph.TaskDescription, ph.TaskCreate from com.landsystems.lrs.model.ProcessHistory ph \
+             where ph.TaskComplete is null and ph.ProcessName = 'Raise Title Deed Plan'", 20000).await.map_err(registry_err)?;
+        let mut stage: std::collections::HashMap<String, (String, String, String)> = std::collections::HashMap::new();
+        for r in open.iter().filter(|r| r.len() >= 4) {
+            stage.insert(r[0].trim().to_string(), (r[1].trim().to_string(), r[2].trim().to_string(), r[3].trim().to_string()));
+        }
+        let ids: Vec<String> = stage.keys().filter(|k| k.chars().all(|c| c.is_ascii_digit()) && !k.is_empty()).cloned().collect();
+        let mut props = Vec::new();
+        for chunk in ids.chunks(300) {
+            let rows = session.query(&format!(
+                "select t.Id, t.TransactionNumber, s.SuID, s.Refnum, s.Upin, s.SpatialDate1 from com.landsystems.lrs.model.Transaction t \
+                 join t.Properties l join l.SpatialUnits s where t.Id in ({}) and l.EndLifespanVersion is null and s.EndLifespanVersion is null \
+                 and s.Upin is not null and s.Upin <> ''", chunk.join(",")), 5000).await.map_err(registry_err)?;
+            props.extend(rows);
+        }
+        Ok::<_, AppError>((stage, props))
+    }.await;
+    session.end().await;
+    let (stage, props) = read?;
+    let upins: Vec<String> = props.iter().filter(|r| r.len() >= 6).map(|r| r[4].trim().to_uppercase()).collect();
+    let txns: Vec<String> = props.iter().filter(|r| r.len() >= 6).map(|r| r[1].trim().to_uppercase()).collect();
+    // What this Cadastre has: the committed parcel; the latest job of the transaction; the plan sent.
+    let parcels: Vec<(String, Option<chrono::DateTime<chrono::Utc>>)> = sqlx::query_as(
+        "SELECT parcel_number, posted_at FROM cadastre.parcel WHERE status = 'posted' AND parcel_number = ANY($1)").bind(&upins).fetch_all(&state.pool).await?;
+    let jobs: Vec<(String, i32, String, bool)> = sqlx::query_as(
+        "SELECT DISTINCT ON (upper(j.lrs_transaction_number)) upper(j.lrs_transaction_number), j.id, s.label, s.is_open FROM cadastre.wf_job_instance j \
+         JOIN cadastre.wf_job_status s ON s.code = j.status WHERE upper(j.lrs_transaction_number) = ANY($1) ORDER BY upper(j.lrs_transaction_number), j.id DESC")
+        .bind(&txns).fetch_all(&state.pool).await?;
+    let sent: Vec<(String, chrono::DateTime<chrono::Utc>, String)> = sqlx::query_as(
+        "SELECT DISTINCT ON (upper(payload->>'transaction_number')) upper(payload->>'transaction_number'), created_at, action FROM cadastre.audit_log \
+         WHERE action IN ('registry_plan_sent', 'registry_plan_withdrawn') AND upper(payload->>'transaction_number') = ANY($1) \
+         ORDER BY upper(payload->>'transaction_number'), id DESC").bind(&txns).fetch_all(&state.pool).await?;
+    let mut files: Vec<serde_json::Value> = props.iter().filter(|r| r.len() >= 6).map(|r| {
+        let (tid, txn, upin) = (r[0].trim(), r[1].trim().to_uppercase(), r[4].trim().to_uppercase());
+        let (task, task_label, since) = stage.get(tid).cloned().unwrap_or_default();
+        let parcel = parcels.iter().find(|p| p.0 == upin);
+        let job = jobs.iter().find(|j| j.0 == txn);
+        let plan = sent.iter().find(|p| p.0 == txn);
+        serde_json::json!({
+            "transaction_number": txn, "su_id": r[2].trim(), "property_number": r[3].trim(), "upin": upin,
+            "linked_at": lrs::parse_datetime(&r[5]).map(|d| d.format("%Y-%m-%dT%H:%M:%SZ").to_string()),
+            "stage": task, "stage_label": task_label, "stage_since": lrs::parse_datetime(&since).map(|d| d.format("%Y-%m-%dT%H:%M:%SZ").to_string()),
+            "in_cadastre": parcel.is_some(), "committed_at": parcel.and_then(|p| p.1).map(|t| t.to_rfc3339()),
+            "job_instance_id": job.map(|j| j.1), "job_status": job.map(|j| j.2.clone()), "job_open": job.map(|j| j.3),
+            "plan": plan.map(|p| serde_json::json!({ "action": p.2, "at": p.1.to_rfc3339() })),
+        })
+    }).collect();
+    files.sort_by(|a, b| b["stage_since"].as_str().cmp(&a["stage_since"].as_str()));
+    let waiting = stage.len();
+    Ok(Json(serde_json::json!({ "files": files, "at_stage": waiting, "linked": files.len(), "read_at": chrono::Utc::now().to_rfc3339() })))
+}
+
+#[derive(Debug, Deserialize, IntoParams)]
+#[into_params(parameter_in = Query)]
+pub struct FileHistoryQuery {
+    /// The file's Registry transaction (PLS…). Or give a job or a UPIN and it is found.
+    #[serde(default)]
+    pub txn: Option<String>,
+    #[serde(default)]
+    pub job: Option<i32>,
+    #[serde(default)]
+    pub upin: Option<String>,
+}
+
+/// A file's history, read only: the Registry's stages for its transaction (workflow, stage, started,
+/// finished, by, next) and the Registry's record of its Cadastre jobs, with this Cadastre's own
+/// events (job and task history, commit, correction, title deed plan, links). Nothing is written.
+/// When the Registry cannot be reached the Cadastre part is still returned.
+#[utoipa::path(get, path = "/api/v1/registry/history", tag = "registry", params(FileHistoryQuery), responses((status = 200)))]
+pub async fn file_history(State(state): State<AppState>, Query(q): Query<FileHistoryQuery>) -> ApiResult<Json<serde_json::Value>> {
+    // Find the transaction from what was given.
+    let mut txn = q.txn.as_deref().map(|t| t.trim().to_uppercase()).filter(|t| !t.is_empty());
+    let upin_in = q.upin.as_deref().map(|u| u.trim().to_uppercase()).filter(|u| !u.is_empty());
+    if txn.is_none() {
+        if let Some(j) = q.job {
+            txn = sqlx::query_scalar::<_, Option<String>>("SELECT upper(lrs_transaction_number) FROM cadastre.wf_job_instance WHERE id = $1").bind(j).fetch_optional(&state.pool).await?.flatten();
+        }
+    }
+    if txn.is_none() {
+        if let Some(u) = &upin_in {
+            txn = sqlx::query_scalar::<_, Option<String>>(
+                "SELECT upper(w.lrs_transaction_number) FROM cadastre.parcel p JOIN cadastre.wf_job_instance w ON w.cadastre_job_id = p.job_id \
+                 WHERE p.parcel_number = $1 AND w.lrs_transaction_number IS NOT NULL ORDER BY w.id DESC LIMIT 1").bind(u).fetch_optional(&state.pool).await?.flatten();
+            if txn.is_none() {
+                // Aumentum's parcels: their job by the property number ("Job-PL68928").
+                txn = sqlx::query_scalar::<_, Option<String>>(
+                    "SELECT upper(w.lrs_transaction_number) FROM cadastre.parcel_attribute a JOIN cadastre.wf_job_instance w ON upper(w.name) = upper('Job-' || a.property_number) \
+                     WHERE a.upin = $1 AND w.lrs_transaction_number IS NOT NULL ORDER BY w.id DESC LIMIT 1").bind(u).fetch_optional(&state.pool).await?.flatten();
+            }
+        }
+    }
+    let txn = txn.map(|t| t.chars().filter(|c| c.is_ascii_alphanumeric() || *c == '-').collect::<String>());
+    // This Cadastre: the file's jobs, their parcels, task history and audit events.
+    let mut jobs: Vec<i32> = match &txn {
+        Some(t) => sqlx::query_scalar("SELECT id FROM cadastre.wf_job_instance WHERE upper(lrs_transaction_number) = $1 ORDER BY id").bind(t).fetch_all(&state.pool).await?,
+        None => Vec::new(),
+    };
+    if let Some(j) = q.job { if !jobs.contains(&j) { jobs.push(j); } }
+    let mut upins: Vec<String> = sqlx::query_scalar(
+        "SELECT DISTINCT p.parcel_number FROM cadastre.wf_job_instance w JOIN cadastre.parcel p ON p.job_id = w.cadastre_job_id \
+         WHERE w.id = ANY($1) AND p.parcel_number IS NOT NULL").bind(&jobs).fetch_all(&state.pool).await?;
+    if let Some(u) = &upin_in { if !upins.contains(u) { upins.push(u.clone()); } }
+    let tasks = sqlx::query(
+        "SELECT ti.job_instance_id, w.name AS job_name, t.name AS task, \
+                CASE WHEN w.source = 'aumentum' THEN ti.started AT TIME ZONE 'Africa/Lagos' ELSE ti.started AT TIME ZONE 'UTC' END AS started, \
+                CASE WHEN w.source = 'aumentum' THEN ti.ended AT TIME ZONE 'Africa/Lagos' ELSE ti.ended AT TIME ZONE 'UTC' END AS ended, \
+                COALESCE(p.name, p.code) AS who, ti.comment \
+         FROM cadastre.wf_task_instance ti JOIN cadastre.wf_task t ON t.id = ti.task_id JOIN cadastre.wf_job_instance w ON w.id = ti.job_instance_id \
+         LEFT JOIN cadastre.principal p ON p.sid = ti.sid WHERE ti.job_instance_id = ANY($1) ORDER BY ti.started NULLS LAST, ti.id").bind(&jobs).fetch_all(&state.pool).await?;
+    let job_rows = sqlx::query(
+        "SELECT w.id, w.name, jt.name AS job_type, \
+                CASE WHEN w.source = 'aumentum' THEN w.created AT TIME ZONE 'Africa/Lagos' ELSE w.created AT TIME ZONE 'UTC' END AS created, \
+                CASE WHEN w.source = 'aumentum' THEN w.ended AT TIME ZONE 'Africa/Lagos' ELSE w.ended AT TIME ZONE 'UTC' END AS ended, s.label \
+         FROM cadastre.wf_job_instance w JOIN cadastre.wf_job_type jt ON jt.id = w.job_type_id \
+         JOIN cadastre.wf_job_status s ON s.code = w.status WHERE w.id = ANY($1)").bind(&jobs).fetch_all(&state.pool).await?;
+    let audits = sqlx::query(
+        "SELECT created_at, actor, action, entity, entity_id, payload FROM cadastre.audit_log \
+         WHERE (entity = 'wf_job_instance' AND entity_id = ANY($1)) OR (entity IN ('registry_link', 'upin') AND entity_id = ANY($2)) \
+         ORDER BY id").bind(jobs.iter().map(|j| j.to_string()).collect::<Vec<_>>()).bind(&upins).fetch_all(&state.pool).await?;
+    let ts = |d: Option<chrono::DateTime<chrono::Utc>>| d.map(|d| d.to_rfc3339());
+    let mut cadastre: Vec<serde_json::Value> = Vec::new();
+    for r in &job_rows {
+        cadastre.push(serde_json::json!({ "at": ts(r.get("created")), "kind": "job_created", "job": r.get::<i32, _>("id"),
+            "text": format!("Job {} created ({})", r.get::<Option<String>, _>("name").unwrap_or_default(), r.get::<String, _>("job_type")) }));
+        if let Some(e) = r.get::<Option<chrono::DateTime<chrono::Utc>>, _>("ended") {
+            cadastre.push(serde_json::json!({ "at": ts(Some(e)), "kind": "job_ended", "job": r.get::<i32, _>("id"),
+                "text": format!("Job {} {}", r.get::<Option<String>, _>("name").unwrap_or_default(), r.get::<String, _>("label").to_lowercase()) }));
+        }
+    }
+    for r in &tasks {
+        cadastre.push(serde_json::json!({ "at": ts(r.get("started")), "end": ts(r.get("ended")), "kind": "task", "job": r.get::<i32, _>("job_instance_id"),
+            "text": format!("Step: {}", r.get::<String, _>("task")), "by": r.get::<Option<String>, _>("who"), "note": r.get::<Option<String>, _>("comment") }));
+    }
+    for r in &audits {
+        let action: String = r.get("action");
+        if matches!(action.as_str(), "wf_advance" | "wf_create" | "wf_complete" | "wf_start_editing") { continue; } // shown by the task / job lines
+        let p: serde_json::Value = r.get("payload");
+        cadastre.push(serde_json::json!({ "at": r.get::<chrono::DateTime<chrono::Utc>, _>("created_at").to_rfc3339(), "kind": action, "by": r.get::<String, _>("actor"),
+            "entity_id": r.get::<Option<String>, _>("entity_id"), "detail": p }));
+    }
+    // The Registry, read only.
+    let mut registry = serde_json::json!({ "reachable": false });
+    if let Some(t) = &txn {
+        let read = async {
+            let cfg = config()?;
+            let session = Session::start(&cfg).await.map_err(registry_err)?;
+            let out = async {
+                let tr = load_transaction(&session, t).await?;
+                let Some(tr) = tr else { return Ok::<_, AppError>(None) };
+                let stages = session.query(&format!(
+                    "select ph.ProcessName, ph.TaskName, ph.TaskDescription, ph.TaskCreate, ph.TaskComplete, ph.TaskTransition, ph.Actor \
+                     from com.landsystems.lrs.model.ProcessHistory ph where ph.TransactionId = {} order by ph.TaskCreate", tr.id), 2000).await.map_err(registry_err)?;
+                let mc = session.query(&format!(
+                    "select j.JobInstanceId, j.JobName, j.JobStatus, j.JobStarted, j.JobEnded from com.landsystems.lrs.model.McJob j where j.TransactionId = {}", tr.id), 100).await.unwrap_or_default();
+                Ok(Some((tr, stages, mc)))
+            }.await;
+            session.end().await;
+            out
+        }.await;
+        let when = |v: &String| lrs::parse_datetime(v).map(|d| d.format("%Y-%m-%dT%H:%M:%SZ").to_string());
+        let o = |v: &String| Some(v.trim().to_string()).filter(|s| !s.is_empty());
+        registry = match read {
+            Err(e) => {
+                let why = match e { AppError::Conflict(m) | AppError::BadRequest(m) | AppError::NotFound(m) => m, other => other.to_string() };
+                serde_json::json!({ "reachable": false, "error": format!("The Registry (10.10.10.5) can't be reached: its stages aren't shown ({why}).") })
+            }
+            Ok(None) => serde_json::json!({ "reachable": true, "found": false }),
+            Ok(Some((tr, stages, mc))) => {
+                let st: Vec<serde_json::Value> = stages.iter().filter(|r| r.len() >= 7).map(|r| serde_json::json!({
+                    "workflow": r[0].trim(), "stage": r[1].trim(), "stage_label": o(&r[2]).unwrap_or_else(|| r[1].trim().to_string()),
+                    "started": when(&r[3]), "finished": when(&r[4]), "next": o(&r[5]), "by": o(&r[6]),
+                })).collect();
+                let current: Vec<serde_json::Value> = st.iter().filter(|s| s["finished"].is_null()).cloned().collect();
+                serde_json::json!({
+                    "reachable": true, "found": true, "transaction_number": tr.transaction_number, "status": tr.status,
+                    "properties": tr.properties.iter().map(|p| serde_json::json!({ "su_id": p.su_id, "property_number": p.refnum, "upin": p.upin, "linked_at": p.linked_at })).collect::<Vec<_>>(),
+                    "current": current, "stages": st,
+                    "cadastre_jobs": mc.iter().filter(|r| r.len() >= 5).map(|r| serde_json::json!({
+                        "job": r[0].trim(), "name": r[1].trim(), "status": r[2].trim(), "started": when(&r[3]), "ended": when(&r[4]) })).collect::<Vec<_>>(),
+                })
+            }
+        };
+    }
+    Ok(Json(serde_json::json!({ "transaction_number": txn, "jobs": jobs, "upins": upins, "registry": registry, "cadastre": cadastre })))
 }
 
 /// Plans this Cadastre has sent for a job (audit), newest first.
