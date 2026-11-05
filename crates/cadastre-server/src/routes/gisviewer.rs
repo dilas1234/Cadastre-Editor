@@ -349,6 +349,49 @@ pub async fn apply_updates(pool: &sqlx::PgPool, lists: &[UpdateDataList], actor:
     Ok((changed, upins))
 }
 
+/// The one link an OK on the map makes: a record by OBJECTID with LinkageStatus 1 and an LRSID. The
+/// desktop's list that clears a UPIN from other parcels has empty values, so it never counts.
+#[derive(Debug, PartialEq)]
+pub struct MapOkLink {
+    pub object_id: i32,
+    pub su_id: String,
+    pub property_number: Option<String>,
+}
+
+/// `Ok(None)`: no link in this call. `Err`: more than one, which is left to the Registry's own save.
+pub fn map_ok_link(lists: &[UpdateDataList]) -> Result<Option<MapOkLink>, String> {
+    fn value<'a>(r: &'a UpdateRecord, field: &str) -> Option<&'a str> {
+        r.values.iter().find(|(f, _)| f.eq_ignore_ascii_case(field)).and_then(|(_, v)| v.as_deref()).map(str::trim).filter(|v| !v.is_empty())
+    }
+    let mut links: Vec<MapOkLink> = lists.iter().flat_map(|l| &l.records)
+        .filter(|r| r.kind.ends_with("ByOID") && value(r, "LinkageStatus") == Some("1"))
+        .filter_map(|r| Some(MapOkLink { object_id: r.object_id?, su_id: value(r, "LRSID")?.to_string(), property_number: value(r, "PropertyNumber").map(str::to_string) }))
+        .collect();
+    match links.len() {
+        0 => Ok(None),
+        1 => Ok(links.pop()),
+        n => Err(format!("OK linked {n} parcels at once: save the file in the Registry")),
+    }
+}
+
+/// The Registry's half of an OK (`CADASTRE_REGISTRY_LINK_ON_MAP_OK`), after the Cadastre's half stood.
+async fn write_registry_half(state: &AppState, lists: &[UpdateDataList], actor: &str, upins: &[String]) {
+    let link = match map_ok_link(lists) {
+        Ok(Some(l)) => l,
+        Ok(None) => return,
+        Err(why) => {
+            for u in upins { crate::routes::registry::map_ok_not_written(state, actor, u, None, &why).await; }
+            return;
+        }
+    };
+    let upin: Option<String> = sqlx::query_scalar("SELECT upin FROM cadastre.parcel_attribute WHERE object_id = $1 AND lrs_id = $2 AND linkage_status = 1")
+        .bind(link.object_id).bind(&link.su_id).fetch_optional(&state.pool).await.ok().flatten();
+    match upin {
+        Some(u) => crate::routes::registry::link_after_map_ok(state, actor, &link.su_id, link.property_number.as_deref(), &u).await,
+        None => tracing::warn!("Registry map: no linked parcel record {} for {}: nothing written to the Registry", link.object_id, link.su_id),
+    }
+}
+
 /// `POST /GISViewer/WebServices/CadastralWebService.asmx`.
 pub async fn service(State(state): State<AppState>, body: Bytes) -> Response {
     let text = String::from_utf8_lossy(&body);
@@ -379,6 +422,10 @@ pub async fn service(State(state): State<AppState>, body: Bytes) -> Response {
         "UpdateCadastralData" => match apply_updates(&state.pool, &lists, &format!("registry:{user}")).await {
             Ok((n, upins)) => {
                 tracing::info!("Registry map: {n} parcel record(s) updated by {user} ({})", upins.join(", "));
+                if crate::routes::registry::link_on_map_ok() {
+                    let (state, lists, actor) = (state.clone(), lists.clone(), format!("registry:{user}"));
+                    tokio::spawn(async move { write_registry_half(&state, &lists, &actor, &upins).await });
+                }
                 soap_ok(&op, "<UpdateCadastralDataResult />")
             }
             Err(e) => {
@@ -432,7 +479,8 @@ button { padding: 3px 8px; cursor: pointer; }
     <input type="text" id="sv" placeholder="e.g. PL000000023901"> <button id="sb">Find</button>
     <div id="found"></div>
   </div>
-  <div class="sec"><h4>Selected <span id="selCount"></span></h4><div id="selected" class="muted">Click parcels on the map to select them (click again to deselect).</div></div>
+  <div class="sec"><h4>Selected <span id="selCount"></span></h4><div id="selected" class="muted">Click parcels on the map to select them (click again to deselect).</div>
+    <div id="okHint" class="muted" style="margin-top:6px">Press OK below to link, then Suspend in the Registry to save the file.</div></div>
 </div>
 <div id="silverlightControl"></div>
 <input type="hidden" id="indexerEvents" value="">
@@ -493,7 +541,7 @@ function loadView() {
 }
 map.on("moveend", loadView);
 function addFeatures(fc) { for (var i = 0; i < fc.features.length; i++) { var f = fc.features[i]; if (!loaded[f.properties.OBJECTID]) { loaded[f.properties.OBJECTID] = true; layer.addData(f); } } layer.setStyle(style); }
-function zoomTo(fc) { try { var g = L.geoJSON(fc); map.fitBounds(g.getBounds(), { maxZoom: 18, padding: [40, 40] }); } catch (e) {} }
+function zoomTo(fc) { try { var g = L.geoJSON(fc); map.fitBounds(g.getBounds(), { maxZoom: 20, padding: [40, 40] }); } catch (e) {} }
 
 function toggle(f) {
   if (readOnly) return;
@@ -567,7 +615,7 @@ $("sb").onclick = function () {
   });
 };
 $("sv").onkeydown = function (e) { if ((e || window.event).keyCode === 13) $("sb").onclick(); };
-window.zoomOid = function (oid) { layer.eachLayer(function (l) { if (l.feature.properties.OBJECTID === oid) { map.fitBounds(l.getBounds(), { maxZoom: 18, padding: [40, 40] }); } }); };
+window.zoomOid = function (oid) { layer.eachLayer(function (l) { if (l.feature.properties.OBJECTID === oid) { map.fitBounds(l.getBounds(), { maxZoom: 20, padding: [40, 40] }); } }); };
 
 // The Registry's MapWorkerControl calls doAction(object, method, a, b, c).
 function selectedEntities() {
@@ -603,6 +651,7 @@ function ready() {
 if (INIT.extent && INIT.extent.MinX) {
   try { var sw = proj4(UTM, "WGS84", [INIT.extent.MinX, INIT.extent.MinY]), ne = proj4(UTM, "WGS84", [INIT.extent.MaxX, INIT.extent.MaxY]); map.fitBounds([[sw[1], sw[0]], [ne[1], ne[0]]]); } catch (e) {}
 }
+if (readOnly) $("okHint").style.display = "none";
 renderInputs();
 searchInputs();
 </script>
@@ -625,6 +674,29 @@ mod tests {
         let reg = format!("<base64Binary xmlns:xsi=\"http://www.w3.org/2001/XMLSchema-instance\" xmlns:xsd=\"http://www.w3.org/2001/XMLSchema\">{b64}[END]");
         assert_eq!(decode_aumentum(&reg), Some(v));
         assert_eq!(parse_form("a=1&lrsuser=ragoro&initparam_inputobjects=%5BBEGIN%5Dab%2B%2Fc%3D%5BEND%5D&x=a+b")["initparam_inputobjects"], "[BEGIN]ab+/c=[END]");
+    }
+
+    fn record(kind: &str, oid: Option<i32>, values: &[(&str, Option<&str>)]) -> UpdateRecord {
+        UpdateRecord { kind: kind.into(), object_id: oid, primary: vec![],
+            values: values.iter().map(|(f, v)| (f.to_string(), v.map(str::to_string))).collect() }
+    }
+
+    #[test]
+    fn only_a_real_link_counts_as_an_ok() {
+        let link = record("UpdateRecordByOID", Some(526260), &[("LRSID", Some("PLT00031551")), ("LinkageStatus", Some("1")),
+            ("LinkageDate", Some("2026-11-05")), ("PropertyNumber", Some("PL63576")), ("Plot", Some("plotNumber"))]);
+        // As the desktop sent it on 5 Nov: the link, then the list clearing the UPIN from other parcels.
+        let clear = record("UpdateRecordByFields", None, &[("LRSID", None), ("LinkageStatus", None), ("PropertyNumber", None)]);
+        let lists = vec![UpdateDataList { records: vec![link.clone()], ..Default::default() }, UpdateDataList { records: vec![clear.clone()], exclude: vec![526260], ..Default::default() }];
+        assert_eq!(map_ok_link(&lists), Ok(Some(MapOkLink { object_id: 526260, su_id: "PLT00031551".into(), property_number: Some("PL63576".into()) })));
+        // The clearing list alone, an unlink, or no LRSID: no link, so nothing goes to the Registry.
+        assert_eq!(map_ok_link(&[UpdateDataList { records: vec![clear], ..Default::default() }]), Ok(None));
+        let unlink = record("UpdateRecordByOID", Some(1), &[("LRSID", Some("PLT1")), ("LinkageStatus", Some("0"))]);
+        assert_eq!(map_ok_link(&[UpdateDataList { records: vec![unlink], ..Default::default() }]), Ok(None));
+        let no_su = record("UpdateRecordByOID", Some(1), &[("LRSID", Some("  ")), ("LinkageStatus", Some("1"))]);
+        assert_eq!(map_ok_link(&[UpdateDataList { records: vec![no_su], ..Default::default() }]), Ok(None));
+        // Two parcels in one OK are not guessed at.
+        assert!(map_ok_link(&[UpdateDataList { records: vec![link.clone(), link], ..Default::default() }]).is_err());
     }
 
     #[test]

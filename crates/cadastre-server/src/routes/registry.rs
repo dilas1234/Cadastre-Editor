@@ -381,7 +381,9 @@ pub(crate) async fn link_parcel(state: &AppState, actor: &str, number: &str, su:
         if let Some(other) = prop.upin.as_deref().filter(|u| !u.eq_ignore_ascii_case(&upin)) {
             return Err(AppError::Conflict(format!("The Registry property {} is already linked to {other}.", prop.su_id)));
         }
-        if let Some(p) = linked.as_deref() {
+        // After an OK on the Registry's map the parcel already holds this property: the desktop's
+        // UpdateCadastralData wrote the Cadastre's half, and the Registry's half is what is missing.
+        if let Some(p) = linked.as_deref().filter(|p| !(how == MAP_OK && p.eq_ignore_ascii_case(&prop.su_id))) {
             return Err(AppError::Conflict(format!("The parcel {upin} is already linked to the Registry property {p}.")));
         }
         // No other current property may hold this UPIN.
@@ -451,6 +453,86 @@ async fn link_after_commit_forced(state: &AppState, actor: &str, job_instance_id
         }
     }
     out
+}
+
+/// How a link made by pressing OK on the Registry's map is recorded.
+const MAP_OK: &str = "map_ok";
+
+/// CADASTRE_REGISTRY_LINK_ON_MAP_OK=1: pressing OK on the Registry's map also writes the UPIN and
+/// the link date to the Registry, so the link no longer waits for the officer to save the file
+/// (Suspend). Off unless set. It needs CADASTRE_REGISTRY_WRITE=1 as well.
+pub(crate) fn link_on_map_ok() -> bool {
+    std::env::var("CADASTRE_REGISTRY_LINK_ON_MAP_OK").map(|v| v.trim() == "1").unwrap_or(false)
+}
+
+/// The property's one Active transaction, from rows of (id, number, status code, …). The map's OK
+/// does not say which file is open, so none or several Active leaves the choice to the officer.
+fn only_active_transaction(rows: &[Vec<String>]) -> Result<String, String> {
+    let mut active: Vec<&str> = rows.iter().filter(|r| r.len() >= 3 && r[2] == "transaction_lodged").map(|r| r[1].trim()).collect();
+    active.sort_unstable();
+    active.dedup();
+    match active.as_slice() {
+        [one] => Ok(one.to_string()),
+        [] => Err("the property has no Active transaction".into()),
+        many => Err(format!("the property has {} Active transactions ({}): save the file in the Registry", many.len(), many.join(", "))),
+    }
+}
+
+/// The Registry's half of an OK on its map. `Ok(false)`: the Registry already holds it. Every check
+/// is `link_parcel`'s, and it is `link_parcel` that writes.
+async fn write_map_ok_link(state: &AppState, actor: &str, su: &str, property_number: Option<&str>, upin: &str) -> ApiResult<bool> {
+    let su = ident("property id", su)?;
+    let upin = ident("UPIN", upin)?.to_uppercase();
+    let cfg = write_config()?;
+    let session = Session::start(&cfg).await.map_err(registry_err)?;
+    let found = async {
+        let rows = session.query(&format!(
+            "select t.Id, t.TransactionNumber, s.Code, s.Label, p.Id, p.Upin from com.landsystems.lrs.model.Transaction t join t.TransactionStatus s \
+             join t.Properties l join l.SpatialUnits p where p.SuID = '{su}' and l.EndLifespanVersion is null and p.EndLifespanVersion is null"), 200).await.map_err(registry_err)?;
+        let number = only_active_transaction(&rows).map_err(AppError::Conflict)?;
+        let t = load_transaction(&session, &number).await?
+            .ok_or_else(|| AppError::NotFound(format!("Cannot retrieve information of the Transaction. Transaction number:'{number}'.")))?;
+        let prop = t.properties.into_iter().find(|p| p.su_id.eq_ignore_ascii_case(&su))
+            .ok_or_else(|| AppError::Conflict(format!("{su} is not a property of {number}")))?;
+        Ok::<_, AppError>((number, prop))
+    }
+    .await;
+    session.end().await;
+    let (number, prop) = found?;
+    if let (Some(sent), Some(held)) = (property_number.map(str::trim).filter(|n| !n.is_empty()), prop.refnum.as_deref()) {
+        if !sent.eq_ignore_ascii_case(held) {
+            return Err(AppError::Conflict(format!("the map sent property {sent} but {su} is {held}")));
+        }
+    }
+    if prop.linked_at.is_some() && prop.upin.as_deref().is_some_and(|u| u.eq_ignore_ascii_case(&upin)) {
+        return Ok(false);
+    }
+    link_parcel(state, actor, &number, Some(&su), None, &upin, MAP_OK).await?;
+    Ok(true)
+}
+
+/// Record that the Registry's half of an OK was not written, for link problems and the file's
+/// history. The Cadastre's half stands; saving the file in the Registry still completes the link.
+pub(crate) async fn map_ok_not_written(state: &AppState, actor: &str, upin: &str, su: Option<&str>, reason: &str) {
+    tracing::warn!("Registry map: {upin} was not written to the Registry on OK: {reason}");
+    if let Ok(mut tx) = state.pool.begin().await {
+        if audit::append(&mut tx, actor, "registry_link_failed", "registry_link", Some(upin), serde_json::json!({
+            "su_id": su, "how": MAP_OK, "reason": reason })).await.is_ok() { let _ = tx.commit().await; }
+    }
+}
+
+/// After an OK on the Registry's map: write its half of the link. It runs after the desktop has
+/// its answer, with a time limit, so a slow Registry never holds the desktop; it reports instead of
+/// failing, because the desktop's own save remains a complete way to finish the link.
+pub(crate) async fn link_after_map_ok(state: &AppState, actor: &str, su: &str, property_number: Option<&str>, upin: &str) {
+    let why = match tokio::time::timeout(std::time::Duration::from_secs(60), write_map_ok_link(state, actor, su, property_number, upin)).await {
+        Ok(Ok(true)) => { tracing::info!("Registry map: {upin} written to the Registry property {su} on OK"); return; }
+        Ok(Ok(false)) => { tracing::info!("Registry map: the Registry property {su} already holds {upin}"); return; }
+        Ok(Err(AppError::Conflict(m) | AppError::BadRequest(m) | AppError::NotFound(m))) => m,
+        Ok(Err(other)) => other.to_string(),
+        Err(_) => "the Registry did not answer within 60 seconds".to_string(),
+    };
+    map_ok_not_written(state, actor, upin, Some(su), &why).await;
 }
 
 /// Aumentum kept one ParcelAttributeTable record per parcel; a parcel committed here may not have
@@ -1332,5 +1414,26 @@ mod send_plan_tests {
         assert!(plan_as_pdf("plan.pdf", b"\x89PNG").is_err());
         assert!(plan_as_pdf("plan.png", b"\x89PNG").is_err());
         assert!(plan_as_pdf("plan.jpg", b"not a jpeg").is_err());
+    }
+}
+
+#[cfg(test)]
+mod map_ok_tests {
+    use super::only_active_transaction;
+
+    fn row(number: &str, code: &str) -> Vec<String> {
+        vec!["1".into(), number.into(), code.into(), "x".into(), "2".into(), "".into()]
+    }
+
+    #[test]
+    fn the_map_ok_writes_only_to_the_one_active_transaction() {
+        let closed = row("PLS1", "transaction_completed");
+        let active = row("PLS2", "transaction_lodged");
+        assert_eq!(only_active_transaction(&[closed.clone(), active.clone()]), Ok("PLS2".to_string()));
+        // The same file twice (a property's two rows) is still one file.
+        assert_eq!(only_active_transaction(&[active.clone(), active.clone()]), Ok("PLS2".to_string()));
+        assert!(only_active_transaction(&[closed]).is_err(), "nothing Active: nothing to write to");
+        assert!(only_active_transaction(&[active, row("PLS3", "transaction_lodged")]).is_err(), "two Active: not guessed at");
+        assert!(only_active_transaction(&[]).is_err());
     }
 }

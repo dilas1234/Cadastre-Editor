@@ -129,6 +129,17 @@ the Registry's browser is IE11. Esri World Imagery is the background. Parcels lo
 The `token` is the map session, issued only after the Registry ticket is accepted, and lasts 8 hours.
 The admin can also find a parcel by hand and click parcels to select or deselect them.
 
+**OK is the link, and the desktop saves it later.** The form's OK button runs `ConnectObjectsAsync`:
+it sends `UpdateCadastralData` and puts the UPIN in the file open on the desktop, which is only
+stored when the officer leaves the file with Suspend, or completes the stage (confirmed live on
+PL63576, 5 Nov 2026). Cancel loses it, and the Cadastre's half then stands alone.
+With `CADASTRE_REGISTRY_LINK_ON_MAP_OK=1` the server also writes the Registry's half itself, through
+`link_parcel`, after the desktop has its answer (60-second limit). It acts only on one link in one
+call, on a property with one Active transaction, and with `link_parcel`'s checks; anything else is
+recorded as `registry_link_failed` (how `map_ok`) and listed in link problems until the Registry
+holds the link. Whether this is safe while the desktop has the file open is what the first live
+test must show: press OK, check the Registry, then Suspend and check there is no error.
+
 Two paths write the link into the Cadastre, and either one is enough. `UpdateCadastralData`
 writes it at once. The link poll (§3.1) also sees it within a minute. The second write changes
 nothing, because values are written only where they differ.
@@ -213,6 +224,7 @@ In the server's environment (`~/.config/cadastre/server.env` on the dev PC):
 | `CADASTRE_REGISTRY_URL` | `http://10.10.10.5:8080/lrs/api/` (the Registry API). Unset: no Registry features. |
 | `CADASTRE_REGISTRY_USER` / `_PASSWORD` | The Registry account (Aumentum's MCServer used `admin`). |
 | `CADASTRE_REGISTRY_WRITE` | `1`: allow writing to the Registry on user action (send plan). |
+| `CADASTRE_REGISTRY_LINK_ON_MAP_OK` | `1`: pressing OK on the Registry's map also writes the UPIN and link date to the Registry (§3.3a). Off unless set; needs `CADASTRE_REGISTRY_WRITE=1`. |
 | `CADASTRE_REGISTRY_POLL_SECS` / `_RECONCILE_SECS` | Link check (60) and unlink check (900) intervals. |
 | `CADASTRE_MC_SERVICE_USER` / `_PASSWORD` | The account the Registry signs in with to the job service. It must equal the Registry's `multicadastre` `mcUserName` / `mcPassword`. Set on 2026-11-02 from `.env`: `administrator`, the Registry's `mcUserName`. Checked: `Authenticate` accepts it and refuses a wrong password. The password must equal the Registry's `mcPassword`. |
 | `CADASTRE_AUMENTUM_JOBSERVICE_URL` | Parallel run with Aumentum: before giving a new UPIN the Cadastre asks Aumentum's job service (`http://10.10.10.6/ApplicationServerAdmin/WebServices/LRSWebServices.asmx`, signed in with `CADASTRE_MC_SERVICE_USER` / `_PASSWORD`) whether Aumentum already issued it; such numbers are recorded (`aumentum:live`) and skipped. If Aumentum cannot be asked the commit is refused. Remove after cut-over. |
