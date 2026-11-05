@@ -2154,6 +2154,98 @@ async fn registry_write_back_like_aumentum() {
     for k in ["CADASTRE_REGISTRY_URL", "CADASTRE_REGISTRY_USER", "CADASTRE_REGISTRY_PASSWORD", "CADASTRE_REGISTRY_WRITE", "CADASTRE_REGISTRY_CADASTRE_LINKING"] { std::env::remove_var(k); }
 }
 
+/// OK on the Registry's map with CADASTRE_REGISTRY_LINK_ON_MAP_OK: off, only the Cadastre's half is
+/// written; on, the Registry's half follows without the desktop saving; a refused write leaves the
+/// Cadastre's half, writes nothing to the Registry, and stays in link problems.
+#[tokio::test]
+async fn registry_map_ok_writes_the_registry_half_when_switched_on() {
+    let Some(db_url) = test_db_url() else {
+        eprintln!("skipping: CADASTRE_TEST_DATABASE_URL not set");
+        return;
+    };
+    let _guard = REGISTRY_SNAPSHOT.lock().await;
+    let n = rand_12() % 1_000_000_000;
+    let su = format!("PLTK{n}");
+    let fake = FakeRegistry::start(su.clone(), None).await;
+    std::env::set_var("CADASTRE_REGISTRY_URL", &fake.url);
+    std::env::set_var("CADASTRE_REGISTRY_USER", "tester");
+    std::env::set_var("CADASTRE_REGISTRY_PASSWORD", "secret");
+    std::env::set_var("CADASTRE_REGISTRY_WRITE", "1");
+    std::env::remove_var("CADASTRE_REGISTRY_LINK_ON_MAP_OK");
+    std::env::remove_var("CADASTRE_GISVIEWER_OPEN");
+    let app = routes::router(state_with(AuthMode::Disabled, None, &db_url).await);
+    let pool = sqlx::PgPool::connect(&db_url).await.unwrap();
+    let parcel = |upin: String, oid: i32, x: i32| { let pool = pool.clone(); async move {
+        sqlx::query("INSERT INTO cadastre.parcel (parcel_number, geom, computed_area, status) VALUES ($1, ST_MakeEnvelope($2, 1200000, $2 + 20, 1200020, 32632), 400, 'posted')")
+            .bind(&upin).bind(x as f64).execute(&pool).await.unwrap();
+        sqlx::query("INSERT INTO cadastre.parcel_attribute (object_id, upin, status, linkage_status) VALUES ($1, $2, '0', 0)").bind(oid).bind(&upin).execute(&pool).await.unwrap();
+    } };
+    let upin = format!("PLK{n:09}");
+    let oid = 700_000_000 + (n % 100_000_000) as i32;
+    parcel(upin.clone(), oid, 300_000 + (n % 100_000) as i32 * 30).await;
+    // As the desktop sends it: the link by OBJECTID, then the list clearing the UPIN elsewhere.
+    let ok = |oid: i32, upin: &str, property: &str| format!(r#"<?xml version="1.0" encoding="utf-8"?><soap:Envelope xmlns:soap="http://schemas.xmlsoap.org/soap/envelope/" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xmlns:xsd="http://www.w3.org/2001/XMLSchema"><soap:Header><SecurityHeader xmlns="http://www.landsystems.com/multicadastre/in4/service"><User>ragoro</User><Password>GOOD-TICKET</Password></SecurityHeader></soap:Header><soap:Body><UpdateCadastralData xmlns="http://www.landsystems.com/multicadastre/in4/service"><updateList><UpdateDataList><LayerNameOrAlias>sde.SDE.Plateau_State_Parcels</LayerNameOrAlias><Records><UpdateRecord xsi:type="UpdateRecordByOID"><Values><UpdateValue><Field>LRSID</Field><Value xsi:type="xsd:string">{su}</Value></UpdateValue><UpdateValue><Field>LinkageStatus</Field><Value xsi:type="xsd:string">1</Value></UpdateValue><UpdateValue><Field>PropertyNumber</Field><Value xsi:type="xsd:string">{property}</Value></UpdateValue></Values><ObjectID>{oid}</ObjectID></UpdateRecord></Records></UpdateDataList><UpdateDataList><LayerNameOrAlias>sde.SDE.Plateau_State_Parcels</LayerNameOrAlias><Records><UpdateRecord xsi:type="UpdateRecordByFields"><Values><UpdateValue><Field>LRSID</Field><Value xsi:nil="true" /></UpdateValue><UpdateValue><Field>LinkageStatus</Field><Value xsi:nil="true" /></UpdateValue></Values><PrimaryFields><UpdateValue><Field>UPIN</Field><Value xsi:type="xsd:string">{upin}</Value></UpdateValue></PrimaryFields></UpdateRecord></Records><ExculdeFeatures><int>{oid}</int></ExculdeFeatures></UpdateDataList></updateList></UpdateCadastralData></soap:Body></soap:Envelope>"#);
+    let press_ok = |body: String| { let app = app.clone(); async move {
+        let req = Request::builder().method("POST").uri("/GISViewer/WebServices/CadastralWebService.asmx").header(header::CONTENT_TYPE, "text/xml; charset=utf-8").body(Body::from(body)).unwrap();
+        let r = app.oneshot(req).await.unwrap();
+        assert_eq!(r.status(), StatusCode::OK);
+        let t = String::from_utf8(to_bytes(r.into_body(), usize::MAX).await.unwrap().to_vec()).unwrap();
+        assert!(!t.contains("<Error>"), "the desktop's OK always succeeds: {t}");
+    } };
+    let linked = |upin: String| { let pool = pool.clone(); async move {
+        sqlx::query_scalar::<_, Option<i16>>("SELECT linkage_status FROM cadastre.parcel_attribute WHERE upin = $1").bind(upin).fetch_one(&pool).await.unwrap()
+    } };
+
+    // Off (the default): the Cadastre's half only, as before.
+    press_ok(ok(oid, &upin, "PL777")).await;
+    tokio::time::sleep(std::time::Duration::from_millis(400)).await;
+    assert_eq!(linked(upin.clone()).await, Some(1));
+    assert!(fake.bodies("SaveEntity").is_empty(), "off: nothing goes to the Registry");
+
+    // On: the Registry takes the UPIN and the link date, and the link is on the Linked tab at once.
+    std::env::set_var("CADASTRE_REGISTRY_LINK_ON_MAP_OK", "1");
+    press_ok(ok(oid, &upin, "PL777")).await;
+    for _ in 0..100 {
+        if !fake.bodies("SaveEntity").is_empty() { break; }
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+    let saves = fake.bodies("SaveEntity");
+    assert_eq!(saves.len(), 1, "one write");
+    assert!(saves[0].contains("<int:transactionId>10000000777</int:transactionId>"), "{}", saves[0]);
+    assert!(saves[0].contains(&format!("<lrs:name>upin</lrs:name><lrs:value>{upin}</lrs:value>")), "{}", saves[0]);
+    assert!(saves[0].contains("<lrs:name>SpatialDate1</lrs:name><lrs:value>20"), "{}", saves[0]);
+    let mut how = None;
+    for _ in 0..100 {
+        how = sqlx::query_scalar::<_, Option<String>>("SELECT payload->>'how' FROM cadastre.audit_log WHERE action = 'registry_link_made' AND entity_id = $1 ORDER BY id DESC LIMIT 1")
+            .bind(&upin).fetch_optional(&pool).await.unwrap().flatten();
+        if how.is_some() { break; }
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+    assert_eq!(how.as_deref(), Some("map_ok"));
+    let (_, links) = send(&app, "GET", "/api/v1/registry/links?days=14", None, None).await;
+    assert!(links.as_array().unwrap().iter().any(|l| l["upin"] == upin.as_str() && l["linked_now"] == true), "{links}");
+
+    // A refused write (the map names another property): the Cadastre's half stands, the Registry
+    // is left alone, and it stays in link problems for someone to finish.
+    let other = format!("PLL{n:09}");
+    let oid2 = oid + 1;
+    parcel(other.clone(), oid2, 300_000 + (n % 100_000) as i32 * 30 + 25).await;
+    press_ok(ok(oid2, &other, "PL000")).await;
+    let mut reason = None;
+    for _ in 0..100 {
+        reason = sqlx::query_scalar::<_, Option<String>>("SELECT payload->>'reason' FROM cadastre.audit_log WHERE action = 'registry_link_failed' AND entity_id = $1 ORDER BY id DESC LIMIT 1")
+            .bind(&other).fetch_optional(&pool).await.unwrap().flatten();
+        if reason.is_some() { break; }
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+    assert!(reason.as_deref().is_some_and(|r| r.contains("PL000")), "{reason:?}");
+    assert_eq!(linked(other.clone()).await, Some(1));
+    assert_eq!(fake.bodies("SaveEntity").len(), 1, "nothing more went to the Registry");
+    let (_, problems) = send(&app, "GET", "/api/v1/registry/link-problems", None, None).await;
+    assert!(problems["commits_not_linked"].as_array().unwrap().iter().any(|p| p["upin"] == other.as_str() && p["how"] == "map_ok"), "{problems}");
+    for k in ["CADASTRE_REGISTRY_URL", "CADASTRE_REGISTRY_USER", "CADASTRE_REGISTRY_PASSWORD", "CADASTRE_REGISTRY_WRITE", "CADASTRE_REGISTRY_LINK_ON_MAP_OK"] { std::env::remove_var(k); }
+}
+
 /// The Registry's job service (Aumentum LRSWebServices.asmx at its path), called as the Registry's
 /// Java client calls it: Authenticate (session cookie), GetAllJobs → CreateJobInstance with the
 /// transaction parameter, GetJobInstance, ApproveJob, the parcel reads, LogOut.

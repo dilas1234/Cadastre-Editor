@@ -397,14 +397,16 @@ pub async fn link_problems(pool: &PgPool) -> Result<serde_json::Value, sqlx::Err
            AND (SELECT count(*) FROM cadastre.registry_property x WHERE x.upin = a.upin) = 1 ORDER BY a.upin LIMIT 500").fetch_all(pool).await?;
     let not_linked: Vec<(String, chrono::DateTime<chrono::Utc>, serde_json::Value)> = sqlx::query_as(
         "SELECT DISTINCT ON (f.entity_id) f.entity_id, f.created_at, f.payload FROM cadastre.audit_log f \
-         WHERE f.action = 'registry_link_failed' AND NOT EXISTS (SELECT 1 FROM cadastre.parcel_attribute a WHERE a.upin = f.entity_id AND a.linkage_status = 1) \
+         WHERE f.action = 'registry_link_failed' AND (NOT EXISTS (SELECT 1 FROM cadastre.parcel_attribute a WHERE a.upin = f.entity_id AND a.linkage_status = 1) \
+                OR (f.payload->>'how' = 'map_ok' AND NOT EXISTS (SELECT 1 FROM cadastre.audit_log m WHERE m.entity = 'registry_link' AND m.entity_id = f.entity_id \
+                    AND m.action IN ('registry_link_made', 'registry_link_synced') AND m.id > f.id))) \
          ORDER BY f.entity_id, f.id DESC LIMIT 500").fetch_all(pool).await?;
     Ok(json!({
         "several_properties": several.iter().map(|(u, s)| json!({ "upin": u, "su_ids": s })).collect::<Vec<_>>(),
         "not_in_cadastre": missing.iter().map(|(u, s, r)| json!({ "upin": u, "su_id": s, "refnum": r })).collect::<Vec<_>>(),
         "not_in_cadastre_total": missing_total,
         "linked_elsewhere": mismatch.iter().map(|(u, l, s)| json!({ "upin": u, "cadastre_lrs_id": l, "registry_su_id": s })).collect::<Vec<_>>(),
-        "commits_not_linked": not_linked.iter().map(|(u, at, p)| json!({ "upin": u, "at": at.to_rfc3339(), "transaction_number": p["transaction_number"], "reason": p["reason"] })).collect::<Vec<_>>(),
+        "commits_not_linked": not_linked.iter().map(|(u, at, p)| json!({ "upin": u, "at": at.to_rfc3339(), "transaction_number": p["transaction_number"], "reason": p["reason"], "how": p["how"] })).collect::<Vec<_>>(),
     }))
 }
 
