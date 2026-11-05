@@ -1,0 +1,112 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<meta name="viewport" content="width=device-width, initial-scale=1"/>
+<title>Sign in — PLAGIS</title>
+<link rel="icon" href="/editor/login/plateau-logo.svg" type="image/svg+xml"/>
+<link rel="stylesheet" href="/editor/login/login.css"/>
+</head>
+<body>
+<main class="page">
+  <section class="hero" aria-label="About PLAGIS">
+    <span class="tick tickA">480 000 E</span><span class="tick tickB">480 400 E</span><span class="tick tickN">1 021 200 N</span>
+    <div class="brand">
+      <span class="brandMark" aria-hidden="true">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"><path d="M9 4 3.5 6.2v13.6L9 17.6l6 2.4 5.5-2.2V4.2L15 6.4 9 4Z"/><path d="M9 4v13.6M15 6.4V20"/></svg>
+      </span>
+      <div><div class="brandName">PLAGIS</div><div class="brandSub">Plateau State Geographic Information Service</div></div>
+    </div>
+    <div class="heroMain">
+      <div class="eyebrow"><span></span>Ministry of Lands, Survey &amp; Town Planning</div>
+      <h1>Land records, surveys and planning, <em>in one secure system.</em></h1>
+      <p>Access cadastral data, survey plans, title documents and development control records for Plateau State.</p>
+      <ul class="pillars">
+        <li><b>Cadastre</b><span>Parcels &amp; beacons</span></li>
+        <li><b>Survey</b><span>Plans &amp; control points</span></li>
+        <li><b>Town Planning</b><span>Permits &amp; layouts</span></li>
+      </ul>
+    </div>
+    <div class="heroFoot">
+      <div><b>Plateau State Government</b><span>Home of Peace and Tourism</span></div>
+      <code>UTM ZONE 32N · WGS 84<br/>JOS, PLATEAU STATE</code>
+    </div>
+  </section>
+
+  <section class="panel">
+    <div class="need">Need access? <button type="button" class="link" data-help>Contact the ICT Unit</button></div>
+    <div class="col">
+      <div class="crest">
+        <img src="/editor/login/plateau-logo.svg" alt="Plateau State Government logo" width="120" height="120"/>
+        <div class="crestName">Plateau State Government</div>
+        <div class="crestSub">Ministry of Lands, Survey &amp; Town Planning</div>
+      </div>
+
+      <form id="signIn" novalidate>
+        <h2>Sign in</h2>
+        <p class="lead">Enter your staff credentials to continue.</p>
+        <div class="msg" id="msg" role="alert" hidden></div>
+        <label for="username">Username</label>
+        <div class="field">
+          <svg class="ic" viewBox="0 0 24 24" aria-hidden="true"><circle cx="12" cy="8" r="4"/><path d="M4.5 20c1.2-3.6 4-5.5 7.5-5.5s6.3 1.9 7.5 5.5"/></svg>
+          <input id="username" name="username" autocomplete="username" autocapitalize="none" spellcheck="false" required autofocus/>
+        </div>
+        <label for="password">Password</label>
+        <div class="field">
+          <svg class="ic" viewBox="0 0 24 24" aria-hidden="true"><rect x="5" y="11" width="14" height="9" rx="2"/><path d="M8 11V8a4 4 0 0 1 8 0v3"/></svg>
+          <input id="password" name="password" type="password" autocomplete="current-password" required/>
+          <button type="button" class="eye" data-eye="password" aria-label="Show password" aria-pressed="false">
+            <svg class="ic" viewBox="0 0 24 24" aria-hidden="true"><path d="M2.5 12S6 5.5 12 5.5 21.5 12 21.5 12 18 18.5 12 18.5 2.5 12 2.5 12Z"/><circle cx="12" cy="12" r="3"/></svg>
+          </button>
+        </div>
+        <label for="view">Workstation</label>
+        <div class="field">
+          <svg class="ic" viewBox="0 0 24 24" aria-hidden="true"><rect x="3" y="4.5" width="18" height="12" rx="2"/><path d="M9 20h6M12 16.5V20"/></svg>
+          <select id="view" name="view" required>
+            <option value="" disabled selected>Select your workstation</option>
+            <option value="digitising">Digitising</option>
+            <option value="titledeed">Title Deed</option>
+            <option value="reporting">Charting and Reporting</option>
+            <option value="sysadmin">Sysadmin</option>
+          </select>
+          <svg class="ic chev" viewBox="0 0 24 24" aria-hidden="true"><path d="m6 9.5 6 6 6-6"/></svg>
+        </div>
+        <div class="row">
+          <label class="check"><input type="checkbox" id="remember"/><span></span>Remember me</label>
+          <button type="button" class="link" data-help>Forgot password?</button>
+        </div>
+        <button class="primary" type="submit"><span>Sign in</span><svg class="ic" viewBox="0 0 24 24" aria-hidden="true"><path d="M4.5 12h15M13.5 6l6 6-6 6"/></svg></button>
+        <p class="note" id="help" hidden>Accounts and passwords are managed by the ICT Unit. Please ask them to set up your access or reset your password.</p>
+        <p class="fine"><svg class="ic" viewBox="0 0 24 24" aria-hidden="true"><path d="M12 3.5 5 6v5.5c0 4.4 2.9 7.6 7 9 4.1-1.4 7-4.6 7-9V6l-7-2.5Z"/></svg>Authorised staff only. All activity is logged.</p>
+      </form>
+
+      <form id="changePw" novalidate hidden>
+        <h2>Set your password</h2>
+        <p class="lead">Your temporary password must be replaced before you continue.</p>
+        <div class="msg" id="msg2" role="alert" hidden></div>
+        <div id="currentRow">
+          <label for="current">Temporary password</label>
+          <div class="field"><input id="current" type="password" autocomplete="current-password" required/></div>
+        </div>
+        <label for="newpw">New password</label>
+        <div class="field">
+          <input id="newpw" type="password" autocomplete="new-password" required aria-describedby="rule"/>
+          <button type="button" class="eye" data-eye="newpw" aria-label="Show password" aria-pressed="false">
+            <svg class="ic" viewBox="0 0 24 24" aria-hidden="true"><path d="M2.5 12S6 5.5 12 5.5 21.5 12 21.5 12 18 18.5 12 18.5 2.5 12 2.5 12Z"/><circle cx="12" cy="12" r="3"/></svg>
+          </button>
+        </div>
+        <p class="rule" id="rule">At least 8 characters, with letters and numbers.</p>
+        <label for="confirm">Confirm new password</label>
+        <div class="field"><input id="confirm" type="password" autocomplete="new-password" required/></div>
+        <button class="primary" type="submit"><span>Save and continue</span><svg class="ic" viewBox="0 0 24 24" aria-hidden="true"><path d="M4.5 12h15M13.5 6l6 6-6 6"/></svg></button>
+      </form>
+    </div>
+    <footer>
+      <div>© <span id="year">2026</span> PLAGIS · Plateau State Government</div>
+      <div class="credit">Logo: <a href="https://commons.wikimedia.org/wiki/File:Plateau_State_Government_Logo.svg" rel="noopener" target="_blank">Veldshan</a>, <a href="https://creativecommons.org/licenses/by-sa/4.0" rel="noopener" target="_blank">CC BY-SA 4.0</a>, via Wikimedia Commons</div>
+    </footer>
+  </section>
+</main>
+<script src="/editor/login/login.js"></script>
+</body>
+</html>

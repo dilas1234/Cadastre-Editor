@@ -228,8 +228,8 @@ const W: f64 = 210.0;
 const FRAME: (f64, f64, f64, f64) = (12.0, 60.0, 198.0, 228.0); // x0, y0, x1, y1
 const RED: &str = "#c00000";
 const LINE: &str = "#8b2f2f";
-/// The WGS 1984 co-ordinates in the footer: a light green that still reads on white paper.
-const COORD_GREEN: &str = "#4caf50";
+/// The WGS 1984 co-ordinates in the footer: dark green.
+const COORD_GREEN: &str = "#1b5e20";
 /// A white outline under labels that may cross a line (beacon numbers, bearings, the road).
 const HALO: &str = r##"stroke="#fff" stroke-width="0.7" paint-order="stroke""##;
 /// A side shorter than this on paper (mm) has no room for its bearing and distance: they are
@@ -1064,11 +1064,12 @@ mod tests {
             let want = want.replace("&#39;", "'");
             assert!(svg.contains(&want), "missing {want}");
         }
-        assert_eq!(svg.matches(r##"fill="#4caf50""##).count(), 3, "the WGS 1984 lines are light green");
+        assert_eq!(svg.matches(r##"fill="#1b5e20""##).count(), 3, "the WGS 1984 lines are dark green");
         // An explicit scale is kept.
         fields.scale = Some(750);
         let svg = render_svg(&PlanData { upin: "PL000000023268".into(), area_m2: 249.489, corners: c, fields });
         assert!(svg.contains("Scale = 1:750"));
+        assert!(svg.contains(r##"fill="#1b5e20">WGS 1984 Co-ordinates of"##), "the co-ordinates are dark green");
     }
 
     #[test]

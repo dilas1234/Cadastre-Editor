@@ -5,6 +5,7 @@ pub mod beacons;
 pub mod catalog;
 pub mod completed;
 pub mod editor;
+pub mod login;
 pub mod fci;
 pub mod fabric;
 pub mod gisviewer;
@@ -37,9 +38,21 @@ use tower_http::trace::TraceLayer;
 
 use crate::state::AppState;
 
+/// The application behind the sign-in gate (`CADASTRE_AUTH=local`; passes everything otherwise).
+pub fn gated(app: Router, state: AppState) -> Router {
+    app.layer(axum::middleware::from_fn_with_state(state, crate::auth::gate))
+}
+
 /// Build the application router with all routes and middleware.
 pub fn router(state: AppState) -> Router {
     Router::new()
+        .route("/", get(login::root))
+        .route("/login", get(login::page))
+        .route("/api/v1/auth/login", post(login::login))
+        .route("/api/v1/auth/logout", post(login::logout))
+        .route("/api/v1/auth/change-password", post(login::change_password))
+        .route("/api/v1/admin/credentials", get(login::credentials))
+        .route("/api/v1/admin/users/{sid}/password", post(login::set_temporary_password))
         .route("/health", get(health::health))
         .route("/ready", get(health::ready))
         // Browser viewer + editor (Phase 7/4, FR-VIEW/FR-SUR)
@@ -148,6 +161,8 @@ pub fn router(state: AppState) -> Router {
         .route("/api/v1/registry/parcels/{upin}/events", get(registry::parcel_events))
         .route("/api/v1/wf/jobs/{id}/registry/send-plan", post(registry::send_plan))
         .route("/api/v1/wf/jobs/{id}/registry/sent", get(registry::sent_plans))
+        .route("/api/v1/wf/jobs/{id}/registry/plan-correction", get(registry::plan_correction))
+        .route("/api/v1/registry/correct-plan", post(registry::correct_plan))
         .route(
             "/api/v1/parcels/{id}/attributes",
             get(parcels::get_parcel_attributes).put(parcels::put_parcel_attributes),

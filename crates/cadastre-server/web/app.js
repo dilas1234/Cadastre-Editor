@@ -84,7 +84,13 @@ async function authLogin() {
     response_type: "code", scope: "openid", state: st, code_challenge: challenge, code_challenge_method: "S256" }));
   return new Promise(() => {}); // the page is leaving
 }
-function authLogout() {
+async function authLogout() {
+  if (auth.cfg?.local) {
+    try { sessionStorage.removeItem("cad.session"); sessionStorage.removeItem("cad.adminSwitch"); } catch { /* ignore */ }
+    await fetch("/api/v1/auth/logout", { method: "POST" }).catch(() => {});
+    location.assign("/login");
+    return;
+  }
   const id = auth.cfg?.enabled ? auth.cfg : null;
   try { sessionStorage.removeItem("cad.tokens"); sessionStorage.removeItem("cad.session"); } catch { /* ignore */ }
   if (id) location.assign(`${id.issuer}/protocol/openid-connect/logout?` + new URLSearchParams({ client_id: id.client_id, post_logout_redirect_uri: authRedirectUri() }));
@@ -117,6 +123,7 @@ async function api(path, opts = {}) {
   const init = { ...opts, headers: { ...(opts.body ? { "content-type": "application/json" } : {}), ...authHeaders(), ...(opts.headers || {}) } };
   if (opts.body && typeof opts.body !== "string") init.body = JSON.stringify(opts.body);
   let r = await fetch(path, init);
+  if (r.status === 401 && auth.cfg?.local) { location.assign("/login"); return new Promise(() => {}); }
   if (r.status === 401 && auth.cfg?.enabled) {
     try { await authRefresh(); } catch { return authLogin(); }
     r = await fetch(path, { ...init, headers: { ...init.headers, ...authHeaders() } });
@@ -485,7 +492,7 @@ const MENUS = () => ({
     "-",
     { label: "Print…", kbd: "Ctrl+P", action: () => window.print() },
     "-",
-    { label: "Sign Out", action: () => authLogout(), disabled: () => !auth.cfg?.enabled },
+    { label: "Sign Out", action: () => authLogout(), disabled: () => !auth.cfg?.enabled && !auth.cfg?.local },
     { label: "Exit", disabled: true },
   ],
   Edit: [
@@ -1325,6 +1332,7 @@ function parcelMenu(e) {
   selectFeatures([f.properties.id], false);
   contextMenu([
     can("titledeed") ? { label: `Start edit — title deed (${upin})`, icon: "editor", action: () => startEditParcel(upin) } : null,
+    can("titledeed") ? { label: "Correct Plan…", icon: "editor", action: () => correctPlan(upin) } : null,
     { label: "Zoom To Parcel", icon: "fullExtent", action: () => registryZoom(upin) },
     { label: "Registry File…", icon: "registry", action: () => startEditParcel(upin, true) },
     "-",
@@ -1460,6 +1468,18 @@ async function correctAndRecommit(upin) {
   editDraftFeature(draft); setTool("editVertex");
   orthoSketchChanged();
   notify(`${upin} is a draft again (it keeps its UPIN). Correct the points (drag, or retype in Edit Sketch Properties), then Finish Sketch.`);
+}
+// Correct a title deed plan that came back: the parcel, its UPIN and its link stay; the plan is
+// redone (scale, form) and resent. The server allows it for a linked parcel at Raise Title Deed Plan.
+async function correctPlan(upin, txn) {
+  const reason = await uiPrompt(`Correct the title deed plan of ${upin}?\n\nThe parcel, its UPIN and its Registry link stay as they are. The plan form opens: change it, Attach as PDF, then Registry → Send plan resends it. The earlier plan is marked as replaced; nothing is deleted in the Registry.\n\nReason:`, "", { title: "Correct Plan", ok: "Correct plan", multiline: true });
+  if (!reason || !reason.trim()) return;
+  let r;
+  try { r = await api("/api/v1/registry/correct-plan", { method: "POST", body: { upin, transaction_number: txn || null, reason: reason.trim() } }); }
+  catch (e) { uiAlert("Correct plan refused: " + e.message); return; }
+  await openWorkflow(); await wfSelect(r.job_instance_id);
+  titleDeedDialog(r.job_instance_id, upin);
+  notify(r.already_open ? `The plan of ${upin} is already being corrected: ${r.reason}` : `Correcting the plan of ${upin}. Attach as PDF, then Registry → Send plan.`);
 }
 async function startEditParcel(upin, fileOnly) {
   let w;
@@ -4038,7 +4058,8 @@ function historyText(e) {
     case "registry_link_synced": return `Linked in the Registry: property ${d.su_id || ""}`;
     case "registry_unlink_synced": return "Unlinked in the Registry";
     case "registry_link_failed": return `Could not be linked: ${d.reason || ""}`;
-    case "registry_plan_sent": return `Title deed plan ${d.resend ? "resent (corrected)" : "sent"} to the Registry: ${d.file_name || ""}`;
+    case "registry_plan_sent": return `Title deed plan ${d.resend ? "resent (corrected)" : "sent"} to the Registry: ${d.file_name || ""}${d.reason ? ` (${d.reason})` : ""}`;
+    case "title_deed_plan_correction": return `Title deed plan correction started: ${d.reason || ""}`;
     case "registry_plan_withdrawn": return `Title deed plan withdrawn: ${d.reason || ""}`;
     case "title_deed_plan_deleted": return "Title deed plan deleted";
     case "wf_reopened_for_correction": return `Reopened for correction (${d.upin || ""}): ${d.reason || ""}`;
@@ -4098,6 +4119,7 @@ function queueCard(f) {
     if (f.job_instance_id && f.job_open) { await openWorkflow(); await wfSelect(f.job_instance_id); titleDeedDialog(f.job_instance_id, f.upin); }
     else startEditParcel(f.upin);
   }, !f.in_cadastre));
+  if (can("titledeed")) actions.push(regLink("Correct plan", "The plan came back: give the reason, change it and resend it (the parcel stays)", () => correctPlan(f.upin, f.transaction_number), !f.in_cadastre));
   actions.push(regLink("Point List", "Beacons, bearings and distances", () => pointListWindow(f.upin), !f.in_cadastre));
   actions.push(regLink("History", "The file's Registry stages and this Cadastre's events", () => historyWindow({ txn: f.transaction_number, upin: f.upin, title: f.property_number })));
   return h("div", { class: "regCard " + (f.in_cadastre ? "job" : "wait") },
@@ -4290,7 +4312,7 @@ async function regLookup(no) {
 }
 // --- send the plan (Aumentum SendImageCommand: the job's image file → its transaction) ---
 async function regSetJob(id) {
-  reg.job = null; reg.files = []; reg.sent = [];
+  reg.job = null; reg.files = []; reg.sent = []; reg.correction = null;
   if (!id) return;
   try {
     const d = await api("/api/v1/wf/jobs/" + id);
@@ -4300,6 +4322,7 @@ async function regSetJob(id) {
     const pdfs = reg.files.filter((f) => /\.pdf$/i.test(f.file_name));
     if (!reg.files.some((f) => f.id === reg.pick)) reg.pick = (pdfs.length ? pdfs[pdfs.length - 1] : reg.files[reg.files.length - 1] || {}).id || null;
     reg.sent = await api(`/api/v1/wf/jobs/${id}/registry/sent`);
+    reg.correction = (await api(`/api/v1/wf/jobs/${id}/registry/plan-correction`)).correction;
     if (reg.job.lrs_transaction_number && !reg.txnNo) await regLookup(reg.job.lrs_transaction_number);
   } catch (e) { notify(e.message, "err"); }
 }
@@ -4315,6 +4338,7 @@ async function regSendPlan(fileId, fileName, resend) {
     const done = `${r.file_name} ${r.resend ? "resent (corrected)" : "sent"} to ${r.transaction_number}.`;
     if (r.replace_note) notify(`${done} Note: ${r.replace_note}.`, "warn");
     else notify(r.resend ? `${done} ${r.replaced.length} earlier plan(s) marked as replaced.` : done);
+    if (r.job_completed) notify(`${done} ${reg.job.name || "The job"} is completed.`);
     await regSetJob(reg.job.id);
   });
 }
@@ -4490,7 +4514,8 @@ function regFindView(box) {
         regMetaRow({ ...f, upin })),
       h("div", { class: "regCardFoot" }, h("span", { class: "regLinks" },
         regLink("Zoom", "Zoom to the parcel", () => registryZoom(upin), !upin),
-        done && !f.job_instance_id && can("digitise") ? regLink("Correct", "Correct & Recommit: the parcel keeps its UPIN and its history", () => correctAndRecommit(upin)) : null), main)));
+        done && !f.job_instance_id && can("digitise") ? regLink("Correct", "Correct & Recommit: the parcel keeps its UPIN and its history", () => correctAndRecommit(upin)) : null,
+        linked && active && here.length && can("titledeed") ? regLink("Correct plan", "The plan came back: give the reason, change it and resend it (the parcel stays)", () => correctPlan(f.upin, f.transaction_number)) : null), main)));
   }
 }
 
@@ -4553,13 +4578,15 @@ function regSendView(box, writes) {
   const f = reg.files.find((x) => x.id === reg.pick);
   const ready = writes && t && t.open && f && !reg.busy;
   // Sent before to this transaction: the button becomes Resend corrected plan.
-  const sentHere = reg.sent.some((x) => x.detail && x.detail.transaction_number === j.lrs_transaction_number);
+  const sentHere = !!reg.correction || reg.sent.some((x) => x.detail && x.detail.transaction_number === j.lrs_transaction_number);
   const pdfName = f ? (/\.pdf$/i.test(f.file_name) ? f.file_name : f.file_name.replace(/\.[^.]+$/, "") + ".pdf") : "";
   box.append(h("div", { class: "regSendBar" },
     h("button", { class: "regAct primary big", disabled: !ready, title: !writes ? "Writing to the Registry is off on this server" : "",
       onclick: () => regSendPlan(f.id, f.file_name, sentHere) },
       reg.busy ? "Sending…" : !f ? "Send plan" : sentHere ? `Resend corrected plan: ${pdfName}` : `Send ${pdfName} to ${j.lrs_transaction_number}`),
-    h("div", { class: "muted" }, sentHere
+    h("div", { class: "muted" }, reg.correction
+      ? `Plan correction: ${reg.correction.reason}. The corrected PDF is filed as "Survey Plan (corrected)" with this reason, and the earlier plans in the transaction are marked as replaced; nothing is deleted.`
+      : sentHere
       ? "A plan was sent before. The corrected PDF is filed as \"Survey Plan (corrected)\" and the earlier plan is marked as replaced; nothing is deleted."
       : "Filed in the transaction as a Title Deed Plan (\"Survey Plan\"), as a PDF.")));
   if (reg.sent.length) {
@@ -5901,12 +5928,29 @@ async function notificationsWindow() {
 }
 
 // --- Administration (Aumentum Web Administrator) ------------------------------------------------
-const adm = { tab: "users", data: null, settings: [], sel: null };
+const adm = { tab: "users", data: null, settings: [], sel: null, creds: [] };
 async function adminWindow() {
-  try { [adm.data, adm.settings] = await Promise.all([api("/api/v1/admin/security"), api("/api/v1/admin/settings")]); if (!wf.defs) wf.defs = await api("/api/v1/wf/definitions"); }
+  try { [adm.data, adm.settings, adm.creds] = await Promise.all([api("/api/v1/admin/security"), api("/api/v1/admin/settings"), api("/api/v1/admin/credentials")]); if (!wf.defs) wf.defs = await api("/api/v1/wf/definitions"); }
   catch (e) { uiAlert(e.message); return; }
   floatWindow("Administration", h("div", { id: "admBody" }), { id: "admWin", width: 700 });
   renderAdmin();
+}
+// A temporary password: shown once here; its owner must change it at first sign-in.
+async function admSetPassword(u) {
+  const had = adm.creds.some((c) => c.sid === u.sid);
+  if (!(await uiConfirm(`${had ? "Reset" : "Set"} the password of ${u.name || u.code} (${u.code})?\n\nA temporary password is made and shown once. ${u.name || u.code} must change it at first sign-in${had ? "; any open session ends" : ""}.`, { ok: had ? "Reset" : "Set password" }))) return;
+  try {
+    const r = await api(`/api/v1/admin/users/${u.sid}/password`, { method: "POST" });
+    adm.creds = await api("/api/v1/admin/credentials");
+    renderAdmin();
+    await uiAlert(`Username: ${r.username}\nTemporary password: ${r.temporary_password}\n\nGive this to ${u.name || u.code}. It will not be shown again.`, { title: "Temporary password" });
+  } catch (e) { uiAlert(e.message); }
+}
+function admPasswordCell(u) {
+  const c = adm.creds.find((x) => x.sid === u.sid);
+  const state = !c ? "None" : c.must_change ? "Temporary" : "Set";
+  return h("td", { style: "white-space:nowrap" }, h("span", { class: "muted", title: c && c.last_login ? `Last sign-in ${fmtDT(c.last_login)}` : "Never signed in" }, state + " "),
+    h("button", { class: "btn", onclick: () => admSetPassword(u) }, c ? "Reset" : "Set"));
 }
 async function admChange(body) {
   try { adm.data = await api("/api/v1/admin/change", { method: "POST", body }); renderAdmin(); status("Saved."); } catch (e) { uiAlert(e.message); }
@@ -5919,13 +5963,14 @@ function renderAdmin() {
   const body = h("div", { style: "max-height:460px;overflow:auto;margin-top:6px" }); root.append(body);
   const groups = P.filter((p) => !p.is_user);
   if (adm.tab === "users") {
-    const tb = h("table", { class: "wfHist" }, h("tr", {}, h("th", {}, "User"), h("th", {}, "Windows account"), h("th", {}, "E-mail"), ...groups.map((g) => h("th", {}, g.name || g.code)), h("th", {}, "Locked")));
+    const tb = h("table", { class: "wfHist" }, h("tr", {}, h("th", {}, "User"), h("th", {}, "Windows account"), h("th", {}, "E-mail"), ...groups.map((g) => h("th", {}, g.name || g.code)), h("th", {}, "Locked"), h("th", {}, "Password")));
     for (const u of P.filter((p) => p.is_user)) {
       const email = h("input", { value: u.email || "", style: "width:150px", onchange: (e) => admChange({ kind: "principal", sid: u.sid, email: e.target.value }) });
       tb.append(h("tr", {}, h("td", {}, u.name || u.code), h("td", {}, u.os_account || ""), h("td", {}, email),
         ...groups.map((g) => { const on = d.memberships.some(([gs, ms]) => gs === g.sid && ms === u.sid);
           return h("td", {}, h("input", { type: "checkbox", checked: on, onchange: (e) => admChange({ kind: "member", group_sid: g.sid, member_sid: u.sid, add: e.target.checked }) })); }),
-        h("td", {}, h("input", { type: "checkbox", checked: u.is_locked, onchange: (e) => admChange({ kind: "principal", sid: u.sid, is_locked: e.target.checked }) }))));
+        h("td", {}, h("input", { type: "checkbox", checked: u.is_locked, onchange: (e) => admChange({ kind: "principal", sid: u.sid, is_locked: e.target.checked }) })),
+        admPasswordCell(u)));
     }
     body.append(tb);
   } else if (adm.tab === "roles") {

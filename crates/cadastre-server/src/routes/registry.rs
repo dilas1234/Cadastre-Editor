@@ -381,7 +381,9 @@ pub(crate) async fn link_parcel(state: &AppState, actor: &str, number: &str, su:
         if let Some(other) = prop.upin.as_deref().filter(|u| !u.eq_ignore_ascii_case(&upin)) {
             return Err(AppError::Conflict(format!("The Registry property {} is already linked to {other}.", prop.su_id)));
         }
-        if let Some(p) = linked.as_deref() {
+        // After an OK on the Registry's map the parcel already holds this property: the desktop's
+        // UpdateCadastralData wrote the Cadastre's half, and the Registry's half is what is missing.
+        if let Some(p) = linked.as_deref().filter(|p| !(how == MAP_OK && p.eq_ignore_ascii_case(&prop.su_id))) {
             return Err(AppError::Conflict(format!("The parcel {upin} is already linked to the Registry property {p}.")));
         }
         // No other current property may hold this UPIN.
@@ -451,6 +453,86 @@ async fn link_after_commit_forced(state: &AppState, actor: &str, job_instance_id
         }
     }
     out
+}
+
+/// How a link made by pressing OK on the Registry's map is recorded.
+const MAP_OK: &str = "map_ok";
+
+/// CADASTRE_REGISTRY_LINK_ON_MAP_OK=1: pressing OK on the Registry's map also writes the UPIN and
+/// the link date to the Registry, so the link no longer waits for the officer to save the file
+/// (Suspend). Off unless set. It needs CADASTRE_REGISTRY_WRITE=1 as well.
+pub(crate) fn link_on_map_ok() -> bool {
+    std::env::var("CADASTRE_REGISTRY_LINK_ON_MAP_OK").map(|v| v.trim() == "1").unwrap_or(false)
+}
+
+/// The property's one Active transaction, from rows of (id, number, status code, …). The map's OK
+/// does not say which file is open, so none or several Active leaves the choice to the officer.
+fn only_active_transaction(rows: &[Vec<String>]) -> Result<String, String> {
+    let mut active: Vec<&str> = rows.iter().filter(|r| r.len() >= 3 && r[2] == "transaction_lodged").map(|r| r[1].trim()).collect();
+    active.sort_unstable();
+    active.dedup();
+    match active.as_slice() {
+        [one] => Ok(one.to_string()),
+        [] => Err("the property has no Active transaction".into()),
+        many => Err(format!("the property has {} Active transactions ({}): save the file in the Registry", many.len(), many.join(", "))),
+    }
+}
+
+/// The Registry's half of an OK on its map. `Ok(false)`: the Registry already holds it. Every check
+/// is `link_parcel`'s, and it is `link_parcel` that writes.
+async fn write_map_ok_link(state: &AppState, actor: &str, su: &str, property_number: Option<&str>, upin: &str) -> ApiResult<bool> {
+    let su = ident("property id", su)?;
+    let upin = ident("UPIN", upin)?.to_uppercase();
+    let cfg = write_config()?;
+    let session = Session::start(&cfg).await.map_err(registry_err)?;
+    let found = async {
+        let rows = session.query(&format!(
+            "select t.Id, t.TransactionNumber, s.Code, s.Label, p.Id, p.Upin from com.landsystems.lrs.model.Transaction t join t.TransactionStatus s \
+             join t.Properties l join l.SpatialUnits p where p.SuID = '{su}' and l.EndLifespanVersion is null and p.EndLifespanVersion is null"), 200).await.map_err(registry_err)?;
+        let number = only_active_transaction(&rows).map_err(AppError::Conflict)?;
+        let t = load_transaction(&session, &number).await?
+            .ok_or_else(|| AppError::NotFound(format!("Cannot retrieve information of the Transaction. Transaction number:'{number}'.")))?;
+        let prop = t.properties.into_iter().find(|p| p.su_id.eq_ignore_ascii_case(&su))
+            .ok_or_else(|| AppError::Conflict(format!("{su} is not a property of {number}")))?;
+        Ok::<_, AppError>((number, prop))
+    }
+    .await;
+    session.end().await;
+    let (number, prop) = found?;
+    if let (Some(sent), Some(held)) = (property_number.map(str::trim).filter(|n| !n.is_empty()), prop.refnum.as_deref()) {
+        if !sent.eq_ignore_ascii_case(held) {
+            return Err(AppError::Conflict(format!("the map sent property {sent} but {su} is {held}")));
+        }
+    }
+    if prop.linked_at.is_some() && prop.upin.as_deref().is_some_and(|u| u.eq_ignore_ascii_case(&upin)) {
+        return Ok(false);
+    }
+    link_parcel(state, actor, &number, Some(&su), None, &upin, MAP_OK).await?;
+    Ok(true)
+}
+
+/// Record that the Registry's half of an OK was not written, for link problems and the file's
+/// history. The Cadastre's half stands; saving the file in the Registry still completes the link.
+pub(crate) async fn map_ok_not_written(state: &AppState, actor: &str, upin: &str, su: Option<&str>, reason: &str) {
+    tracing::warn!("Registry map: {upin} was not written to the Registry on OK: {reason}");
+    if let Ok(mut tx) = state.pool.begin().await {
+        if audit::append(&mut tx, actor, "registry_link_failed", "registry_link", Some(upin), serde_json::json!({
+            "su_id": su, "how": MAP_OK, "reason": reason })).await.is_ok() { let _ = tx.commit().await; }
+    }
+}
+
+/// After an OK on the Registry's map: write its half of the link. It runs after the desktop has
+/// its answer, with a time limit, so a slow Registry never holds the desktop; it reports instead of
+/// failing, because the desktop's own save remains a complete way to finish the link.
+pub(crate) async fn link_after_map_ok(state: &AppState, actor: &str, su: &str, property_number: Option<&str>, upin: &str) {
+    let why = match tokio::time::timeout(std::time::Duration::from_secs(60), write_map_ok_link(state, actor, su, property_number, upin)).await {
+        Ok(Ok(true)) => { tracing::info!("Registry map: {upin} written to the Registry property {su} on OK"); return; }
+        Ok(Ok(false)) => { tracing::info!("Registry map: the Registry property {su} already holds {upin}"); return; }
+        Ok(Err(AppError::Conflict(m) | AppError::BadRequest(m) | AppError::NotFound(m))) => m,
+        Ok(Err(other)) => other.to_string(),
+        Err(_) => "the Registry did not answer within 60 seconds".to_string(),
+    };
+    map_ok_not_written(state, actor, upin, Some(su), &why).await;
 }
 
 /// Aumentum kept one ParcelAttributeTable record per parcel; a parcel committed here may not have
@@ -563,7 +645,9 @@ async fn plan_documents(session: &Session, transaction_id: i64, doc_type: &str) 
 /// The plan always goes as a PDF, uploaded and filed in the transaction as a new incoming
 /// document of type SurveyPlanFromMC (sd_titledeedPlan) with an `attachment` page (setting
 /// `aumentum.Integration.PlanPageType`). With `resend`, the corrected plan is filed and the plans
-/// sent before are marked as replaced (their Comments); nothing in the Registry is deleted.
+/// sent before are marked as replaced (their Comments); nothing in the Registry is deleted. A job
+/// under plan correction (`correct_plan`) always sends this way, with the reason in the Comments:
+/// the plan it replaces may have been filed by Aumentum, so only the Registry knows of it.
 #[utoipa::path(post, path = "/api/v1/wf/jobs/{id}/registry/send-plan", tag = "registry", request_body = SendPlanRequest,
     params(("id" = i32, Path, description = "Job instance id")),
     responses((status = 200), (status = 400, description = "No transaction on the job, or not a PDF/JPG of this job"),
@@ -583,7 +667,8 @@ pub async fn send_plan(State(state): State<AppState>, user: AuthUser, Path(id): 
         "SELECT max(s.created_at) FROM cadastre.audit_log s WHERE s.entity = 'wf_job_instance' AND s.entity_id = $1 AND s.action = 'registry_plan_sent' AND s.payload->>'transaction_number' = $2 \
            AND s.id > COALESCE((SELECT max(w.id) FROM cadastre.audit_log w WHERE w.entity = 'wf_job_instance' AND w.entity_id = $1 AND w.action = 'registry_plan_withdrawn'), 0)")
         .bind(id.to_string()).bind(&txn).fetch_one(&state.pool).await?;
-    if let (Some(at), false) = (sent_before, req.resend) {
+    let correction = open_plan_correction(&state.pool, id).await?;
+    if let (Some(at), false) = (sent_before, req.resend || correction.is_some()) {
         return Err(AppError::Conflict(format!("the plan was already sent to {txn} ({} UTC). To correct it, use Resend corrected plan.", at.format("%Y-%m-%d %H:%M"))));
     }
     let (name, _mime, bytes, job) = crate::routes::wfadmin::read_job_file(&state.pool, req.file_id).await?;
@@ -593,9 +678,10 @@ pub async fn send_plan(State(state): State<AppState>, user: AuthUser, Path(id): 
     let (sent_name, pdf) = plan_as_pdf(&name, &bytes)?;
     let doc_type = registry_sync::setting(&state.pool, "aumentum.Integration.SurveyPlanFromMC").await?.unwrap_or_else(|| "sd_titledeedPlan".into());
     let page_type = registry_sync::setting(&state.pool, "aumentum.Integration.PlanPageType").await?.unwrap_or_else(|| "attachment".into());
-    let resend = req.resend && sent_before.is_some();
+    let resend = (req.resend && sent_before.is_some()) || correction.is_some();
     let now = chrono::Local::now();
-    let comments = if resend { format!("Survey Plan (corrected, {})", now.format("%d-%m-%Y %H:%M")) } else { "Survey Plan".to_string() };
+    let stamp = now.format("%d-%m-%Y %H:%M").to_string();
+    let comments = if resend { corrected_comments(&stamp, correction.as_ref().map(|c| c.reason.as_str())) } else { "Survey Plan".to_string() };
     let session = Session::start(&cfg).await.map_err(registry_err)?;
     let result = async {
         let t = load_transaction(&session, &txn).await?
@@ -636,10 +722,148 @@ pub async fn send_plan(State(state): State<AppState>, user: AuthUser, Path(id): 
     audit::append(&mut tx, &actor.label, "registry_plan_sent", "wf_job_instance", Some(&id.to_string()), serde_json::json!({
         "transaction_number": t.transaction_number, "file_id": req.file_id, "file_name": sent_name, "source_file": name, "bytes": pdf.len(),
         "document_type": doc_type, "page_type": page_type, "resend": resend, "comments": comments, "replaced": replaced, "replace_note": replace_note,
+        "reason": correction.as_ref().map(|c| c.reason.clone()),
     })).await?;
+    // A job opened for the correction ends with it; a job that was already open carries on.
+    let completed = match &correction {
+        Some(c) if c.created_job => complete_correction_job(&mut tx, &actor.label, id).await?,
+        _ => false,
+    };
     tx.commit().await?;
     Ok(Json(serde_json::json!({ "transaction_number": t.transaction_number, "file_name": sent_name, "document_type": doc_type,
-        "resend": resend, "replaced": replaced, "replace_note": replace_note })))
+        "resend": resend, "replaced": replaced, "replace_note": replace_note, "job_completed": completed })))
+}
+
+/// The Comments of a corrected plan in the Registry (the Registry keeps 240 characters).
+fn corrected_comments(stamp: &str, reason: Option<&str>) -> String {
+    match reason {
+        Some(r) => format!("Survey Plan (corrected, {stamp}): {r}").chars().take(240).collect(),
+        None => format!("Survey Plan (corrected, {stamp})"),
+    }
+}
+
+/// Complete a job opened for a plan correction, once the plan is sent. Left open if it has drafts.
+async fn complete_correction_job(tx: &mut sqlx::PgConnection, actor: &str, id: i32) -> ApiResult<bool> {
+    let drafts: i64 = sqlx::query_scalar("SELECT count(*) FROM cadastre.parcel p JOIN cadastre.wf_job_instance w ON w.cadastre_job_id = p.job_id WHERE w.id = $1 AND p.status = 'draft'")
+        .bind(id).fetch_one(&mut *tx).await?;
+    if drafts > 0 {
+        return Ok(false);
+    }
+    sqlx::query("UPDATE cadastre.wf_task_instance SET ended = now()::timestamp, started = COALESCE(started, now()::timestamp) WHERE job_instance_id = $1 AND ended IS NULL")
+        .bind(id).execute(&mut *tx).await?;
+    sqlx::query("UPDATE cadastre.wf_job_instance SET status = 3, ended = now()::timestamp, updated = now()::timestamp WHERE id = $1")
+        .bind(id).execute(&mut *tx).await?;
+    audit::append(&mut *tx, actor, "wf_complete", "wf_job_instance", Some(&id.to_string()), serde_json::json!({ "plan_correction": true })).await?;
+    Ok(true)
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct PlanCorrection {
+    reason: String,
+    /// The job was opened for this correction, so it completes when the plan is sent.
+    created_job: bool,
+}
+
+/// The job's correction still waiting for its plan: started, and no plan sent since.
+async fn open_plan_correction(pool: &sqlx::PgPool, id: i32) -> ApiResult<Option<PlanCorrection>> {
+    let payload: Option<serde_json::Value> = sqlx::query_scalar(
+        "SELECT c.payload FROM cadastre.audit_log c WHERE c.entity = 'wf_job_instance' AND c.entity_id = $1 AND c.action = 'title_deed_plan_correction' \
+           AND c.id > COALESCE((SELECT max(s.id) FROM cadastre.audit_log s WHERE s.entity = 'wf_job_instance' AND s.entity_id = $1 AND s.action = 'registry_plan_sent'), 0) \
+         ORDER BY c.id DESC LIMIT 1")
+        .bind(id.to_string()).fetch_optional(pool).await?;
+    Ok(payload.map(|p| PlanCorrection {
+        reason: p["reason"].as_str().unwrap_or_default().to_string(),
+        created_job: p["created_job"].as_bool().unwrap_or(false),
+    }))
+}
+
+/// The job's plan correction waiting to be sent, if any (Send plan shows it).
+#[utoipa::path(get, path = "/api/v1/wf/jobs/{id}/registry/plan-correction", tag = "registry", params(("id" = i32, Path, description = "Job instance id")),
+    responses((status = 200)))]
+pub async fn plan_correction(State(state): State<AppState>, Path(id): Path<i32>) -> ApiResult<Json<serde_json::Value>> {
+    Ok(Json(serde_json::json!({ "correction": open_plan_correction(&state.pool, id).await? })))
+}
+
+#[derive(Debug, Deserialize, ToSchema)]
+pub struct CorrectPlanRequest {
+    /// The linked parcel whose plan is corrected.
+    pub upin: String,
+    /// The file's Registry transaction, if the caller knows it; found from the parcel otherwise.
+    #[serde(default)]
+    pub transaction_number: Option<String>,
+    /// Why the plan is corrected (History, and the Comments of the plan in the Registry).
+    pub reason: String,
+}
+
+/// Correct a title deed plan that came back: the parcel, its UPIN and its Registry link stay; only
+/// the plan is redone and resent. Allowed for a parcel linked on an Active transaction at Raise
+/// Title Deed Plan, read live from the Registry. Uses the transaction's open job, or a new
+/// Job-<file number>, with the latest saved form of the parcel carried over.
+#[utoipa::path(post, path = "/api/v1/registry/correct-plan", tag = "registry", request_body = CorrectPlanRequest,
+    responses((status = 200), (status = 400, description = "No reason given"), (status = 404, description = "No such transaction"),
+              (status = 409, description = "Not linked, not Active, not at Raise Title Deed Plan, or writing turned off"), (status = 422, description = "The Registry could not be read")))]
+pub async fn correct_plan(State(state): State<AppState>, user: AuthUser, Json(req): Json<CorrectPlanRequest>) -> ApiResult<Json<serde_json::Value>> {
+    let actor = crate::routes::wf::resolve_actor(&state, &user).await?;
+    let upin = ident("UPIN", &req.upin)?.to_uppercase();
+    let reason = req.reason.trim().to_string();
+    if reason.is_empty() {
+        return Err(AppError::BadRequest("say why the plan is corrected".into()));
+    }
+    let posted: bool = sqlx::query_scalar("SELECT EXISTS (SELECT 1 FROM cadastre.parcel WHERE parcel_number = $1 AND status = 'posted')")
+        .bind(&upin).fetch_one(&state.pool).await?;
+    if !posted {
+        return Err(AppError::Conflict(format!("{upin} is not a committed parcel of this Cadastre")));
+    }
+    let work = parcel_work(State(state.clone()), Path(upin.clone())).await?.0;
+    let txn = match req.transaction_number.as_deref().map(str::trim).filter(|t| !t.is_empty()) {
+        Some(t) => ident("transaction number", t)?.to_uppercase(),
+        None => work.transaction_number.clone().ok_or_else(|| AppError::Conflict(format!(
+            "the Registry transaction of {upin} is not known here: use Correct plan on its card in Registry → Find file")))?.to_uppercase(),
+    };
+    let cfg = write_config()?;
+    let session = Session::start(&cfg).await.map_err(registry_err)?;
+    let read = async {
+        let t = load_transaction(&session, &txn).await?
+            .ok_or_else(|| AppError::NotFound(format!("Cannot retrieve information of the Transaction. Transaction number:'{txn}'.")))?;
+        let stage = session.query(&format!(
+            "select ph.TaskName, ph.TaskDescription from com.landsystems.lrs.model.ProcessHistory ph \
+             where ph.TaskComplete is null and ph.ProcessName = 'Raise Title Deed Plan' and ph.TransactionId = {}", t.id), 5).await.map_err(registry_err)?;
+        Ok::<_, AppError>((t, !stage.is_empty()))
+    }.await;
+    session.end().await;
+    let (t, at_stage) = read?;
+    if let Some(why) = &t.refused {
+        return Err(AppError::Conflict(why.clone()));
+    }
+    let property = t.properties.iter().find(|p| p.upin.as_deref().is_some_and(|u| u.eq_ignore_ascii_case(&upin)))
+        .ok_or_else(|| AppError::Conflict(format!("{upin} is not linked to a property of {txn}: the Registry admin links it first")))?;
+    if !at_stage {
+        return Err(AppError::Conflict(format!("{txn} is not at Raise Title Deed Plan in the Registry: a plan is corrected at that stage")));
+    }
+    let file = property.refnum.clone().or(work.property_number.clone());
+    let open: Option<i32> = sqlx::query_scalar("SELECT j.id FROM cadastre.wf_job_instance j JOIN cadastre.wf_job_status s ON s.code = j.status \
+                                                WHERE upper(j.lrs_transaction_number) = $1 AND s.is_open ORDER BY j.id DESC LIMIT 1")
+        .bind(&txn).fetch_optional(&state.pool).await?;
+    if let Some(id) = open {
+        if let Some(c) = open_plan_correction(&state.pool, id).await? {
+            return Ok(Json(serde_json::json!({ "job_instance_id": id, "upin": upin, "transaction_number": txn, "reason": c.reason, "already_open": true })));
+        }
+    }
+    let (id, created_job) = match open {
+        Some(id) => (id, false),
+        None => (create_file_job(&state.pool, &actor.label, &txn, file.as_deref(), "registry.correct-plan").await?.0, true),
+    };
+    let mut tx = state.pool.begin().await?;
+    let carried = sqlx::query(
+        "INSERT INTO cadastre.title_deed_plan (wf_job_instance_id, upin, fields, updated_by) \
+         SELECT $1, upin, fields, updated_by FROM cadastre.title_deed_plan WHERE upin = $2 AND wf_job_instance_id <> $1 ORDER BY updated_at DESC LIMIT 1 \
+         ON CONFLICT (wf_job_instance_id, upin) DO NOTHING")
+        .bind(id).bind(&upin).execute(&mut *tx).await?.rows_affected() > 0;
+    audit::append(&mut tx, &actor.label, "title_deed_plan_correction", "wf_job_instance", Some(&id.to_string()), serde_json::json!({
+        "upin": upin, "transaction_number": txn, "reason": reason, "created_job": created_job, "form_carried_over": carried,
+    })).await?;
+    tx.commit().await?;
+    Ok(Json(serde_json::json!({ "job_instance_id": id, "upin": upin, "transaction_number": txn, "reason": reason, "already_open": false })))
 }
 
 #[derive(Debug, Deserialize, ToSchema)]
@@ -1132,24 +1356,26 @@ pub async fn parcel_work(State(state): State<AppState>, Path(upin): Path<String>
     // Fallback: links that reached the attributes without a sync event (Aumentum-era links) carry
     // no transaction. An open job for the parcel's file still serves it: found by its linkage
     // (property number / LRSID) or by its name Job-<file number> / Job-<UPIN>, and its
-    // transaction is the parcel's.
+    // transaction is the parcel's. A closed job gives the transaction too (a file back after its
+    // title deed has only its completed job), but it is not a job to work on.
     let mut txn = txn;
     if txn.is_none() {
-        job = sqlx::query(
-            "SELECT j.id, j.name, tk.name AS task, j.lrs_transaction_number FROM cadastre.wf_job_instance j \
+        let found = sqlx::query(
+            "SELECT j.id, j.name, tk.name AS task, j.lrs_transaction_number, s.is_open FROM cadastre.wf_job_instance j \
              JOIN cadastre.wf_job_status s ON s.code = j.status \
              LEFT JOIN cadastre.wf_job_linkage l ON l.wf_job_instance_id = j.id \
              LEFT JOIN cadastre.wf_task tk ON tk.id = j.current_task_id \
-             WHERE s.is_open AND j.lrs_transaction_number IS NOT NULL AND j.lrs_transaction_number <> '' \
+             WHERE j.lrs_transaction_number IS NOT NULL AND j.lrs_transaction_number <> '' \
                AND ((NULLIF($2, '') IS NOT NULL AND upper(l.property_number) = upper($2)) \
                  OR (NULLIF($3, '') IS NOT NULL AND upper(l.lrs_id) = upper($3)) \
                  OR upper(j.name) = upper('Job-' || $1) \
                  OR (NULLIF($2, '') IS NOT NULL AND upper(j.name) = upper('Job-' || $2))) \
-             ORDER BY j.id DESC LIMIT 1",
+             ORDER BY s.is_open DESC, j.id DESC LIMIT 1",
         )
         .bind(&upin).bind(&pn).bind(&su)
         .fetch_optional(&state.pool).await?;
-        txn = job.as_ref().and_then(|j| j.get::<Option<String>, _>("lrs_transaction_number"));
+        txn = found.as_ref().and_then(|j| j.get::<Option<String>, _>("lrs_transaction_number"));
+        job = found.filter(|j| j.get::<bool, _>("is_open"));
     }
     Ok(Json(ParcelWorkDto {
         upin, linked, su_id: su, property_number: pn, transaction_number: txn,
@@ -1169,11 +1395,14 @@ fn cadastre_linking_allowed() -> ApiResult<()> {
 
 #[cfg(test)]
 mod send_plan_tests {
-    use super::plan_as_pdf;
+    use super::{corrected_comments, plan_as_pdf};
 
     #[test]
     fn the_registry_always_gets_a_pdf() {
         // A PDF goes as it is.
+        assert_eq!(corrected_comments("05-11-2026 10:00", None), "Survey Plan (corrected, 05-11-2026 10:00)");
+        assert_eq!(corrected_comments("05-11-2026 10:00", Some("Wrong scale")), "Survey Plan (corrected, 05-11-2026 10:00): Wrong scale");
+        assert_eq!(corrected_comments("05-11-2026 10:00", Some(&"é".repeat(300))).chars().count(), 240);
         let (n, b) = plan_as_pdf("Title Deed Plan PL67363.pdf", b"%PDF-1.4 x %%EOF").unwrap();
         assert_eq!((n.as_str(), b.as_slice()), ("Title Deed Plan PL67363.pdf", b"%PDF-1.4 x %%EOF".as_slice()));
         // A JPG becomes a PDF under the same name.
@@ -1185,5 +1414,26 @@ mod send_plan_tests {
         assert!(plan_as_pdf("plan.pdf", b"\x89PNG").is_err());
         assert!(plan_as_pdf("plan.png", b"\x89PNG").is_err());
         assert!(plan_as_pdf("plan.jpg", b"not a jpeg").is_err());
+    }
+}
+
+#[cfg(test)]
+mod map_ok_tests {
+    use super::only_active_transaction;
+
+    fn row(number: &str, code: &str) -> Vec<String> {
+        vec!["1".into(), number.into(), code.into(), "x".into(), "2".into(), "".into()]
+    }
+
+    #[test]
+    fn the_map_ok_writes_only_to_the_one_active_transaction() {
+        let closed = row("PLS1", "transaction_completed");
+        let active = row("PLS2", "transaction_lodged");
+        assert_eq!(only_active_transaction(&[closed.clone(), active.clone()]), Ok("PLS2".to_string()));
+        // The same file twice (a property's two rows) is still one file.
+        assert_eq!(only_active_transaction(&[active.clone(), active.clone()]), Ok("PLS2".to_string()));
+        assert!(only_active_transaction(&[closed]).is_err(), "nothing Active: nothing to write to");
+        assert!(only_active_transaction(&[active, row("PLS3", "transaction_lodged")]).is_err(), "two Active: not guessed at");
+        assert!(only_active_transaction(&[]).is_err());
     }
 }
