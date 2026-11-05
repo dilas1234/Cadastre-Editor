@@ -47,6 +47,39 @@ pub struct PlanFeature {
     pub side: Option<usize>,
     /// Drawn on the map: Easting and Northing of its points (one for a point symbol).
     pub points: Vec<[f64; 2]>,
+    /// A line runs as a smooth curve through its points, rather than straight from one to the next.
+    pub smooth: bool,
+    /// The line or symbol's colour (`#rrggbb`); blank = the symbol's own.
+    pub color: Option<String>,
+    /// A double line: how far apart its two lines are, on paper (mm); blank = the symbol's own.
+    pub width: Option<f64>,
+}
+
+/// Free text written on the plan.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize, ToSchema)]
+#[serde(default)]
+pub struct PlanNote {
+    pub text: String,
+    /// Where it starts: Easting and Northing.
+    pub at: [f64; 2],
+    /// `#rrggbb`; blank = black.
+    pub color: Option<String>,
+    /// Letter size on paper (mm); blank = `NOTE_SIZE`.
+    pub size: Option<f64>,
+    /// Turned this many degrees clockwise.
+    pub angle: Option<f64>,
+}
+
+/// The officer's changes to something the sheet writes or draws itself, by its `data-move` key (or
+/// `roadline:<side>` for the lines of an access road).
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize, ToSchema)]
+#[serde(default)]
+pub struct LabelStyle {
+    /// `#rrggbb`; blank = as the sheet has it.
+    pub color: Option<String>,
+    /// The words of an access road's label. Bearings, distances and areas always come from the
+    /// registered co-ordinates, so they have none.
+    pub text: Option<String>,
 }
 
 /// One entry of the plan's symbol list.
@@ -62,21 +95,36 @@ pub struct Symbol {
     dash: &'static str,
     /// A white line down the middle this wide (mm): a double line.
     inner: f64,
+    /// Drawn as two lines this far apart (mm), as an access road is; 0 = one line.
+    pub double: f64,
+}
+
+impl Symbol {
+    /// Its colour, unless a feature sets its own.
+    pub fn stroke(&self) -> &'static str {
+        if self.point { match self.id { "tree" => "#2e7d32", "well" => WATER, _ => "#000000" } } else { self.stroke }
+    }
 }
 
 const fn line(id: &'static str, label: &'static str, group: &'static str, stroke: &'static str, width: f64, dash: &'static str, inner: f64) -> Symbol {
-    Symbol { id, label, group, point: false, stroke, width, dash, inner }
+    Symbol { id, label, group, point: false, stroke, width, dash, inner, double: 0.0 }
+}
+
+const fn double(id: &'static str, label: &'static str, dash: &'static str) -> Symbol {
+    Symbol { id, label, group: "Roads", point: false, stroke: "#000", width: 0.3, dash, inner: 0.0, double: ROAD_GAP }
 }
 
 const fn spot(id: &'static str, label: &'static str) -> Symbol {
-    Symbol { id, label, group: "Point features", point: true, stroke: "#000", width: 0.0, dash: "", inner: 0.0 }
+    Symbol { id, label, group: "Point features", point: true, stroke: "#000", width: 0.0, dash: "", inner: 0.0, double: 0.0 }
 }
 
 const WATER: &str = "#1f6fb5";
 
 /// The symbols of the plan form, in its order.
-pub const SYMBOLS: [Symbol; 14] = [
+pub const SYMBOLS: [Symbol; 16] = [
     line("road", "Road", "Roads", "#000", 0.3, "2.5 1.5", 0.0),
+    double("road_access", "Access road (two dashed lines)", "2.5 1.5"),
+    double("road_double", "Road (two solid lines)", ""),
     line("road_unpaved", "Road, unpaved", "Roads", "#555", 0.25, "1.2 1.2", 0.0),
     line("road_proposed", "Road, proposed", "Roads", RED, 0.3, "", 0.0),
     line("footpath", "Footpath", "Roads", "#000", 0.2, "0.5 1", 0.0),
@@ -131,6 +179,10 @@ pub struct PlanFields {
     /// Labels the officer dragged on the sheet: by label (`data-move` on the sheet), how far it
     /// moved on paper (mm, x right and y down). Only the writing moves, never a beacon.
     pub label_moves: BTreeMap<String, [f64; 2]>,
+    /// Free text on the plan.
+    pub notes: Vec<PlanNote>,
+    /// Colours and wording the officer set on the sheet's own labels and access roads.
+    pub styles: BTreeMap<String, LabelStyle>,
 }
 
 impl PlanFields {
@@ -189,6 +241,14 @@ const FEATURE_OFF: f64 = 4.0;
 const FEATURE_STEP: f64 = 2.5;
 /// The corners of an access road T-junction are rounded, starting this far from the corner (mm).
 const ROAD_FILLET: f64 = 6.0;
+/// How far an access road's two lines are apart, and the inner one from the side (mm).
+const ROAD_GAP: f64 = 8.0;
+const ROAD_IN: f64 = 5.0;
+const ROAD_OUT: f64 = ROAD_IN + ROAD_GAP;
+/// Straight pieces per stretch of a smooth curve: finer than the eye sees at A4.
+const CURVE_STEPS: usize = 16;
+/// A note's letter size (mm), unless the officer sets one.
+const NOTE_SIZE: f64 = 2.8;
 /// Road junctions, on paper (mm). An end this close past another road is cut back to it...
 const TRIM_MM: f64 = 12.0;
 /// ...and one this close short of it is carried on to it.
@@ -435,36 +495,116 @@ fn spread_labels(boxes: &mut [LabelBox]) {
     }
 }
 
-/// Open a label's group, moved as the officer placed it; `data-move` names it for the sheet's
-/// Adjust labels view. Close it with [`end_move`].
-fn begin_move(svg: &mut String, moves: &BTreeMap<String, [f64; 2]>, key: &str) {
-    match moves.get(key) {
-        Some([dx, dy]) => { let _ = writeln!(svg, r#"<g data-move="{key}" transform="translate({dx:.2} {dy:.2})">"#); }
-        None => { let _ = writeln!(svg, r#"<g data-move="{key}">"#); }
+/// Open a label's group, moved and coloured as the officer set it; `data-move` names it for the
+/// sheet's editor. Close it with [`end_move`].
+fn begin_move(svg: &mut String, f: &PlanFields, key: &str) {
+    let _ = write!(svg, r#"<g data-move="{key}""#);
+    if let Some([dx, dy]) = f.label_moves.get(key) {
+        let _ = write!(svg, r#" transform="translate({dx:.2} {dy:.2})""#);
     }
+    if let Some(c) = safe_color(f.styles.get(key).and_then(|x| x.color.as_deref())) {
+        let _ = write!(svg, r#" fill="{c}""#);
+    }
+    svg.push_str(">\n");
 }
 
 fn end_move(svg: &mut String) {
     svg.push_str("</g>\n");
 }
 
+/// A colour as it may go on the sheet: `#rrggbb`, nothing else.
+fn safe_color(c: Option<&str>) -> Option<&str> {
+    c.map(str::trim).filter(|c| c.len() == 7 && c.starts_with('#') && c[1..].chars().all(|h| h.is_ascii_hexdigit()))
+}
+
+/// A smooth curve through `pts` (centripetal Catmull-Rom: it passes through every point and does
+/// not overshoot where they are unevenly spaced), as short straight pieces.
+fn spline(pts: &[Pt]) -> Vec<Pt> {
+    let mut p: Vec<Pt> = pts.to_vec();
+    p.dedup_by(|a, b| dist(*a, *b) < 1e-6);
+    if p.len() < 3 {
+        return p;
+    }
+    let n = p.len();
+    // Past each end, the end's reflection, so that the curve runs out straight.
+    let get = |i: isize| -> Pt {
+        if i < 0 {
+            (2.0 * p[0].0 - p[1].0, 2.0 * p[0].1 - p[1].1)
+        } else if i as usize >= n {
+            (2.0 * p[n - 1].0 - p[n - 2].0, 2.0 * p[n - 1].1 - p[n - 2].1)
+        } else {
+            p[i as usize]
+        }
+    };
+    let mix = |a: Pt, b: Pt, ta: f64, tb: f64, t: f64| {
+        let w = (t - ta) / (tb - ta);
+        (a.0 + (b.0 - a.0) * w, a.1 + (b.1 - a.1) * w)
+    };
+    let mut out = vec![p[0]];
+    for i in 0..n - 1 {
+        let (p0, p1, p2, p3) = (get(i as isize - 1), p[i], p[i + 1], get(i as isize + 2));
+        let (t0, t1) = (0.0, dist(p0, p1).sqrt());
+        let t2 = t1 + dist(p1, p2).sqrt();
+        let t3 = t2 + dist(p2, p3).sqrt();
+        for step in 1..=CURVE_STEPS {
+            let t = t1 + (t2 - t1) * step as f64 / CURVE_STEPS as f64;
+            let (a1, a2, a3) = (mix(p0, p1, t0, t1, t), mix(p1, p2, t1, t2, t), mix(p2, p3, t2, t3, t));
+            out.push(mix(mix(a1, a2, t0, t2, t), mix(a2, a3, t1, t3, t), t1, t2, t));
+        }
+    }
+    out
+}
+
+/// A line `off` mm to the left of `pts` (paper, y down), mitred at its bends.
+fn offset_line(pts: &[Pt], off: f64) -> Vec<Pt> {
+    let normal = |a: Pt, b: Pt| { let l = dist(a, b).max(1e-9); ((b.1 - a.1) / l, -(b.0 - a.0) / l) };
+    (0..pts.len()).map(|i| {
+        let before = (i > 0).then(|| normal(pts[i - 1], pts[i]));
+        let after = (i + 1 < pts.len()).then(|| normal(pts[i], pts[i + 1]));
+        let (a, b) = (before.or(after).unwrap_or((0.0, 0.0)), after.or(before).unwrap_or((0.0, 0.0)));
+        let (mx, my) = (a.0 + b.0, a.1 + b.1);
+        let l = (mx * mx + my * my).sqrt().max(1e-9);
+        let (mx, my) = (mx / l, my / l);
+        let stretch = 1.0 / (mx * a.0 + my * a.1).max(0.5); // a sharp bend keeps its width, up to double
+        (pts[i].0 + mx * off * stretch, pts[i].1 + my * off * stretch)
+    }).collect()
+}
+
+/// The point halfway along a line and the stretch it lies on.
+fn middle(pts: &[Pt]) -> Option<(Pt, Pt)> {
+    let mut left = length(pts) / 2.0;
+    for w in pts.windows(2) {
+        let seg = dist(w[0], w[1]);
+        if seg >= left && seg > 0.0 {
+            return Some((w[0], w[1]));
+        }
+        left -= seg;
+    }
+    None
+}
+
+/// Paper points as an SVG attribute.
+fn pts_attr(pts: &[Pt]) -> String {
+    pts.iter().map(|q| format!("{:.2},{:.2}", q.0, q.1)).collect::<Vec<_>>().join(" ")
+}
+
 /// A line symbol along paper points.
-fn feature_line(svg: &mut String, sym: &Symbol, pts: &[(f64, f64)]) {
-    let d: String = pts.iter().map(|q| format!("{:.2},{:.2}", q.0, q.1)).collect::<Vec<_>>().join(" ");
+fn feature_line(svg: &mut String, sym: &Symbol, pts: &[(f64, f64)], color: Option<&str>) {
+    let d = pts_attr(pts);
     let dash = if sym.dash.is_empty() { String::new() } else { format!(r#" stroke-dasharray="{}""#, sym.dash) };
-    let _ = writeln!(svg, r#"<polyline points="{d}" fill="none" stroke="{}" stroke-width="{}" stroke-linejoin="round"{dash}/>"#, sym.stroke, sym.width);
+    let _ = writeln!(svg, r#"<polyline points="{d}" fill="none" stroke="{}" stroke-width="{}" stroke-linejoin="round"{dash}/>"#, color.unwrap_or(sym.stroke), sym.width);
     if sym.inner > 0.0 {
         let _ = writeln!(svg, r##"<polyline points="{d}" fill="none" stroke="#fff" stroke-width="{}" stroke-linejoin="round"/>"##, sym.inner);
     }
 }
 
 /// A point symbol at a paper point.
-fn feature_point(svg: &mut String, sym: &Symbol, q: (f64, f64)) {
+fn feature_point(svg: &mut String, sym: &Symbol, q: (f64, f64), color: Option<&str>) {
     let glyph = match sym.id {
-        "tree" => r##"<g stroke="#2e7d32" stroke-width="0.25" fill="none"><circle r="1.5"/><circle r="0.3" fill="#2e7d32"/></g>"##,
-        "pole" => r##"<g stroke="#000" stroke-width="0.25"><line x1="0" y1="-1.6" x2="0" y2="1.6"/><line x1="-1" y1="-1.6" x2="1" y2="-1.6"/><circle r="0.5" fill="#000"/></g>"##,
-        "well" => r##"<g stroke="#1f6fb5" stroke-width="0.25" fill="none"><circle r="1.2"/><circle r="0.5" fill="#1f6fb5"/></g>"##,
-        _ => r##"<path d="M-1.5 1.5 L-1.5 -1.5 L1.5 -1.5" fill="none" stroke="#000" stroke-width="0.35"/>"##,
+        "tree" => { let c = color.unwrap_or("#2e7d32"); format!(r##"<g stroke="{c}" stroke-width="0.25" fill="none"><circle r="1.5"/><circle r="0.3" fill="{c}"/></g>"##) }
+        "pole" => { let c = color.unwrap_or("#000"); format!(r##"<g stroke="{c}" stroke-width="0.25"><line x1="0" y1="-1.6" x2="0" y2="1.6"/><line x1="-1" y1="-1.6" x2="1" y2="-1.6"/><circle r="0.5" fill="{c}"/></g>"##) }
+        "well" => { let c = color.unwrap_or(WATER); format!(r##"<g stroke="{c}" stroke-width="0.25" fill="none"><circle r="1.2"/><circle r="0.5" fill="{c}"/></g>"##) }
+        _ => format!(r##"<path d="M-1.5 1.5 L-1.5 -1.5 L1.5 -1.5" fill="none" stroke="{}" stroke-width="0.35"/>"##, color.unwrap_or("#000")),
     };
     let _ = writeln!(svg, r#"<g transform="translate({:.2} {:.2})">{glyph}</g>"#, q.0, q.1);
 }
@@ -472,7 +612,6 @@ fn feature_point(svg: &mut String, sym: &Symbol, q: (f64, f64)) {
 /// The sheet as SVG.
 pub fn render_svg(d: &PlanData) -> String {
     let f = &d.fields;
-    let moves = &f.label_moves;
     let corners: Vec<Corner> = d.corners.iter().enumerate().map(|(i, c)| {
         let name = f.corner_names.get(i).cloned().flatten().filter(|s| !s.trim().is_empty()).unwrap_or_else(|| c.name.clone());
         Corner { name, ..c.clone() }
@@ -561,8 +700,6 @@ pub fn render_svg(d: &PlanData) -> String {
     // neighbouring sides meet in a junction: the longer runs through, the other ends at it, and
     // the two corners of the opening are rounded, as on the printed plans.
     let roads: Vec<usize> = f.roads().into_iter().filter(|&i| i < p.len() && p.len() >= 3).collect();
-    const ROAD_IN: f64 = 5.0;
-    const ROAD_OUT: f64 = 13.0;
     struct Road { a: (f64, f64), u: (f64, f64), nrm: (f64, f64), len: f64, t0: f64, t1: f64, t0_out: f64, t1_out: f64, gaps: Vec<(f64, f64)> }
     let mut rd: Vec<Road> = roads.iter().map(|&side| {
         let (a, b) = (p[side], p[(side + 1) % p.len()]);
@@ -578,7 +715,7 @@ pub fn render_svg(d: &PlanData) -> String {
         Road { a, u: (ux, uy), nrm: (nx, ny), len, t0: -ext, t1: len + ext, t0_out: -ext, t1_out: len + ext, gaps: Vec::new() }
     }).collect();
     let off_pt = |r: &Road, off: f64| (r.a.0 + r.nrm.0 * off, r.a.1 + r.nrm.1 * off);
-    let mut fillets: Vec<(Pt, Pt, Pt)> = Vec::new(); // from, corner, to
+    let mut fillets: Vec<(Pt, Pt, Pt, usize)> = Vec::new(); // from, corner, to, the joining road's side
     for i in 0..rd.len() {
         for j in i + 1..rd.len() {
             // Two roads whose inner lines would cross (neighbouring sides, or sides a short side
@@ -602,8 +739,8 @@ pub fn render_svg(d: &PlanData) -> String {
             // The rounded corners: the through road's line, round the corner, into the joining road's.
             let on = |o: Pt, u: Pt, t: f64| (o.0 + u.0 * t, o.1 + u.1 * t);
             let away = if t_thr < g_out { -ROAD_FILLET } else { ROAD_FILLET };
-            fillets.push((on(tin.0, tin.1, t_thr + away), on(tin.0, tin.1, t_thr), on(jin, ju, t_join + back)));
-            fillets.push((on(tin.0, tin.1, g_out - away), on(tin.0, tin.1, g_out), on(jout, ju, cut_out + back)));
+            fillets.push((on(tin.0, tin.1, t_thr + away), on(tin.0, tin.1, t_thr), on(jin, ju, t_join + back), roads[join]));
+            fillets.push((on(tin.0, tin.1, g_out - away), on(tin.0, tin.1, g_out), on(jout, ju, cut_out + back), roads[join]));
             // The through road runs on past the junction, open where the other road comes in.
             let r = &mut rd[thr];
             let (g0, g1) = (t_thr.min(g_out) - ROAD_FILLET, t_thr.max(g_out) + ROAD_FILLET);
@@ -613,13 +750,15 @@ pub fn render_svg(d: &PlanData) -> String {
         }
     }
     // Where each feature goes on paper. One on a side keeps that side's length, outside the parcel.
-    struct Placed<'a> { fi: usize, sym: &'a Symbol, label: Option<&'a str>, pts: Vec<Pt>, label_off: f64 }
+    // `nodes` are the points the officer placed, `lines` what is drawn through them.
+    struct Placed<'a> { fi: usize, sym: &'a Symbol, label: Option<&'a str>, nodes: Vec<Pt>, lines: Vec<Vec<Pt>>, label_off: f64, color: Option<&'a str> }
     let mut on_side = vec![0u32; p.len()];
     let mut placed: Vec<Placed> = Vec::new();
     for (fi, feat) in f.features.iter().enumerate() {
         let Some(sym) = SYMBOLS.iter().find(|y| y.id == feat.symbol) else { continue };
         let label = feat.label.as_deref().map(str::trim).filter(|l| !l.is_empty());
-        let (pts, label_off): (Vec<Pt>, f64) = match feat.side {
+        let gap = if sym.double > 0.0 { feat.width.filter(|w| w.is_finite()).unwrap_or(sym.double).clamp(2.0, 30.0) } else { 0.0 };
+        let (nodes, label_off): (Vec<Pt>, f64) = match feat.side {
             Some(i) if i < p.len() && p.len() >= 3 => {
                 let (a, b) = (p[i], p[(i + 1) % p.len()]);
                 let len = dist(a, b).max(1e-9);
@@ -627,16 +766,18 @@ pub fn render_svg(d: &PlanData) -> String {
                 let left = (u.1, -u.0);
                 let (mx, my) = ((a.0 + b.0) / 2.0, (a.1 + b.1) / 2.0);
                 let sign = if (mx + left.0 - pcx).powi(2) + (my + left.1 - pcy).powi(2) > (mx - pcx).powi(2) + (my - pcy).powi(2) { 1.0 } else { -1.0 };
-                let off = sign * (FEATURE_OFF + FEATURE_STEP * on_side[i] as f64);
+                let off = sign * (if gap > 0.0 { ROAD_IN + gap / 2.0 } else { FEATURE_OFF } + FEATURE_STEP * on_side[i] as f64);
                 on_side[i] += 1;
                 let shift = |q: Pt, along: f64| (q.0 + left.0 * off + u.0 * along, q.1 + left.1 * off + u.1 * along);
                 let ext = if sym.group == "Roads" { ROAD_EXT_MM } else { 0.0 };
-                (if sym.point { vec![shift((mx, my), 0.0)] } else { vec![shift(a, -ext), shift(b, ext)] }, sign * 1.8)
+                (if sym.point { vec![shift((mx, my), 0.0)] } else { vec![shift(a, -ext), shift(b, ext)] }, if gap > 0.0 { 0.0 } else { sign * 1.8 })
             }
             Some(_) => continue,
-            None => (feat.points.iter().map(|q| paper(q[0], q[1])).collect(), 1.8),
+            None => (feat.points.iter().map(|q| paper(q[0], q[1])).collect(), if gap > 0.0 { 0.0 } else { 1.8 }),
         };
-        placed.push(Placed { fi, sym, label, pts, label_off });
+        let centre = if feat.smooth && !sym.point { spline(&nodes) } else { nodes.clone() };
+        let lines = if gap > 0.0 { vec![offset_line(&centre, gap / 2.0), offset_line(&centre, -gap / 2.0)] } else { vec![centre] };
+        placed.push(Placed { fi, sym, label, nodes, lines, label_off, color: safe_color(feat.color.as_deref()) });
     }
 
     // Road junctions: drawn roads stop at the roads they meet, and an access road's overshoot at a
@@ -657,13 +798,16 @@ pub fn render_svg(d: &PlanData) -> String {
         let (i, o) = (off_pt(r, ROAD_IN), off_pt(r, ROAD_OUT));
         inner_pieces(r).into_iter().map(move |(t0, t1)| [at(i, r.u, t0), at(i, r.u, t1)]).chain([[at(o, r.u, r.t0_out), at(o, r.u, r.t1_out)]]).collect::<Vec<_>>()
     }).collect();
-    let is_road = |x: &Placed| x.sym.group == "Roads" && !x.sym.point && x.pts.len() >= 2;
-    let mut drawn: Vec<Vec<Pt>> = placed.iter().filter(|x| is_road(x)).map(|x| x.pts.clone()).collect();
+    // Each line of a double road meets the others on its own, so that both stop at a road.
+    let is_road = |x: &Placed| x.sym.group == "Roads" && !x.sym.point && x.nodes.len() >= 2;
+    let mut drawn: Vec<Vec<Pt>> = placed.iter().filter(|x| is_road(x)).flat_map(|x| x.lines.clone()).collect();
     trim_roads(&mut drawn, &access);
     let mut trimmed = drawn.iter();
     for x in &mut placed {
         if is_road(x) {
-            x.pts.clone_from(trimmed.next().expect("one per road"));
+            for line in &mut x.lines {
+                line.clone_from(trimmed.next().expect("one per road line"));
+            }
         }
     }
     for r in &mut rd {
@@ -671,53 +815,71 @@ pub fn render_svg(d: &PlanData) -> String {
         (r.t0_out, r.t1_out) = stop_at_through(off_pt(r, ROAD_OUT), r.u, r.len, (r.t0_out, r.t1_out), &drawn);
     }
 
-    let dashed = |s: &mut String, o: (f64, f64), u: (f64, f64), t0: f64, t1: f64| {
+    let road_color = |side: usize| safe_color(f.styles.get(&format!("roadline:{side}")).and_then(|x| x.color.as_deref())).unwrap_or("#000");
+    let dashed = |s: &mut String, o: (f64, f64), u: (f64, f64), t0: f64, t1: f64, c: &str| {
         if t1 - t0 > 0.2 {
-            let _ = writeln!(s, r##"<line x1="{:.2}" y1="{:.2}" x2="{:.2}" y2="{:.2}" stroke="#000" stroke-width="0.3" stroke-dasharray="2.5 1.5"/>"##,
+            let _ = writeln!(s, r##"<line x1="{:.2}" y1="{:.2}" x2="{:.2}" y2="{:.2}" stroke="{c}" stroke-width="0.3" stroke-dasharray="2.5 1.5"/>"##,
                 o.0 + u.0 * t0, o.1 + u.1 * t0, o.0 + u.0 * t1, o.1 + u.1 * t1);
         }
     };
     let label = f.road_label.clone().filter(|l| !l.trim().is_empty()).unwrap_or_else(|| "Access Road".into());
-    for (r, side) in rd.iter().zip(&roads) {
+    for (r, &side) in rd.iter().zip(&roads) {
+        let c = road_color(side);
+        // The road's centre line, for the editor to turn it into a road that can bend.
+        let mid = off_pt(r, (ROAD_IN + ROAD_OUT) / 2.0);
+        let nodes = [at(mid, r.u, r.t0.max(r.t0_out)), at(mid, r.u, (r.t0.max(r.t0_out) + r.t1.min(r.t1_out)) / 2.0), at(mid, r.u, r.t1.min(r.t1_out))];
+        let _ = writeln!(s, r#"<g data-road="{side}" data-nodes="{}">"#, pts_attr(&nodes));
         // Inner line, broken where a joining road comes in.
         for (t0, t1) in inner_pieces(r) {
-            dashed(&mut s, off_pt(r, ROAD_IN), r.u, t0, t1);
+            dashed(&mut s, off_pt(r, ROAD_IN), r.u, t0, t1, c);
         }
-        dashed(&mut s, off_pt(r, ROAD_OUT), r.u, r.t0_out, r.t1_out);
+        dashed(&mut s, off_pt(r, ROAD_OUT), r.u, r.t0_out, r.t1_out, c);
+        s.push_str("</g>\n");
         let m = off_pt(r, (ROAD_IN + ROAD_OUT) / 2.0);
-        begin_move(&mut s, moves, &format!("road:{side}"));
-        along(&mut s, m, (m.0 + r.u.0 * r.len, m.1 + r.u.1 * r.len), 0.5, 0.0, 2.8, &label);
+        let key = format!("road:{side}");
+        let words = f.styles.get(&key).and_then(|x| x.text.as_deref()).map(str::trim).filter(|l| !l.is_empty()).unwrap_or(&label);
+        begin_move(&mut s, f, &key);
+        along(&mut s, m, (m.0 + r.u.0 * r.len, m.1 + r.u.1 * r.len), 0.5, 0.0, 2.8, words);
         end_move(&mut s);
     }
 
-    for (a, c, b) in &fillets {
-        let _ = writeln!(s, r##"<path d="M{:.2} {:.2} Q{:.2} {:.2} {:.2} {:.2}" fill="none" stroke="#000" stroke-width="0.3" stroke-dasharray="2.5 1.5"/>"##, a.0, a.1, c.0, c.1, b.0, b.1);
+    for (a, c, b, side) in &fillets {
+        let _ = writeln!(s, r##"<path d="M{:.2} {:.2} Q{:.2} {:.2} {:.2} {:.2}" fill="none" stroke="{}" stroke-width="0.3" stroke-dasharray="2.5 1.5"/>"##, a.0, a.1, c.0, c.1, b.0, b.1, road_color(*side));
     }
 
     // Features from the symbol list, under the parcel, and cut at the frame: a drawn one can run
     // past it.
     let _ = writeln!(s, r#"<clipPath id="planFrame"><rect x="{x0}" y="{y0}" width="{}" height="{}"/></clipPath><g clip-path="url(#planFrame)">"#, x1 - x0, y1 - y0);
-    for Placed { fi, sym, label, pts, label_off } in &placed {
-        let (fi, sym, label, label_off) = (*fi, *sym, *label, *label_off);
+    for x in &placed {
+        let (fi, sym, label) = (x.fi, x.sym, x.label);
+        let _ = writeln!(s, r#"<g data-feat="{fi}" data-nodes="{}">"#, pts_attr(&x.nodes));
         if sym.point {
-            let Some(&q) = pts.first() else { continue };
-            feature_point(&mut s, sym, q);
+            let Some(&q) = x.nodes.first() else { s.push_str("</g>\n"); continue };
+            feature_point(&mut s, sym, q, x.color);
+            s.push_str("</g>\n");
             if let Some(l) = label {
-                begin_move(&mut s, moves, &format!("feature:{fi}"));
+                begin_move(&mut s, f, &format!("feature:{fi}"));
                 text(&mut s, q.0 + 2.2, q.1 + 0.9, 2.4, "start", HALO, &esc(l));
                 end_move(&mut s);
             }
-        } else if pts.len() >= 2 {
-            feature_line(&mut s, sym, pts);
+        } else if x.nodes.len() >= 2 {
+            for line in &x.lines {
+                feature_line(&mut s, sym, line, x.color);
+            }
+            s.push_str("</g>\n");
             if let Some(l) = label {
-                // On the longest stretch, where it has the most room.
+                // A curve: halfway along, turned to it; else the longest stretch, the most room.
                 let seg = |w: &&[(f64, f64)]| (w[1].0 - w[0].0).powi(2) + (w[1].1 - w[0].1).powi(2);
-                if let Some(w) = pts.windows(2).max_by(|x, y| seg(x).total_cmp(&seg(y))) {
-                    begin_move(&mut s, moves, &format!("feature:{fi}"));
-                    along(&mut s, w[0], w[1], 0.5, label_off, 2.4, l);
+                let centre: Vec<Pt> = if x.lines.len() == 2 { x.lines[0].iter().zip(&x.lines[1]).map(|(a, b)| ((a.0 + b.0) / 2.0, (a.1 + b.1) / 2.0)).collect() } else { x.lines[0].clone() };
+                let spot = if f.features[fi].smooth { middle(&centre) } else { centre.windows(2).max_by(|p, q| seg(p).total_cmp(&seg(q))).map(|w| (w[0], w[1])) };
+                if let Some((a, b)) = spot {
+                    begin_move(&mut s, f, &format!("feature:{fi}"));
+                    along(&mut s, a, b, 0.5, x.label_off, 2.4, l);
                     end_move(&mut s);
                 }
             }
+        } else {
+            s.push_str("</g>\n");
         }
     }
     s.push_str("</g>\n");
@@ -751,7 +913,7 @@ pub fn render_svg(d: &PlanData) -> String {
             continue;
         }
         for (key, t, off, label) in [("degrees", t_deg, out, format!("{deg}°")), ("minutes", t_min, out, format!("{min:02}'")), ("distance", 0.5, -out, format!("{dist:.2}m"))] {
-            begin_move(&mut s, moves, &format!("{key}:{i}"));
+            begin_move(&mut s, f, &format!("{key}:{i}"));
             along(&mut s, a, b, t, off, 2.6, &label);
             end_move(&mut s);
         }
@@ -772,19 +934,34 @@ pub fn render_svg(d: &PlanData) -> String {
     }).collect();
     spread_labels(&mut boxes);
     for (i, ((&(x, _, anchor), b), c)) in labels.iter().zip(&boxes).zip(&corners).enumerate() {
-        begin_move(&mut s, moves, &format!("beacon:{i}"));
+        begin_move(&mut s, f, &format!("beacon:{i}"));
         text(&mut s, x, b.y, BEACON_SIZE, anchor, HALO, &esc(&c.name));
         end_move(&mut s);
     }
     let file_no = if f.plan_no.as_deref().unwrap_or("").is_empty() { title_no.clone() } else { up(&f.plan_no) };
-    begin_move(&mut s, moves, "parcel");
+    begin_move(&mut s, f, "parcel");
     text(&mut s, pcx, pcy - 0.8, 2.6, "middle", "", &file_no);
     text(&mut s, pcx, pcy + 2.8, 2.6, "middle", "", &format!("{} Sq.m", area3(d.area_m2)));
     end_move(&mut s);
 
+    // The officer's own text.
+    for (i, note) in f.notes.iter().enumerate() {
+        let words = note.text.trim();
+        if words.is_empty() || !note.at.iter().all(|v| v.is_finite()) {
+            continue;
+        }
+        let (x, y) = paper(note.at[0], note.at[1]);
+        let size = note.size.filter(|v| v.is_finite()).unwrap_or(NOTE_SIZE).clamp(1.5, 12.0);
+        let turn = note.angle.filter(|a| a.is_finite() && *a != 0.0).map(|a| format!(r#" transform="rotate({a:.1} {x:.2} {y:.2})""#)).unwrap_or_default();
+        let color = safe_color(note.color.as_deref()).unwrap_or("#000");
+        begin_move(&mut s, f, &format!("note:{i}"));
+        text(&mut s, x, y, size, "start", &format!(r#"fill="{color}"{turn}"#), &esc(words));
+        end_move(&mut s);
+    }
+
     // Short sides, bottom-right inside the frame (the last one lowest).
     for (j, (i, line)) in short.iter().rev().enumerate() {
-        begin_move(&mut s, moves, &format!("short:{i}"));
+        begin_move(&mut s, f, &format!("short:{i}"));
         text(&mut s, FRAME.2 - 2.0, FRAME.3 - 2.5 - j as f64 * 4.0, 2.6, "end", "", line);
         end_move(&mut s);
     }
@@ -997,7 +1174,7 @@ mod tests {
 
     #[test]
     fn features_are_drawn_at_their_co_ordinates_or_along_a_side() {
-        let feat = |symbol: &str, label: Option<&str>, side, points| PlanFeature { symbol: symbol.into(), label: label.map(Into::into), side, points };
+        let feat = |symbol: &str, label: Option<&str>, side, points| PlanFeature { symbol: symbol.into(), label: label.map(Into::into), side, points, ..Default::default() };
         let features = vec![
             // 1:500 puts 495116 / 1092379 on the frame's lower-left corner (12, 228): 2 mm per metre.
             feat("river", Some("River Delimi"), None, vec![[495126.0, 1092389.0], [495146.0, 1092389.0]]),
@@ -1143,6 +1320,126 @@ mod tests {
         // Through road: inner line broken in two + outer; joining road: inner + outer; two rounded corners.
         assert_eq!(svg.matches("stroke-dasharray=\"2.5 1.5\"").count(), 7);
         assert_eq!(svg.matches(" Q").count(), 2, "the corners of the opening are rounded");
+    }
+
+    fn editor_plan() -> PlanData {
+        let corners = vec![Corner { name: "A".into(), e: 1000.0, n: 1000.0 }, Corner { name: "B".into(), e: 1040.0, n: 1000.0 }, Corner { name: "C".into(), e: 1040.0, n: 1040.0 }, Corner { name: "D".into(), e: 1000.0, n: 1040.0 }];
+        PlanData { upin: "PL1".into(), area_m2: 1600.0, corners, fields: PlanFields { scale: Some(500), ..Default::default() } }
+    }
+
+    #[test]
+    fn a_spline_goes_through_every_point_and_bends_between_them() {
+        let nodes = [(0.0, 0.0), (10.0, 10.0), (20.0, 0.0), (45.0, 12.0)];
+        let c = spline(&nodes);
+        assert_eq!(c.len(), 3 * CURVE_STEPS + 1);
+        for (i, q) in nodes.iter().enumerate() {
+            assert!(dist(c[i * CURVE_STEPS], *q) < 1e-9, "point {i}");
+        }
+        // Between the first two it is off the straight line, and has no break at the second.
+        let (m, chord) = (c[CURVE_STEPS / 2], (5.0, 5.0));
+        assert!(dist(m, chord) > 0.2);
+        let dir = |a: Pt, b: Pt| (b.1 - a.1).atan2(b.0 - a.0);
+        assert!((dir(c[CURVE_STEPS - 1], c[CURVE_STEPS]) - dir(c[CURVE_STEPS], c[CURVE_STEPS + 1])).abs() < 0.4); // a corner here would be 1.6
+        assert_eq!(spline(&[(0.0, 0.0), (1.0, 1.0)]).len(), 2);
+    }
+
+    #[test]
+    fn a_double_line_keeps_its_width_round_a_bend() {
+        let line = offset_line(&[(0.0, 0.0), (10.0, 0.0), (10.0, 10.0)], 2.0);
+        assert!(dist(line[0], (0.0, -2.0)) < 1e-9);
+        assert!(dist(line[1], (12.0, -2.0)) < 1e-9, "{:?}", line[1]);
+        assert!(dist(line[2], (12.0, 10.0)) < 1e-9);
+    }
+
+    #[test]
+    fn a_curved_double_road_prints_two_lines_with_its_colour() {
+        let mut d = editor_plan();
+        d.fields.features.push(PlanFeature { symbol: "road_access".into(), smooth: true, color: Some("#ff0000".into()), label: Some("A & B <Road>".into()),
+            points: vec![[990.0, 1060.0], [1020.0, 1070.0], [1050.0, 1060.0]], ..Default::default() });
+        let svg = render_svg(&d);
+        let g = &svg[svg.find(r#"<g data-feat="0""#).unwrap()..];
+        let g = &g[..g.find("</g>").unwrap()];
+        assert_eq!(g.matches("<polyline").count(), 2, "{g}");
+        assert_eq!(g.matches(r##"stroke="#ff0000""##).count(), 2);
+        assert_eq!(g.lines().nth(1).unwrap().matches(',').count(), 2 * CURVE_STEPS + 1);
+        // The nodes stay the three the officer placed; the label is written safely.
+        assert_eq!(g.lines().next().unwrap().matches(',').count(), 3);
+        assert!(svg.contains("A &amp; B &lt;Road&gt;"));
+    }
+
+    #[test]
+    fn both_lines_of_a_double_road_stop_at_the_road_they_meet() {
+        let mut d = editor_plan();
+        let across = PlanFeature { symbol: "road".into(), points: vec![[960.0, 1065.0], [1080.0, 1065.0]], ..Default::default() };
+        let stem = PlanFeature { symbol: "road_double".into(), points: vec![[1020.0, 1100.0], [1020.0, 1062.0]], ..Default::default() };
+        d.fields.features = vec![across, stem];
+        let svg = render_svg(&d);
+        let g = &svg[svg.find(r#"<g data-feat="1""#).unwrap()..];
+        let g = &g[..g.find("</g>").unwrap()];
+        let [e0, n0, k, x0, y1]: [f64; 5] = svg.split("data-grid=\"").nth(1).unwrap().split('"').next().unwrap().split(' ').map(|v| v.parse().unwrap()).collect::<Vec<_>>().try_into().unwrap();
+        let y = y1 - (1065.0 - n0) * k;
+        let _ = (e0, x0);
+        let ends: Vec<f64> = g.lines().skip(1).map(|l| l.split("points=\"").nth(1).unwrap().split('"').next().unwrap().split(' ').last().unwrap().split(',').nth(1).unwrap().parse().unwrap()).collect();
+        assert_eq!(ends.len(), 2);
+        assert!(ends.iter().all(|v| (v - y).abs() < 0.02), "{ends:?} {y}");
+    }
+
+    #[test]
+    fn a_colour_is_only_ever_a_colour() {
+        assert_eq!(safe_color(Some(" #A1b2C3 ")), Some("#A1b2C3"));
+        for bad in ["red", "#12345", "#12345g", "\"><script>", ""] {
+            assert_eq!(safe_color(Some(bad)), None, "{bad}");
+        }
+        let mut d = editor_plan();
+        d.fields.features.push(PlanFeature { symbol: "tree".into(), color: Some("\"/><script>".into()), points: vec![[1020.0, 1020.0]], ..Default::default() });
+        d.fields.styles.insert("beacon:0".into(), LabelStyle { color: Some("\"/><script>".into()), text: None });
+        d.fields.notes.push(PlanNote { text: "x".into(), at: [1010.0, 1010.0], color: Some("\"/><script>".into()), ..Default::default() });
+        assert!(!render_svg(&d).contains("<script>"));
+    }
+
+    #[test]
+    fn a_label_takes_its_colour_and_an_access_road_its_own_words() {
+        let mut d = editor_plan();
+        d.fields.road_sides = vec![2];
+        d.fields.styles.insert("beacon:1".into(), LabelStyle { color: Some("#0000ff".into()), text: None });
+        d.fields.styles.insert("road:2".into(), LabelStyle { text: Some("Rayfield Road".into()), color: None });
+        d.fields.styles.insert("roadline:2".into(), LabelStyle { color: Some("#00aa00".into()), text: None });
+        let svg = render_svg(&d);
+        assert!(svg.contains(r##"<g data-move="beacon:1" fill="#0000ff">"##));
+        assert!(svg.contains("Rayfield Road") && !svg.contains("Access Road"));
+        let g = &svg[svg.find(r#"<g data-road="2""#).unwrap()..];
+        assert_eq!(g[..g.find("</g>").unwrap()].matches(r##"stroke="#00aa00""##).count(), 2);
+    }
+
+    #[test]
+    fn a_note_is_written_where_it_was_placed_and_can_be_turned() {
+        let mut d = editor_plan();
+        d.fields.notes.push(PlanNote { text: "Rock <outcrop>".into(), at: [1020.0, 1020.0], color: Some("#123456".into()), size: Some(3.5), angle: Some(30.0) });
+        d.fields.notes.push(PlanNote { text: "  ".into(), ..Default::default() });
+        let svg = render_svg(&d);
+        assert!(svg.contains(r#"<g data-move="note:0">"#) && !svg.contains("note:1"));
+        assert!(svg.contains("Rock &lt;outcrop&gt;") && svg.contains(r##"fill="#123456""##) && svg.contains(r#"font-size="3.5""#) && svg.contains("rotate(30.0 "));
+    }
+
+    #[test]
+    fn the_editor_changes_nothing_of_the_beacons_or_the_figures() {
+        let plain = editor_plan();
+        let mut d = editor_plan();
+        d.fields.features.push(PlanFeature { symbol: "road_access".into(), smooth: true, points: vec![[990.0, 1060.0], [1020.0, 1070.0], [1050.0, 1060.0]], ..Default::default() });
+        d.fields.styles.insert("distance:0".into(), LabelStyle { color: Some("#ff0000".into()), text: Some("99.99m".into()) });
+        let (a, b) = (render_svg(&plain), render_svg(&d));
+        assert!(b.contains("40.00m") && !b.contains("99.99m"));
+        let beacons = |svg: &str| svg.lines().filter(|l| l.contains(" h2 M")).map(str::to_string).collect::<Vec<_>>();
+        assert_eq!(beacons(&a), beacons(&b));
+        assert_eq!(beacons(&b).len(), 4);
+    }
+
+    #[test]
+    fn a_form_saved_before_the_editor_still_reads() {
+        let f: PlanFeature = serde_json::from_str(r#"{"symbol":"road","label":null,"side":null,"points":[[1,2],[3,4]]}"#).unwrap();
+        assert!(!f.smooth && f.color.is_none() && f.width.is_none());
+        let p: PlanFields = serde_json::from_str(r#"{"features":[],"label_moves":{}}"#).unwrap();
+        assert!(p.notes.is_empty() && p.styles.is_empty());
     }
 
     #[test]

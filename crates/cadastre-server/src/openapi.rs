@@ -29,7 +29,7 @@ use crate::routes::{
         crate::routes::wf::assign, crate::routes::wf::hold,
         crate::routes::wf::get_editing, crate::routes::wf::start_editing, crate::routes::wf::put_area, crate::routes::wf::area_action,
         crate::routes::wf::delete_area, crate::routes::wf::discard, crate::routes::wf::commit, crate::routes::wfbeacons::corners, crate::routes::wfbeacons::identify, crate::routes::precheck::precheck, crate::routes::wf::add_principal, crate::routes::completed::list, crate::routes::completed::correct, crate::routes::registry::withdraw_plan, crate::routes::registry::link_problems, crate::routes::registry::title_deed_queue, crate::routes::registry::file_history, crate::routes::registry::link_job, crate::routes::parcels::parcel_metadata, crate::routes::parcels::sketch_overlaps, crate::routes::parcels::parcel_points, crate::routes::precheck::confirm, crate::routes::precheck::last_confirmation, crate::routes::wf::finish, crate::routes::wf::end_job,
-        crate::routes::wf::get_linkage, crate::routes::wf::put_linkage, crate::routes::wf::next_upin, crate::routes::titledeed::get_plan, crate::routes::titledeed::put_plan, crate::routes::titledeed::attach_pdf, crate::routes::titledeed::svg,
+        crate::routes::wf::get_linkage, crate::routes::wf::put_linkage, crate::routes::wf::next_upin, crate::routes::titledeed::get_plan, crate::routes::titledeed::put_plan, crate::routes::titledeed::attach_pdf, crate::routes::titledeed::svg, crate::routes::titledeed::preview,
         crate::routes::wfadmin::list_files, crate::routes::wfadmin::get_file, crate::routes::wfadmin::upload_file,
         crate::routes::wfadmin::productivity, crate::routes::wfadmin::notifications, crate::routes::wfadmin::security,
         crate::routes::wfadmin::change, crate::routes::wfadmin::settings, crate::routes::wfadmin::put_setting,
@@ -110,7 +110,7 @@ use crate::routes::{
     ),
     components(schemas(
         crate::routes::jobs::UpinPreview, crate::routes::titledeed::TitleDeedDto, crate::routes::titledeed::SaveTitleDeed,
-        crate::titledeed::PlanData, crate::titledeed::PlanFields, crate::titledeed::PlanFeature, crate::titledeed::Corner, crate::routes::titledeed::SymbolDto,
+        crate::titledeed::PlanData, crate::titledeed::PlanFields, crate::titledeed::PlanFeature, crate::titledeed::PlanNote, crate::titledeed::LabelStyle, crate::titledeed::Corner, crate::routes::titledeed::SymbolDto,
         crate::routes::wf::WfDefinitionsDto, crate::routes::wf::WfJobTypeDto, crate::routes::wf::WfEdgeDto,
         crate::routes::wf::WfTaskDto, crate::routes::wf::WfStepDto, crate::routes::wf::WfStatusDto,
         crate::routes::wf::WfJobDto, crate::routes::wf::WfJobListDto, crate::routes::wf::WfJobDetailDto,
