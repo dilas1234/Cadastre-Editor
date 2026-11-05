@@ -22,6 +22,8 @@ pub async fn me(user: AuthUser) -> Json<MeDto> {
 #[derive(serde::Serialize, utoipa::ToSchema)]
 pub struct AuthConfigDto {
     pub enabled: bool,
+    /// This server's own sign-in page is in use (`CADASTRE_AUTH=local`).
+    pub local: bool,
     /// Realm URL for browsers (CADASTRE_KEYCLOAK_PUBLIC_ISSUER, else the issuer).
     pub issuer: Option<String>,
     /// The editor's OIDC client (CADASTRE_KEYCLOAK_CLIENT, default `cadastre-editor`).
@@ -32,6 +34,7 @@ pub struct AuthConfigDto {
 pub async fn auth_config(axum::extract::State(state): axum::extract::State<crate::state::AppState>) -> Json<AuthConfigDto> {
     Json(AuthConfigDto {
         enabled: state.config.auth_mode == crate::config::AuthMode::Enabled,
+        local: state.config.auth_mode == crate::config::AuthMode::Local,
         issuer: std::env::var("CADASTRE_KEYCLOAK_PUBLIC_ISSUER").ok().filter(|s| !s.is_empty()).or_else(|| state.config.keycloak_issuer.clone()),
         client_id: std::env::var("CADASTRE_KEYCLOAK_CLIENT").ok().filter(|s| !s.is_empty()).unwrap_or_else(|| "cadastre-editor".into()),
     })

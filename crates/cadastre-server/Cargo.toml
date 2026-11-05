@@ -56,6 +56,8 @@ png = "0.17"
 base64 = "0.22"
 rsa = "0.9"
 sha2 = { version = "0.10", features = ["oid"] }
+# Passwords of CADASTRE_AUTH=local. Pure Rust, like the above.
+argon2 = "0.5"
 
 # Observability + errors
 tracing = "0.1"

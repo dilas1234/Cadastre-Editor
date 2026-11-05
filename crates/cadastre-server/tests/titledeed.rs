@@ -131,3 +131,71 @@ async fn a_jobs_title_deed_plan_prefills_saves_and_prints() {
     assert_eq!(st, StatusCode::CONFLICT, "{v}");
     let _ = other;
 }
+
+/// A file back after its title deed: its job is closed and it has no link event, so the
+/// transaction comes from the closed job, and no job is offered to work on. Correct plan needs a
+/// reason and a Registry to check the link and stage against.
+#[tokio::test]
+async fn a_closed_jobs_file_keeps_its_transaction_for_plan_correction() {
+    let Some(url) = test_db_url() else {
+        eprintln!("skipped: CADASTRE_TEST_DATABASE_URL not set");
+        return;
+    };
+    std::env::remove_var("CADASTRE_REGISTRY_URL");
+    std::env::remove_var("CADASTRE_AUMENTUM_JOBSERVICE_URL");
+    let (router, pool) = app(&url).await;
+    sqlx::query("INSERT INTO cadastre.wf_task (id, name) VALUES ($1, 'Title deed test task') ON CONFLICT (id) DO NOTHING").bind(TASK).execute(&pool).await.unwrap();
+    sqlx::query("INSERT INTO cadastre.wf_job_type (id, name, start_task_id, end_task_id) VALUES ($1, 'Title deed test', $2, $2) ON CONFLICT (id) DO NOTHING")
+        .bind(TYPE).bind(TASK).execute(&pool).await.unwrap();
+    let seed = (std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos() % 5_000) as f64;
+    let (x, y) = (300_000.0 + seed * 100.0, 9_050_000.0);
+    let n = seed as u32;
+    let (file, txn) = (format!("PLTDC{n}"), format!("PLS9{n}"));
+
+    // Committed under another job, as an Aumentum parcel is: no job of the parcel to follow.
+    let (work_job, cid) = wf_job(&router, &format!("PLTDW{n}")).await;
+    let upin = commit_rect(&router, work_job, &cid, x, y).await;
+    sqlx::query("UPDATE cadastre.parcel SET job_id = NULL WHERE parcel_number = $1").bind(&upin).execute(&pool).await.unwrap();
+    sqlx::query("INSERT INTO cadastre.parcel_attribute (object_id, upin, property_number, lrs_id, linkage_status, status) VALUES ($4, $1, $2, $3, 1, '0')")
+        .bind(&upin).bind(&file).bind(format!("PLT9{n}")).bind(900_000 + n as i32).execute(&pool).await.unwrap();
+
+    let (job, _) = wf_job(&router, &file).await;
+    sqlx::query("UPDATE cadastre.wf_job_instance SET lrs_transaction_number = $2, status = 3, ended = now()::timestamp WHERE id = $1")
+        .bind(job as i32).bind(&txn).execute(&pool).await.unwrap();
+
+    let (st, w, _) = send(&router, "GET", &format!("/api/v1/registry/parcels/{upin}/work"), None).await;
+    assert_eq!(st, StatusCode::OK, "{w}");
+    assert_eq!(w["linked"], json!(true));
+    assert_eq!(w["transaction_number"], json!(txn), "the closed job gives the transaction");
+    assert_eq!(w["job_instance_id"], Value::Null, "a closed job is not offered as the job to work on");
+
+    // An open job of the file is still the one to work on.
+    sqlx::query("UPDATE cadastre.wf_job_instance SET status = 2, ended = NULL WHERE id = $1").bind(job as i32).execute(&pool).await.unwrap();
+    let (_, w, _) = send(&router, "GET", &format!("/api/v1/registry/parcels/{upin}/work"), None).await;
+    assert_eq!(w["job_instance_id"], json!(job));
+
+    // The reason is required; without a Registry the link and stage cannot be checked, so it is refused.
+    let (st, v, _) = send(&router, "POST", "/api/v1/registry/correct-plan", Some(json!({"upin": upin, "reason": "  "}))).await;
+    assert_eq!(st, StatusCode::BAD_REQUEST, "{v}");
+    let (st, v, _) = send(&router, "POST", "/api/v1/registry/correct-plan", Some(json!({"upin": upin, "reason": "Wrong scale"}))).await;
+    assert_eq!(st, StatusCode::CONFLICT, "{v}");
+
+    // A correction waits for its plan: it is open until a plan is sent after it.
+    let (_, c, _) = send(&router, "GET", &format!("/api/v1/wf/jobs/{job}/registry/plan-correction"), None).await;
+    assert_eq!(c["correction"], Value::Null);
+    let audit = |action: &'static str, payload: Value| {
+        let (pool, job) = (pool.clone(), job);
+        async move {
+            let mut tx = pool.begin().await.unwrap();
+            cadastre_server::audit::append(&mut tx, "test", action, "wf_job_instance", Some(&job.to_string()), payload).await.unwrap();
+            tx.commit().await.unwrap();
+        }
+    };
+    audit("title_deed_plan_correction", json!({"reason": "Wrong scale", "created_job": true})).await;
+    let (_, c, _) = send(&router, "GET", &format!("/api/v1/wf/jobs/{job}/registry/plan-correction"), None).await;
+    assert_eq!(c["correction"]["reason"], json!("Wrong scale"));
+    assert_eq!(c["correction"]["created_job"], json!(true));
+    audit("registry_plan_sent", json!({"transaction_number": txn})).await;
+    let (_, c, _) = send(&router, "GET", &format!("/api/v1/wf/jobs/{job}/registry/plan-correction"), None).await;
+    assert_eq!(c["correction"], Value::Null, "the plan sent ends the correction");
+}

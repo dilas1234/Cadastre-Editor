@@ -28,7 +28,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         tracing::info!("loaded {} Keycloak verification key(s)", keys.len());
         Some(Arc::new(keys))
     } else {
-        tracing::warn!("CADASTRE_AUTH=disabled — all requests run as a dev superuser");
+        if config.auth_mode == AuthMode::Disabled {
+            tracing::warn!("CADASTRE_AUTH=disabled — all requests run as a dev superuser");
+        }
         None
     };
 
@@ -50,8 +52,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
     let state = AppState { pool, config, jwks };
 
-    let app = routes::router(state).merge(
-        SwaggerUi::new("/swagger-ui").url("/api-docs/openapi.json", ApiDoc::openapi()),
+    let app = routes::gated(
+        routes::router(state.clone()).merge(SwaggerUi::new("/swagger-ui").url("/api-docs/openapi.json", ApiDoc::openapi())),
+        state,
     );
 
     let listener = tokio::net::TcpListener::bind(&bind_addr).await?;

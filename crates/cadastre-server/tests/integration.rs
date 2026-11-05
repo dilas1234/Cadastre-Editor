@@ -2057,8 +2057,10 @@ async fn registry_write_back_like_aumentum() {
         sqlx::query("INSERT INTO cadastre.registry_property (su_id, upin) VALUES ($1, $2) ON CONFLICT (su_id) DO UPDATE SET upin = EXCLUDED.upin")
             .bind(format!("SUD{n}{k}")).bind(&twice).execute(&pool).await.unwrap();
     }
-    let mut conn = pool.acquire().await.unwrap();
-    let recognised = cadastre_server::registry_sync::recognise_links(&mut conn).await.unwrap();
+    // In a transaction, as the sync runs it: the audit's lock lasts for the transaction.
+    let mut tx = pool.begin().await.unwrap();
+    let recognised = cadastre_server::registry_sync::recognise_links(&mut tx).await.unwrap();
+    tx.commit().await.unwrap();
     assert!(recognised >= 1, "the typed UPIN is recognised");
     let rec: (Option<String>, Option<i16>, Option<String>, Option<String>) = sqlx::query_as("SELECT lrs_id, linkage_status, property_number, linkage_date FROM cadastre.parcel_attribute WHERE upin = $1")
         .bind(&typed).fetch_one(&pool).await.unwrap();

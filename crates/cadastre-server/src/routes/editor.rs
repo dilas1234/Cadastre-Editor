@@ -22,7 +22,7 @@ pub async fn asset(Path(path): Path<String>) -> Response {
     serve(&path)
 }
 
-fn serve(path: &str) -> Response {
+pub(crate) fn serve(path: &str) -> Response {
     match WebAssets::get(path) {
         Some(file) => (
             [(header::CONTENT_TYPE, content_type(path))],

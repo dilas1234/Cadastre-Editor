@@ -10,6 +10,8 @@ pub enum AuthMode {
     Disabled,
     /// A bearer token is required and its RS256 signature is verified against the JWKS.
     Enabled,
+    /// This server's own sign-in page and session cookie (`routes::login`).
+    Local,
 }
 
 /// Server configuration.
@@ -42,7 +44,7 @@ impl Config {
     ///
     /// Required: `CADASTRE_DATABASE_URL` (falls back to `DATABASE_URL`).
     /// Optional: `CADASTRE_BIND` (default `0.0.0.0:8080`), `CADASTRE_AUTH`
-    /// (`enabled`/`disabled`, default `disabled`), `CADASTRE_KEYCLOAK_ISSUER`,
+    /// (`local`/`enabled`/`disabled`, default `disabled`), `CADASTRE_KEYCLOAK_ISSUER`,
     /// `CADASTRE_KEYCLOAK_AUDIENCE`, `CADASTRE_KEYCLOAK_JWKS_JSON`, `CADASTRE_KEYCLOAK_JWKS_PATH`,
     /// `CADASTRE_CATALOG_FOLDERS` (e.g. `\\PRODUCTIONMC\Image=D:\Image`).
     pub fn from_env() -> Result<Self, String> {
@@ -54,9 +56,10 @@ impl Config {
 
         let auth_mode = match env::var("CADASTRE_AUTH").as_deref() {
             Ok("enabled") => AuthMode::Enabled,
+            Ok("local") => AuthMode::Local,
             Ok("disabled") | Err(_) => AuthMode::Disabled,
             Ok(other) => {
-                return Err(format!("CADASTRE_AUTH must be enabled|disabled, got {other:?}"))
+                return Err(format!("CADASTRE_AUTH must be local|enabled|disabled, got {other:?}"))
             }
         };
 
