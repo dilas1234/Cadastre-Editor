@@ -24,7 +24,6 @@ use axum::extract::{Request, State};
 use axum::http::{HeaderName, HeaderValue, Method, StatusCode};
 use axum::response::{IntoResponse, Response};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::net::TcpStream;
 use serde_json::{json, Value};
 use sqlx::Row;
 
@@ -118,7 +117,7 @@ pub async fn aumentum_get(path_q: &str) -> Option<Result<Vec<u8>, String>> {
     let (auth, host, port) = authority(&up)?;
     let head = format!("GET {path_q} HTTP/1.0\r\nHost: {auth}\r\nConnection: close\r\nAccept: application/json\r\n\r\n");
     let exchange = async {
-        let mut s = TcpStream::connect((host.as_str(), port)).await?;
+        let mut s = crate::lrs::connect(host.as_str(), port).await?;
         s.write_all(head.as_bytes()).await?;
         let mut raw = Vec::new();
         (&mut s).take(MAX_BODY as u64).read_to_end(&mut raw).await?;
@@ -169,7 +168,7 @@ pub async fn forward(State(state): State<AppState>, req: Request) -> Response {
     head.push_str("\r\n");
 
     let exchange = async {
-        let mut s = TcpStream::connect((host.as_str(), port)).await?;
+        let mut s = crate::lrs::connect(host.as_str(), port).await?;
         s.write_all(head.as_bytes()).await?;
         s.write_all(&body).await?;
         let mut raw = Vec::new();
