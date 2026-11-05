@@ -117,6 +117,17 @@ pub struct Access {
     pub staff: bool,
 }
 
+/// The Registry groups that open Sysadmin.
+const REGISTRY_ADMIN_GROUPS: [&str; 1] = ["GROUP_LRS_ADMINISTRATION_SYSTEM"];
+/// The Registry groups that open Digitising and Title Deed.
+const REGISTRY_STAFF_GROUPS: [&str; 4] = ["GROUP_Scanning Clerk", "GROUP_Scanning Officer", "GROUP_Map Compilation Officer", "GROUP_Vectorization Clerk"];
+
+/// What a Registry user's groups allow.
+pub fn registry_access(groups: &[String]) -> Access {
+    let any = |names: &[&str]| groups.iter().any(|g| names.contains(&g.as_str()));
+    Access { admin: any(&REGISTRY_ADMIN_GROUPS), staff: any(&REGISTRY_STAFF_GROUPS) }
+}
+
 /// The workstations of the sign-in page.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum View {
@@ -160,6 +171,8 @@ pub struct LocalSession {
     pub sid: i32,
     pub code: String,
     pub must_change: bool,
+    /// Signed in with a Registry password: it is changed in the Registry, not here.
+    pub from_registry: bool,
     pub access: Access,
     pub user: AuthUser,
 }
@@ -194,14 +207,17 @@ fn roles_of(a: Access) -> Vec<String> {
 
 async fn load_session(pool: &sqlx::PgPool, token: &str) -> Result<Option<LocalSession>, sqlx::Error> {
     let row = sqlx::query(
-        "SELECT p.sid, p.code, c.must_change FROM cadastre.user_session s JOIN cadastre.principal p ON p.sid = s.sid \
-         JOIN cadastre.user_credential c ON c.sid = s.sid WHERE s.token_hash = $1 AND s.expires_at > now() AND p.is_user AND NOT p.is_locked")
+        "SELECT p.sid, p.code, s.source = 'registry' AS from_registry, s.registry_admin, s.registry_staff, COALESCE(c.must_change, false) AS must_change \
+         FROM cadastre.user_session s JOIN cadastre.principal p ON p.sid = s.sid LEFT JOIN cadastre.user_credential c ON c.sid = s.sid \
+         WHERE s.token_hash = $1 AND s.expires_at > now() AND p.is_user AND NOT p.is_locked AND (s.source = 'registry' OR c.sid IS NOT NULL)")
         .bind(token_hash(token)).fetch_optional(pool).await?;
     let Some(r) = row else { return Ok(None) };
     let (sid, code): (i32, String) = (r.get("sid"), r.get("code"));
-    let access = access_of(pool, sid).await?;
+    let local = access_of(pool, sid).await?;
+    let from_registry: bool = r.get("from_registry");
+    let access = Access { admin: local.admin || r.get::<bool, _>("registry_admin"), staff: local.staff || r.get::<bool, _>("registry_staff") };
     let user = AuthUser { subject: code.clone(), username: Some(code.clone()), roles: roles_of(access) };
-    Ok(Some(LocalSession { sid, code, must_change: r.get("must_change"), access, user }))
+    Ok(Some(LocalSession { sid, code, must_change: !from_registry && r.get::<bool, _>("must_change"), from_registry, access, user }))
 }
 
 /// Reachable without signing in: the sign-in page, health checks, and what the Registry and
@@ -301,6 +317,16 @@ mod tests {
         assert!(is_public(crate::routes::mcservice::PATH));
         assert!(is_public("/GISViewer/MapWorker.aspx") && is_public("/editor/vendor/proj4.js"));
         assert!(!is_public("/editor/app.js") && !is_public("/digitising") && !is_public("/api/v1/jobs") && !is_public("/viewer"));
+    }
+
+    #[test]
+    fn registry_groups_give_access() {
+        let g = |names: &[&str]| names.iter().map(|n| n.to_string()).collect::<Vec<_>>();
+        assert_eq!(registry_access(&g(&["GROUP_LRS", "GROUP_Scanning Clerk"])), STAFF);
+        assert_eq!(registry_access(&g(&["GROUP_Vectorization Clerk"])), STAFF);
+        assert_eq!(registry_access(&g(&["GROUP_LRS_ADMINISTRATION_SYSTEM"])), ADMIN);
+        assert_eq!(registry_access(&g(&["GROUP_LRS", "GROUP_Cashier", "GROUP_Data Entry (Charting and Reporting)"])), OTHER);
+        assert_eq!(registry_access(&[]), OTHER);
     }
 
     #[test]

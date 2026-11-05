@@ -17,6 +17,7 @@ use tokio::net::TcpStream;
 
 const SOAP: &str = "http://schemas.xmlsoap.org/soap/envelope/";
 const AUTH: &str = "http://www.alfresco.org/ws/service/authentication/1.0";
+const ACS: &str = "http://www.alfresco.org/ws/service/accesscontrol/1.0";
 const DOM: &str = "http://www.landsystems.com/domainmodel-service/1.0";
 const LRS: &str = "http://www.landsystems.com/lrs/service";
 const WSSE: &str = "http://docs.oasis-open.org/wss/2004/01/oasis-200401-wss-wssecurity-secext-1.0.xsd";
@@ -191,6 +192,17 @@ impl Session {
         let xml = soap(cfg, "AuthenticationService", &format!("{AUTH}/startSession"), "", &body).await?;
         let ticket = find_text(&xml, "ticket").ok_or(LrsError::NoTicket)?;
         Ok(Self { cfg: cfg.clone(), ticket, offset })
+    }
+
+    /// The Registry groups a user belongs to, directly or through other groups (Alfresco's
+    /// AccessControlService), as `GROUP_…` names. Read-only.
+    pub async fn user_groups(&self, username: &str) -> Result<Vec<String>, LrsError> {
+        let body = format!(
+            "<acs:getParentAuthorities xmlns:acs=\"{ACS}\"><acs:authority>{}</acs:authority><acs:filter><acs:authorityType>GROUP</acs:authorityType><acs:immediate>false</acs:immediate></acs:filter></acs:getParentAuthorities>",
+            escape(username)
+        );
+        let xml = soap(&self.cfg, "AccessControlService", &format!("{ACS}/getParentAuthorities"), &self.security_header(), &body).await?;
+        Ok(xml.split("GROUP_").skip(1).filter_map(|t| t.split('<').next()).map(|n| format!("GROUP_{}", n.replace("&amp;", "&"))).collect())
     }
 
     /// The Registry clock minus this machine's, in seconds.

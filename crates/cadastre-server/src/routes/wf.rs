@@ -213,7 +213,12 @@ pub(crate) async fn resolve_actor(state: &AppState, user: &AuthUser) -> ApiResul
     let membership: Vec<(i32, i32)> = sqlx::query_as("SELECT group_sid, member_sid FROM cadastre.principal_member")
         .fetch_all(&state.pool)
         .await?;
-    let sids = sid.map(|s| wfengine::effective_sids(s, &membership)).unwrap_or_default();
+    let mut sids = sid.map(|s| wfengine::effective_sids(s, &membership)).unwrap_or_default();
+    // A Registry working group counts as the Users group for the workflow's task permissions.
+    if state.config.auth_mode == crate::config::AuthMode::Local && user.has_role("editor") {
+        let users: Option<i32> = sqlx::query_scalar("SELECT sid FROM cadastre.principal WHERE lower(code) = 'users' AND NOT is_user").fetch_optional(&state.pool).await?;
+        sids.extend(users.filter(|u| !sids.contains(u)));
+    }
     let aumentum_admin: bool = if sids.is_empty() {
         false
     } else {

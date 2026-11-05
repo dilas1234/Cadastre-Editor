@@ -1,11 +1,11 @@
 //! Sign-in on this server (`CADASTRE_AUTH=local`): the login page, sessions and passwords.
 //!
-//! Accounts are `cadastre.principal`. Who may open what is decided by `auth::view_allowed`:
-//! Sysadmin for the Administrators group, Digitising and Title Deed for the Users group (and
-//! administrators), Charting and Reporting for anyone signed in. Passwords are Argon2 hashes; an
-//! administrator sets a temporary one (also while sign-in is off, so accounts can be prepared
-//! first) and its owner must change it at first sign-in. Five wrong passwords lock the account
-//! for 15 minutes.
+//! The Registry's users sign in with their Registry password, checked by the Registry itself
+//! (`AuthenticationService`), and its groups say what they may open (`auth::registry_access`).
+//! Staff who are not in the Registry use this server's accounts (`cadastre.principal`): Argon2
+//! hashes, a temporary password set by an administrator and changed at first sign-in. Sysadmin is
+//! for either admin group, Digitising and Title Deed for the working groups and Users, Charting
+//! and Reporting for anyone signed in. Five wrong passwords lock that name for 15 minutes.
 
 use argon2::password_hash::rand_core::{OsRng, RngCore};
 use argon2::password_hash::{PasswordHash, PasswordHasher, PasswordVerifier, SaltString};
@@ -23,6 +23,7 @@ use crate::audit;
 use crate::auth::{self, AuthUser, LocalSession, SESSION_COOKIE};
 use crate::config::AuthMode;
 use crate::error::{ApiResult, AppError};
+use crate::lrs::{LrsConfig, LrsError, Session};
 use crate::state::AppState;
 
 const MAX_FAILURES: i32 = 5;
@@ -114,7 +115,69 @@ pub struct LoginRequest {
     pub remember: bool,
 }
 
-/// Sign in: checks the password, then that the account may open the chosen view.
+/// The Registry's answer for a login: it accepted the password, and these are its groups.
+async fn registry_sign_in(login: &str, password: &str) -> Option<Vec<String>> {
+    // Alfresco's guest needs no real password, and an empty password proves nothing.
+    if password.is_empty() || login.eq_ignore_ascii_case("guest") {
+        return None;
+    }
+    let service = LrsConfig::from_env()?;
+    let own = LrsConfig { user: login.to_string(), password: password.to_string(), ..service.clone() };
+    match Session::start(&own).await {
+        Ok(s) => s.end().await,
+        // A refusal, or the Registry cannot be reached: local accounts can still sign in.
+        Err(e) => {
+            if !matches!(e, LrsError::Fault(_)) {
+                tracing::warn!("sign-in could not ask the Registry: {e}");
+            }
+            return None;
+        }
+    }
+    // Groups through the server's account. Unreadable groups give no access beyond reporting.
+    let groups = match Session::start(&service).await {
+        Ok(s) => {
+            let g = s.user_groups(login).await;
+            s.end().await;
+            g
+        }
+        Err(e) => Err(e),
+    };
+    Some(groups.unwrap_or_else(|e| {
+        tracing::warn!("sign-in could not read the Registry groups of {login}: {e}");
+        Vec::new()
+    }))
+}
+
+/// The account of a Registry user, made at first sign-in; `None` if it is locked here.
+async fn registry_principal(state: &AppState, login: &str) -> ApiResult<Option<(i32, String)>> {
+    let mut tx = state.pool.begin().await?;
+    sqlx::query("SELECT pg_advisory_xact_lock(4207011)").execute(&mut *tx).await?;
+    let found = sqlx::query("SELECT sid, code, is_locked FROM cadastre.principal WHERE is_user AND lower(code) = lower($1)").bind(login).fetch_optional(&mut *tx).await?;
+    if let Some(r) = found {
+        return Ok((!r.get::<bool, _>("is_locked")).then(|| (r.get("sid"), r.get("code"))));
+    }
+    let sid: i32 = sqlx::query_scalar("SELECT GREATEST(1000000, COALESCE(max(sid), 0)) + 1 FROM cadastre.principal").fetch_one(&mut *tx).await?;
+    sqlx::query("INSERT INTO cadastre.principal (sid, code, name, description, is_user, is_locked, is_system) VALUES ($1, $2, $2, 'Registry user', true, false, false)")
+        .bind(sid).bind(login).execute(&mut *tx).await?;
+    sqlx::query("INSERT INTO cadastre.principal_member (group_sid, member_sid) SELECT sid, $1 FROM cadastre.principal WHERE lower(code) = 'everyone' AND NOT is_user ON CONFLICT DO NOTHING")
+        .bind(sid).execute(&mut *tx).await?;
+    audit::append(&mut tx, login, "auth_registry_user_added", "auth", Some(login), json!({ "sid": sid })).await?;
+    tx.commit().await?;
+    Ok(Some((sid, login.to_string())))
+}
+
+/// A wrong login: counts towards the lockout of that name, whether or not it exists.
+async fn refuse(state: &AppState, name: &str, view: auth::View) -> ApiResult<Response> {
+    sqlx::query("INSERT INTO cadastre.login_throttle (login, failed_count) VALUES ($1, 1) ON CONFLICT (login) DO UPDATE SET \
+                 failed_count = CASE WHEN cadastre.login_throttle.failed_count + 1 >= $2 THEN 0 ELSE cadastre.login_throttle.failed_count + 1 END, \
+                 locked_until = CASE WHEN cadastre.login_throttle.failed_count + 1 >= $2 THEN now() + make_interval(mins => $3) ELSE cadastre.login_throttle.locked_until END")
+        .bind(name).bind(MAX_FAILURES).bind(LOCK_MINUTES).execute(&state.pool).await?;
+    log(state, "anonymous", "auth_login_failed", name, json!({ "view": view.key() })).await?;
+    Err(AppError::Unauthorized(BAD_LOGIN.into()))
+}
+
+/// Sign in: the Registry checks the password first, then this server's own accounts (staff who
+/// are not in the Registry). Then the account must be allowed the chosen view.
 #[utoipa::path(post, path = "/api/v1/auth/login", tag = "auth", request_body = LoginRequest,
     responses((status = 200), (status = 401, description = "Wrong username or password"), (status = 403, description = "Account locked, or the view is not allowed")))]
 pub async fn login(State(state): State<AppState>, Json(req): Json<LoginRequest>) -> ApiResult<Response> {
@@ -122,31 +185,39 @@ pub async fn login(State(state): State<AppState>, Json(req): Json<LoginRequest>)
         return Err(AppError::Conflict("sign-in is not turned on on this server".into()));
     }
     let view = auth::View::parse(&req.view).ok_or_else(|| AppError::BadRequest("choose a workstation".into()))?;
-    let login: String = req.username.trim().chars().take(64).collect();
-    let short = login.rsplit('\\').next().unwrap_or(&login).to_lowercase();
-    let row = sqlx::query(
-        "SELECT p.sid, p.code, c.password_hash, c.failed_count, COALESCE(c.locked_until > now(), false) AS locked \
-         FROM cadastre.principal p LEFT JOIN cadastre.user_credential c ON c.sid = p.sid \
-         WHERE p.is_user AND NOT p.is_locked AND lower(p.code) = $1")
-        .bind(&short).fetch_optional(&state.pool).await?;
-    let found = row.as_ref().and_then(|r| r.get::<Option<String>, _>("password_hash").map(|h| (r.get::<i32, _>("sid"), r.get::<String, _>("code"), h, r.get::<bool, _>("locked"))));
-    let Some((sid, code, hash, locked)) = found else {
-        // The same work and the same answer as a wrong password: usernames cannot be probed.
-        let _ = hash_blocking(req.password).await;
-        log(&state, "anonymous", "auth_login_failed", &short, json!({ "view": view.key() })).await?;
-        return Err(AppError::Unauthorized(BAD_LOGIN.into()));
-    };
+    let typed: String = req.username.trim().chars().take(64).collect();
+    let name = typed.rsplit('\\').next().unwrap_or(&typed).to_string();
+    let short = name.to_lowercase();
+    let locked: bool = sqlx::query_scalar("SELECT COALESCE((SELECT locked_until > now() FROM cadastre.login_throttle WHERE login = $1), false)")
+        .bind(&short).fetch_one(&state.pool).await?;
     if locked {
         return Err(AppError::Forbidden(format!("Too many wrong passwords. Try again in {LOCK_MINUTES} minutes, or contact the ICT Unit.")));
     }
-    if !verify_blocking(req.password, hash).await? {
-        sqlx::query("UPDATE cadastre.user_credential SET failed_count = CASE WHEN failed_count + 1 >= $2 THEN 0 ELSE failed_count + 1 END, \
-                     locked_until = CASE WHEN failed_count + 1 >= $2 THEN now() + make_interval(mins => $3) ELSE locked_until END WHERE sid = $1")
-            .bind(sid).bind(MAX_FAILURES).bind(LOCK_MINUTES).execute(&state.pool).await?;
-        log(&state, "anonymous", "auth_login_failed", &code, json!({ "view": view.key() })).await?;
-        return Err(AppError::Unauthorized(BAD_LOGIN.into()));
-    }
-    let access = auth::access_of(&state.pool, sid).await?;
+    let groups = if name.is_empty() { None } else { registry_sign_in(&name, &req.password).await };
+    let from_registry = groups.is_some();
+    let extra = groups.as_deref().map(auth::registry_access).unwrap_or(auth::Access { admin: false, staff: false });
+    let (sid, code) = if from_registry {
+        match registry_principal(&state, &name).await? {
+            Some(p) => p,
+            None => return refuse(&state, &short, view).await,
+        }
+    } else {
+        let row = sqlx::query(
+            "SELECT p.sid, p.code, c.password_hash FROM cadastre.principal p JOIN cadastre.user_credential c ON c.sid = p.sid \
+             WHERE p.is_user AND NOT p.is_locked AND lower(p.code) = $1")
+            .bind(&short).fetch_optional(&state.pool).await?;
+        let Some(r) = row else {
+            // The same work and the same answer as a wrong password: usernames cannot be probed.
+            let _ = hash_blocking(req.password).await;
+            return refuse(&state, &short, view).await;
+        };
+        if !verify_blocking(req.password, r.get("password_hash")).await? {
+            return refuse(&state, &short, view).await;
+        }
+        (r.get("sid"), r.get("code"))
+    };
+    let local = auth::access_of(&state.pool, sid).await?;
+    let access = auth::Access { admin: local.admin || extra.admin, staff: local.staff || extra.staff };
     if !view.allowed(access) {
         log(&state, &code, "auth_view_refused", &code, json!({ "view": view.key() })).await?;
         return Err(AppError::Forbidden(format!("Your account cannot open {}. Choose another workstation, or contact the ICT Unit.", view.label())));
@@ -155,13 +226,16 @@ pub async fn login(State(state): State<AppState>, Json(req): Json<LoginRequest>)
     OsRng.fill_bytes(&mut raw);
     let token: String = raw.iter().map(|b| format!("{b:02x}")).collect();
     let hours = if req.remember { REMEMBER_DAYS * 24 } else { SESSION_HOURS };
+    let source = if from_registry { "registry" } else { "local" };
     let mut tx = state.pool.begin().await?;
     sqlx::query("DELETE FROM cadastre.user_session WHERE expires_at < now()").execute(&mut *tx).await?;
-    sqlx::query("INSERT INTO cadastre.user_session (token_hash, sid, view, expires_at) VALUES ($1, $2, $3, now() + make_interval(hours => $4))")
-        .bind(auth::token_hash(&token)).bind(sid).bind(view.key()).bind(hours).execute(&mut *tx).await?;
-    let must_change: bool = sqlx::query_scalar("UPDATE cadastre.user_credential SET failed_count = 0, locked_until = NULL, last_login = now() WHERE sid = $1 RETURNING must_change")
-        .bind(sid).fetch_one(&mut *tx).await?;
-    audit::append(&mut tx, &code, "auth_login", "auth", Some(&code), json!({ "view": view.key(), "remember": req.remember })).await?;
+    sqlx::query("DELETE FROM cadastre.login_throttle WHERE login = $1").bind(&short).execute(&mut *tx).await?;
+    sqlx::query("INSERT INTO cadastre.user_session (token_hash, sid, view, expires_at, source, registry_admin, registry_staff) VALUES ($1, $2, $3, now() + make_interval(hours => $4), $5, $6, $7)")
+        .bind(auth::token_hash(&token)).bind(sid).bind(view.key()).bind(hours).bind(source).bind(extra.admin).bind(extra.staff).execute(&mut *tx).await?;
+    let must_change: bool = if from_registry { false } else {
+        sqlx::query_scalar("UPDATE cadastre.user_credential SET last_login = now() WHERE sid = $1 RETURNING must_change").bind(sid).fetch_one(&mut *tx).await?
+    };
+    audit::append(&mut tx, &code, "auth_login", "auth", Some(&code), json!({ "view": view.key(), "remember": req.remember, "source": source })).await?;
     tx.commit().await?;
     let cookie = session_cookie(&token, req.remember.then_some(hours as i64 * 3600));
     Ok(([(header::SET_COOKIE, cookie)], Json(json!({ "username": code, "must_change": must_change, "redirect": view.path() }))).into_response())
@@ -193,6 +267,9 @@ pub struct ChangePasswordRequest {
     responses((status = 200), (status = 400, description = "The new password is refused"), (status = 401, description = "Wrong current password")))]
 pub async fn change_password(State(state): State<AppState>, session: Option<Extension<LocalSession>>, headers: HeaderMap, Json(req): Json<ChangePasswordRequest>) -> ApiResult<Json<Value>> {
     let Some(Extension(s)) = session else { return Err(AppError::Conflict("sign-in is not turned on on this server".into())) };
+    if s.from_registry {
+        return Err(AppError::Conflict("Your password is your Registry password: change it in the Registry.".into()));
+    }
     if let Some(why) = password_problem(&req.new_password, &s.code) {
         return Err(AppError::BadRequest(why.into()));
     }
@@ -242,9 +319,10 @@ pub async fn set_temporary_password(State(state): State<AppState>, user: AuthUse
     let hash = hash_blocking(password.clone()).await?;
     let mut tx = state.pool.begin().await?;
     sqlx::query("INSERT INTO cadastre.user_credential (sid, password_hash, must_change, set_by) VALUES ($1, $2, true, $3) \
-                 ON CONFLICT (sid) DO UPDATE SET password_hash = EXCLUDED.password_hash, must_change = true, failed_count = 0, locked_until = NULL, set_by = EXCLUDED.set_by, updated_at = now()")
+                 ON CONFLICT (sid) DO UPDATE SET password_hash = EXCLUDED.password_hash, must_change = true, set_by = EXCLUDED.set_by, updated_at = now()")
         .bind(sid).bind(hash).bind(&by).execute(&mut *tx).await?;
     sqlx::query("DELETE FROM cadastre.user_session WHERE sid = $1").bind(sid).execute(&mut *tx).await?;
+    sqlx::query("DELETE FROM cadastre.login_throttle WHERE login = lower($1)").bind(&code).execute(&mut *tx).await?;
     audit::append(&mut tx, &by, "auth_password_set", "auth", Some(&code), json!({ "temporary": true })).await?;
     tx.commit().await?;
     Ok(Json(json!({ "username": code, "temporary_password": password })))

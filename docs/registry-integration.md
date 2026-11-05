@@ -332,21 +332,31 @@ Live checks (read-only) used the Registry account in the repo's `.env` (`REGISTR
 
 ## Sign-in (`CADASTRE_AUTH=local`)
 
-The server has its own sign-in page at `/login`: username, password and workstation. Accounts are
-`cadastre.principal`; Keycloak (`CADASTRE_AUTH=enabled`) is not needed.
+The server has its own sign-in page at `/login`: username, password and workstation. Keycloak
+(`CADASTRE_AUTH=enabled`) is not needed.
 
-| Workstation | Address | Who |
-|---|---|---|
-| Sysadmin | `/sys-editor` | Administrators group |
-| Digitising, Title Deed | `/digitising`, `/title-deed` | Users group and administrators |
-| Charting and Reporting | `/reporting` | Anyone signed in (read-only unless in Users) |
+**Who signs in.** The Registry's users, with their Registry password, checked first by the Registry
+(`AuthenticationService.startSession`); their account here is made at first sign-in and no Registry
+password is kept. Staff who are not in the Registry use this server's accounts. If the Registry
+cannot be reached, only those local accounts can sign in. The Registry's users and groups live in
+its Alfresco store (`LRSAdmin.alf_authority` in LRS43), read with `AccessControlService`. `guest` and
+empty passwords never pass through the Registry.
+
+| Workstation | Address | Registry group | This server's group |
+|---|---|---|---|
+| Sysadmin | `/sys-editor` | `GROUP_LRS_ADMINISTRATION_SYSTEM` | Administrators |
+| Digitising, Title Deed | `/digitising`, `/title-deed` | `GROUP_Scanning Clerk`, `GROUP_Scanning Officer`, `GROUP_Map Compilation Officer`, `GROUP_Vectorization Clerk` | Users |
+| Charting and Reporting | `/reporting` | Any signed-in user, read-only unless in a group above | |
+
+A session keeps the Registry groups read at sign-in, so a change in the Registry applies at the next
+sign-in. The workflow treats those working groups as the Users group for its task permissions.
 
 * **Enforced on the server** (`auth::gate`) for pages and API, not only in the screens.
   `/api/v1/admin`, `/api/v1/audit` and Swagger need Administrators.
-* **Passwords**: Sysadmin → Administration → Users & Groups → Set / Reset makes a temporary password,
+* **Passwords of local accounts**: Sysadmin → Administration → Users & Groups → Set / Reset makes a temporary password,
   shown once; its owner must change it at first sign-in. This also works with sign-in off, so accounts
   are prepared before it is turned on. There is no e-mail reset: the ICT Unit resets.
-* **Limits**: five wrong passwords lock the account for 15 minutes (a reset clears it). Sessions last
+* **Limits**: five wrong passwords lock that login name for 15 minutes, Registry or local (a reset clears it). Sessions last
   12 hours, or 30 days with Remember me. Locking an account ends its sessions at once.
 * **Stay public, because the Registry and Aumentum call them without a browser session**: the job
   service (`/ApplicationServerAdmin/WebServices/LRSWebServices.asmx`) and `/GISViewer/*`.
