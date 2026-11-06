@@ -4288,6 +4288,23 @@ async function registryLoad() {
   buildTocTools();
 }
 setInterval(async () => { await registryLoad(); if (regOpen() && !reg.busy) renderRegistry(); }, 60000);
+// Aumentum not answering: commits are refused, so the units that commit are told before they try.
+// It clears itself when Aumentum is back.
+async function aumentumWarning() {
+  if (!can("digitise") && !can("titledeed")) return;
+  let s; try { s = await api("/api/v1/aumentum/status"); } catch { return; }
+  const down = s.configured && !s.ok;
+  let bar = $("aumWarn");
+  if (down && !bar) {
+    bar = h("div", { id: "aumWarn", role: "alert", title: s.reason || "" },
+      h("b", {}, "Aumentum server is not responding."), " New commits are paused until it is back. Please contact the ICT Admin. You can keep working: your drafts stay as they are.");
+    $("toolbars").after(bar);
+  } else if (bar && !down) bar.remove();
+  else if (bar) bar.title = s.reason || "";
+  try { map.resize(); } catch { /* the map is not ready */ }
+}
+aumentumWarning();
+setInterval(aumentumWarning, 60000);
 setTimeout(registryLoad, 1500);
 const regTime = (s) => (s ? s.replace("T", " ").slice(0, 16) : "—");
 async function regRun(label, fn) {
@@ -5000,7 +5017,7 @@ async function wfCommitDialog(opts = {}) {
         (p.aumentum_skipped.length ? `; skipped ${p.aumentum_skipped.join(", ")} (already issued in Aumentum).` : ": not issued there.")));
     } else if (p.aumentum === "unavailable") {
       upinLine.style.borderColor = "#c00"; upinLine.style.background = "#fde8e8";
-      upinLine.append(h("span", { style: "color:#900" }, `Aumentum could not be asked (${p.message || "no answer"}): the commit will be refused until it can.`));
+      upinLine.append(h("span", { style: "color:#900" }, `Aumentum could not be asked (${(p.message || "no answer").replace(/\.? Please contact the ICT Admin\.$/, "")}): the commit will be refused until it can. Please contact the ICT Admin.`));
     } else {
       upinLine.append(h("span", { class: "muted" }, "Not checked with Aumentum on this server (no parallel-run check configured)."));
     }

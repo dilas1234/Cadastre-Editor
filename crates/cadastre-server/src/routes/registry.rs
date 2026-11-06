@@ -954,6 +954,12 @@ pub async fn link_job(State(state): State<AppState>, user: AuthUser, Path(id): P
     Ok(Json(out))
 }
 
+/// Whether a commit could ask Aumentum about a UPIN right now.
+#[utoipa::path(get, path = "/api/v1/aumentum/status", tag = "registry", responses((status = 200, body = crate::aumentum::Health)))]
+pub async fn aumentum_status() -> Json<crate::aumentum::Health> {
+    Json(crate::aumentum::health().await)
+}
+
 /// The title deed queue: files the Registry has at Raise Title Deed Plan (C of O processing) whose
 /// property the Registry admin has linked (holds a UPIN), read live from the Registry, with what this
 /// Cadastre has for each (the parcel, the title deed job, the plan sent). The title deed unit works

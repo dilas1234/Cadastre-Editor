@@ -448,3 +448,6 @@ table.legs tr.selrow td { background: #fff6cf; }
 body.view-digitising .viewBadge { color: #13612a; }
 body.view-titledeed .viewBadge { color: #8a3b00; }
 body.view-reporting .viewBadge { color: #5b2a86; }
+
+/* Aumentum is not answering: see aumentumWarning */
+#aumWarn { flex: none; padding: 7px 12px; font-size: 13px; color: #7a1414; background: #fdecec; border-bottom: 1px solid #e8b4b4; }

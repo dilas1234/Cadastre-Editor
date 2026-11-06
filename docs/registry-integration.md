@@ -353,6 +353,10 @@ it is changed in the Registry (`AdministrationService.changePassword`, in the us
 the row goes. Users created with `AdministrationService.createUsers` wait on any long query holding
 `LRSAdmin.alf_node`, so a heavy search on that table blocks new users.
 
+If Aumentum cannot answer the UPIN check, commits are refused and Digitising, Title Deed and Sysadmin
+show a red warning to contact the ICT Admin (`GET /api/v1/aumentum/status`: signs in and asks about a
+UPIN, at most once a minute). It clears itself when Aumentum answers.
+
 A session keeps the Registry groups read at sign-in, so a change in the Registry applies at the next
 sign-in. The workflow treats those working groups as the Users group for its task permissions.
 

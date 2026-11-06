@@ -180,6 +180,10 @@ async fn a_closed_jobs_file_keeps_its_transaction_for_plan_correction() {
     let (st, v, _) = send(&router, "POST", "/api/v1/registry/correct-plan", Some(json!({"upin": upin, "reason": "Wrong scale"}))).await;
     assert_eq!(st, StatusCode::CONFLICT, "{v}");
 
+    // Nothing to warn about while the Aumentum check is off.
+    let (st, h, _) = send(&router, "GET", "/api/v1/aumentum/status", None).await;
+    assert_eq!((st, h["configured"].clone(), h["ok"].clone()), (StatusCode::OK, json!(false), json!(true)));
+
     // A correction waits for its plan: it is open until a plan is sent after it.
     let (_, c, _) = send(&router, "GET", &format!("/api/v1/wf/jobs/{job}/registry/plan-correction"), None).await;
     assert_eq!(c["correction"], Value::Null);

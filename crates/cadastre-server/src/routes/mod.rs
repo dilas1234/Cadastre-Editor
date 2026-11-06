@@ -135,6 +135,7 @@ pub fn router(state: AppState) -> Router {
         .route("/api/v1/wf/jobs/{id}/mutations/{group}/keep-upin", put(mutations::keep_upin))
         .route("/api/v1/registry/links", get(registry::links))
         .route("/api/v1/registry/status", get(registry::status))
+        .route("/api/v1/aumentum/status", get(registry::aumentum_status))
         .route("/api/v1/registry/sync", post(registry::sync_now))
         // The Registry's job service, at Aumentum's path (Registry setting mcServiceAddress).
         .route(mcservice::PATH, get(mcservice::get).post(mcservice::post))
