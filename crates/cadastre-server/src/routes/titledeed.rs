@@ -4,6 +4,7 @@
 //! * `GET  /api/v1/wf/jobs/{id}/titledeed[?upin=]`     the plan: saved form over the prefill
 //! * `PUT  /api/v1/wf/jobs/{id}/titledeed`             save the form (`{ upin, fields }`)
 //! * `GET  /api/v1/wf/jobs/{id}/titledeed.svg[?upin=]` the sheet (A4, SVG)
+//! * `POST /api/v1/wf/jobs/{id}/titledeed/preview`     the sheet of a form not yet saved (the editor)
 //!
 //! The parcel is the one the job committed, else the file's active parcel (the existing-parcel
 //! path: Search Cadastre for Parcels → Generate Title Deed Plan). Prefill, each field only where
@@ -43,6 +44,10 @@ pub struct SymbolDto {
     pub group: String,
     /// Placed at one spot; the others are lines.
     pub point: bool,
+    /// Drawn as two lines; this far apart on paper (mm) unless the feature says otherwise.
+    pub double: f64,
+    /// Its colour, unless the feature says otherwise.
+    pub stroke: String,
 }
 
 #[derive(Debug, Serialize, ToSchema)]
@@ -189,11 +194,15 @@ fn merge(prefill: &PlanFields, saved: &PlanFields) -> PlanFields {
         grid_corner: saved.grid_corner.or(prefill.grid_corner),
         features: saved.features.clone(),
         label_moves: saved.label_moves.clone(),
+        notes: saved.notes.clone(),
+        styles: saved.styles.clone(),
         road_label: non_empty(saved.road_label.clone()).or_else(|| prefill.road_label.clone()) } } }
     pick!(region, location, plan_no, tracing_no, title_no, address, lga, holder, surveyed_by, survey_date, plotted_by, checked_by, surveyor_general, prepared_by)
 }
 
-async fn load(state: &AppState, id: i32, want: Option<String>, user: Option<&AuthUser>) -> ApiResult<TitleDeedDto> {
+/// The plan. `registry` = ask the Registry for the prefill too, which takes a session of its own;
+/// the sheet's editor, redrawing as the officer works, does without.
+async fn load(state: &AppState, id: i32, want: Option<String>, user: Option<&AuthUser>, registry: bool) -> ApiResult<TitleDeedDto> {
     let (upins, file_no, txn) = job_parcels(state, id).await?;
     let upin = match want.map(|u| u.trim().to_uppercase()).filter(|u| !u.is_empty()) {
         Some(u) => u,
@@ -231,7 +240,7 @@ async fn load(state: &AppState, id: i32, want: Option<String>, user: Option<&Aut
         prefill.plan_no = file_no.clone();
     }
     let file_for_registry = prefill.title_no.clone();
-    let registry = registry_prefill(&mut prefill, su_id, txn.as_deref(), file_for_registry.as_deref()).await;
+    let registry = if registry { registry_prefill(&mut prefill, su_id, txn.as_deref(), file_for_registry.as_deref()).await } else { "off".to_string() };
     // The region: the Registry's, else the parcel record's dataset region (Plateau_State →
     // Plateau), else Plateau.
     if prefill.region.is_none() {
@@ -254,7 +263,7 @@ async fn load(state: &AppState, id: i32, want: Option<String>, user: Option<&Aut
         .and_then(|v| serde_json::from_value(v).ok());
     let mut fields = match &saved { Some(s) => merge(&prefill, s), None => prefill.clone() };
     fields.surveyed_by = fields.surveyed_by.as_deref().map(cap_words);
-    let symbols = SYMBOLS.iter().map(|y| SymbolDto { id: y.id.into(), label: y.label.into(), group: y.group.into(), point: y.point }).collect();
+    let symbols = SYMBOLS.iter().map(|y| SymbolDto { id: y.id.into(), label: y.label.into(), group: y.group.into(), point: y.point, double: y.double, stroke: y.stroke().into() }).collect();
     Ok(TitleDeedDto { plan: PlanData { upin, area_m2: area, corners, fields }, prefill, saved, upins, registry, symbols })
 }
 
@@ -262,7 +271,7 @@ async fn load(state: &AppState, id: i32, want: Option<String>, user: Option<&Aut
 #[utoipa::path(get, path = "/api/v1/wf/jobs/{id}/titledeed", tag = "wf", params(("id" = i32, Path, description = "Job instance id"), PlanQuery),
     responses((status = 200, body = TitleDeedDto), (status = 404, description = "Job or parcel not found"), (status = 409, description = "No committed parcel yet")))]
 pub async fn get_plan(State(state): State<AppState>, user: AuthUser, Path(id): Path<i32>, Query(q): Query<PlanQuery>) -> ApiResult<Json<TitleDeedDto>> {
-    Ok(Json(load(&state, id, q.upin, Some(&user)).await?))
+    Ok(Json(load(&state, id, q.upin, Some(&user), true).await?))
 }
 
 /// Save the plan form (so a reprint is identical).
@@ -287,14 +296,28 @@ pub async fn put_plan(State(state): State<AppState>, user: AuthUser, Path(id): P
     .bind(&actor.label)
     .execute(&state.pool)
     .await?;
-    Ok(Json(load(&state, id, Some(upin), Some(&user)).await?))
+    Ok(Json(load(&state, id, Some(upin), Some(&user), true).await?))
 }
 
 /// The printable sheet (A4 SVG).
 #[utoipa::path(get, path = "/api/v1/wf/jobs/{id}/titledeed.svg", tag = "wf", params(("id" = i32, Path, description = "Job instance id"), PlanQuery),
     responses((status = 200, description = "Title deed plan", content_type = "image/svg+xml")))]
 pub async fn svg(State(state): State<AppState>, Path(id): Path<i32>, Query(q): Query<PlanQuery>) -> ApiResult<impl IntoResponse> {
-    let d = load(&state, id, q.upin, None).await?;
+    let d = load(&state, id, q.upin, None, true).await?;
+    Ok(([(header::CONTENT_TYPE, "image/svg+xml; charset=utf-8"), (header::CACHE_CONTROL, "no-store")], render_svg(&d.plan)))
+}
+
+/// The sheet with the given form, not saved: the sheet's editor redrawing as the officer works. The
+/// form is printed as sent, so it comes with the prefill already filled in.
+#[utoipa::path(post, path = "/api/v1/wf/jobs/{id}/titledeed/preview", tag = "wf", params(("id" = i32, Path, description = "Job instance id")),
+    request_body = SaveTitleDeed, responses((status = 200, description = "Title deed plan", content_type = "image/svg+xml"), (status = 409, description = "Not a committed parcel of this job")))]
+pub async fn preview(State(state): State<AppState>, _user: AuthUser, Path(id): Path<i32>, Json(req): Json<SaveTitleDeed>) -> ApiResult<impl IntoResponse> {
+    let upin = req.upin.trim().to_uppercase();
+    let mut d = load(&state, id, Some(upin.clone()), None, false).await?;
+    if !d.upins.contains(&upin) {
+        return Err(AppError::Conflict(format!("{upin} is not a committed parcel of this job")));
+    }
+    d.plan.fields = req.fields;
     Ok(([(header::CONTENT_TYPE, "image/svg+xml; charset=utf-8"), (header::CACHE_CONTROL, "no-store")], render_svg(&d.plan)))
 }
 

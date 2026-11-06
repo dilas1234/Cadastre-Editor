@@ -91,6 +91,7 @@ pub fn router(state: AppState) -> Router {
         .route("/api/v1/wf/jobs/{id}/next-upin", get(wf::next_upin))
         .route("/api/v1/wf/jobs/{id}/titledeed", get(titledeed::get_plan).put(titledeed::put_plan))
         .route("/api/v1/wf/jobs/{id}/titledeed.svg", get(titledeed::svg))
+        .route("/api/v1/wf/jobs/{id}/titledeed/preview", post(titledeed::preview))
         .route("/api/v1/wf/jobs/{id}/titledeed.pdf", post(titledeed::attach_pdf))
         .route("/api/v1/wf/jobs/{id}/finish", post(wf::finish))
         .route("/api/v1/wf/jobs/{id}/linkage", get(wf::get_linkage).put(wf::put_linkage))

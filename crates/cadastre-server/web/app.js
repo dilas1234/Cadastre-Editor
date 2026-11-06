@@ -5141,6 +5141,8 @@ function tdShow(feats) {
   map.getSource("tdfeat")?.setData({ type: "FeatureCollection", features: feats.filter((x) => x.points?.length).map((x) => ({ type: "Feature", properties: {},
     geometry: x.points.length > 1 ? { type: "LineString", coordinates: x.points.map(([e, n]) => toLL(e, n)) } : { type: "Point", coordinates: toLL(...x.points[0]) } })) });
 }
+// The road or feature copied in the plan editor; it stays for the next plan opened.
+let tdClip = null;
 const TD_SCALES = [250, 500, 750, 1000, 1250, 1500, 2000, 2500, 3000, 4000, 5000, 7500, 10000, 25000];
 async function titleDeedDialog(jobId, upin) {
   let d;
@@ -5185,12 +5187,16 @@ async function titleDeedDialog(jobId, upin) {
   };
   // Label moves of the plan, kept by label: a removed feature's goes, the later ones shift down.
   let moves = { ...(f.label_moves || {}) };
+  // Colours and wording set on the sheet's labels, and the plan's free text.
+  let styles = { ...(f.styles || {}) };
+  const notes = (f.notes || []).map((x) => ({ ...x }));
   const dropFeatureMove = (i) => {
-    moves = Object.fromEntries(Object.entries(moves).flatMap(([k, v]) => {
+    const shift = (o) => Object.fromEntries(Object.entries(o).flatMap(([k, v]) => {
       const m = /^feature:(\d+)$/.exec(k);
       if (!m || Number(m[1]) < i) return [[k, v]];
       return Number(m[1]) === i ? [] : [[`feature:${Number(m[1]) - 1}`, v]];
     }));
+    moves = shift(moves); styles = shift(styles);
   };
   const featsChanged = () => { renderFeats(); save().catch((e) => { msg.style.color = "#900"; msg.textContent = e.message; }); };
   const addFeat = () => {
@@ -5229,6 +5235,8 @@ async function titleDeedDialog(jobId, upin) {
     out.road_label = roadLabel.value.trim() || null;
     out.features = feats;
     out.label_moves = moves;
+    out.notes = notes;
+    out.styles = styles;
     return out;
   };
   const msg = h("div", { style: "min-height:1.2em;margin:4px 0" });
@@ -5237,103 +5245,598 @@ async function titleDeedDialog(jobId, upin) {
     msg.style.color = "#060"; msg.textContent = "Saved with the job.";
     return r;
   };
-  // Adjust labels: the sheet full size. Drag a label to move it, double-click it to put it back;
-  // only the writing moves. Plan features can be added here too: drawn on the sheet (clicks become
-  // ground co-ordinates through its data-grid) or tied to a side, and the sheet redraws at once,
-  // so a road is seen stopping at the road it meets.
-  const adjust = async () => {
-    const before = { ...moves };
-    const fail = (e) => { msg.style.color = "#900"; msg.textContent = e.message; };
-    const page = h("div", { style: "width:900px;margin:0 auto 20px;background:#fff;touch-action:none;user-select:none" });
-    let el = null, drag = null, draw = null;
+  // Edit plan: the sheet full size, as a drawing tool. Roads and other features are drawn on it as
+  // curves or straight lines, and reshaped by their points; labels are dragged, recoloured and
+  // retyped; text can be added. The beacons and the bearings, distances and area stay as computed
+  // from the registered co-ordinates. Nothing is saved until Done: the sheet redraws from the
+  // server's preview, and Undo / Cancel work on the editor's own copy.
+  const edit = async () => {
+    const fail = (e) => { msg.style.color = "#900"; msg.textContent = e.message; hint.textContent = "The sheet could not be redrawn: " + e.message; };
+    const SVG = "http://www.w3.org/2000/svg";
+    const page = h("div", { class: "peSheet" });
+    const hint = h("div", { style: "min-height:1.3em" });
+    let el = null, ui = null, zoom = 1, sel = null, node = null, drag = null, draw = null, seq = 0, tool = "select", space = false, pivot = null;
+    // What Undo and Cancel put back.
+    const snap = () => JSON.stringify({ feats, moves, styles, notes, names: names.map((x) => x.value), sides: roadBoxes.map((b) => b.checked) });
+    const restore = (j) => {
+      const v = JSON.parse(j);
+      feats.splice(0, feats.length, ...v.feats); notes.splice(0, notes.length, ...v.notes);
+      moves = v.moves; styles = v.styles;
+      names.forEach((x, i) => { x.value = v.names[i]; x.dispatchEvent(new Event("input")); });
+      roadBoxes.forEach((b, i) => { b.checked = v.sides[i]; });
+      renderFeats();
+    };
+    const opened = snap();
+    const undo = [], redo = [];
+    const mark = () => { undo.push(snap()); redo.length = 0; if (undo.length > 100) undo.shift(); bars(); };
+    const step = (from, to) => { if (!from.length) return; to.push(snap()); restore(from.pop()); sel = null; node = null; fillPanel(); show().catch(fail); bars(); };
+    // The form as it prints, for the preview: what is left blank falls back on the prefill.
+    const printed = () => {
+      const out = collect();
+      for (const k of [...keys, "lga", "road_label"]) out[k] = out[k] ?? d.prefill[k] ?? null;
+      return out;
+    };
     const show = async () => {
-      page.innerHTML = await sheet();
+      const mine = ++seq;
+      const svg = await api(`/api/v1/wf/jobs/${jobId}/titledeed/preview`, { method: "POST", body: { upin: p.upin, fields: printed() } });
+      if (mine !== seq) return; // a newer change is already on its way
+      page.innerHTML = svg;
       el = page.querySelector("svg");
       el.removeAttribute("height"); el.setAttribute("width", "100%"); el.style.display = "block";
+      scaleText.textContent = `Scale 1:${Math.round(1000 / grid()[2])}`;
+      // Thin lines are hard to hit: a wide invisible copy under the pointer. It lives only here;
+      // the printed sheet comes from the server.
+      for (const g of el.querySelectorAll("[data-feat],[data-road]")) for (const l of [...g.querySelectorAll("polyline,line")]) {
+        const c = l.cloneNode(); c.setAttribute("stroke", "#000"); c.setAttribute("stroke-opacity", "0"); c.setAttribute("stroke-width", "3"); c.removeAttribute("stroke-dasharray"); c.setAttribute("pointer-events", "stroke"); g.append(c);
+      }
+      for (const g of el.querySelectorAll("[data-feat]")) {
+        const q = nodesOf(g), x = feats[Number(g.getAttribute("data-feat"))], gap = symOf(x?.symbol)?.double ? x.width ?? symOf(x.symbol).double : 0;
+        if (q.length === 1) g.append(svgEl("circle", { cx: q[0][0], cy: q[0][1], r: 2.5, "fill-opacity": 0, "pointer-events": "all" }));
+        else if (gap) g.append(grabBand(through(q, x.smooth), gap)); // a double line is held anywhere between its lines
+      }
+      for (const g of el.querySelectorAll("[data-road]")) g.append(grabBand(nodesOf(g), 8));
+      ui = document.createElementNS(SVG, "g");
+      el.append(ui);
+      overlay();
     };
-    try { await show(); } catch (e) { fail(e); return; }
-    const hint = h("span", {}, "");
-    const idle = "Drag a label to move it. Double-click a label to put it back.";
-    hint.textContent = idle;
-    const adjSym = symSel.cloneNode(true), adjPlace = placeSel.cloneNode(true);
-    adjPlace.options[0].textContent = "Draw on the sheet";
-    adjSym.style.width = adjPlace.style.width = "170px";
-    const adjLabel = h("input", { placeholder: "Label (optional)", style: "width:130px" });
-    const drawBtn = h("button", { class: "btn" }, "Add feature");
-    // Paper mm at a mouse position, and ground co-ordinates of paper mm.
+    // Paper mm <-> ground co-ordinates, through the sheet's data-grid.
+    const grid = () => el.getAttribute("data-grid").split(" ").map(Number);
     const mmAt = (e) => { const q = new DOMPoint(e.clientX, e.clientY).matrixTransform(el.getScreenCTM().inverse()); return [q.x, q.y]; };
-    const toGround = ([x, y]) => {
-      const [e0, n0, k, x0, y1] = el.getAttribute("data-grid").split(" ").map(Number);
-      const r = (v) => Math.round(v * 1000) / 1000;
-      return [r(e0 + (x - x0) / k), r(n0 + (y1 - y) / k)];
+    const toGround = ([x, y]) => { const [e0, n0, k, x0, y1] = grid(); const r = (v) => Math.round(v * 1000) / 1000; return [r(e0 + (x - x0) / k), r(n0 + (y1 - y) / k)]; };
+    const toPaper = ([e, n]) => { const [e0, n0, k, x0, y1] = grid(); return [x0 + (e - e0) * k, y1 - (n - n0) * k]; };
+    const nodesOf = (g) => g.getAttribute("data-nodes").split(" ").filter(Boolean).map((q) => q.split(",").map(Number));
+    const featEl = (i) => el.querySelector(`[data-feat="${i}"]`);
+    // A feature on a side has no points of its own: it takes them from the sheet when first shaped.
+    const freeFeature = (i) => {
+      const x = feats[i];
+      if (x.side != null || !x.points?.length) { x.points = nodesOf(featEl(i)).map(toGround); x.side = null; }
+      return x;
     };
-    const addFeature = (x) => { feats.push(x); adjLabel.value = ""; renderFeats(); show().catch(fail); };
-    const stopDraw = () => {
-      draw?.line.remove(); draw = null;
-      page.classList.remove("drawing"); drawBtn.textContent = "Add feature"; hint.textContent = idle;
+    const svgEl = (name, attrs) => { const n = document.createElementNS(SVG, name); for (const [k, v] of Object.entries(attrs)) n.setAttribute(k, v); return n; };
+    // The curve the server draws (centripetal Catmull-Rom), for the outline while dragging.
+    const curve = (pts) => {
+      if (pts.length < 3) return pts;
+      const dd = (a, b) => Math.hypot(a[0] - b[0], a[1] - b[1]), n = pts.length;
+      const at = (i) => i < 0 ? [2 * pts[0][0] - pts[1][0], 2 * pts[0][1] - pts[1][1]] : i >= n ? [2 * pts[n - 1][0] - pts[n - 2][0], 2 * pts[n - 1][1] - pts[n - 2][1]] : pts[i];
+      const mix = (a, b, ta, tb, t) => { const w = (t - ta) / ((tb - ta) || 1e-9); return [a[0] + (b[0] - a[0]) * w, a[1] + (b[1] - a[1]) * w]; };
+      const out = [pts[0]];
+      for (let i = 0; i < n - 1; i++) {
+        const p0 = at(i - 1), p1 = pts[i], p2 = pts[i + 1], p3 = at(i + 2);
+        const t1 = Math.sqrt(dd(p0, p1)), t2 = t1 + Math.sqrt(dd(p1, p2)), t3 = t2 + Math.sqrt(dd(p2, p3));
+        for (let s = 1; s <= 16; s++) {
+          const t = t1 + (t2 - t1) * s / 16;
+          const a1 = mix(p0, p1, 0, t1, t), a2 = mix(p1, p2, t1, t2, t), a3 = mix(p2, p3, t2, t3, t);
+          out.push(mix(mix(a1, a2, 0, t2, t), mix(a2, a3, t1, t3, t), t1, t2, t));
+        }
+      }
+      return out;
     };
+    const through = (pts, smooth) => (smooth ? curve(pts) : pts);
+    const grabBand = (pts, width) => svgEl("polyline", { points: pts.map((q) => q.join(",")).join(" "), fill: "none", stroke: "#000", "stroke-opacity": 0, "stroke-width": width, "pointer-events": "stroke" });
+    // Selection marks: the outline and its points (round: drag; small square: drag to add a point).
+    const overlay = () => {
+      if (!ui) return;
+      ui.replaceChildren();
+      const r = 1.1 / zoom;
+      if (draw) {
+        ui.append(svgEl("polyline", { points: through(draw.pts, draw.smooth).map((q) => q.join(",")).join(" "), fill: "none", stroke: "#f0f", "stroke-width": 0.35 / zoom }));
+        for (const q of draw.pts) ui.append(svgEl("circle", { cx: q[0], cy: q[1], r, fill: "#f0f", "pointer-events": "none" }));
+        return;
+      }
+      if (tool === "rotate") {
+        const g = selGroup();
+        if (!g || !canTurn()) return;
+        const c = pivotOf();
+        if (g.hasAttribute("data-nodes") && nodesOf(g).length > 1) {
+          const line = sel.kind === "feat" ? through(nodesOf(g), feats[sel.i].smooth) : nodesOf(g);
+          ui.append(svgEl("polyline", { points: line.map((q) => q.join(",")).join(" "), fill: "none", stroke: "#06c", "stroke-width": 0.25 / zoom, "stroke-opacity": 0.7, "pointer-events": "none" }));
+        }
+        const free = sel.kind === "feat" || sel.kind === "road"; // a label turns about its own place
+        ui.append(svgEl("circle", { cx: c[0], cy: c[1], r: 2 * r, fill: "#fff", "fill-opacity": 0.7, stroke: "#f60", "stroke-width": 0.3 / zoom, ...(free ? { "data-pivot": 1, style: "cursor:move" } : { "pointer-events": "none" }) }),
+          svgEl("path", { d: `M${c[0] - 3 * r} ${c[1]}H${c[0] + 3 * r}M${c[0]} ${c[1] - 3 * r}V${c[1] + 3 * r}`, stroke: "#f60", "stroke-width": 0.25 / zoom, "pointer-events": "none" }));
+        return;
+      }
+      if (sel?.kind !== "feat") return;
+      const x = feats[sel.i], g = featEl(sel.i);
+      if (!x || !g) return;
+      const pts = nodesOf(g);
+      if (symOf(x.symbol)?.point) { ui.append(svgEl("circle", { cx: pts[0][0], cy: pts[0][1], r: 3 / zoom, fill: "none", stroke: "#06c", "stroke-width": 0.3 / zoom, "pointer-events": "none" })); return; }
+      const line = through(pts, x.smooth);
+      ui.append(svgEl("polyline", { points: line.map((q) => q.join(",")).join(" "), fill: "none", stroke: "#06c", "stroke-width": 0.25 / zoom, "stroke-opacity": 0.7, "pointer-events": "none" }));
+      for (let i = 0; i + 1 < pts.length; i++) {
+        const m = x.smooth && pts.length > 2 ? line[i * 16 + 8] : [(pts[i][0] + pts[i + 1][0]) / 2, (pts[i][1] + pts[i + 1][1]) / 2];
+        ui.append(svgEl("rect", { x: m[0] - r * 0.7, y: m[1] - r * 0.7, width: r * 1.4, height: r * 1.4, fill: "#fff", stroke: "#06c", "stroke-width": 0.2 / zoom, "data-mid": i, style: "cursor:copy" }));
+      }
+      pts.forEach((q, i) => ui.append(svgEl("circle", { cx: q[0], cy: q[1], r, fill: i === node ? "#f60" : "#06c", stroke: "#fff", "stroke-width": 0.2 / zoom, "data-node": i, style: "cursor:grab" })));
+    };
+    // The panel: what the selected thing can do.
+    const panel = h("div", { "data-panel": "props", style: "flex:1 1 55%;min-height:0;padding:10px;overflow:auto;box-sizing:border-box" });
+    const layers = h("div", { "data-panel": "layers", style: "flex:1 1 45%;min-height:0;overflow:auto" });
+    // Everything drawn on the plan, to pick it from a list as well as on the sheet.
+    const fillLayers = () => {
+      const same = (a, b) => a?.kind === b.kind && a.i === b.i && a.side === b.side;
+      const row = (s0, colour, text) => h("div", { class: `peLayer${same(sel, s0) ? " on" : ""}`, title: text, onclick: () => select(s0) }, h("span", { class: "peSwatch", style: `background:${colour}` }), text);
+      const six = (c) => (c || "#000").replace(/^#(.)(.)(.)$/, "#$1$1$2$2$3$3");
+      const rows = [
+        ...notes.map((x, i) => row({ kind: "note", i }, x.color || "#000000", `Text: ${x.text}`)).reverse(),
+        ...feats.map((x, i) => row({ kind: "feat", i }, six(x.color || symOf(x.symbol)?.stroke), `${symOf(x.symbol)?.label || x.symbol}${x.label ? `: ${x.label}` : ""}`)).reverse(),
+        ...roadBoxes.flatMap((b, side) => (b.checked ? [row({ kind: "road", side }, styles[`roadline:${side}`]?.color || "#000000", `Access road, side ${side + 1}`)] : [])),
+      ];
+      layers.replaceChildren(...(rows.length ? rows : [h("div", { style: "padding:10px;color:#aaa" }, "Nothing drawn yet.")]));
+    };
+    const prop = (label, input) => h("label", { style: "display:block;margin:8px 0" }, h("div", { style: "margin-bottom:2px;color:#ccc" }, label), input);
+    const wide = "width:100%;box-sizing:border-box";
+    const colourBox = (value, set, clear) => h("div", { style: "display:flex;gap:6px" },
+      h("input", { type: "color", value: value, style: "flex:1;height:26px", onchange: (e) => set(e.target.value) }),
+      h("button", { class: "btn", onclick: clear }, "Default"));
+    const changed = () => { show().catch(fail); fillPanel(); };
+    const removeSelected = () => {
+      if (sel?.kind === "feat") { mark(); feats.splice(sel.i, 1); dropFeatureMove(sel.i); renderFeats(); }
+      else if (sel?.kind === "note") { mark(); notes.splice(sel.i, 1); }
+      else return;
+      sel = null; node = null; changed();
+    };
+    const deleteNode = () => {
+      if (nodesOf(featEl(sel.i)).length <= 2) { hint.textContent = "A line needs at least two points. Use Delete feature to remove it."; return; }
+      mark(); freeFeature(sel.i).points.splice(node, 1); node = null; show().catch(fail);
+    };
+    // A straight access road becomes a feature with points, so that it can bend.
+    const freeRoad = (side, dx = 0, dy = 0, shape = (q) => q) => {
+      mark();
+      const g = el.querySelector(`[data-road="${side}"]`);
+      const key = `road:${side}`, i = feats.length;
+      feats.push({ symbol: "road_access", label: styles[key]?.text || roadLabel.value.trim() || d.prefill.road_label || "Access Road", side: null,
+        points: nodesOf(g).map(shape).map(([x, y]) => toGround([x + dx, y + dy])), smooth: true, color: styles[`roadline:${side}`]?.color || null, width: null });
+      if (moves[key]) { moves[`feature:${i}`] = moves[key]; delete moves[key]; }
+      if (styles[key]?.color || styles[key]?.angle) styles[`feature:${i}`] = { color: styles[key].color ?? null, text: null, angle: styles[key].angle ?? null };
+      delete styles[key]; delete styles[`roadline:${side}`];
+      roadBoxes[side].checked = false;
+      sel = { kind: "feat", i }; renderFeats(); changed();
+    };
+    // Copy and paste: the copy has its own points, so it is edited apart from the original. Each
+    // paste lands a little further on, to be dragged into place; one from another plan, whose
+    // ground lies off this sheet, comes in at the middle of the frame.
+    const copySelected = () => {
+      if (sel?.kind === "feat") {
+        const x = feats[sel.i];
+        tdClip = { feat: { ...x, side: null, points: x.side == null && x.points?.length ? x.points.map((q) => [...q]) : nodesOf(featEl(sel.i)).map(toGround) }, pasted: 0 };
+      } else if (sel?.kind === "road") {
+        const key = `road:${sel.side}`;
+        tdClip = { feat: { symbol: "road_access", label: styles[key]?.text || roadLabel.value.trim() || "Access Road", side: null,
+          points: nodesOf(el.querySelector(`[data-road="${sel.side}"]`)).map(toGround), smooth: true, color: styles[`roadline:${sel.side}`]?.color || null, width: null }, pasted: 0 };
+      } else { hint.textContent = "Select a road or feature to copy it."; return; }
+      hint.textContent = "Copied. Ctrl+V or Paste puts in a copy.";
+      bars();
+    };
+    const paste = () => {
+      if (!tdClip || draw) return;
+      if (!symOf(tdClip.feat.symbol)) { hint.textContent = "That symbol is not on this plan."; return; }
+      const [, , , fx0, fy1] = grid();
+      let pts = tdClip.feat.points.map(toPaper);
+      if (!pts.some(([x, y]) => x >= fx0 && x <= 210 - fx0 && y >= 60 && y <= fy1)) {
+        const cx = pts.reduce((a, q) => a + q[0], 0) / pts.length, cy = pts.reduce((a, q) => a + q[1], 0) / pts.length;
+        pts = pts.map(([x, y]) => [x - cx + 105, y - cy + (60 + fy1) / 2]);
+      }
+      const off = 5 * ++tdClip.pasted;
+      mark();
+      feats.push({ ...tdClip.feat, points: pts.map(([x, y]) => toGround([x + off, y + off])) });
+      sel = { kind: "feat", i: feats.length - 1 }; node = null;
+      renderFeats(); changed();
+      hint.textContent = "Pasted. Drag it into place.";
+    };
+    // The arrow keys move the selected line or feature (mm on the sheet).
+    const nudge = (dx, dy) => {
+      if (sel?.kind === "road") { freeRoad(sel.side, dx, dy); return; }
+      if (sel?.kind !== "feat") return;
+      mark();
+      const x = freeFeature(sel.i);
+      x.points = x.points.map((q) => { const [a, b] = toPaper(q); return toGround([a + dx, b + dy]); });
+      show().catch(fail);
+    };
+    const styleOf = (key) => (styles[key] ||= { color: null, text: null });
+    const tidyStyle = (key) => { if (styles[key] && !styles[key].color && !styles[key].text && !styles[key].angle) delete styles[key]; };
+    // Rotate: a line or road turns about its pivot (the middle, or where it is dragged to), and
+    // its points are stored turned; a label or text turns about the place it is written. Angles
+    // are clockwise. The beacons and the parcel have no part in it.
+    const selGroup = () => !sel ? null : sel.kind === "feat" ? featEl(sel.i) : sel.kind === "road" ? el.querySelector(`[data-road="${sel.side}"]`)
+      : el.querySelector(`[data-move="${sel.kind === "note" ? `note:${sel.i}` : sel.key}"]`);
+    const pivotOf = () => {
+      const g = selGroup();
+      if (g && !g.hasAttribute("data-nodes")) return g.getAttribute("data-at").split(" ").map(Number);
+      if (pivot?.of === JSON.stringify(sel)) return pivot.at; // set for this selection, not an earlier one
+      const q = nodesOf(g), xs = q.map((v) => v[0]), ys = q.map((v) => v[1]);
+      return [(Math.min(...xs) + Math.max(...xs)) / 2, (Math.min(...ys) + Math.max(...ys)) / 2];
+    };
+    const setPivot = (at) => { pivot = { at, of: JSON.stringify(sel) }; };
+    const turned = (c, deg) => ([x, y]) => {
+      const a = deg * Math.PI / 180, dx = x - c[0], dy = y - c[1];
+      return [c[0] + dx * Math.cos(a) - dy * Math.sin(a), c[1] + dx * Math.sin(a) + dy * Math.cos(a)];
+    };
+    const wrap = (a) => { const v = Math.round((((a + 180) % 360 + 360) % 360 - 180) * 10) / 10; return v === 0 ? null : v; };
+    const canTurn = () => sel && !(sel.kind === "feat" && symOf(feats[sel.i].symbol)?.point);
+    const applyTurn = (deg) => {
+      if (!sel) { hint.textContent = "Click a road, label or text to rotate it."; return; }
+      if (!canTurn()) { hint.textContent = "A point symbol has no direction to turn."; return; }
+      const c = pivotOf(), turn = turned(c, deg);
+      if (sel.kind === "road") { freeRoad(sel.side, 0, 0, turn); setPivot(c); overlay(); return; }
+      mark();
+      if (sel.kind === "feat") { setPivot(c); const x = freeFeature(sel.i); x.points = x.points.map((q) => toGround(turn(toPaper(q)))); }
+      else if (sel.kind === "note") notes[sel.i].angle = wrap((notes[sel.i].angle || 0) + deg);
+      else { styleOf(sel.key).angle = wrap((styles[sel.key]?.angle || 0) + deg); tidyStyle(sel.key); }
+      changed();
+    };
+    const straighten = () => {
+      if (sel?.kind === "note") { mark(); notes[sel.i].angle = null; changed(); }
+      else if (sel?.kind === "label" && styles[sel.key]?.angle) { mark(); styles[sel.key].angle = null; tidyStyle(sel.key); changed(); }
+    };
+    const fillPanel = () => {
+      const rows = [];
+      if (!sel) {
+        rows.push(h("b", {}, "Nothing selected"), h("p", { style: "color:#ccc;line-height:1.4" },
+          "Click a road, feature or label to edit it, or pick it under Layers. The tools on the left draw lines, symbols and text."));
+      } else if (sel.kind === "feat") {
+        const x = feats[sel.i], y = symOf(x.symbol);
+        rows.push(h("b", {}, y?.point ? "Point feature" : "Line feature"));
+        rows.push(prop("Type", h("select", { style: wide, onchange: (e) => { mark(); x.symbol = e.target.value; x.width = null; changed(); } },
+          ...d.symbols.filter((s) => s.point === !!y?.point).map((s) => h("option", { value: s.id, selected: s.id === x.symbol }, s.label)))));
+        if (!y?.point) rows.push(h("label", { style: "display:block;margin:8px 0" }, h("input", { type: "checkbox", checked: !!x.smooth, onchange: (e) => { mark(); x.smooth = e.target.checked; changed(); } }), " Smooth curve (spline)"));
+        rows.push(prop("Colour", colourBox(x.color || y?.stroke.replace(/^#(.)(.)(.)$/, "#$1$1$2$2$3$3") || "#000000", (c) => { mark(); x.color = c; changed(); }, () => { mark(); x.color = null; changed(); })));
+        if (y?.double) rows.push(prop("Width between lines (mm on the sheet)", h("input", { type: "number", min: 2, max: 30, step: 0.5, value: x.width ?? y.double, style: wide, onchange: (e) => { mark(); x.width = Number(e.target.value) || null; changed(); } })));
+        rows.push(prop("Label", h("input", { value: x.label || "", style: wide, onchange: (e) => { mark(); x.label = e.target.value.trim() || null; renderFeats(); changed(); } })));
+        if (!y?.point) rows.push(h("p", { style: "color:#ccc;line-height:1.4" }, "Drag a round point to reshape, or a small square to add a point. Double-click a point or press Delete to remove it. Drag the line, or use the arrow keys (Shift for bigger steps), to move all of it."));
+        rows.push(h("button", { class: "btn", onclick: removeSelected }, "Delete feature"));
+      } else if (sel.kind === "road") {
+        const key = `roadline:${sel.side}`;
+        rows.push(h("b", {}, `Access road, ${sideText(sel.side)}`));
+        rows.push(prop("Colour", colourBox(styles[key]?.color || "#000000", (c) => { mark(); styleOf(key).color = c; changed(); }, () => { mark(); delete styles[key]; changed(); })));
+        rows.push(h("button", { class: "btn", style: wide, onclick: () => freeRoad(sel.side) }, "Make editable (bend it, change its type)"));
+        rows.push(h("p", { style: "color:#ccc;line-height:1.4" }, "Drag it or use the arrow keys to move it. Moved or made editable, it becomes a drawn road: it no longer follows the side, and its rounded junction with a neighbouring access road goes."));
+      } else if (sel.kind === "note") {
+        const x = notes[sel.i];
+        rows.push(h("b", {}, "Text"));
+        rows.push(prop("Words", h("input", { value: x.text, style: wide, onchange: (e) => { mark(); x.text = e.target.value; changed(); } })));
+        rows.push(prop("Colour", colourBox(x.color || "#000000", (c) => { mark(); x.color = c; changed(); }, () => { mark(); x.color = null; changed(); })));
+        rows.push(prop("Size (mm)", h("input", { type: "number", min: 1.5, max: 12, step: 0.1, value: x.size ?? 2.8, style: wide, onchange: (e) => { mark(); x.size = Number(e.target.value) || null; changed(); } })));
+        rows.push(prop("Turn (degrees)", h("input", { type: "number", min: -180, max: 180, step: 1, value: x.angle ?? 0, style: wide, onchange: (e) => { mark(); x.angle = Number(e.target.value) || null; changed(); } })));
+        rows.push(h("button", { class: "btn", onclick: removeSelected }, "Delete text"));
+      } else {
+        const key = sel.key, [kind, idx] = key.split(":"), i = Number(idx);
+        rows.push(h("b", {}, "Label"));
+        const words = (value, set) => rows.push(prop("Words", h("input", { value, style: wide, onchange: (e) => { mark(); set(e.target.value.trim()); changed(); } })));
+        if (kind === "beacon") words(names[i].value || p.corners[i].name, (v) => { names[i].value = v === p.corners[i].name ? "" : v; names[i].dispatchEvent(new Event("input")); });
+        else if (kind === "road") words(styles[key]?.text || roadLabel.value || "Access Road", (v) => { styleOf(key).text = v || null; tidyStyle(key); });
+        else if (kind === "feature") words(feats[i].label || "", (v) => { feats[i].label = v || null; renderFeats(); });
+        else rows.push(h("p", { style: "color:#ccc;line-height:1.4" }, "Computed from the registered co-ordinates, so its words can't be changed. It can be moved and recoloured."));
+        rows.push(prop("Colour", colourBox(styles[key]?.color || "#000000", (c) => { mark(); styleOf(key).color = c; changed(); }, () => { mark(); if (styles[key]) { styles[key].color = null; tidyStyle(key); } changed(); })));
+        rows.push(prop("Turn (degrees)", h("input", { type: "number", min: -180, max: 180, step: 1, value: styles[key]?.angle ?? 0, style: wide, onchange: (e) => { mark(); styleOf(key).angle = wrap(Number(e.target.value) || 0); tidyStyle(key); changed(); } })));
+        rows.push(h("button", { class: "btn", onclick: () => { mark(); delete moves[key]; if (styles[key]) { styles[key].angle = null; tidyStyle(key); } changed(); } }, "Put it back"));
+      }
+      panel.replaceChildren(...rows);
+      fillLayers();
+    };
+    const select = (s) => { sel = s; node = null; pivot = null; fillPanel(); overlay(); };
+
+    // The workspace, laid out as in an image editor: tools down the left, the tool's options along
+    // the top, Properties and Layers on the right, and a status bar.
+    const lineSym = symSel.cloneNode(true), spotSym = symSel.cloneNode(true);
+    for (const g of [...lineSym.querySelectorAll("optgroup")]) if (g.label === "Point features") g.remove();
+    for (const g of [...spotSym.querySelectorAll("optgroup")]) if (g.label !== "Point features") g.remove();
+    lineSym.setAttribute("data-opt", "line"); spotSym.setAttribute("data-opt", "spot");
+    const adjPlace = placeSel.cloneNode(true);
+    adjPlace.options[0].textContent = "Draw on the sheet";
+    const adjLabel = h("input", { placeholder: "Label (optional)", style: "width:130px" });
+    const adjSmooth = h("input", { type: "checkbox", checked: true });
+    const sideBtn = h("button", { class: "btn" }, "Add along the side");
+    const undoBtn = h("button", { class: "btn", title: "Ctrl+Z", onclick: () => step(undo, redo) }, "Undo");
+    const redoBtn = h("button", { class: "btn", title: "Ctrl+Y", onclick: () => step(redo, undo) }, "Redo");
+    const copyBtn = h("button", { class: "btn", title: "Copy the selected road or feature (Ctrl+C)", onclick: copySelected }, "Copy");
+    const pasteBtn = h("button", { class: "btn", title: "Put in a copy (Ctrl+V)", onclick: paste }, "Paste");
+    const zoomText = h("span", {}, "100%");
+    const scaleText = h("span", {}, "");
+    const cursorText = h("span", { style: "font-variant-numeric:tabular-nums" }, "");
+    const bars = () => { undoBtn.disabled = !undo.length; redoBtn.disabled = !redo.length; pasteBtn.disabled = !tdClip; };
+    const setZoom = (z) => { zoom = Math.min(6, Math.max(0.5, z)); page.style.width = `${900 * zoom}px`; zoomText.textContent = `${Math.round(zoom * 100)}%`; overlay(); };
+    const idle = "Click something to edit it. Drag labels, points and lines. Ctrl+wheel zooms, Space drags the sheet.";
+    const TOOLS = [
+      ["select", "V", "Select and move", '<path d="M4 2l11 10-5 .6 3 6-2.4 1-2.8-6L4 17z" fill="currentColor"/>'],
+      ["rotate", "R", "Rotate a road, label or text", '<path d="M16.500 10a6.500 6.500 0 11-2-4.700" fill="none" stroke="currentColor" stroke-width="2"/><path d="M12 6.500h5.500V1z" fill="currentColor"/>'],
+      ["pen", "P", "Draw a road or line", '<path d="M2 17C6 3 12 17 18 3" fill="none" stroke="currentColor" stroke-width="1.8"/><rect x="0.5" y="15" width="4" height="4" fill="currentColor"/><rect x="15.5" y="1" width="4" height="4" fill="currentColor"/>'],
+      ["symbol", "S", "Place a tree, pole or other point", '<circle cx="10" cy="10" r="7" fill="none" stroke="currentColor" stroke-width="1.8"/><circle cx="10" cy="10" r="2" fill="currentColor"/>'],
+      ["text", "T", "Add text", '<path d="M3 3h14v4h-1.5l-.5-2H11.2v10.5l2 .5V18H6.8v-2l2-.5V5H5L4.500 7H3z" fill="currentColor"/>'],
+      ["hand", "H", "Drag the sheet (or hold Space)", '<path d="M6 10V4.500a1.200 1.200 0 012.400 0V9h.6V3.200a1.200 1.200 0 012.400 0V9h.6V4.200a1.200 1.200 0 012.400 0V12c0 4-2 6-5.500 6-3 0-4.200-1.500-5.500-4L1.800 10.500c-.7-1.300 1.100-2.300 2-1.200z" fill="currentColor"/>'],
+      ["zoom", "Z", "Zoom: click to zoom in, Alt+click out", '<circle cx="8" cy="8" r="5.500" fill="none" stroke="currentColor" stroke-width="2"/><path d="M12 12l6 6" stroke="currentColor" stroke-width="2.500"/>'],
+    ];
+    const toolBtns = Object.fromEntries(TOOLS.map(([id, k, name, icon]) => [id, h("button", { class: "peTool", title: `${name} (${k})`, "data-tool": id, html: `<svg viewBox="0 0 20 20" width="20" height="20">${icon}</svg>`, onclick: () => setEditTool(id) })]));
+    const options = h("div", { class: "peRow" });
+    const zoomOptions = () => [h("button", { class: "btn", onclick: () => setZoom(zoom / 1.25) }, "Zoom out"), h("button", { class: "btn", onclick: () => setZoom(zoom * 1.25) }, "Zoom in"), h("button", { class: "btn", onclick: () => setZoom(1) }, "Fit")];
+    const fillOptions = () => {
+      const place = [h("span", {}, "Place:"), adjPlace, h("span", {}, "Label:"), adjLabel];
+      const add = adjPlace.value !== "" ? [sideBtn] : [];
+      options.replaceChildren(...{
+        select: () => [h("span", {}, "Select and move"), h("button", { class: "btn", onclick: () => { mark(); moves = {}; for (const k of Object.keys(styles)) { styles[k].angle = null; tidyStyle(k); } show().catch(fail); } }, "Reset all labels")],
+        pen: () => [h("span", {}, "Type:"), lineSym, ...place, h("label", { style: "white-space:nowrap" }, adjSmooth, " Curve"), ...add],
+        symbol: () => [h("span", {}, "Symbol:"), spotSym, ...place, ...add],
+        text: () => [h("span", {}, "Click the sheet where the text starts.")],
+        rotate: () => {
+          const by = h("input", { type: "number", "data-opt": "angle", min: -360, max: 360, step: 1, value: 15, style: "width:60px" });
+          return [h("span", {}, "Angle:"), by, h("span", {}, "°"), h("button", { class: "btn", title: "Clockwise", onclick: () => applyTurn(Number(by.value) || 0) }, "Rotate"),
+            h("button", { class: "btn", onclick: () => applyTurn(-90) }, "Left 90°"), h("button", { class: "btn", onclick: () => applyTurn(90) }, "Right 90°"),
+            h("button", { class: "btn", title: "A label or text back to how the sheet writes it", onclick: straighten }, "Straighten")];
+        },
+        hand: () => [h("span", {}, "Drag the sheet to look around it."), ...zoomOptions()],
+        zoom: () => zoomOptions(),
+      }[tool]());
+    };
+    const toolHints = {
+      rotate: "Click what to rotate, then drag around the orange pivot (Shift: 15° steps). Drag the pivot to turn a line about another point.",
+      pen: "Click along it, double-click or Enter to finish. Backspace takes back a point. Esc cancels.",
+      symbol: "Click its position on the sheet. Esc cancels.", text: "Click where the text starts. Esc cancels.",
+      hand: "Drag to look around the sheet.", zoom: "Click to zoom in, Alt+click to zoom out.",
+    };
+    // A drawing tool is ready at once, unless it is to go along a side.
+    const arm = () => {
+      draw = null;
+      if (tool === "text") draw = { pts: [], text: true };
+      else if ((tool === "pen" || tool === "symbol") && adjPlace.value === "") draw = { pts: [], point: tool === "symbol", smooth: tool === "pen" && adjSmooth.checked };
+    };
+    const setEditTool = (t) => {
+      tool = t; arm();
+      if (draw) { sel = null; node = null; fillPanel(); }
+      page.className = `peSheet tool-${t}${draw ? " drawing" : ""}`;
+      for (const [id, b] of Object.entries(toolBtns)) b.classList.toggle("on", id === t);
+      fillOptions(); hint.textContent = toolHints[t] || idle; overlay();
+    };
+    const stopDraw = () => setEditTool("select");
+    const addFeat = (x) => { mark(); feats.push(x); adjLabel.value = ""; sel = { kind: "feat", i: feats.length - 1 }; node = null; renderFeats(); };
+    const currentSym = () => (tool === "symbol" ? spotSym : lineSym).value;
     const finishDraw = () => {
-      const x = { ...draw.base, points: draw.pts.map(toGround) };
-      stopDraw(); addFeature(x);
+      if (draw.text) return;
+      const x = { symbol: currentSym(), label: adjLabel.value.trim() || null, side: null, points: draw.pts.map(toGround), smooth: draw.smooth, color: null, width: null };
+      draw = null; addFeat(x); stopDraw(); changed();
     };
-    drawBtn.addEventListener("click", () => {
-      if (draw) { stopDraw(); return; }
-      const base = { symbol: adjSym.value, label: adjLabel.value.trim() || null, side: null, points: [] };
-      if (adjPlace.value !== "") { addFeature({ ...base, side: Number(adjPlace.value) }); return; }
-      const point = symOf(base.symbol).point;
-      const line = document.createElementNS("http://www.w3.org/2000/svg", "polyline");
-      line.setAttribute("fill", "none"); line.setAttribute("stroke", "#f0f"); line.setAttribute("stroke-width", "0.4");
-      el.append(line);
-      draw = { pts: [], point, base, line };
-      page.classList.add("drawing"); drawBtn.textContent = "Cancel drawing";
-      hint.textContent = point ? "Click its position on the sheet. Esc cancels." : "Click along it on the sheet, double-click to finish. Esc cancels.";
+    adjPlace.addEventListener("change", () => setEditTool(tool));
+    adjSmooth.addEventListener("change", () => { if (draw) { draw.smooth = adjSmooth.checked; overlay(); } });
+    sideBtn.addEventListener("click", () => {
+      addFeat({ symbol: currentSym(), label: adjLabel.value.trim() || null, side: Number(adjPlace.value), points: [], smooth: false, color: null, width: null });
+      adjPlace.value = ""; stopDraw(); changed();
     });
-    const onKey = (e) => { if (e.key === "Escape" && draw) stopDraw(); };
+    const onKey = (e) => {
+      const typing = /^(INPUT|SELECT|TEXTAREA)$/.test(e.target.tagName);
+      if ((e.ctrlKey || e.metaKey) && !typing && e.key.toLowerCase() === "z") { e.preventDefault(); if (e.shiftKey) step(redo, undo); else step(undo, redo); return; }
+      if ((e.ctrlKey || e.metaKey) && !typing && e.key.toLowerCase() === "y") { e.preventDefault(); step(redo, undo); return; }
+      if ((e.ctrlKey || e.metaKey) && !typing && e.key.toLowerCase() === "c") { e.preventDefault(); copySelected(); return; }
+      if ((e.ctrlKey || e.metaKey) && !typing && e.key.toLowerCase() === "v") { e.preventDefault(); paste(); return; }
+      if (typing) return;
+      if (e.key === " ") { e.preventDefault(); document.activeElement?.blur?.(); space = true; page.classList.add("space"); return; }
+      if (e.key === "Escape") { if (tool !== "select") stopDraw(); else select(null); return; }
+      const picked = !e.ctrlKey && !e.metaKey && !e.altKey && TOOLS.find((t) => t[1] === e.key.toUpperCase());
+      if (picked) { setEditTool(picked[0]); return; }
+      if (draw) {
+        if (e.key === "Enter" && !draw.point && !draw.text && draw.pts.length >= 2) finishDraw();
+        if (e.key === "Backspace") { e.preventDefault(); draw.pts.pop(); overlay(); }
+        return;
+      }
+      const arrow = { ArrowLeft: [-1, 0], ArrowRight: [1, 0], ArrowUp: [0, -1], ArrowDown: [0, 1] }[e.key];
+      if (arrow && (sel?.kind === "feat" || sel?.kind === "road")) { e.preventDefault(); const by = e.shiftKey ? 5 : 1; nudge(arrow[0] * by, arrow[1] * by); return; }
+      if (e.key === "Delete" || e.key === "Backspace") {
+        e.preventDefault();
+        if (sel?.kind === "feat" && node != null) deleteNode(); else removeSelected();
+      }
+    };
+    const onKeyUp = (e) => { if (e.key === " ") { space = false; page.classList.remove("space"); } };
     document.addEventListener("keydown", onKey);
-    const close = () => { stopDraw(); document.removeEventListener("keydown", onKey); ov.remove(); };
-    const place = (g, key) => { const m = moves[key]; if (m) g.setAttribute("transform", `translate(${m[0]} ${m[1]})`); else g.removeAttribute("transform"); };
-    const bar = h("div", { style: "position:sticky;top:0;z-index:1;padding:8px;background:#333;color:#fff;font:13px sans-serif;text-align:center" },
-      h("div", { style: "display:flex;gap:8px;align-items:center;justify-content:center;margin-bottom:6px" }, adjSym, adjPlace, adjLabel, drawBtn,
-        h("button", { class: "btn", onclick: () => { if (!feats.length || draw) return; feats.pop(); dropFeatureMove(feats.length); renderFeats(); show().catch(fail); } }, "Remove last feature")),
-      h("div", { style: "display:flex;gap:8px;align-items:center;justify-content:center" }, hint,
-        h("button", { class: "btn", onclick: () => { moves = {}; page.querySelectorAll("[data-move]").forEach((g) => g.removeAttribute("transform")); } }, "Reset all labels"),
-        h("button", { class: "btn", title: "Put the labels back as they were; added features stay", onclick: () => { moves = before; close(); save().catch(fail); } }, "Cancel label moves"),
-        h("button", { class: "btn", onclick: () => { close(); save().catch(fail); } }, "Done")));
-    const ov = h("div", { style: "position:fixed;inset:0;z-index:2000;overflow:auto;background:#777" },
-      h("style", {}, "[data-move]{cursor:move}[data-move]:hover text{fill:#06c}.drawing svg,.drawing [data-move]{cursor:crosshair}"), bar, page);
+    document.addEventListener("keyup", onKeyUp);
+    const close = () => { seq++; document.removeEventListener("keydown", onKey); document.removeEventListener("keyup", onKeyUp); ov.remove(); };
+    const place = (g, key) => {
+      const m = moves[key], a = styles[key]?.angle, at = g.getAttribute("data-at");
+      const t = [m ? `translate(${m[0]} ${m[1]})` : "", a ? `rotate(${a} ${at})` : ""].filter(Boolean).join(" ");
+      if (t) g.setAttribute("transform", t); else g.removeAttribute("transform");
+    };
+    const scroller = h("div", { class: "peBoard" }, page);
+    const ov = h("div", { class: "peWork" },
+      h("style", {}, `.peWork{position:fixed;inset:0;z-index:2000;display:flex;flex-direction:column;background:#2b2b2b;color:#ddd;font:12px sans-serif}
+.peRow{display:flex;gap:8px;align-items:center;flex-wrap:wrap}.peBar{flex:none;padding:5px 10px;background:#3a3a3a;border-bottom:1px solid #1e1e1e}
+.peWork .btn{background:#505050;color:#eee;border:1px solid #1e1e1e;border-radius:3px;padding:3px 9px;font:12px sans-serif;cursor:pointer}.peWork .btn:hover:not(:disabled){background:#626262}.peWork .btn:disabled{opacity:.4;cursor:default}
+.peWork input:not([type=checkbox]):not([type=color]),.peWork select{background-color:#262626;color:#eee;border:1px solid #1a1a1a;border-radius:2px;padding:2px 4px;font:12px sans-serif}
+.peWork select{appearance:none;-webkit-appearance:none;padding-right:18px;background-image:linear-gradient(45deg,transparent 50%,#bbb 50%),linear-gradient(135deg,#bbb 50%,transparent 50%);background-size:5px 5px;background-position:right 10px center,right 5px center;background-repeat:no-repeat}.peWork option,.peWork optgroup{background:#262626;color:#eee}
+.peTools{flex:none;width:42px;padding:6px 0;background:#3a3a3a;border-right:1px solid #1e1e1e;display:flex;flex-direction:column;align-items:center;gap:3px}
+.peTool{width:32px;height:32px;padding:6px;background:none;color:#ccc;border:0;border-radius:3px;cursor:pointer}.peTool:hover{background:#505050}.peTool.on{background:#1e6fc4;color:#fff}
+.peBoard{flex:1;overflow:auto;background:#1f1f1f;padding:24px;min-width:0}.peSheet{margin:0 auto;background:#fff;box-shadow:0 0 12px #000;touch-action:none;user-select:none}
+.peDock{flex:none;width:270px;display:flex;flex-direction:column;background:#3a3a3a;border-left:1px solid #1e1e1e;min-height:0}.peHead{flex:none;padding:4px 10px;background:#2f2f2f;border-bottom:1px solid #1e1e1e;font-weight:bold}
+.peLayer{display:flex;gap:7px;align-items:center;padding:4px 10px;border-bottom:1px solid #303030;cursor:pointer;white-space:nowrap;overflow:hidden}.peLayer:hover{background:#464646}.peLayer.on{background:#1e6fc4;color:#fff}
+.peSwatch{flex:none;width:12px;height:12px;border:1px solid #111}.peGap{flex:1}
+.peStatus{flex:none;display:flex;gap:18px;align-items:center;padding:3px 10px;background:#2f2f2f;border-top:1px solid #1e1e1e}
+.peSheet [data-move]{cursor:move}.peSheet [data-move]:hover text{fill:#06c}.peSheet [data-feat],.peSheet [data-road]{cursor:pointer}
+.peSheet.drawing svg,.peSheet.drawing [data-move],.peSheet.drawing [data-feat],.peSheet.drawing [data-road]{cursor:crosshair}
+.peSheet.tool-rotate svg,.peSheet.tool-rotate *{cursor:grab}.peSheet.tool-hand svg,.peSheet.tool-hand *,.peSheet.space svg,.peSheet.space *{cursor:grab!important}.peSheet.tool-zoom svg,.peSheet.tool-zoom *{cursor:zoom-in!important}`),
+      h("div", { class: "peBar peRow" }, h("b", {}, `Edit plan: ${fields.title_no.value || p.upin}`), undoBtn, redoBtn, copyBtn, pasteBtn, h("span", { class: "peGap" }),
+        h("button", { class: "btn", title: "Put the plan back as it was when the editor opened", onclick: () => { restore(opened); close(); } }, "Cancel"),
+        h("button", { class: "btn", title: "Save the plan with the job", onclick: () => { close(); save().catch(fail); } }, "Done")),
+      h("div", { class: "peBar", style: "min-height:24px" }, options),
+      h("div", { style: "flex:1;display:flex;min-height:0" }, h("div", { class: "peTools" }, ...Object.values(toolBtns)), scroller,
+        h("div", { class: "peDock" }, h("div", { class: "peHead" }, "Properties"), panel, h("div", { class: "peHead" }, "Layers"), layers)),
+      h("div", { class: "peStatus" }, hint, h("span", { class: "peGap" }), cursorText, scaleText, zoomText));
+    setZoom(1); bars(); fillPanel(); setEditTool("select");
+    try { await show(); } catch (e) { close(); fail(e); return; }
     document.body.append(ov);
+    scroller.addEventListener("wheel", (e) => { if (!e.ctrlKey) return; e.preventDefault(); setZoom(zoom * (e.deltaY < 0 ? 1.15 : 1 / 1.15)); }, { passive: false });
+    let pressed = null; // the last point pressed: a second press soon after is a double-click
     page.addEventListener("pointerdown", (e) => {
+      if (tool === "hand" || space) { drag = { kind: "pan", x: e.clientX, y: e.clientY, left: scroller.scrollLeft, top: scroller.scrollTop, moved: true }; e.preventDefault(); return; }
+      if (tool === "zoom") {
+        const r = scroller.getBoundingClientRect(), fx = (e.clientX - r.left + scroller.scrollLeft) / scroller.scrollWidth, fy = (e.clientY - r.top + scroller.scrollTop) / scroller.scrollHeight;
+        setZoom(zoom * (e.altKey ? 1 / 1.5 : 1.5));
+        scroller.scrollLeft = fx * scroller.scrollWidth - r.width / 2; scroller.scrollTop = fy * scroller.scrollHeight - r.height / 2;
+        e.preventDefault(); return;
+      }
+      if (tool === "rotate") {
+        if (panel.contains(document.activeElement)) document.activeElement.blur();
+        e.preventDefault();
+        if (e.target.dataset?.pivot != null) { drag = { kind: "pivot", moved: true }; return; }
+        const label = e.target.closest("[data-move]"), f1 = e.target.closest("[data-feat]"), r1 = e.target.closest("[data-road]");
+        const key = label?.getAttribute("data-move"), note = key && /^note:(\d+)$/.exec(key);
+        const hit = note ? { kind: "note", i: Number(note[1]) } : label ? { kind: "label", key } : f1 ? { kind: "feat", i: Number(f1.getAttribute("data-feat")) } : r1 ? { kind: "road", side: Number(r1.getAttribute("data-road")) } : null;
+        // A press on something else picks it; on it, or on the bare sheet, it starts the turn.
+        if (hit && !(sel?.kind === hit.kind && sel.i === hit.i && sel.side === hit.side && sel.key === hit.key)) { select(hit); return; }
+        if (!sel) { hint.textContent = "Click a road, label or text to rotate it."; return; }
+        if (!canTurn()) { hint.textContent = "A point symbol has no direction to turn."; return; }
+        const c = pivotOf(), q = mmAt(e), g = selGroup();
+        drag = { kind: "turn", c, a0: Math.atan2(q[1] - c[1], q[0] - c[0]), g, base: g.getAttribute("transform") || "", deg: 0, moved: true };
+        return;
+      }
       if (draw) return;
-      const g = e.target.closest("[data-move]");
-      if (!g) return;
-      const key = g.getAttribute("data-move");
-      drag = { g, key, x: e.clientX, y: e.clientY, base: moves[key] || [0, 0], mm: el.getScreenCTM().a };
-      e.preventDefault();
+      // What is being typed in the panel counts before the selection moves on.
+      if (panel.contains(document.activeElement)) document.activeElement.blur();
+      const start = { x: e.clientX, y: e.clientY, mm: el.getScreenCTM().a, moved: false };
+      const t = e.target;
+      if (t.dataset?.node != null) {
+        node = Number(t.dataset.node);
+        const twice = pressed?.i === node && e.timeStamp - pressed.at < 400;
+        pressed = { i: node, at: e.timeStamp };
+        e.preventDefault();
+        if (twice) { pressed = null; deleteNode(); return; }
+        const x = feats[sel.i], pts = nodesOf(featEl(sel.i));
+        drag = { ...start, kind: "node", x0: x, pts, i: node };
+        overlay(); e.preventDefault(); return;
+      }
+      if (t.dataset?.mid != null) {
+        const x = feats[sel.i], pts = nodesOf(featEl(sel.i)), i = Number(t.dataset.mid) + 1;
+        const at = [Number(t.getAttribute("x")) + Number(t.getAttribute("width")) / 2, Number(t.getAttribute("y")) + Number(t.getAttribute("height")) / 2];
+        pts.splice(i, 0, at);
+        node = i;
+        drag = { ...start, kind: "node", x0: x, pts, i, added: true };
+        e.preventDefault(); return;
+      }
+      const label = t.closest("[data-move]");
+      if (label) {
+        const key = label.getAttribute("data-move"), note = /^note:(\d+)$/.exec(key);
+        select(note ? { kind: "note", i: Number(note[1]) } : { kind: "label", key });
+        drag = { ...start, kind: "label", g: label, key, base: moves[key] || [0, 0], before: snap(), note: note ? Number(note[1]) : null };
+        e.preventDefault(); return;
+      }
+      const f0 = t.closest("[data-feat]");
+      if (f0) {
+        const i = Number(f0.getAttribute("data-feat"));
+        select({ kind: "feat", i });
+        drag = { ...start, kind: "line", g: f0, i, pts: nodesOf(f0), before: snap() };
+        e.preventDefault(); return;
+      }
+      const r0 = t.closest("[data-road]");
+      if (r0) {
+        const side = Number(r0.getAttribute("data-road"));
+        select({ kind: "road", side });
+        drag = { ...start, kind: "road", g: r0, side };
+        e.preventDefault(); return;
+      }
+      select(null);
     });
     ov.addEventListener("pointermove", (e) => {
+      if (el && page.contains(e.target)) {
+        const q = mmAt(e), [ge, gn] = toGround(q);
+        cursorText.textContent = `E ${ge.toFixed(3)}   N ${gn.toFixed(3)}`;
+      }
       if (!drag) return;
-      const r = (v) => Math.round(v * 100) / 100;
-      moves[drag.key] = [r(drag.base[0] + (e.clientX - drag.x) / drag.mm), r(drag.base[1] + (e.clientY - drag.y) / drag.mm)];
-      place(drag.g, drag.key);
+      if (drag.kind === "pivot") { setPivot(mmAt(e)); overlay(); return; }
+      if (drag.kind === "turn") {
+        const q = mmAt(e), raw = (Math.atan2(q[1] - drag.c[1], q[0] - drag.c[0]) - drag.a0) * 180 / Math.PI;
+        drag.deg = e.shiftKey ? Math.round(raw / 15) * 15 : Math.round(raw * 10) / 10;
+        drag.g.setAttribute("transform", `rotate(${drag.deg} ${drag.c[0]} ${drag.c[1]}) ${drag.base}`);
+        hint.textContent = `Rotating ${wrap(drag.deg) ?? 0}°`;
+        return;
+      }
+      if (drag.kind === "pan") { scroller.scrollLeft = drag.left - (e.clientX - drag.x); scroller.scrollTop = drag.top - (e.clientY - drag.y); return; }
+      const dx = (e.clientX - drag.x) / drag.mm, dy = (e.clientY - drag.y) / drag.mm;
+      if (!drag.moved && Math.hypot(e.clientX - drag.x, e.clientY - drag.y) < 3) return;
+      drag.moved = true;
+      if (drag.kind === "label") {
+        const r = (v) => Math.round(v * 100) / 100;
+        moves[drag.key] = [r(drag.base[0] + dx), r(drag.base[1] + dy)];
+        place(drag.g, drag.key);
+      } else if (drag.kind === "line" || drag.kind === "road") {
+        drag.g.setAttribute("transform", `translate(${dx} ${dy})`);
+        ui.replaceChildren();
+      } else {
+        drag.pts[drag.i] = mmAt(e);
+        ui.replaceChildren(svgEl("polyline", { points: through(drag.pts, drag.x0.smooth).map((q) => q.join(",")).join(" "), fill: "none", stroke: "#f60", "stroke-width": 0.3 / zoom, "pointer-events": "none" }),
+          ...drag.pts.map((q) => svgEl("circle", { cx: q[0], cy: q[1], r: 1 / zoom, fill: "#f60", "pointer-events": "none" })));
+      }
     });
-    const drop = () => { drag = null; };
+    const drop = (e) => {
+      const g = drag;
+      drag = null;
+      if (!g || g.kind === "pan" || g.kind === "pivot") return;
+      if (g.kind === "turn") { hint.textContent = toolHints.rotate; if (wrap(g.deg)) applyTurn(wrap(g.deg)); return; }
+      if (!g.moved) { if (g.added) overlay(); else { overlay(); fillPanel(); } return; }
+      const dx = (e.clientX - g.x) / g.mm, dy = (e.clientY - g.y) / g.mm;
+      if (g.kind === "road") { freeRoad(g.side, dx, dy); return; }
+      if (g.kind === "label") {
+        undo.push(g.before); redo.length = 0; bars();
+        if (g.note != null) { // a note keeps its place in co-ordinates, not as a move
+          const [x, y] = toPaper(notes[g.note].at);
+          notes[g.note].at = toGround([x + dx, y + dy]);
+          delete moves[g.key];
+          show().catch(fail);
+        }
+      } else if (g.kind === "line") {
+        undo.push(g.before); redo.length = 0; bars();
+        const x = feats[g.i];
+        x.side = null;
+        x.points = g.pts.map(([a, b]) => toGround([a + dx, b + dy]));
+        show().catch(fail);
+      } else {
+        mark();
+        const x = freeFeature(sel.i);
+        x.points = g.pts.map(toGround);
+        show().catch(fail);
+      }
+    };
     ov.addEventListener("pointerup", drop);
     ov.addEventListener("pointercancel", drop);
     page.addEventListener("click", (e) => {
       if (!draw) return;
+      const q = mmAt(e);
+      if (draw.text) {
+        stopDraw(); mark();
+        notes.push({ text: "Text", at: toGround(q), color: null, size: null, angle: null });
+        sel = { kind: "note", i: notes.length - 1 }; changed();
+        panel.querySelector("input")?.select(); // ready to type over
+        return;
+      }
       // A double-click also delivers two clicks at the same spot; don't add zero-length segments.
-      const q = mmAt(e), last = draw.pts[draw.pts.length - 1];
+      const last = draw.pts[draw.pts.length - 1];
       if (last && Math.hypot(q[0] - last[0], q[1] - last[1]) < 0.5) return;
       draw.pts.push(q);
       if (draw.point) { finishDraw(); return; }
-      draw.line.setAttribute("points", draw.pts.map((p) => p.join(",")).join(" "));
+      overlay();
     });
     page.addEventListener("dblclick", (e) => {
-      if (draw) { if (draw.pts.length >= 2) finishDraw(); return; }
+      if (draw) { if (!draw.text && draw.pts.length >= 2) finishDraw(); return; }
       const g = e.target.closest("[data-move]");
       if (!g) return;
       const key = g.getAttribute("data-move");
-      delete moves[key];
+      if (key.startsWith("note:") || !(moves[key] || styles[key]?.angle)) return;
+      mark(); delete moves[key];
+      if (styles[key]) { styles[key].angle = null; tidyStyle(key); }
       place(g, key);
     });
   };
@@ -5391,7 +5894,7 @@ async function titleDeedDialog(jobId, upin) {
     msg,
     h("div", { class: "frow", style: "flex-wrap:wrap;justify-content:flex-end" },
       h("button", { class: "btn", onclick: () => save().catch((e) => { msg.style.color = "#900"; msg.textContent = e.message; }) }, "Save"),
-      h("button", { class: "btn", onclick: adjust, title: "On the sheet: drag beacon numbers, bearings and distances, and add roads and other features" }, "Adjust labels"),
+      h("button", { class: "btn", onclick: edit, title: "On the sheet: draw and reshape roads and features, move, recolour and retype labels, add text" }, "Edit plan"),
       h("button", { class: "btn", onclick: preview }, "Preview / Print"),
       h("button", { class: "btn", onclick: attach, title: "File the plan on the job as a PDF, for Send plan" }, "Attach as PDF"),
       h("button", { class: "btn", onclick: () => openRegistry({ job: jobId, view: "send" }) }, "Send plan…"))),
