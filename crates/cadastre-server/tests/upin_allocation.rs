@@ -32,7 +32,7 @@ async fn app(db_url: &str) -> Router {
         keycloak_jwks_json: None,
         keycloak_jwks_path: None,
         catalog_folders: Vec::new(),
-        catalog_databases: Vec::new(),
+        catalog_databases: Vec::new(), registry_sql: None,
     };
     routes::router(AppState { pool, config, jwks: None::<Arc<_>> })
 }

@@ -14,6 +14,45 @@ pub enum AuthMode {
     Local,
 }
 
+/// How to reach the Aumentum Registry's SQL Server (LRS43) for the user-admin write-path. A plain
+/// value (no driver dependency); the `registry-admin` feature's `regadmin` module consumes it.
+#[derive(Clone)]
+pub struct RegistrySqlConfig {
+    pub host: String,
+    pub port: u16,
+    pub database: String,
+    pub username: String,
+    pub password: String,
+}
+
+impl std::fmt::Debug for RegistrySqlConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("RegistrySqlConfig")
+            .field("host", &self.host)
+            .field("port", &self.port)
+            .field("database", &self.database)
+            .field("username", &self.username)
+            .field("password", &"****")
+            .finish()
+    }
+}
+
+impl RegistrySqlConfig {
+    /// `CADASTRE_REGISTRY_SQL_HOST`, `_USER`, `_PASSWORD` are required; `_PORT` (default 1433) and
+    /// `_DATABASE` (default `LRS43`) are optional. `None` when any required var is unset — the
+    /// Registry-admin dashboard is then off.
+    pub fn from_env() -> Option<Self> {
+        let get = |k: &str| env::var(k).ok().map(|v| v.trim().to_string()).filter(|v| !v.is_empty());
+        Some(Self {
+            host: get("CADASTRE_REGISTRY_SQL_HOST")?,
+            port: get("CADASTRE_REGISTRY_SQL_PORT").and_then(|v| v.parse().ok()).unwrap_or(1433),
+            database: get("CADASTRE_REGISTRY_SQL_DATABASE").unwrap_or_else(|| "LRS43".to_string()),
+            username: get("CADASTRE_REGISTRY_SQL_USER")?,
+            password: get("CADASTRE_REGISTRY_SQL_PASSWORD")?,
+        })
+    }
+}
+
 /// Server configuration.
 #[derive(Clone, Debug)]
 pub struct Config {
@@ -37,6 +76,9 @@ pub struct Config {
     /// Catalog database connections (`CADASTRE_CATALOG_DATABASES`, `name=jsonpath;…`) — geodatabase
     /// feature-class lists read from a snapshot JSON.
     pub catalog_databases: Vec<crate::catalog::DatabaseConnection>,
+    /// Registry (LRS43) SQL Server connection for the user-admin dashboard, when configured
+    /// (`CADASTRE_REGISTRY_SQL_*`). Used only by the `registry-admin` feature.
+    pub registry_sql: Option<RegistrySqlConfig>,
 }
 
 impl Config {
@@ -104,6 +146,7 @@ impl Config {
             keycloak_jwks_path: non_empty(env::var("CADASTRE_KEYCLOAK_JWKS_PATH").ok()),
             catalog_folders,
             catalog_databases,
+            registry_sql: RegistrySqlConfig::from_env(),
         })
     }
 }

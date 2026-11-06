@@ -18,7 +18,7 @@ async fn state(url: &str, auth_mode: AuthMode) -> AppState {
     let config = Config {
         database_url: url.to_string(), bind_addr: "127.0.0.1:0".to_string(), auth_mode,
         keycloak_issuer: None, keycloak_audience: None, keycloak_jwks_json: None, keycloak_jwks_path: None,
-        catalog_folders: Vec::new(), catalog_databases: Vec::new(),
+        catalog_folders: Vec::new(), catalog_databases: Vec::new(), registry_sql: None,
     };
     AppState { pool, config, jwks: None::<Arc<_>> }
 }

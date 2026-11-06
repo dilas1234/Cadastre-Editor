@@ -32,7 +32,7 @@ async fn app(db_url: &str) -> (Router, sqlx::PgPool) {
         keycloak_jwks_json: None,
         keycloak_jwks_path: None,
         catalog_folders: Vec::new(),
-        catalog_databases: Vec::new(),
+        catalog_databases: Vec::new(), registry_sql: None,
     };
     (routes::router(AppState { pool: pool.clone(), config, jwks: None::<Arc<_>> }), pool)
 }

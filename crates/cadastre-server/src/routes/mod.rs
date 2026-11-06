@@ -21,6 +21,8 @@ pub mod precheck;
 pub mod promote;
 pub mod titledeed;
 pub mod registry;
+#[cfg(feature = "registry-admin")]
+pub mod regadmin;
 pub mod reports;
 pub mod sessions;
 pub mod survey;
@@ -45,7 +47,7 @@ pub fn gated(app: Router, state: AppState) -> Router {
 
 /// Build the application router with all routes and middleware.
 pub fn router(state: AppState) -> Router {
-    Router::new()
+    let router = Router::new()
         .route("/", get(login::root))
         .route("/login", get(login::page))
         .route("/api/v1/auth/login", post(login::login))
@@ -225,7 +227,13 @@ pub fn router(state: AppState) -> Router {
         .route(
             "/api/v1/sessions/{id}/locks/{lock_id}",
             delete(sessions::release_lock),
-        )
+        );
+
+    // Registry (LRS43) user administration — only compiled with the `registry-admin` feature.
+    #[cfg(feature = "registry-admin")]
+    let router = router.merge(regadmin::routes());
+
+    router
         // gzip for clients that ask (the map's GeoJSON and beacon lists shrink several-fold).
         .layer(tower_http::compression::CompressionLayer::new())
         .layer(TraceLayer::new_for_http())

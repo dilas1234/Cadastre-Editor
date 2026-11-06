@@ -23,6 +23,8 @@ pub mod state;
 pub mod lrs;
 pub mod aumentum;
 pub mod registry;
+#[cfg(feature = "registry-admin")]
+pub mod regadmin;
 pub mod registry_sync;
 pub mod upin_watch;
 pub mod titledeed;
