@@ -28,11 +28,10 @@ $("signIn").addEventListener("submit", async (e) => {
   e.preventDefault();
   const username = $("username").value.trim(), password = $("password").value, view = $("view").value;
   if (!username || !password) return show($("msg"), "Enter your username and password.");
-  if (!view) return show($("msg"), "Select your workstation.");
   show($("msg"), ""); busy(e.target, true);
   try {
     const r = await post("/api/v1/auth/login", { username, password, view, remember: $("remember").checked });
-    try { localStorage.setItem(LAST_VIEW, view); } catch { /* storage */ }
+    if (view) try { localStorage.setItem(LAST_VIEW, view); } catch { /* storage */ }
     next = r.redirect;
     if (r.must_change) askForNewPassword(password); else location.assign(next);
   } catch (err) {

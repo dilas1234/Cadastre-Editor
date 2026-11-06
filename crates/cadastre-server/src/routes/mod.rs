@@ -64,6 +64,7 @@ pub fn router(state: AppState) -> Router {
             axum::response::Redirect::temporary(&format!("/digitising{}", q.map(|q| format!("?{q}")).unwrap_or_default()))
         }))
         .route("/sys-editor", get(editor::index))
+        .route("/user-management", get(|| async { editor::serve("users/users.html") }))
         .route("/digitising", get(editor::index))
         .route("/title-deed", get(editor::index))
         .route("/reporting", get(editor::index))

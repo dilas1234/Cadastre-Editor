@@ -235,7 +235,7 @@ pub fn is_public(path: &str) -> bool {
 pub fn may_reach(path: &str, method: &Method, a: Access) -> bool {
     let staff = a.admin || a.staff;
     match path {
-        "/sys-editor" => return a.admin,
+        "/sys-editor" | "/user-management" => return a.admin,
         "/digitising" | "/editor" | "/title-deed" => return staff,
         _ => {}
     }

@@ -68,8 +68,10 @@ CADASTRE_REGISTRY_SQL_USER=plagis_admin_app
 CADASTRE_REGISTRY_SQL_PASSWORD=...
 ```
 
-The dashboard lives in the Sysadmin view (**Administration… → Users & Units**) and is
-reachable only by the Registry's `GROUP_LRS_ADMINISTRATION_SYSTEM` administrators. Every
+The dashboard is the User Management page (`/user-management`), also in the Sysadmin view
+(**Administration… → Registry Users**), and is
+reachable only by administrators: the Registry's `GROUP_LRS_ADMINISTRATION_SYSTEM` and this
+server's Administrators group. Every
 change is written to `plagis_admin.audit_log` (who, what, when — never passwords).
 
 Changes need `CADASTRE_REGISTRY_WRITE=1`; with it off the dashboard can only read. A password

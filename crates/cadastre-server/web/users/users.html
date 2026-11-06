@@ -1,0 +1,65 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<meta name="viewport" content="width=device-width, initial-scale=1"/>
+<title>User Management - PLAGIS</title>
+<link rel="stylesheet" href="/editor/users/users.css"/>
+</head>
+<body>
+<header class="top">
+  <div class="topIn">
+    <a class="brand" href="/user-management"><img src="/editor/login/plateau-logo.svg" alt=""/><span>PLAGIS</span></a>
+    <nav aria-label="Sections">
+      <button type="button" id="navUsers" class="nav on">Users</button>
+      <button type="button" id="navUnits" class="nav">Units</button>
+      <a class="nav" href="/sys-editor">Sysadmin</a>
+    </nav>
+    <div class="who"><span id="me"></span><button type="button" id="signOut" class="btn">Sign out</button></div>
+  </div>
+</header>
+<main class="wrap">
+  <div id="notice" class="notice" role="status" hidden></div>
+  <section id="usersView">
+    <div class="head">
+      <h1>Users List</h1>
+      <div class="acts">
+        <button type="button" id="export" class="btn">
+          <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 4v11m0 0-4-4m4 4 4-4M5 20h14"/></svg>Export CSV</button>
+        <button type="button" id="addUser" class="btn green">
+          <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 5v14M5 12h14"/></svg>Add User</button>
+      </div>
+    </div>
+    <div class="filters">
+      <div class="f grow"><label for="q">Search</label>
+        <div class="search"><input id="q" type="search" placeholder="Search by name or username" autocomplete="off"/>
+          <svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="11" cy="11" r="6.5"/><path d="m20 20-4.2-4.2"/></svg></div></div>
+      <div class="f"><span class="lbl" id="statusLbl">Status</span>
+        <div class="seg" role="group" aria-labelledby="statusLbl">
+          <button type="button" data-status="all" class="on">All</button>
+          <button type="button" data-status="active">Active</button>
+          <button type="button" data-status="disabled">Disabled</button>
+        </div></div>
+      <div class="f"><label for="unit">Unit</label><select id="unit"></select></div>
+    </div>
+    <div class="card"><table>
+      <thead><tr><th>Name</th><th>Username</th><th>Status</th><th>Unit</th><th>Action</th></tr></thead>
+      <tbody id="rows"></tbody>
+    </table></div>
+    <div class="foot"><span id="count"></span><div id="pages" class="pages"></div></div>
+  </section>
+  <section id="unitsView" hidden>
+    <div class="head"><h1>Units</h1>
+      <div class="acts"><button type="button" id="addUnit" class="btn green">
+        <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 5v14M5 12h14"/></svg>Add Unit</button></div></div>
+    <div class="card"><table>
+      <thead><tr><th>Unit</th><th>Registry group</th><th>Members</th></tr></thead>
+      <tbody id="unitRows"></tbody>
+    </table></div>
+  </section>
+</main>
+<dialog id="dlg"><div id="dlgBody"></div></dialog>
+<div id="toast" class="toast" role="status" hidden></div>
+<script src="/editor/users/users.js"></script>
+</body>
+</html>

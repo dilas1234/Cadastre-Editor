@@ -6077,7 +6077,7 @@ function renderAdmin() {
     }
     body.append(tb);
   } else if (adm.tab === "registry") {
-    renderRegistry(body);
+    renderRegistryUsers(body);
   } else if (adm.tab === "roles") {
     const sel = h("select", { onchange: (e) => { adm.sel = Number(e.target.value); renderAdmin(); } }, ...P.map((p) => h("option", { value: p.sid, selected: p.sid === adm.sel }, `${p.name || p.code}${p.is_user ? "" : " (group)"}`)));
     if (adm.sel == null) adm.sel = P[0]?.sid;
@@ -6158,7 +6158,7 @@ function regForm(title, fields, { ok = "Save", width = 360 } = {}) {
         h("button", { class: "btn active", style: "font-weight:bold", onclick: submit }, ok))), { width });
   });
 }
-function renderRegistry(body) {
+function renderRegistryUsers(body) {
   const r = adm.reg;
   if (!r.loaded) { body.append(h("div", { class: "muted" }, "Loading Registry users…")); regLoad(); return; }
   const search = h("input", { value: r.search, placeholder: "search name…", style: "width:150px" });
