@@ -90,7 +90,7 @@ async fn registry_users_sign_in_and_local_staff_still_can() {
     let config = Config {
         database_url: url.clone(), bind_addr: "127.0.0.1:0".into(), auth_mode: AuthMode::Local,
         keycloak_issuer: None, keycloak_audience: None, keycloak_jwks_json: None, keycloak_jwks_path: None,
-        catalog_folders: Vec::new(), catalog_databases: Vec::new(),
+        catalog_folders: Vec::new(), catalog_databases: Vec::new(), registry_sql: None,
     };
     let state = AppState { pool: pool.clone(), config, jwks: None::<Arc<_>> };
     let app = routes::gated(routes::router(state.clone()), state);

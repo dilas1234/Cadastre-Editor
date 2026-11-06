@@ -35,6 +35,10 @@ pub enum AppError {
     /// A database error. The detail is logged, not returned to the client.
     #[error("database error")]
     Database(#[from] sqlx::Error),
+
+    /// An unexpected server-side failure. The detail is logged; a generic message is returned.
+    #[error("{0}")]
+    Internal(String),
 }
 
 impl AppError {
@@ -47,6 +51,7 @@ impl AppError {
             AppError::Conflict(_) => StatusCode::CONFLICT,
             AppError::UnprocessableEntity(_) => StatusCode::UNPROCESSABLE_ENTITY,
             AppError::Database(_) => StatusCode::INTERNAL_SERVER_ERROR,
+            AppError::Internal(_) => StatusCode::INTERNAL_SERVER_ERROR,
         }
     }
 }
@@ -57,10 +62,18 @@ impl IntoResponse for AppError {
         if let AppError::Database(ref e) = self {
             tracing::error!(error = %e, "database error");
         }
+        if let AppError::Internal(ref detail) = self {
+            tracing::error!(detail = %detail, "internal error");
+        }
+        // The internal detail is logged above, never returned to the client.
+        let message = match self {
+            AppError::Internal(_) => "internal server error".to_string(),
+            ref other => other.to_string(),
+        };
         let body = Json(json!({
             "status": status.as_u16(),
             "error": status.canonical_reason().unwrap_or("Error"),
-            "message": self.to_string(),
+            "message": message,
         }));
         (status, body).into_response()
     }

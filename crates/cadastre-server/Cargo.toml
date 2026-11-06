@@ -10,6 +10,13 @@ description = "PLAGIS Cadastre Editor REST API server (axum + PostGIS + Keycloak
 [lints]
 workspace = true
 
+[features]
+# Off by default so the standard (win7 server target, NFR-02) build stays TLS-free.
+# `registry-admin` adds the tiberius write-path to the Aumentum Registry's SQL Server
+# (LRS43), used by the Sysadmin "Users & Units" dashboard. tiberius needs rustls for the
+# SQL Server login handshake, so enable this only on a build whose host can run it.
+registry-admin = ["dep:tiberius", "dep:tokio-util", "dep:futures-util"]
+
 [dependencies]
 cadastre-core = { path = "../cadastre-core" }
 cadastre-import = { path = "../cadastre-import" }
@@ -65,6 +72,13 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 thiserror = "2"
 # Aumentum Registry (LRS) SOAP responses (Phase 5).
 quick-xml = "0.37"
+
+# Registry admin write-path (feature `registry-admin`): direct SQL Server access to LRS43 to
+# call the plagis_admin stored procedures. Same stack the importer uses — tiberius is pure-Rust,
+# rustls is acceptable here because this feature runs on a modern host, not the win7 target.
+tiberius = { version = "0.12", optional = true, default-features = false, features = ["rustls", "tds73", "chrono"] }
+tokio-util = { version = "0.7", optional = true, features = ["compat"] }
+futures-util = { version = "0.3", optional = true }
 
 [dev-dependencies]
 # RSA keypair generation for JWT verification tests.

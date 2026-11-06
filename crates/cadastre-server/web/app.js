@@ -6014,7 +6014,7 @@ async function notificationsWindow() {
 }
 
 // --- Administration (Aumentum Web Administrator) ------------------------------------------------
-const adm = { tab: "users", data: null, settings: [], sel: null, creds: [] };
+const adm = { tab: "users", data: null, settings: [], sel: null, creds: [], reg: { loaded: false, users: [], groups: [], search: "", error: null } };
 async function adminWindow() {
   try { [adm.data, adm.settings, adm.creds] = await Promise.all([api("/api/v1/admin/security"), api("/api/v1/admin/settings"), api("/api/v1/admin/credentials")]); if (!wf.defs) wf.defs = await api("/api/v1/wf/definitions"); }
   catch (e) { uiAlert(e.message); return; }
@@ -6044,7 +6044,7 @@ async function admChange(body) {
 function renderAdmin() {
   const root = $("admBody"); if (!root) return; root.innerHTML = "";
   const d = adm.data, P = d.principals, name = (sid) => { const p = P.find((x) => x.sid === sid); return p ? p.name || p.code : "sid " + sid; };
-  const tabs = [["users", "Users & Groups"], ["roles", "Roles"], ["tasks", "Task Permissions"], ["jobtypes", "Job Types"], ["settings", "Settings"]];
+  const tabs = [["users", "Users & Groups"], ["registry", "Registry Users"], ["roles", "Roles"], ["tasks", "Task Permissions"], ["jobtypes", "Job Types"], ["settings", "Settings"]];
   root.append(h("div", { class: "frow", style: "flex-wrap:wrap" }, ...tabs.map(([k, l]) => h("button", { class: "btn" + (adm.tab === k ? " active" : ""), style: adm.tab === k ? "font-weight:bold" : "", onclick: () => { adm.tab = k; renderAdmin(); } }, l))));
   const body = h("div", { style: "max-height:460px;overflow:auto;margin-top:6px" }); root.append(body);
   const groups = P.filter((p) => !p.is_user);
@@ -6059,6 +6059,8 @@ function renderAdmin() {
         admPasswordCell(u)));
     }
     body.append(tb);
+  } else if (adm.tab === "registry") {
+    renderRegistry(body);
   } else if (adm.tab === "roles") {
     const sel = h("select", { onchange: (e) => { adm.sel = Number(e.target.value); renderAdmin(); } }, ...P.map((p) => h("option", { value: p.sid, selected: p.sid === adm.sel }, `${p.name || p.code}${p.is_user ? "" : " (group)"}`)));
     if (adm.sel == null) adm.sel = P[0]?.sid;
@@ -6095,6 +6097,147 @@ function renderAdmin() {
     const k = h("input", { placeholder: "e.g. mail.smtp_password", style: "width:220px" }), v = h("input", { style: "width:220px" });
     body.append(tb, h("div", { class: "frow" }, h("label", {}, "Add setting:"), k, v, h("button", { class: "btn", onclick: async () => { if (!k.value) return; adm.settings = await api("/api/v1/admin/settings", { method: "PUT", body: { key: k.value, value: v.value } }); renderAdmin(); } }, "Save")));
   }
+}
+
+/* =====================================================================================
+ * Registry (LRS43 / Alfresco) users & units. The Sysadmin manages the Registry's own accounts and
+ * the groups ("units", e.g. Title Deed Plan) through the plagis_admin stored procedures. Reads show
+ * the live database; a change takes effect for sign-in only after the Registry (JBoss) restarts.
+ * Needs the server built with --features registry-admin and CADASTRE_REGISTRY_SQL_* set.
+ * ===================================================================================== */
+async function regLoad() {
+  const r = adm.reg; r.error = null;
+  try {
+    const q = r.search ? "?search=" + encodeURIComponent(r.search) : "";
+    [r.users, r.groups] = await Promise.all([api("/api/v1/admin/registry/users" + q), api("/api/v1/admin/registry/groups")]);
+  } catch (e) { r.error = e.message; r.users = []; r.groups = []; }
+  r.loaded = true; renderAdmin();
+}
+function regLabel(g) { return String(g || "").replace(/^GROUP_/, ""); }
+// A small modal form (floatWindow) resolving to the field values, or null on cancel. Field types:
+// text/password (default), select (options [{value,label}]), checklist (multi, resolves to an array).
+function regForm(title, fields, { ok = "Save", width = 360 } = {}) {
+  return new Promise((resolve) => {
+    const readers = {};
+    const field = (f, inp) => h("div", { style: "margin:5px 0" }, h("label", { style: "display:block;font-size:12px;color:#555" }, f.label), inp);
+    const rows = fields.map((f) => {
+      if (f.type === "select") {
+        const inp = h("select", { style: "width:100%" }, ...f.options.map((o) => h("option", { value: o.value ?? o, selected: (o.value ?? o) === f.value }, o.label ?? o)));
+        readers[f.key] = () => inp.value; return field(f, inp);
+      }
+      if (f.type === "checklist") {
+        const boxes = f.options.map((o) => ({ value: o.value ?? o, label: o.label ?? o, el: h("input", { type: "checkbox", checked: (f.value || []).includes(o.value ?? o) }) }));
+        readers[f.key] = () => boxes.filter((b) => b.el.checked).map((b) => b.value);
+        return field(f, h("div", { style: "max-height:150px;overflow:auto;border:1px solid #ccc;padding:4px" }, ...(boxes.length ? boxes.map((b) => h("label", { style: "display:block;font-size:12px" }, b.el, " " + b.label)) : [h("span", { class: "muted" }, "no units yet")])));
+      }
+      const inp = h("input", { type: f.type || "text", value: f.value ?? "", placeholder: f.placeholder || "", style: "width:100%" });
+      readers[f.key] = () => inp.value; return field(f, inp);
+    });
+    let win;
+    const submit = () => { const out = {}; for (const f of fields) out[f.key] = readers[f.key](); win.remove(); resolve(out); };
+    win = floatWindow(title, h("div", {}, ...rows,
+      h("div", { class: "frow", style: "margin-top:8px;justify-content:flex-end;gap:6px" },
+        h("button", { class: "btn", onclick: () => { win.remove(); resolve(null); } }, "Cancel"),
+        h("button", { class: "btn active", style: "font-weight:bold", onclick: submit }, ok))), { width });
+  });
+}
+function renderRegistry(body) {
+  const r = adm.reg;
+  if (!r.loaded) { body.append(h("div", { class: "muted" }, "Loading Registry users…")); regLoad(); return; }
+  const search = h("input", { value: r.search, placeholder: "search name…", style: "width:150px" });
+  search.onkeydown = (e) => { if (e.key === "Enter") { r.search = search.value.trim(); regLoad(); } };
+  body.append(h("div", { class: "frow", style: "flex-wrap:wrap;gap:6px;margin-bottom:6px" },
+    search,
+    h("button", { class: "btn", onclick: () => { r.search = search.value.trim(); regLoad(); } }, "Search"),
+    h("button", { class: "btn", onclick: () => { r.search = ""; regLoad(); } }, "All"),
+    h("span", { style: "flex:1" }),
+    h("button", { class: "btn", onclick: regNewUser }, "+ New user"),
+    h("button", { class: "btn", onclick: regNewUnit }, "+ New unit")));
+  if (r.error) {
+    body.append(h("div", {}, h("p", { style: "color:#b00" }, "Registry user administration is not available on this server."),
+      h("p", { class: "muted" }, r.error), h("p", { class: "muted" }, "It needs the server built with --features registry-admin and CADASTRE_REGISTRY_SQL_* set.")));
+    return;
+  }
+  body.append(h("div", { class: "muted", style: "margin-bottom:4px" }, `${r.users.length} user(s), ${r.groups.length} unit(s). A change takes effect for sign-in after the Registry (JBoss) service restarts.`));
+  const tb = h("table", { class: "wfHist" }, h("tr", {}, h("th", {}, "User"), h("th", {}, "Name"), h("th", {}, "Office"), h("th", {}, "Units"), h("th", {}, "Status"), h("th", {}, "Actions")));
+  for (const u of r.users) {
+    const enabled = u.enabled !== false;
+    const units = h("td", {}, ...(u.groups.length ? u.groups.map((g) => h("span", { class: "wfPill", style: "display:inline-block;margin:1px;cursor:pointer", title: "Remove from " + regLabel(g), onclick: () => regRemoveUnit(u, g) }, regLabel(g), " ×")) : [h("span", { class: "muted" }, "—")]),
+      h("button", { class: "btn", style: "margin-left:4px", title: "Add to a unit", onclick: () => regAddUnit(u) }, "+"));
+    const stat = u.has_login ? h("span", { class: "wfPill " + (enabled ? "done" : "ended") }, enabled ? "enabled" : "disabled") : h("span", { class: "muted" }, "no login");
+    const actions = h("td", { style: "white-space:nowrap" },
+      h("button", { class: "btn", onclick: () => regEdit(u) }, "Edit"),
+      h("button", { class: "btn", onclick: () => regResetPassword(u) }, "Password"),
+      u.has_login ? h("button", { class: "btn", onclick: () => regToggleEnabled(u, !enabled) }, enabled ? "Disable" : "Enable") : null);
+    tb.append(h("tr", {}, h("td", {}, u.user_name), h("td", {}, [u.first_name, u.last_name].filter(Boolean).join(" ")), h("td", {}, u.office_id || ""), units, stat, actions));
+  }
+  body.append(tb);
+}
+async function regNewUser() {
+  const r = adm.reg;
+  const refs = r.users.map((u) => u.user_name);
+  const vals = await regForm("New Registry user", [
+    { key: "user_name", label: "Username (a–z, 0–9, . _ -)" },
+    { key: "first_name", label: "First name" },
+    { key: "last_name", label: "Last name" },
+    { key: "password", label: "Password (at least 6 characters)" },
+    { key: "ref_user", label: "Copy groups & office from", type: refs.length ? "select" : "text", value: refs.includes("cgugin") ? "cgugin" : refs[0], options: refs.map((x) => ({ value: x, label: x })) },
+    { key: "extra_groups", label: "Units", type: "checklist", value: [], options: r.groups.map((g) => ({ value: g.group_name, label: regLabel(g.group_name) })) },
+  ], { ok: "Create user", width: 380 });
+  if (!vals) return;
+  const b = { user_name: (vals.user_name || "").trim(), first_name: (vals.first_name || "").trim(), last_name: (vals.last_name || "").trim(), password: vals.password || "", ref_user: (vals.ref_user || "").trim(), extra_groups: (vals.extra_groups || []).join(",") };
+  if (!b.user_name || !b.first_name || !b.last_name || !b.password || !b.ref_user) { uiAlert("Username, name, password and a reference user are all required."); return; }
+  try { const res = await api("/api/v1/admin/registry/users", { method: "POST", body: b }); status("User created."); await regLoad(); await uiAlert(res.note || "Created.", { title: "User created" }); }
+  catch (e) { uiAlert(e.message); }
+}
+async function regNewUnit() {
+  const r = adm.reg;
+  const vals = await regForm("New unit (group)", [
+    { key: "display_name", label: "Unit name (without GROUP_)", placeholder: "e.g. Title Deed Plan" },
+    { key: "ref_group", label: "Copy structure from", type: "select", value: "", options: [{ value: "", label: "— default (Map Compilation Officer) —" }, ...r.groups.map((g) => ({ value: g.group_name, label: regLabel(g.group_name) }))] },
+  ], { ok: "Create unit" });
+  if (!vals) return;
+  const name = (vals.display_name || "").trim();
+  if (!name) { uiAlert("A unit name is required."); return; }
+  try { const res = await api("/api/v1/admin/registry/groups", { method: "POST", body: { display_name: name, ref_group: vals.ref_group || null } }); status("Unit created."); await regLoad(); await uiAlert(res.note || "Created.", { title: "Unit created" }); }
+  catch (e) { uiAlert(e.message); }
+}
+async function regEdit(u) {
+  const vals = await regForm("Edit " + u.user_name, [
+    { key: "first_name", label: "First name", value: u.first_name || "" },
+    { key: "last_name", label: "Last name", value: u.last_name || "" },
+    { key: "office_id", label: "Office id", value: u.office_id || "" },
+  ], { ok: "Save" });
+  if (!vals) return;
+  try { await api(`/api/v1/admin/registry/users/${encodeURIComponent(u.user_name)}`, { method: "PUT", body: { first_name: vals.first_name, last_name: vals.last_name, office_id: vals.office_id } }); status("Saved."); regLoad(); }
+  catch (e) { uiAlert(e.message); }
+}
+async function regResetPassword(u) {
+  const p = await uiPrompt(`New password for ${u.user_name} (at least 6 characters). The account is also unlocked.`, "", { ok: "Set password", title: "Reset password" });
+  if (p == null) return;
+  if (String(p).length < 6) { uiAlert("Password must be at least 6 characters."); return; }
+  try { const res = await api(`/api/v1/admin/registry/users/${encodeURIComponent(u.user_name)}/password`, { method: "POST", body: { password: p } }); status("Password set."); await uiAlert(res.note || "Password set.", { title: "Password" }); }
+  catch (e) { uiAlert(e.message); }
+}
+async function regToggleEnabled(u, enable) {
+  if (!(await uiConfirm(`${enable ? "Enable" : "Disable"} ${u.user_name}?`, { ok: enable ? "Enable" : "Disable", kind: enable ? "question" : "warn" }))) return;
+  try { await api(`/api/v1/admin/registry/users/${encodeURIComponent(u.user_name)}/enabled`, { method: "POST", body: { enabled: enable } }); status(enable ? "Enabled." : "Disabled."); regLoad(); }
+  catch (e) { uiAlert(e.message); }
+}
+async function regAddUnit(u) {
+  const choices = adm.reg.groups.map((x) => x.group_name).filter((g) => !u.groups.includes(g));
+  if (!choices.length) { uiAlert(u.user_name + " is already in every unit."); return; }
+  const vals = await regForm("Add " + u.user_name + " to a unit", [
+    { key: "group", label: "Unit", type: "select", value: choices[0], options: choices.map((g) => ({ value: g, label: regLabel(g) })) },
+  ], { ok: "Add" });
+  if (!vals || !vals.group) return;
+  try { await api(`/api/v1/admin/registry/users/${encodeURIComponent(u.user_name)}/groups`, { method: "POST", body: { group: vals.group } }); status("Added to unit."); regLoad(); }
+  catch (e) { uiAlert(e.message); }
+}
+async function regRemoveUnit(u, g) {
+  if (!(await uiConfirm(`Remove ${u.user_name} from ${regLabel(g)}?`, { ok: "Remove", kind: "warn" }))) return;
+  try { await api(`/api/v1/admin/registry/users/${encodeURIComponent(u.user_name)}/groups/${encodeURIComponent(g)}`, { method: "DELETE" }); status("Removed from unit."); regLoad(); }
+  catch (e) { uiAlert(e.message); }
 }
 
 /* =====================================================================================
