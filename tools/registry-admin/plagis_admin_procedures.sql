@@ -474,6 +474,9 @@ BEGIN
     SET NOCOUNT ON; SET XACT_ABORT ON;
     DECLARE @Login bigint = plagis_admin.fn_login_node(@UserName);
     IF @Login IS NULL THROW 50301, 'User not found.', 1;
+    -- The Cadastre and Aumentum sign in as these; a new password here would break them.
+    IF LOWER(@UserName) IN (N'admin', N'aumentumws', N'mcconfig')
+        THROW 50304, 'System accounts cannot be changed here.', 1;
     IF LEN(ISNULL(@NewPassword, '')) < 6 THROW 50302, 'Password must be at least 6 characters.', 1;
 
     DECLARE @PwHash nvarchar(64) = LOWER(CONVERT(varchar(32), HASHBYTES('MD4', @NewPassword), 2));

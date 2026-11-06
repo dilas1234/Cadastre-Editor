@@ -8,6 +8,7 @@ app login.
 
 ## Files
 
+- `preflight.sql` — read-only checks to run before installing.
 - `plagis_admin_procedures.sql` — the whole database layer: CRC32/node-lookup helpers,
   an `audit_log` table, and ten procedures (`usp_create_user`, `usp_create_group`,
   `usp_add_to_group`, `usp_remove_from_group`, `usp_reset_password`,
@@ -16,6 +17,8 @@ app login.
 
 ## Install (once, on the Registry's SQL Server)
 
+0. Run `preflight.sql` in SSMS. It is read-only and returns no passwords or hashes. Sort out
+   anything marked `FIX` before going on.
 1. Back up `LRS43`.
 2. Run the whole `plagis_admin_procedures.sql` in SSMS. Re-running is safe (it drops
    and recreates the procedures; the audit log table is kept).
@@ -68,3 +71,7 @@ CADASTRE_REGISTRY_SQL_PASSWORD=...
 The dashboard lives in the Sysadmin view (**Administration… → Users & Units**) and is
 reachable only by the Registry's `GROUP_LRS_ADMINISTRATION_SYSTEM` administrators. Every
 change is written to `plagis_admin.audit_log` (who, what, when — never passwords).
+
+Changes need `CADASTRE_REGISTRY_WRITE=1`; with it off the dashboard can only read. A password
+set here is temporary: the user must replace it at their next sign-in, which needs
+`CADASTRE_AUTH=local`. `usp_reset_password` refuses `admin`, `AumentumWS` and `MCConfig`.

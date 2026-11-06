@@ -348,7 +348,8 @@ empty passwords never pass through the Registry.
 | Digitising, Title Deed | `/digitising`, `/title-deed` | `GROUP_Scanning Clerk`, `GROUP_Scanning Officer`, `GROUP_Map Compilation Officer`, `GROUP_Vectorization Clerk` | Users |
 | Charting and Reporting | `/reporting` | Any signed-in user, read-only unless in a group above | |
 
-A Registry user listed in `cadastre.registry_password_reset` must set a new password at first sign-in;
+A Registry user listed in `cadastre.registry_password_reset` must set a new password at first sign-in
+(Sysadmin → Registry Users lists them when it creates a user or resets a password);
 it is changed in the Registry (`AdministrationService.changePassword`, in the user's own session) and
 the row goes. Users created with `AdministrationService.createUsers` wait on any long query holding
 `LRSAdmin.alf_node`, so a heavy search on that table blocks new users.

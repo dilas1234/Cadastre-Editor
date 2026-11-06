@@ -6197,7 +6197,7 @@ async function regNewUser() {
     { key: "user_name", label: "Username (a–z, 0–9, . _ -)" },
     { key: "first_name", label: "First name" },
     { key: "last_name", label: "Last name" },
-    { key: "password", label: "Password (at least 6 characters)" },
+    { key: "password", label: "Temporary password (at least 6 characters; changed at first sign-in)" },
     { key: "ref_user", label: "Copy groups & office from", type: refs.length ? "select" : "text", value: refs.includes("cgugin") ? "cgugin" : refs[0], options: refs.map((x) => ({ value: x, label: x })) },
     { key: "extra_groups", label: "Units", type: "checklist", value: [], options: r.groups.map((g) => ({ value: g.group_name, label: regLabel(g.group_name) })) },
   ], { ok: "Create user", width: 380 });
@@ -6230,7 +6230,7 @@ async function regEdit(u) {
   catch (e) { uiAlert(e.message); }
 }
 async function regResetPassword(u) {
-  const p = await uiPrompt(`New password for ${u.user_name} (at least 6 characters). The account is also unlocked.`, "", { ok: "Set password", title: "Reset password" });
+  const p = await uiPrompt(`Temporary password for ${u.user_name} (at least 6 characters). They must change it at their next sign-in. The account is also unlocked.`, "", { ok: "Set password", title: "Reset password" });
   if (p == null) return;
   if (String(p).length < 6) { uiAlert("Password must be at least 6 characters."); return; }
   try { const res = await api(`/api/v1/admin/registry/users/${encodeURIComponent(u.user_name)}/password`, { method: "POST", body: { password: p } }); status("Password set."); await uiAlert(res.note || "Password set.", { title: "Password" }); }
