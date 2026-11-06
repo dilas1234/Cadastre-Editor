@@ -11,7 +11,7 @@
 //! [`RegAdminError::Refused`] and are shown to the administrator. Alfresco caches users and groups
 //! in memory, so a change does not take effect until the Registry (JBoss) service is restarted.
 
-use tiberius::{AuthMethod, Client, Config as TdsConfig, Row};
+use tiberius::{AuthMethod, Client, Config as TdsConfig, EncryptionLevel, Row};
 use tokio::net::TcpStream;
 use tokio_util::compat::{Compat, TokioAsyncWriteCompatExt};
 
@@ -104,7 +104,8 @@ pub struct UpdateUser {
 type Conn = Client<Compat<TcpStream>>;
 
 /// Connect to the Registry's SQL Server as the admin login. SQL authentication; the server's
-/// certificate is trusted (same as the importer — a LAN host, often a self-signed cert).
+/// certificate is trusted (same as the importer — a LAN host, often a self-signed cert). With
+/// `encrypt` off there is no TLS at all: see [`RegistrySqlConfig::encrypt`].
 async fn connect(cfg: &RegistrySqlConfig) -> Result<Conn, RegAdminError> {
     let mut config = TdsConfig::new();
     config.host(&cfg.host);
@@ -112,6 +113,9 @@ async fn connect(cfg: &RegistrySqlConfig) -> Result<Conn, RegAdminError> {
     config.database(&cfg.database);
     config.authentication(AuthMethod::sql_server(&cfg.username, &cfg.password));
     config.trust_cert();
+    if !cfg.encrypt {
+        config.encryption(EncryptionLevel::NotSupported);
+    }
 
     let tcp = TcpStream::connect(config.get_addr()).await.map_err(|e| RegAdminError::Connect(e.to_string()))?;
     tcp.set_nodelay(true).ok();

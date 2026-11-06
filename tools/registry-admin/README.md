@@ -66,7 +66,13 @@ CADASTRE_REGISTRY_SQL_PORT=1433
 CADASTRE_REGISTRY_SQL_DATABASE=LRS43
 CADASTRE_REGISTRY_SQL_USER=plagis_admin_app
 CADASTRE_REGISTRY_SQL_PASSWORD=...
+CADASTRE_REGISTRY_SQL_ENCRYPT=off
 ```
+
+`_ENCRYPT=off` is needed while LRS43 is SQL Server 2012 RTM (11.0.2100): it offers only TLS 1.0,
+which the server's TLS library refuses. The `plagis_admin_app` login and any password set here
+then cross the LAN unprotected, so use it only on the trusted LAN and never with `sa`. Remove the
+setting once LRS43 is patched to a build with TLS 1.2.
 
 The dashboard is the User Management page (`/user-management`), also in the Sysadmin view
 (**Administration… → Registry Users**), and is

@@ -60,7 +60,7 @@ async fn writes_are_refused_while_registry_writing_is_off() {
     std::env::set_var("CADASTRE_REGISTRY_WRITE", "0");
     let pool = db::connect_and_migrate(&url).await.expect("migrate");
     // A SQL Server nothing listens on: reaching it would answer 422, not the 409 of the switch.
-    let registry_sql = Some(RegistrySqlConfig { host: "127.0.0.1".into(), port: 9, database: "LRS43".into(), username: "x".into(), password: "x".into() });
+    let registry_sql = Some(RegistrySqlConfig { host: "127.0.0.1".into(), port: 9, database: "LRS43".into(), username: "x".into(), password: "x".into(), encrypt: true });
     let config = Config {
         database_url: url, bind_addr: "127.0.0.1:0".into(), auth_mode: AuthMode::Disabled,
         keycloak_issuer: None, keycloak_audience: None, keycloak_jwks_json: None, keycloak_jwks_path: None,
