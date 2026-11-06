@@ -599,6 +599,7 @@ function buildMenus() {
       } }], r.left, r.bottom);
   });
   bar.append(vb);
+  if (currentView === "sysadmin" && can("admin")) bar.append(h("div", { class: "viewBadge canSwitch", style: "margin-left:0", title: "Add a Registry user", onclick: settingsAddUser }, "Settings"));
 }
 function menuList(items) {
   const list = h("div", { class: "menuList" });
@@ -6190,9 +6191,19 @@ function renderRegistryUsers(body) {
   }
   body.append(tb);
 }
+// Sysadmin's Settings button: the add-user form as a modal, the page dimmed behind it.
+async function settingsAddUser() {
+  await regLoad();
+  if (adm.reg.error) { uiAlert(adm.reg.error); return; }
+  const open = regNewUser();
+  const win = [...document.querySelectorAll(".float")].pop();
+  const back = h("div", { style: `position:fixed;inset:0;background:rgba(20,28,36,.45);z-index:${(parseInt(getComputedStyle(win).zIndex, 10) || 100) - 1}` });
+  document.body.append(back);
+  try { await open; } finally { back.remove(); }
+}
 async function regNewUser() {
   const r = adm.reg;
-  const refs = r.users.map((u) => u.user_name);
+  const refs = r.users.map((u) => u.user_name).filter((n) => !["admin", "aumentumws", "mcconfig"].includes(String(n).toLowerCase()));
   const vals = await regForm("New Registry user", [
     { key: "user_name", label: "Username (a–z, 0–9, . _ -)" },
     { key: "first_name", label: "First name" },
