@@ -163,7 +163,7 @@ pub(crate) fn config() -> ApiResult<LrsConfig> {
     LrsConfig::from_env().ok_or_else(|| AppError::Conflict("the Registry connection is not configured on this server".into()))
 }
 
-fn write_config() -> ApiResult<LrsConfig> {
+pub(crate) fn write_config() -> ApiResult<LrsConfig> {
     let c = config()?;
     if !c.write_enabled {
         return Err(AppError::Conflict("writing to the Registry is turned off on this server (CADASTRE_REGISTRY_WRITE)".into()));

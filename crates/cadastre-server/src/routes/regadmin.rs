@@ -5,6 +5,11 @@
 //! These drive the Sysadmin "Users & Units" dashboard: list users and groups, create a user into a
 //! unit, move users between units, reset a password and enable/disable an account. Every write
 //! lands in `plagis_admin.audit_log` on the Registry's SQL Server.
+//!
+//! Writes obey `CADASTRE_REGISTRY_WRITE`, like every other write to the Registry. A password set
+//! here is temporary: its owner must replace it at their next sign-in (`routes::login`).
+
+use std::future::Future;
 
 use axum::extract::{Path, Query, State};
 use axum::routing::{get, post, put};
@@ -15,6 +20,7 @@ use serde_json::{json, Value};
 use crate::auth::AuthUser;
 use crate::error::{ApiResult, AppError};
 use crate::regadmin::{self, CreateGroup, CreateUser, RegistryGroup, RegistryUser, UpdateUser};
+use crate::routes::registry::write_config;
 use crate::state::AppState;
 
 /// Shown after any write: Alfresco caches users and groups, so a change needs a JBoss restart.
@@ -42,6 +48,20 @@ fn cfg(state: &AppState) -> Result<&crate::config::RegistrySqlConfig, AppError> 
 /// The audit actor: the signed-in username (falls back to the subject).
 fn actor(user: &AuthUser) -> String {
     user.username.clone().unwrap_or_else(|| user.subject.clone())
+}
+
+/// Run a Registry write that gives `login` a password chosen by an administrator, and list that
+/// login in `cadastre.registry_password_reset` so its owner must replace it at sign-in. The row is
+/// held in a transaction across the write: a refused write leaves no row, and a row that cannot be
+/// saved stops the write, so a user never ends up with an administrator's password and no prompt.
+pub async fn with_forced_change(pool: &sqlx::PgPool, login: &str, by: &str, write: impl Future<Output = ApiResult<()>>) -> ApiResult<()> {
+    let mut tx = pool.begin().await?;
+    sqlx::query("INSERT INTO cadastre.registry_password_reset (login, set_by) VALUES ($1, $2) \
+                 ON CONFLICT (login) DO UPDATE SET set_by = EXCLUDED.set_by, created_at = now()")
+        .bind(login.trim().to_lowercase()).bind(by).execute(&mut *tx).await?;
+    write.await?;
+    tx.commit().await?;
+    Ok(())
 }
 
 #[derive(Debug, Deserialize)]
@@ -72,13 +92,16 @@ pub async fn user_groups(State(state): State<AppState>, user: AuthUser, Path(nam
 /// POST `/api/v1/admin/registry/users` — create a user by cloning a reference user.
 pub async fn create_user(State(state): State<AppState>, user: AuthUser, Json(req): Json<CreateUser>) -> ApiResult<Json<Value>> {
     user.require_role("admin")?;
-    regadmin::create_user(cfg(&state)?, &req, &actor(&user)).await.map_err(map)?;
+    write_config()?;
+    let (sql, by) = (cfg(&state)?, actor(&user));
+    with_forced_change(&state.pool, &req.user_name, &by, async { regadmin::create_user(sql, &req, &by).await.map_err(map) }).await?;
     Ok(Json(json!({ "user_name": req.user_name, "note": RESTART_NOTE })))
 }
 
 /// POST `/api/v1/admin/registry/groups` — create a group ("unit").
 pub async fn create_group(State(state): State<AppState>, user: AuthUser, Json(req): Json<CreateGroup>) -> ApiResult<Json<Value>> {
     user.require_role("admin")?;
+    write_config()?;
     regadmin::create_group(cfg(&state)?, &req, &actor(&user)).await.map_err(map)?;
     Ok(Json(json!({ "group_name": format!("GROUP_{}", req.display_name.trim()), "note": RESTART_NOTE })))
 }
@@ -91,6 +114,7 @@ pub struct GroupBody {
 /// POST `/api/v1/admin/registry/users/{user}/groups` — add the user to a group.
 pub async fn add_to_group(State(state): State<AppState>, user: AuthUser, Path(name): Path<String>, Json(req): Json<GroupBody>) -> ApiResult<Json<Value>> {
     user.require_role("admin")?;
+    write_config()?;
     regadmin::add_to_group(cfg(&state)?, &name, &req.group, &actor(&user)).await.map_err(map)?;
     Ok(Json(json!({ "note": RESTART_NOTE })))
 }
@@ -98,6 +122,7 @@ pub async fn add_to_group(State(state): State<AppState>, user: AuthUser, Path(na
 /// DELETE `/api/v1/admin/registry/users/{user}/groups/{group}` — remove the user from a group.
 pub async fn remove_from_group(State(state): State<AppState>, user: AuthUser, Path((name, group)): Path<(String, String)>) -> ApiResult<Json<Value>> {
     user.require_role("admin")?;
+    write_config()?;
     regadmin::remove_from_group(cfg(&state)?, &name, &group, &actor(&user)).await.map_err(map)?;
     Ok(Json(json!({ "note": RESTART_NOTE })))
 }
@@ -107,10 +132,12 @@ pub struct PasswordBody {
     pub password: String,
 }
 
-/// POST `/api/v1/admin/registry/users/{user}/password` — set a new password and unlock.
+/// POST `/api/v1/admin/registry/users/{user}/password` — set a temporary password and unlock.
 pub async fn reset_password(State(state): State<AppState>, user: AuthUser, Path(name): Path<String>, Json(req): Json<PasswordBody>) -> ApiResult<Json<Value>> {
     user.require_role("admin")?;
-    regadmin::reset_password(cfg(&state)?, &name, &req.password, &actor(&user)).await.map_err(map)?;
+    write_config()?;
+    let (sql, by) = (cfg(&state)?, actor(&user));
+    with_forced_change(&state.pool, &name, &by, async { regadmin::reset_password(sql, &name, &req.password, &by).await.map_err(map) }).await?;
     Ok(Json(json!({ "note": RESTART_NOTE })))
 }
 
@@ -122,6 +149,7 @@ pub struct EnabledBody {
 /// POST `/api/v1/admin/registry/users/{user}/enabled` — disable or enable an account.
 pub async fn set_enabled(State(state): State<AppState>, user: AuthUser, Path(name): Path<String>, Json(req): Json<EnabledBody>) -> ApiResult<Json<Value>> {
     user.require_role("admin")?;
+    write_config()?;
     regadmin::set_enabled(cfg(&state)?, &name, req.enabled, &actor(&user)).await.map_err(map)?;
     Ok(Json(json!({ "note": RESTART_NOTE })))
 }
@@ -129,6 +157,7 @@ pub async fn set_enabled(State(state): State<AppState>, user: AuthUser, Path(nam
 /// PUT `/api/v1/admin/registry/users/{user}` — change first name, last name or office.
 pub async fn update_user(State(state): State<AppState>, user: AuthUser, Path(name): Path<String>, Json(req): Json<UpdateUser>) -> ApiResult<Json<Value>> {
     user.require_role("admin")?;
+    write_config()?;
     regadmin::update_user(cfg(&state)?, &name, &req, &actor(&user)).await.map_err(map)?;
     Ok(Json(json!({ "note": RESTART_NOTE })))
 }

@@ -109,7 +109,9 @@ pub async fn page(State(state): State<AppState>) -> Response {
 pub struct LoginRequest {
     pub username: String,
     pub password: String,
-    /// `sysadmin`, `digitising`, `titledeed` or `reporting`.
+    /// `sysadmin`, `digitising`, `titledeed` or `reporting`. An administrator may leave it empty
+    /// and goes to User Management; anyone else must choose.
+    #[serde(default)]
     pub view: String,
     #[serde(default)]
     pub remember: bool,
@@ -167,12 +169,12 @@ async fn registry_principal(state: &AppState, login: &str) -> ApiResult<Option<(
 }
 
 /// A wrong login: counts towards the lockout of that name, whether or not it exists.
-async fn refuse(state: &AppState, name: &str, view: auth::View) -> ApiResult<Response> {
+async fn refuse(state: &AppState, name: &str, view: Option<auth::View>) -> ApiResult<Response> {
     sqlx::query("INSERT INTO cadastre.login_throttle (login, failed_count) VALUES ($1, 1) ON CONFLICT (login) DO UPDATE SET \
                  failed_count = CASE WHEN cadastre.login_throttle.failed_count + 1 >= $2 THEN 0 ELSE cadastre.login_throttle.failed_count + 1 END, \
                  locked_until = CASE WHEN cadastre.login_throttle.failed_count + 1 >= $2 THEN now() + make_interval(mins => $3) ELSE cadastre.login_throttle.locked_until END")
         .bind(name).bind(MAX_FAILURES).bind(LOCK_MINUTES).execute(&state.pool).await?;
-    log(state, "anonymous", "auth_login_failed", name, json!({ "view": view.key() })).await?;
+    log(state, "anonymous", "auth_login_failed", name, json!({ "view": view.map(auth::View::key) })).await?;
     Err(AppError::Unauthorized(BAD_LOGIN.into()))
 }
 
@@ -184,7 +186,10 @@ pub async fn login(State(state): State<AppState>, Json(req): Json<LoginRequest>)
     if state.config.auth_mode != AuthMode::Local {
         return Err(AppError::Conflict("sign-in is not turned on on this server".into()));
     }
-    let view = auth::View::parse(&req.view).ok_or_else(|| AppError::BadRequest("choose a workstation".into()))?;
+    let chosen = match req.view.trim() {
+        "" => None,
+        key => Some(auth::View::parse(key).ok_or_else(|| AppError::BadRequest("choose a workstation".into()))?),
+    };
     let typed: String = req.username.trim().chars().take(64).collect();
     let name = typed.rsplit('\\').next().unwrap_or(&typed).to_string();
     let short = name.to_lowercase();
@@ -199,7 +204,7 @@ pub async fn login(State(state): State<AppState>, Json(req): Json<LoginRequest>)
     let (sid, code) = if from_registry {
         match registry_principal(&state, &name).await? {
             Some(p) => p,
-            None => return refuse(&state, &short, view).await,
+            None => return refuse(&state, &short, chosen).await,
         }
     } else {
         let row = sqlx::query(
@@ -209,15 +214,20 @@ pub async fn login(State(state): State<AppState>, Json(req): Json<LoginRequest>)
         let Some(r) = row else {
             // The same work and the same answer as a wrong password: usernames cannot be probed.
             let _ = hash_blocking(req.password).await;
-            return refuse(&state, &short, view).await;
+            return refuse(&state, &short, chosen).await;
         };
         if !verify_blocking(req.password, r.get("password_hash")).await? {
-            return refuse(&state, &short, view).await;
+            return refuse(&state, &short, chosen).await;
         }
         (r.get("sid"), r.get("code"))
     };
     let local = auth::access_of(&state.pool, sid).await?;
     let access = auth::Access { admin: local.admin || extra.admin, staff: local.staff || extra.staff };
+    let (view, landing) = match chosen {
+        Some(v) => (v, v.path()),
+        None if access.admin => (auth::View::Sysadmin, "/user-management"),
+        None => return Err(AppError::BadRequest("Select your workstation.".into())),
+    };
     if !view.allowed(access) {
         log(&state, &code, "auth_view_refused", &code, json!({ "view": view.key() })).await?;
         return Err(AppError::Forbidden(format!("Your account cannot open {}. Choose another workstation, or contact the ICT Unit.", view.label())));
@@ -240,7 +250,7 @@ pub async fn login(State(state): State<AppState>, Json(req): Json<LoginRequest>)
     audit::append(&mut tx, &code, "auth_login", "auth", Some(&code), json!({ "view": view.key(), "remember": req.remember, "source": source })).await?;
     tx.commit().await?;
     let cookie = session_cookie(&token, req.remember.then_some(hours as i64 * 3600));
-    Ok(([(header::SET_COOKIE, cookie)], Json(json!({ "username": code, "must_change": must_change, "redirect": view.path() }))).into_response())
+    Ok(([(header::SET_COOKIE, cookie)], Json(json!({ "username": code, "must_change": must_change, "redirect": landing }))).into_response())
 }
 
 /// Sign out: the session ends on the server too.

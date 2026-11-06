@@ -141,6 +141,22 @@ async fn sign_in_follows_the_groups() {
     }
     assert_eq!(call(&app, "GET", "/api/v1/admin/security", Some(&c), None).await.status, StatusCode::OK);
 
+    // The workstation is optional for administrators, who go to User Management, and for nobody else.
+    let r = sign_in(&app, &admin, "Plateau2026", "").await;
+    assert_eq!((r.status, &r.json["redirect"]), (StatusCode::OK, &json!("/user-management")));
+    assert_eq!(call(&app, "GET", "/user-management", Some(&c), None).await.status, StatusCode::OK);
+    let r = call(&app, "POST", "/api/v1/auth/login", None, Some(json!({"username": admin, "password": "Plateau2026"}))).await;
+    assert_eq!((r.status, &r.json["redirect"]), (StatusCode::OK, &json!("/user-management")), "the field left out altogether");
+    let r = sign_in(&app, &admin, "Plateau2026", "digitising").await;
+    assert_eq!((r.status, &r.json["redirect"]), (StatusCode::OK, &json!("/digitising")), "an administrator may still choose");
+    let sc = sign_in(&app, &staff, "Plateau2026", "digitising").await.cookie.unwrap();
+    assert_eq!(call(&app, "GET", "/user-management", Some(&sc), None).await.location, "/login?denied=1", "administrators only");
+    assert_eq!(call(&app, "GET", "/user-management", None, None).await.location, "/login");
+    let r = sign_in(&app, &staff, "Plateau2026", "").await;
+    assert_eq!((r.status, r.cookie.is_none()), (StatusCode::BAD_REQUEST, true), "staff must choose, and no session is made");
+    assert_eq!(sign_in(&app, &admin, "wrong", "").await.status, StatusCode::UNAUTHORIZED);
+    assert_eq!(sign_in(&app, &admin, "Plateau2026", "nowhere").await.status, StatusCode::BAD_REQUEST);
+
     // Five wrong passwords lock the account, even for the right one, until an administrator resets it.
     for _ in 0..5 {
         assert_eq!(sign_in(&app, &victim, "wrong", "digitising").await.status, StatusCode::UNAUTHORIZED);
