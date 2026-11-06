@@ -353,6 +353,19 @@ it is changed in the Registry (`AdministrationService.changePassword`, in the us
 the row goes. Users created with `AdministrationService.createUsers` wait on any long query holding
 `LRSAdmin.alf_node`, so a heavy search on that table blocks new users.
 
+**Beacon numbers at commit.** A typed number another beacon already has is checked first
+(`POST /api/v1/wf/jobs/{id}/editing/beacon-check`). On a property sharing a boundary with this parcel,
+within `commit.adjoining_beacon_m` (1 m), it is the same beacon: the corner takes its position. Anywhere
+else the digitizer sees the property holding it (file number, UPIN, Zoom, Point List) and goes on only
+with a reason; the number then repeats (`beacon.duplicate_seq`). The property is found by position,
+because Aumentum's parcels have no corner records. Both are kept in the commit's `beacon_notes`.
+
+**Correcting points, at the digitizing stage only.** On a draft, the Point List's Edit Points and beacon
+number boxes. After commit, Edit on a Point List row corrects a wrong number with a reason
+(`POST /api/v1/parcels/beacon-number`), and wrong coordinates go through Correct & Recommit. Both are
+refused once the parcel is linked in the Registry: it is unlinked there first. A number on a beacon
+shared with a linked parcel is refused too, as it would change that file.
+
 If Aumentum cannot answer the UPIN check, commits are refused and Digitising, Title Deed and Sysadmin
 show a red warning to contact the ICT Admin (`GET /api/v1/aumentum/status`: signs in and asks about a
 UPIN, at most once a minute). It clears itself when Aumentum answers.

@@ -3,16 +3,24 @@
 //! `CA6782`). The system never generates a beacon number. A corner lying on a beacon that is
 //! already in the fabric (a shared boundary pillar) is that beacon. Corners are grouped into
 //! points: two new parcels sharing a corner share one beacon.
+//!
+//! A typed number that a beacon elsewhere already has is one of two things. On a property sharing
+//! a boundary with this parcel, within `commit.adjoining_beacon_m` (1 m), it is that same beacon:
+//! the corner takes the beacon's position. Anywhere else the digitizer is shown the property
+//! holding it (`check`) and may go on only with a reason; the number then repeats.
 
 use std::collections::HashMap;
 
 use axum::extract::{Path, State};
 use axum::Json;
+use serde_json::{json, Value};
 use serde::{Deserialize, Serialize};
 use sqlx::Row;
 use utoipa::ToSchema;
 use uuid::Uuid;
 
+use crate::audit;
+use crate::auth::AuthUser;
 use crate::error::{ApiResult, AppError};
 use crate::state::AppState;
 
@@ -36,6 +44,45 @@ pub struct WfBeaconNumber {
     pub easting: f64,
     pub northing: f64,
     pub number: String,
+    /// Why this number is used although another property holds it (see `check`).
+    #[serde(default)]
+    pub reason: Option<String>,
+}
+
+/// A property holding a beacon.
+#[derive(Debug, Clone, Serialize, ToSchema)]
+pub struct BeaconProperty {
+    pub upin: String,
+    /// The file number.
+    pub file_number: Option<String>,
+}
+
+/// A typed beacon number that a beacon elsewhere already has.
+#[derive(Debug, Clone, Serialize, ToSchema)]
+pub struct BeaconConflict {
+    /// The corner it was typed for, as in the Beacon Numbers window.
+    pub point: i32,
+    pub easting: f64,
+    pub northing: f64,
+    pub number: String,
+    /// `adjoining`: the same beacon, the corner takes its position. `elsewhere`: needs a reason.
+    pub kind: String,
+    pub beacon_id: Uuid,
+    pub beacon_easting: f64,
+    pub beacon_northing: f64,
+    pub distance_m: f64,
+    /// The properties at that beacon. Empty if it is on no parcel of this Cadastre.
+    pub properties: Vec<BeaconProperty>,
+}
+
+/// How near a beacon's parcel boundary must be for the parcel to be holding it.
+const ON_BOUNDARY_M: f64 = 0.1;
+
+/// What `apply` did besides adding numbers, for the commit's audit record.
+#[derive(Debug, Default)]
+pub struct Applied {
+    pub added: Vec<String>,
+    pub notes: Vec<Value>,
 }
 
 #[derive(Debug, Default, Deserialize, ToSchema)]
@@ -110,6 +157,87 @@ async fn corner_points(conn: &mut sqlx::PgConnection, job_id: Uuid, tol: f64) ->
         }
     }
     Ok(points)
+}
+
+async fn adjoining_limit(conn: &mut sqlx::PgConnection) -> ApiResult<f64> {
+    Ok(setting(conn, "commit.adjoining_beacon_m").await?.and_then(|v| v.trim().parse().ok()).filter(|t: &f64| *t > 0.0).unwrap_or(1.0))
+}
+
+/// The committed properties at a beacon, by position: Aumentum's parcels have no corner records.
+async fn properties_at(conn: &mut sqlx::PgConnection, beacon: Uuid) -> ApiResult<Vec<BeaconProperty>> {
+    let rows = sqlx::query(
+        "SELECT p.parcel_number, a.property_number FROM cadastre.beacon b \
+         JOIN cadastre.parcel p ON p.status = 'posted' AND p.geom && ST_Expand(b.geom, $2) AND ST_DWithin(ST_Boundary(p.geom), b.geom, $2) \
+         LEFT JOIN LATERAL (SELECT property_number FROM cadastre.parcel_attribute x WHERE x.upin = p.parcel_number \
+                            ORDER BY (x.status = '0') DESC NULLS LAST, x.object_id DESC LIMIT 1) a ON true \
+         WHERE b.id = $1 ORDER BY p.parcel_number LIMIT 20",
+    )
+    .bind(beacon).bind(ON_BOUNDARY_M).fetch_all(&mut *conn).await?;
+    Ok(rows.iter().map(|r| BeaconProperty { upin: r.get("parcel_number"), file_number: r.get("property_number") }).collect())
+}
+
+/// The other beacon with this number nearest to the point, if any.
+async fn nearest_with_number(conn: &mut sqlx::PgConnection, number: &str, e: f64, n: f64, except: Option<Uuid>) -> ApiResult<Option<(Uuid, f64, f64)>> {
+    let row = sqlx::query(
+        "SELECT id, ST_X(geom) AS e, ST_Y(geom) AS n FROM cadastre.beacon WHERE upper(number) = upper($1) AND id IS DISTINCT FROM $4 \
+         ORDER BY geom <-> ST_SetSRID(ST_MakePoint($2, $3), 32632) LIMIT 1",
+    )
+    .bind(number).bind(e).bind(n).bind(except).fetch_optional(&mut *conn).await?;
+    Ok(row.map(|r| (r.get("id"), r.get("e"), r.get("n"))))
+}
+
+/// A number typed for a point, if a beacon elsewhere has it: on an adjoining property or not.
+async fn conflict(conn: &mut sqlx::PgConnection, index: usize, p: &Point, number: &str, limit: f64) -> ApiResult<Option<BeaconConflict>> {
+    let Some((beacon_id, be, bn)) = nearest_with_number(conn, number, p.e, p.n, None).await? else { return Ok(None) };
+    let distance_m = (p.e - be).hypot(p.n - bn);
+    let drafts: Vec<Uuid> = p.corners.iter().map(|c| c.0).collect();
+    let adjoining = distance_m <= limit && sqlx::query_scalar::<_, bool>(
+        "SELECT EXISTS (SELECT 1 FROM cadastre.beacon b \
+           JOIN cadastre.parcel n ON n.status = 'posted' AND n.geom && ST_Expand(b.geom, $3) AND ST_DWithin(ST_Boundary(n.geom), b.geom, $3) \
+           JOIN cadastre.parcel d ON d.id = ANY($2) AND ST_DWithin(n.geom, d.geom, $4) \
+           WHERE b.id = $1)",
+    )
+    .bind(beacon_id).bind(&drafts).bind(ON_BOUNDARY_M).bind(limit).fetch_one(&mut *conn).await?;
+    Ok(Some(BeaconConflict {
+        point: index as i32 + 1, easting: p.e, northing: p.n, number: number.to_string(),
+        kind: if adjoining { "adjoining" } else { "elsewhere" }.to_string(),
+        beacon_id, beacon_easting: be, beacon_northing: bn, distance_m,
+        properties: properties_at(conn, beacon_id).await?,
+    }))
+}
+
+/// Where a beacon is held, for messages: "file PL67436 (UPIN PL…)".
+fn held_by(properties: &[BeaconProperty]) -> String {
+    if properties.is_empty() {
+        return "no property in this Cadastre".to_string();
+    }
+    properties.iter().map(|p| match &p.file_number {
+        Some(f) if !f.trim().is_empty() => format!("file {} (UPIN {})", f.trim(), p.upin),
+        _ => format!("UPIN {} (no file number)", p.upin),
+    }).collect::<Vec<_>>().join(", ")
+}
+
+/// Move a draft's corners onto a point. The drafts are simple rings: a corner's `seq` is its
+/// position in the ring, and the first corner also closes it.
+async fn move_corners(conn: &mut sqlx::PgConnection, corners: &[(Uuid, i32)], e: f64, n: f64) -> ApiResult<()> {
+    for (parcel, seq) in corners {
+        let moved = sqlx::query(
+            "WITH r AS (SELECT id, GeometryType(geom) AS t, ST_ExteriorRing(ST_GeometryN(ST_Multi(geom), 1)) AS l, ST_SetSRID(ST_MakePoint($3, $4), ST_SRID(geom)) AS pt \
+                        FROM cadastre.parcel WHERE id = $1 AND ST_NumGeometries(ST_Multi(geom)) = 1 AND ST_NumInteriorRings(ST_GeometryN(ST_Multi(geom), 1)) = 0), \
+                  s AS (SELECT id, t, ST_MakePolygon(ST_SetPoint(ST_SetPoint(l, $2 - 1, pt), CASE WHEN $2 = 1 THEN ST_NPoints(l) - 1 ELSE $2 - 1 END, pt)) AS g FROM r) \
+             UPDATE cadastre.parcel d SET geom = CASE WHEN s.t = 'MULTIPOLYGON' THEN ST_Multi(s.g) ELSE s.g END, computed_area = ST_Area(s.g), updated_at = now() FROM s WHERE d.id = s.id",
+        )
+        .bind(parcel).bind(seq).bind(e).bind(n).execute(&mut *conn).await?.rows_affected();
+        if moved == 0 {
+            return Err(AppError::Conflict("a parcel with several parts or holes cannot take an adjoining beacon's position: move its corner onto the beacon".into()));
+        }
+    }
+    Ok(())
+}
+
+/// The next free repeat of a number.
+async fn next_repeat(conn: &mut sqlx::PgConnection, number: &str) -> ApiResult<i32> {
+    Ok(sqlx::query_scalar("SELECT COALESCE(max(duplicate_seq) + 1, 0) FROM cadastre.beacon WHERE number = $1").bind(number).fetch_one(&mut *conn).await?)
 }
 
 fn to_dto(points: &[Point]) -> Vec<WfCornerPointDto> {
@@ -232,7 +360,7 @@ pub async fn identify(State(state): State<AppState>, Json(req): Json<IdentifyVer
 
 /// Within the commit transaction: check the typed beacon numbers, add the new beacons and link
 /// every corner to its beacon. Returns the numbers of the beacons added.
-pub async fn apply(conn: &mut sqlx::PgConnection, job_id: Uuid, req: &WfCommitRequest) -> ApiResult<Vec<String>> {
+pub async fn apply(conn: &mut sqlx::PgConnection, job_id: Uuid, req: &WfCommitRequest) -> ApiResult<Applied> {
     let tol = tolerance(conn).await?;
     let required = setting(conn, "commit.require_beacon_numbers").await?.map(|v| v.trim() != "0").unwrap_or(true);
     let points = corner_points(conn, job_id, tol).await?;
@@ -273,35 +401,40 @@ pub async fn apply(conn: &mut sqlx::PgConnection, job_id: Uuid, req: &WfCommitRe
         )));
     }
 
+    let limit = adjoining_limit(conn).await?;
+    let reason_for = |p: &Point| req.beacons.iter().find(|b| (p.e - b.easting).hypot(p.n - b.northing) <= tol)
+        .and_then(|b| b.reason.as_deref()).map(str::trim).filter(|r| !r.is_empty()).map(str::to_string);
     let mut added = Vec::new();
+    let mut notes = Vec::new();
     let mut beacon_of: Vec<Option<Uuid>> = points.iter().map(|p| p.beacon.as_ref().map(|b| b.0)).collect();
     for (i, p) in points.iter().enumerate() {
         let Some(number) = typed[i].as_ref().filter(|_| p.beacon.is_none()) else { continue };
-        // A number already in the fabric belongs to a beacon elsewhere (this corner is on none).
-        if let Some(row) = sqlx::query(
-            "SELECT number, ST_X(geom) AS e, ST_Y(geom) AS n FROM cadastre.beacon WHERE upper(number) = upper($1) LIMIT 1",
-        )
-        .bind(number)
-        .fetch_optional(&mut *conn)
-        .await?
-        {
-            let (e, n): (f64, f64) = (row.get("e"), row.get("n"));
-            return Err(AppError::Conflict(format!(
-                "beacon {} already exists at {e:.3} {n:.3}, {:.2} m from point {} ({:.3} {:.3}); check the number",
-                row.get::<String, _>("number"),
-                (p.e - e).hypot(p.n - n),
-                i + 1,
-                p.e,
-                p.n
-            )));
+        // A number already in the fabric, on a beacon this corner is not on.
+        let mut repeat = 0;
+        if let Some(c) = conflict(&mut *conn, i, p, number, limit).await? {
+            if c.kind == "adjoining" {
+                move_corners(&mut *conn, &p.corners, c.beacon_easting, c.beacon_northing).await?;
+                beacon_of[i] = Some(c.beacon_id);
+                notes.push(json!({ "number": number, "kind": "adjoining", "moved_m": c.distance_m, "held_by": held_by(&c.properties) }));
+                continue;
+            }
+            let Some(reason) = reason_for(p) else {
+                return Err(AppError::Conflict(format!(
+                    "Beacon {number} already exists on {}, at {:.3} {:.3}, {:.2} m from point {}. Check that property; to use the number anyway, give a reason.",
+                    held_by(&c.properties), c.beacon_easting, c.beacon_northing, c.distance_m, i + 1
+                )));
+            };
+            repeat = next_repeat(&mut *conn, number).await?;
+            notes.push(json!({ "number": number, "kind": "repeated", "reason": reason, "distance_m": c.distance_m, "held_by": held_by(&c.properties) }));
         }
         let id: Uuid = sqlx::query_scalar(
-            "INSERT INTO cadastre.beacon (number, geom, accuracy, is_control) \
-             VALUES ($1, ST_SetSRID(ST_MakePoint($2, $3), 32632), 0.05, false) RETURNING id",
+            "INSERT INTO cadastre.beacon (number, geom, accuracy, is_control, duplicate_seq) \
+             VALUES ($1, ST_SetSRID(ST_MakePoint($2, $3), 32632), 0.05, false, $4) RETURNING id",
         )
         .bind(number)
         .bind(p.e)
         .bind(p.n)
+        .bind(repeat)
         .fetch_one(&mut *conn)
         .await?;
         beacon_of[i] = Some(id);
@@ -322,5 +455,117 @@ pub async fn apply(conn: &mut sqlx::PgConnection, job_id: Uuid, req: &WfCommitRe
             .await?;
         }
     }
-    Ok(added)
+    Ok(Applied { added, notes })
+}
+
+/// Before committing: which typed numbers another beacon already has, with the properties holding
+/// them, so the digitizer can check them. Nothing is changed.
+#[utoipa::path(post, path = "/api/v1/wf/jobs/{id}/editing/beacon-check", tag = "wf", params(("id" = i32, Path, description = "Job instance id")),
+    request_body = WfCommitRequest, responses((status = 200, body = [BeaconConflict])))]
+pub async fn check(State(state): State<AppState>, Path(id): Path<i32>, Json(req): Json<WfCommitRequest>) -> ApiResult<Json<Vec<BeaconConflict>>> {
+    let job_id: Option<Uuid> = sqlx::query_scalar("SELECT cadastre_job_id FROM cadastre.wf_job_instance WHERE id = $1").bind(id)
+        .fetch_optional(&state.pool).await?.ok_or_else(|| AppError::NotFound(format!("job instance {id}")))?;
+    let Some(job_id) = job_id else { return Ok(Json(Vec::new())) };
+    let mut conn = state.pool.acquire().await?;
+    let tol = tolerance(&mut conn).await?;
+    let limit = adjoining_limit(&mut conn).await?;
+    let points = corner_points(&mut conn, job_id, tol).await?;
+    let mut out = Vec::new();
+    for b in &req.beacons {
+        let number = b.number.trim();
+        if number.is_empty() {
+            continue;
+        }
+        let Some(i) = points.iter().position(|p| p.beacon.is_none() && (p.e - b.easting).hypot(p.n - b.northing) <= tol) else { continue };
+        out.extend(conflict(&mut conn, i, &points[i], number, limit).await?);
+    }
+    Ok(Json(out))
+}
+
+#[derive(Debug, Deserialize, ToSchema)]
+pub struct BeaconNumberChange {
+    /// A committed parcel, and the corner of it whose beacon number is wrong.
+    pub upin: String,
+    pub easting: f64,
+    pub northing: f64,
+    /// The right number.
+    pub number: String,
+    pub reason: String,
+    /// The digitizer has seen the property already holding this number and goes on.
+    #[serde(default)]
+    pub confirm_repeat: bool,
+}
+
+/// Which of these parcels are linked in the Registry (the rule of Correct & Recommit).
+async fn linked(conn: &mut sqlx::PgConnection, upins: &[String]) -> ApiResult<Vec<String>> {
+    Ok(sqlx::query_scalar(
+        "SELECT u FROM unnest($1::text[]) u WHERE EXISTS (SELECT 1 FROM cadastre.parcel_attribute a WHERE a.upin = u AND (a.linkage_status = 1 OR a.lrs_id IS NOT NULL)) \
+           OR EXISTS (SELECT 1 FROM cadastre.registry_property r WHERE r.upin = u) ORDER BY 1")
+        .bind(upins).fetch_all(conn).await?)
+}
+
+/// Correct the beacon number of a committed corner, at the digitizing stage only: refused while
+/// the parcel, or a parcel sharing the beacon, is linked in the Registry (unlink it there first).
+/// The parcel's shape and UPIN are not touched. A beacon shared with other parcels changes for
+/// them as well: they are listed in the answer.
+#[utoipa::path(post, path = "/api/v1/parcels/beacon-number", tag = "parcels", request_body = BeaconNumberChange,
+    responses((status = 200), (status = 400, description = "No number or reason"), (status = 404, description = "Not a corner of that parcel"), (status = 409, description = "Linked in the Registry, or another property holds the number")))]
+pub async fn change_number(State(state): State<AppState>, user: AuthUser, Json(req): Json<BeaconNumberChange>) -> ApiResult<Json<Value>> {
+    user.require_role("editor")?;
+    let actor = crate::routes::wf::resolve_actor(&state, &user).await?;
+    let (number, reason) = (req.number.trim().to_string(), req.reason.trim().to_string());
+    if number.is_empty() || reason.is_empty() {
+        return Err(AppError::BadRequest("give the beacon number and the reason".into()));
+    }
+    let upin = req.upin.trim().to_uppercase();
+    let mut tx = state.pool.begin().await?;
+    let tol = tolerance(&mut tx).await?;
+    let corner: bool = sqlx::query_scalar(
+        "SELECT EXISTS (SELECT 1 FROM cadastre.parcel WHERE parcel_number = $1 AND status = 'posted' \
+           AND ST_DWithin(ST_Boundary(geom), ST_SetSRID(ST_MakePoint($2, $3), ST_SRID(geom)), $4))")
+        .bind(&upin).bind(req.easting).bind(req.northing).bind(tol).fetch_one(&mut *tx).await?;
+    if !corner {
+        return Err(AppError::NotFound(format!("{:.3} {:.3} is not a corner of committed parcel {upin}", req.easting, req.northing)));
+    }
+    let here = sqlx::query("SELECT id, number FROM cadastre.beacon WHERE ST_DWithin(geom, ST_SetSRID(ST_MakePoint($1, $2), 32632), $3) \
+                            ORDER BY geom <-> ST_SetSRID(ST_MakePoint($1, $2), 32632) LIMIT 1")
+        .bind(req.easting).bind(req.northing).bind(tol).fetch_optional(&mut *tx).await?;
+    let (id, old): (Option<Uuid>, Option<String>) = match &here {
+        Some(r) => (Some(r.get("id")), Some(r.get("number"))),
+        None => (None, None),
+    };
+    let mut affected = vec![upin.clone()];
+    if let Some(id) = id {
+        affected.extend(properties_at(&mut tx, id).await?.into_iter().map(|p| p.upin));
+    }
+    let held = linked(&mut tx, &affected).await?;
+    if !held.is_empty() {
+        return Err(AppError::Conflict(format!("{} is linked in the Registry: unlink it there first", held.join(", "))));
+    }
+    let mut repeat = 0;
+    if let Some((other, be, bn)) = nearest_with_number(&mut tx, &number, req.easting, req.northing, id).await? {
+        let holders = properties_at(&mut tx, other).await?;
+        if !req.confirm_repeat {
+            return Err(AppError::Conflict(format!("Beacon {number} already exists on {}, at {be:.3} {bn:.3}, {:.2} m from this corner.",
+                held_by(&holders), (req.easting - be).hypot(req.northing - bn))));
+        }
+        repeat = next_repeat(&mut tx, &number).await?;
+    }
+    let id = match id {
+        Some(id) => {
+            sqlx::query("UPDATE cadastre.beacon SET number = $2, duplicate_seq = $3, updated_at = now() WHERE id = $1")
+                .bind(id).bind(&number).bind(repeat).execute(&mut *tx).await?;
+            id
+        }
+        None => sqlx::query_scalar("INSERT INTO cadastre.beacon (number, geom, accuracy, is_control, duplicate_seq) \
+                                    VALUES ($1, ST_SetSRID(ST_MakePoint($2, $3), 32632), 0.05, false, $4) RETURNING id")
+            .bind(&number).bind(req.easting).bind(req.northing).bind(repeat).fetch_one(&mut *tx).await?,
+    };
+    let shared: Vec<BeaconProperty> = properties_at(&mut tx, id).await?.into_iter().filter(|p| p.upin != upin).collect();
+    audit::append(&mut tx, &actor.label, "beacon_number_changed", "upin", Some(&upin), json!({
+        "from": old, "to": number, "reason": reason, "easting": req.easting, "northing": req.northing,
+        "repeat": repeat > 0, "also_on": held_by(&shared),
+    })).await?;
+    tx.commit().await?;
+    Ok(Json(json!({ "upin": upin, "from": old, "number": number, "also_on": shared })))
 }

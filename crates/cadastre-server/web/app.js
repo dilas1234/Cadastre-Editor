@@ -1415,10 +1415,67 @@ async function draftPoints(d) {
     const dist = Math.hypot(nx[0] - e, nx[1] - n);
     let az = Math.atan2(nx[0] - e, nx[1] - n) * 180 / Math.PI; if (az < 0) az += 360;
     const dd = Math.floor(az), mm = Math.floor((az - dd) * 60), ss = Math.round(((az - dd) * 60 - mm) * 60);
-    return { beacon, easting: e, northing: n, distance: dist, bearing: `${dd}°${String(mm).padStart(2, "0")}'${String(ss).padStart(2, "0")}"` };
+    return { beacon, fixed: id?.source === "beacon", typed: typed || "", easting: e, northing: n, distance: dist, bearing: `${dd}°${String(mm).padStart(2, "0")}'${String(ss).padStart(2, "0")}"` };
   });
 }
 async function showDraftBeacons(d) { const pts = await draftPoints(d); setBeaconLabels("draft:" + d.properties.id, pts); status(`Draft parcel: ${pts.length} corners shown (Esc hides them).`); }
+// A corner's number in the Point List: a draft's typed number can be retyped; a committed one is
+// corrected with a reason. A number from a fabric beacon on a draft is that beacon's.
+function beaconCell(p, upin, data) {
+  const stop = (e) => e.stopPropagation();
+  if (!can("digitise")) return h("b", {}, p.beacon);
+  if (upin && data.linked) return h("b", { title: "Linked in the Registry: unlink it there first to change it" }, p.beacon);
+  if (upin) return h("span", {}, h("b", {}, p.beacon), " ", h("a", { href: "#", class: "regLinkBtn", title: "Correct this beacon number (the parcel and its UPIN stay)", onclick: (e) => { e.preventDefault(); stop(e); correctBeaconNumber(upin, p); } }, "Edit"));
+  if (p.fixed) return h("b", { title: "This corner is on a beacon already in the fabric" }, p.beacon);
+  return h("input", { value: p.typed, placeholder: p.beacon, style: "width:90px", title: "The number offered at commit", onclick: stop,
+    onchange: (e) => { const v = e.target.value.trim(); if (v) pointIds.set(ptKey(p.easting, p.northing), v); else pointIds.delete(ptKey(p.easting, p.northing)); notify(v ? `Beacon number set to ${v}.` : "Beacon number cleared."); } });
+}
+async function correctBeaconNumber(upin, p) {
+  const number = await uiPrompt(`The right beacon number for this corner of ${upin}?\n\nNow: ${p.beacon} at ${fmt3(p.easting)} ${fmt3(p.northing)}. The parcel and its UPIN do not change. A beacon shared with a neighbour changes there too.`, p.beacon, { title: "Correct Beacon Number", ok: "Next" });
+  if (!number || !number.trim() || number.trim() === p.beacon) return;
+  const reason = await uiPrompt(`Why does ${p.beacon} become ${number.trim()}?`, "", { title: "Correct Beacon Number", ok: "Correct", multiline: true });
+  if (!reason || !reason.trim()) return;
+  const body = { upin, easting: p.easting, northing: p.northing, number: number.trim(), reason: reason.trim() };
+  const done = (r) => { notify(`Beacon ${r.from || p.beacon} is now ${r.number}.` + (r.also_on.length ? ` Also changed on ${r.also_on.map((x) => x.file_number || x.upin).join(", ")}.` : "")); loadBeacons(); pointListWindow(upin); };
+  try { done(await api("/api/v1/parcels/beacon-number", { method: "POST", body })); }
+  catch (e) {
+    if (!/already exists/.test(e.message)) { uiAlert(e.message); return; }
+    if (!(await uiConfirm(`${e.message}\n\nCheck that property first. Use ${body.number} here as well?`, { ok: "Use it anyway", kind: "warn" }))) return;
+    try { done(await api("/api/v1/parcels/beacon-number", { method: "POST", body: { ...body, confirm_repeat: true } })); } catch (e2) { uiAlert(e2.message); }
+  }
+}
+// Beacon numbers another beacon already has: the digitizer sees the property holding each one
+// before going on. Adjoining: the corner takes that beacon's position. Elsewhere: a reason is
+// needed. Resolves to reasons by point, or null to go back and fix the numbers.
+function beaconConflictDialog(conflicts) {
+  return new Promise((resolve) => {
+    const reasons = new Map();
+    const close = (v) => { w.remove(); resolve(v); };
+    const held = (c) => c.properties.length ? c.properties.map((p) => h("div", {},
+      h("b", {}, p.file_number ? `File ${p.file_number}` : "No file number"), ` · UPIN ${p.upin} `,
+      regLink("Zoom", "Zoom to this property", () => registryZoom(p.upin)), " ", regLink("Point List", "Its beacons", () => pointListWindow(p.upin)))) : [h("div", { class: "muted" }, "On no property in this Cadastre.")];
+    const go = h("button", { class: "btn btnPrimary" }, "Continue");
+    const need = conflicts.filter((c) => c.kind === "elsewhere");
+    const check = () => { go.disabled = need.some((c) => !(reasons.get(c.point) || "").trim()); };
+    const cards = conflicts.map((c) => {
+      const where = `${fmt3(c.beacon_easting)} ${fmt3(c.beacon_northing)}, ${Number(c.distance_m).toFixed(2)} m from point ${c.point}`;
+      const see = regLink("Show beacon", "Go to this beacon on the map", () => map.easeTo({ center: toLL(c.beacon_easting, c.beacon_northing), zoom: Math.max(map.getZoom(), 19) }));
+      return h("div", { class: "beaconCard" + (c.kind === "elsewhere" ? " warn" : "") },
+        h("div", {}, h("b", {}, c.number), c.kind === "adjoining" ? " is the adjoining property's beacon" : " is already used elsewhere"),
+        ...held(c), h("div", { class: "muted" }, where, " ", see),
+        c.kind === "adjoining"
+          ? h("div", {}, `Point ${c.point} will take this beacon's position (moves ${Number(c.distance_m).toFixed(2)} m).`)
+          : h("label", {}, "Reason for using this number here:", h("input", { style: "width:100%;box-sizing:border-box", oninput: (e) => { reasons.set(c.point, e.target.value); check(); } })));
+    });
+    go.onclick = () => close(reasons);
+    const w = floatWindow("Check Beacon Numbers", h("div", {},
+      h("p", { class: "muted", style: "margin:0 0 6px" }, "These numbers are already in the fabric. Check each property against the survey plan."),
+      h("div", { style: "max-height:380px;overflow:auto" }, ...cards),
+      h("div", { class: "frow", style: "justify-content:flex-end;margin-top:6px" }, go, h("button", { class: "btn", onclick: () => close(null) }, "Go Back"))), { id: "beaconCheckWin", width: 440 });
+    w.querySelector(".fx")?.addEventListener("click", () => resolve(null));
+    check();
+  });
+}
 async function pointListWindow(upin, draft) {
   let data;
   if (upin) { try { data = await api("/api/v1/parcels/points?upin=" + encodeURIComponent(upin)); } catch (e) { uiAlert(e.message); return; } }
@@ -1426,7 +1483,7 @@ async function pointListWindow(upin, draft) {
   const pts = data.points;
   const tbl = h("table", { class: "verifyTbl" }, h("tr", {}, h("th", {}, "#"), h("th", {}, "Beacon"), h("th", {}, "Easting"), h("th", {}, "Northing"), h("th", {}, "Bearing"), h("th", {}, "Distance (m)")));
   pts.forEach((p, i) => {
-    const tr = h("tr", { title: "Zoom to this corner" }, h("td", { class: "n" }, String(i + 1)), h("td", {}, h("b", {}, p.beacon)), h("td", {}, fmt3(p.easting)), h("td", {}, fmt3(p.northing)),
+    const tr = h("tr", { title: "Zoom to this corner" }, h("td", { class: "n" }, String(i + 1)), h("td", {}, beaconCell(p, upin, data)), h("td", {}, fmt3(p.easting)), h("td", {}, fmt3(p.northing)),
       h("td", {}, p.bearing), h("td", { class: "n" }, Number(p.distance).toFixed(2)));
     tr.onclick = () => { map.easeTo({ center: toLL(p.easting, p.northing), zoom: Math.max(map.getZoom(), 19) }); tbl.querySelectorAll("tr.selrow").forEach((r) => r.classList.remove("selrow")); tr.classList.add("selrow"); };
     tbl.append(tr);
@@ -1440,6 +1497,7 @@ async function pointListWindow(upin, draft) {
       h("button", { class: "btn", title: "Beacon Easting Northing, one per line (the surveyor's format)", onclick: async (ev) => {
         try { await navigator.clipboard.writeText(listText); ev.target.textContent = "Copied"; } catch { status("Select the table to copy it."); } } }, "Copy list"),
       h("button", { class: "btn", onclick: () => upin ? showParcelBeacons(upin) : showDraftBeacons(draft) }, "Show Beacons"),
+      !upin && can("digitise") ? h("button", { class: "btn btnPrimary", title: "Drag the corners, or retype them in Edit Sketch Properties, then Finish Sketch", onclick: () => { $("pointListWin")?.remove(); editDraftFeature(draft); setTool("editVertex"); notify("Correct the points (drag, or retype in Edit Sketch Properties), then Finish Sketch."); } }, "Edit Points") : null,
       upin ? h("button", { class: "btn btnPrimary", title: data.can_correct ? "Reopen as a draft (same UPIN), fix the points, commit again" : data.why_not, disabled: !data.can_correct,
         onclick: () => correctAndRecommit(upin) }, "Correct & Recommit…") : null,
       upin && !data.can_correct ? h("span", { class: "muted", style: "font-size:11px" }, `Correct here: no, ${data.why_not}.`) : null)),
@@ -4063,6 +4121,7 @@ function historyText(e) {
     case "registry_plan_withdrawn": return `Title deed plan withdrawn: ${d.reason || ""}`;
     case "title_deed_plan_deleted": return "Title deed plan deleted";
     case "wf_reopened_for_correction": return `Reopened for correction (${d.upin || ""}): ${d.reason || ""}`;
+    case "beacon_number_changed": return `Beacon number corrected: ${d.from || "(none)"} to ${d.to}: ${d.reason || ""}`;
     case "wf_commit_reverted": return `Commit undone (${d.upin || ""})`;
     case "wf_job_area_save": return "Job area saved";
     case "precheck_acknowledged": return `System check warnings accepted: ${d.reason || ""}`;
@@ -4988,7 +5047,16 @@ async function wfCommitDialog(opts = {}) {
     const staff = staffP.get();
     if (!staff) { msg.style.color = "#b00"; msg.textContent = "Committed by: pick the staff member from the list, or add them (it is recorded in the audit log)."; staffP.focus(); return; }
     keepStaff(staff);
-    commitBtn.disabled = true; msg.style.color = ""; msg.textContent = "Committing…";
+    commitBtn.disabled = true; msg.style.color = ""; msg.textContent = "Checking the beacon numbers…";
+    let conflicts;
+    try { conflicts = await api(`/api/v1/wf/jobs/${id}/editing/beacon-check`, { method: "POST", body: { beacons } }); }
+    catch (e) { commitBtn.disabled = false; msg.style.color = "#b00"; msg.textContent = e.message; return; }
+    if (conflicts.length) {
+      const reasons = await beaconConflictDialog(conflicts);
+      if (!reasons) { commitBtn.disabled = false; msg.textContent = "Correct the numbers, then Commit."; return; }
+      for (const c of conflicts) { const b = beacons.find((x) => x.number === c.number); if (b && reasons.get(c.point)) b.reason = reasons.get(c.point).trim(); }
+    }
+    msg.style.color = ""; msg.textContent = "Committing…";
     if (opts.submit) {
       try { await opts.submit(beacons, staff); w.remove(); src()?.setData(empty()); }
       catch (e) { commitBtn.disabled = false; msg.style.color = "#b00"; msg.textContent = e.message; }

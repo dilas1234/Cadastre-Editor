@@ -44,7 +44,7 @@ pub async fn promote_run(
         // Imported beacons come from Aumentum's PLAGIS_COORDINATES: the survey control network.
         "INSERT INTO cadastre.beacon (number, geom, is_control) \
          SELECT number, geom, true FROM import.beacon WHERE run_id = $1 \
-         ON CONFLICT (number) DO UPDATE SET geom = EXCLUDED.geom, is_control = true, updated_at = now()",
+         ON CONFLICT (number, duplicate_seq) DO UPDATE SET geom = EXCLUDED.geom, is_control = true, updated_at = now()",
     )
     .bind(run_id)
     .execute(&mut *tx)

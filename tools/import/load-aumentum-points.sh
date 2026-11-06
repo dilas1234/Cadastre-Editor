@@ -61,7 +61,7 @@ WHERE n.name NOT IN (SELECT name FROM clash);
 
 INSERT INTO cadastre.beacon (number, geom, is_control)
 SELECT name, geom, false FROM named WHERE name NOT IN (SELECT name FROM clash) AND name NOT IN (SELECT name FROM is_ctrl)
-ON CONFLICT (number) DO NOTHING; -- a beacon already in the editor (an earlier load, or committed since) is never moved
+ON CONFLICT (number, duplicate_seq) DO NOTHING; -- a beacon already in the editor (an earlier load, or committed since) is never moved
 SELECT format('  already in the editor (kept):  %s', count(*)) FROM named n JOIN cadastre.beacon b ON b.number = n.name
   WHERE NOT b.is_control AND n.name NOT IN (SELECT name FROM clash) AND NOT ST_DWithin(b.geom, n.geom, $SAME_M);
 

@@ -311,7 +311,7 @@ pub async fn import_into_job(
             let inserted: Option<(Uuid,)> = sqlx::query_as(
                 "INSERT INTO cadastre.beacon (number, geom, accuracy) \
                  VALUES ($1, ST_SetSRID(ST_MakePoint($2, $3), 32632), $4) \
-                 ON CONFLICT (number) DO NOTHING RETURNING id",
+                 ON CONFLICT (number, duplicate_seq) DO NOTHING RETURNING id",
             )
             .bind(&point.id)
             .bind(point.point.x)

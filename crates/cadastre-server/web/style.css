@@ -451,3 +451,7 @@ body.view-reporting .viewBadge { color: #5b2a86; }
 
 /* Aumentum is not answering: see aumentumWarning */
 #aumWarn { flex: none; padding: 7px 12px; font-size: 13px; color: #7a1414; background: #fdecec; border-bottom: 1px solid #e8b4b4; }
+
+/* Check Beacon Numbers */
+.beaconCard { margin-bottom: 8px; padding: 6px 8px; border: 1px solid #ccd; background: #f7f9fc; line-height: 1.5; }
+.beaconCard.warn { border-color: #e0b070; background: #fff8ec; }
