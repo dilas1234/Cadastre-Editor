@@ -80,6 +80,8 @@ pub struct LabelStyle {
     /// The words of an access road's label. Bearings, distances and areas always come from the
     /// registered co-ordinates, so they have none.
     pub text: Option<String>,
+    /// Turned this many degrees clockwise about where it is written. Only the writing turns.
+    pub angle: Option<f64>,
 }
 
 /// One entry of the plan's symbol list.
@@ -495,17 +497,21 @@ fn spread_labels(boxes: &mut [LabelBox]) {
     }
 }
 
-/// Open a label's group, moved and coloured as the officer set it; `data-move` names it for the
-/// sheet's editor. Close it with [`end_move`].
-fn begin_move(svg: &mut String, f: &PlanFields, key: &str) {
+/// Open a label's group, moved, turned and coloured as the officer set it; `data-move` names it
+/// for the sheet's editor, `data-at` is the paper point it turns about. Close it with [`end_move`].
+fn begin_move(svg: &mut String, f: &PlanFields, key: &str, at: Pt) {
     let _ = write!(svg, r#"<g data-move="{key}""#);
-    if let Some([dx, dy]) = f.label_moves.get(key) {
-        let _ = write!(svg, r#" transform="translate({dx:.2} {dy:.2})""#);
+    let style = f.styles.get(key);
+    let shift = f.label_moves.get(key).map(|[dx, dy]| format!("translate({dx:.2} {dy:.2})"));
+    let turn = style.and_then(|x| x.angle).filter(|a| a.is_finite() && *a != 0.0).map(|a| format!("rotate({a:.1} {:.2} {:.2})", at.0, at.1));
+    let transform = [shift, turn].into_iter().flatten().collect::<Vec<_>>().join(" ");
+    if !transform.is_empty() {
+        let _ = write!(svg, r#" transform="{transform}""#);
     }
-    if let Some(c) = safe_color(f.styles.get(key).and_then(|x| x.color.as_deref())) {
+    if let Some(c) = safe_color(style.and_then(|x| x.color.as_deref())) {
         let _ = write!(svg, r#" fill="{c}""#);
     }
-    svg.push_str(">\n");
+    let _ = writeln!(svg, r#" data-at="{:.2} {:.2}">"#, at.0, at.1);
 }
 
 fn end_move(svg: &mut String) {
@@ -838,7 +844,7 @@ pub fn render_svg(d: &PlanData) -> String {
         let m = off_pt(r, (ROAD_IN + ROAD_OUT) / 2.0);
         let key = format!("road:{side}");
         let words = f.styles.get(&key).and_then(|x| x.text.as_deref()).map(str::trim).filter(|l| !l.is_empty()).unwrap_or(&label);
-        begin_move(&mut s, f, &key);
+        begin_move(&mut s, f, &key, (m.0 + r.u.0 * r.len / 2.0, m.1 + r.u.1 * r.len / 2.0));
         along(&mut s, m, (m.0 + r.u.0 * r.len, m.1 + r.u.1 * r.len), 0.5, 0.0, 2.8, words);
         end_move(&mut s);
     }
@@ -858,7 +864,7 @@ pub fn render_svg(d: &PlanData) -> String {
             feature_point(&mut s, sym, q, x.color);
             s.push_str("</g>\n");
             if let Some(l) = label {
-                begin_move(&mut s, f, &format!("feature:{fi}"));
+                begin_move(&mut s, f, &format!("feature:{fi}"), (q.0 + 2.2, q.1));
                 text(&mut s, q.0 + 2.2, q.1 + 0.9, 2.4, "start", HALO, &esc(l));
                 end_move(&mut s);
             }
@@ -873,7 +879,7 @@ pub fn render_svg(d: &PlanData) -> String {
                 let centre: Vec<Pt> = if x.lines.len() == 2 { x.lines[0].iter().zip(&x.lines[1]).map(|(a, b)| ((a.0 + b.0) / 2.0, (a.1 + b.1) / 2.0)).collect() } else { x.lines[0].clone() };
                 let spot = if f.features[fi].smooth { middle(&centre) } else { centre.windows(2).max_by(|p, q| seg(p).total_cmp(&seg(q))).map(|w| (w[0], w[1])) };
                 if let Some((a, b)) = spot {
-                    begin_move(&mut s, f, &format!("feature:{fi}"));
+                    begin_move(&mut s, f, &format!("feature:{fi}"), ((a.0 + b.0) / 2.0, (a.1 + b.1) / 2.0));
                     along(&mut s, a, b, 0.5, x.label_off, 2.4, l);
                     end_move(&mut s);
                 }
@@ -913,7 +919,7 @@ pub fn render_svg(d: &PlanData) -> String {
             continue;
         }
         for (key, t, off, label) in [("degrees", t_deg, out, format!("{deg}°")), ("minutes", t_min, out, format!("{min:02}'")), ("distance", 0.5, -out, format!("{dist:.2}m"))] {
-            begin_move(&mut s, f, &format!("{key}:{i}"));
+            begin_move(&mut s, f, &format!("{key}:{i}"), (a.0 + (b.0 - a.0) * t, a.1 + (b.1 - a.1) * t));
             along(&mut s, a, b, t, off, 2.6, &label);
             end_move(&mut s);
         }
@@ -934,12 +940,12 @@ pub fn render_svg(d: &PlanData) -> String {
     }).collect();
     spread_labels(&mut boxes);
     for (i, ((&(x, _, anchor), b), c)) in labels.iter().zip(&boxes).zip(&corners).enumerate() {
-        begin_move(&mut s, f, &format!("beacon:{i}"));
+        begin_move(&mut s, f, &format!("beacon:{i}"), (x, b.y));
         text(&mut s, x, b.y, BEACON_SIZE, anchor, HALO, &esc(&c.name));
         end_move(&mut s);
     }
     let file_no = if f.plan_no.as_deref().unwrap_or("").is_empty() { title_no.clone() } else { up(&f.plan_no) };
-    begin_move(&mut s, f, "parcel");
+    begin_move(&mut s, f, "parcel", (pcx, pcy + 1.0));
     text(&mut s, pcx, pcy - 0.8, 2.6, "middle", "", &file_no);
     text(&mut s, pcx, pcy + 2.8, 2.6, "middle", "", &format!("{} Sq.m", area3(d.area_m2)));
     end_move(&mut s);
@@ -954,14 +960,14 @@ pub fn render_svg(d: &PlanData) -> String {
         let size = note.size.filter(|v| v.is_finite()).unwrap_or(NOTE_SIZE).clamp(1.5, 12.0);
         let turn = note.angle.filter(|a| a.is_finite() && *a != 0.0).map(|a| format!(r#" transform="rotate({a:.1} {x:.2} {y:.2})""#)).unwrap_or_default();
         let color = safe_color(note.color.as_deref()).unwrap_or("#000");
-        begin_move(&mut s, f, &format!("note:{i}"));
+        begin_move(&mut s, f, &format!("note:{i}"), (x, y));
         text(&mut s, x, y, size, "start", &format!(r#"fill="{color}"{turn}"#), &esc(words));
         end_move(&mut s);
     }
 
     // Short sides, bottom-right inside the frame (the last one lowest).
     for (j, (i, line)) in short.iter().rev().enumerate() {
-        begin_move(&mut s, f, &format!("short:{i}"));
+        begin_move(&mut s, f, &format!("short:{i}"), (FRAME.2 - 2.0, FRAME.3 - 2.5 - j as f64 * 4.0));
         text(&mut s, FRAME.2 - 2.0, FRAME.3 - 2.5 - j as f64 * 4.0, 2.6, "end", "", line);
         end_move(&mut s);
     }
@@ -1237,7 +1243,7 @@ mod tests {
             assert!(before.contains(&format!(r#"data-move="{key}""#)), "{key} can be dragged");
         }
         let after = render_svg(&plan(BTreeMap::from([("beacon:0".to_string(), [3.5, -2.0])])));
-        assert!(after.contains(r#"<g data-move="beacon:0" transform="translate(3.50 -2.00)">"#));
+        assert!(after.contains(r#"<g data-move="beacon:0" transform="translate(3.50 -2.00)""#));
         let marks = |s: &str| s.lines().filter(|l| l.contains(" h2 M") || l.contains("<polygon")).map(String::from).collect::<Vec<_>>();
         assert_eq!(marks(&before), marks(&after), "the beacons and the boundary stay where they are");
     }
@@ -1393,7 +1399,7 @@ mod tests {
         }
         let mut d = editor_plan();
         d.fields.features.push(PlanFeature { symbol: "tree".into(), color: Some("\"/><script>".into()), points: vec![[1020.0, 1020.0]], ..Default::default() });
-        d.fields.styles.insert("beacon:0".into(), LabelStyle { color: Some("\"/><script>".into()), text: None });
+        d.fields.styles.insert("beacon:0".into(), LabelStyle { color: Some("\"/><script>".into()), ..Default::default() });
         d.fields.notes.push(PlanNote { text: "x".into(), at: [1010.0, 1010.0], color: Some("\"/><script>".into()), ..Default::default() });
         assert!(!render_svg(&d).contains("<script>"));
     }
@@ -1402,11 +1408,11 @@ mod tests {
     fn a_label_takes_its_colour_and_an_access_road_its_own_words() {
         let mut d = editor_plan();
         d.fields.road_sides = vec![2];
-        d.fields.styles.insert("beacon:1".into(), LabelStyle { color: Some("#0000ff".into()), text: None });
-        d.fields.styles.insert("road:2".into(), LabelStyle { text: Some("Rayfield Road".into()), color: None });
-        d.fields.styles.insert("roadline:2".into(), LabelStyle { color: Some("#00aa00".into()), text: None });
+        d.fields.styles.insert("beacon:1".into(), LabelStyle { color: Some("#0000ff".into()), ..Default::default() });
+        d.fields.styles.insert("road:2".into(), LabelStyle { text: Some("Rayfield Road".into()), ..Default::default() });
+        d.fields.styles.insert("roadline:2".into(), LabelStyle { color: Some("#00aa00".into()), ..Default::default() });
         let svg = render_svg(&d);
-        assert!(svg.contains(r##"<g data-move="beacon:1" fill="#0000ff">"##));
+        assert!(svg.contains(r##"fill="#0000ff" data-at="##));
         assert!(svg.contains("Rayfield Road") && !svg.contains("Access Road"));
         let g = &svg[svg.find(r#"<g data-road="2""#).unwrap()..];
         assert_eq!(g[..g.find("</g>").unwrap()].matches(r##"stroke="#00aa00""##).count(), 2);
@@ -1418,7 +1424,7 @@ mod tests {
         d.fields.notes.push(PlanNote { text: "Rock <outcrop>".into(), at: [1020.0, 1020.0], color: Some("#123456".into()), size: Some(3.5), angle: Some(30.0) });
         d.fields.notes.push(PlanNote { text: "  ".into(), ..Default::default() });
         let svg = render_svg(&d);
-        assert!(svg.contains(r#"<g data-move="note:0">"#) && !svg.contains("note:1"));
+        assert!(svg.contains(r#"<g data-move="note:0""#) && !svg.contains("note:1"));
         assert!(svg.contains("Rock &lt;outcrop&gt;") && svg.contains(r##"fill="#123456""##) && svg.contains(r#"font-size="3.5""#) && svg.contains("rotate(30.0 "));
     }
 
@@ -1427,7 +1433,7 @@ mod tests {
         let plain = editor_plan();
         let mut d = editor_plan();
         d.fields.features.push(PlanFeature { symbol: "road_access".into(), smooth: true, points: vec![[990.0, 1060.0], [1020.0, 1070.0], [1050.0, 1060.0]], ..Default::default() });
-        d.fields.styles.insert("distance:0".into(), LabelStyle { color: Some("#ff0000".into()), text: Some("99.99m".into()) });
+        d.fields.styles.insert("distance:0".into(), LabelStyle { color: Some("#ff0000".into()), text: Some("99.99m".into()), ..Default::default() });
         let (a, b) = (render_svg(&plain), render_svg(&d));
         assert!(b.contains("40.00m") && !b.contains("99.99m"));
         let beacons = |svg: &str| svg.lines().filter(|l| l.contains(" h2 M")).map(str::to_string).collect::<Vec<_>>();
@@ -1441,6 +1447,22 @@ mod tests {
         assert!(!f.smooth && f.color.is_none() && f.width.is_none());
         let p: PlanFields = serde_json::from_str(r#"{"features":[],"label_moves":{}}"#).unwrap();
         assert!(p.notes.is_empty() && p.styles.is_empty());
+    }
+
+    #[test]
+    fn a_turned_label_turns_about_where_it_is_written_and_changes_nothing_else() {
+        let plain = editor_plan();
+        let mut d = editor_plan();
+        d.fields.styles.insert("distance:0".into(), LabelStyle { angle: Some(45.0), ..Default::default() });
+        d.fields.label_moves.insert("distance:0".into(), [2.0, -1.0]);
+        d.fields.styles.insert("beacon:1".into(), LabelStyle { angle: Some(f64::NAN), ..Default::default() });
+        let (a, b) = (render_svg(&plain), render_svg(&d));
+        let g = b.lines().find(|l| l.contains(r#"data-move="distance:0""#)).unwrap();
+        let at = g.split("data-at=\"").nth(1).unwrap().split('"').next().unwrap();
+        assert!(g.contains(&format!(r#"transform="translate(2.00 -1.00) rotate(45.0 {at})""#)), "{g}");
+        assert!(!b.lines().find(|l| l.contains(r#"data-move="beacon:1""#)).unwrap().contains("rotate"));
+        let writing = |svg: &str| svg.lines().filter(|l| l.starts_with("<text") || l.contains(" h2 M") || l.starts_with("<polygon")).map(str::to_string).collect::<Vec<_>>();
+        assert_eq!(writing(&a), writing(&b));
     }
 
     #[test]
