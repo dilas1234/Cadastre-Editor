@@ -364,7 +364,9 @@ else the digitizer sees the property holding it (file number, UPIN, Zoom, Point 
 with a reason; the number then repeats (`beacon.duplicate_seq`). The property is found by position,
 because Aumentum's parcels have no corner records. Both are kept in the commit's `beacon_notes`.
 
-**Correcting points, at the digitizing stage only.** On a draft, the Point List's Edit Points and beacon
+**Correcting points, at the digitizing stage only.** While sketching, Edit Sketch Properties has a beacon
+number box for each new corner, and the number stays with the corner when its coordinates are corrected;
+a corner on a fabric beacon shows that beacon's number. On a draft, the Point List's Edit Points and beacon
 number boxes. After commit, Edit on a Point List row corrects a wrong number with a reason
 (`POST /api/v1/parcels/beacon-number`), and wrong coordinates go through Correct & Recommit. Both are
 refused once the parcel is linked in the Registry: it is unlinked there first. A number on a beacon

@@ -261,10 +261,18 @@ const edit = { active: false, template: "parcel", geomType: "polygon", construct
 const pointIds = new Map();
 const ptKey = (e, n) => `${Number(e).toFixed(3)} ${Number(n).toFixed(3)}`;
 try { for (const [k, v] of JSON.parse(localStorage.getItem("cad.pointIds") || "[]")) pointIds.set(k, v); } catch { /* storage unavailable */ }
+const savePointIds = () => { try { localStorage.setItem("cad.pointIds", JSON.stringify([...pointIds].slice(-5000))); } catch { /* storage unavailable */ } };
 function rememberPointId(e, n, id) {
   if (!id) return;
   pointIds.set(ptKey(e, n), String(id).trim());
-  try { localStorage.setItem("cad.pointIds", JSON.stringify([...pointIds].slice(-5000))); } catch { /* storage unavailable */ }
+  savePointIds();
+}
+function forgetPointId(e, n) { if (pointIds.delete(ptKey(e, n))) savePointIds(); }
+// A corrected corner keeps its number: numbers are held by coordinates.
+function movePointId(fromE, fromN, toE, toN) {
+  const from = ptKey(fromE, fromN), to = ptKey(toE, toN), id = pointIds.get(from);
+  if (!id || from === to) return;
+  pointIds.delete(from); pointIds.set(to, id); savePointIds();
 }
 // Feature templates in the Create Features window; each maps to a layer and a geometry type.
 const FEATURE_TEMPLATES = [
@@ -1428,7 +1436,7 @@ function beaconCell(p, upin, data) {
   if (upin) return h("span", {}, h("b", {}, p.beacon), " ", h("a", { href: "#", class: "regLinkBtn", title: "Correct this beacon number (the parcel and its UPIN stay)", onclick: (e) => { e.preventDefault(); stop(e); correctBeaconNumber(upin, p); } }, "Edit"));
   if (p.fixed) return h("b", { title: "This corner is on a beacon already in the fabric" }, p.beacon);
   return h("input", { value: p.typed, placeholder: p.beacon, style: "width:90px", title: "The number offered at commit", onclick: stop,
-    onchange: (e) => { const v = e.target.value.trim(); if (v) pointIds.set(ptKey(p.easting, p.northing), v); else pointIds.delete(ptKey(p.easting, p.northing)); notify(v ? `Beacon number set to ${v}.` : "Beacon number cleared."); } });
+    onchange: (e) => { const v = e.target.value.trim(); if (v) rememberPointId(p.easting, p.northing, v); else forgetPointId(p.easting, p.northing); notify(v ? `Beacon number set to ${v}.` : "Beacon number cleared."); } });
 }
 async function correctBeaconNumber(upin, p) {
   const number = await uiPrompt(`The right beacon number for this corner of ${upin}?\n\nNow: ${p.beacon} at ${fmt3(p.easting)} ${fmt3(p.northing)}. The parcel and its UPIN do not change. A beacon shared with a neighbour changes there too.`, p.beacon, { title: "Correct Beacon Number", ok: "Next" });
@@ -3170,13 +3178,13 @@ function updateEditorButtons() {
 }
 
 // Dragging an existing sketch vertex (Edit tool, or the Sketch tool if you grab a vertex).
-let vtxDrag = null;
+let vtxDrag = null, vtxDragFrom = null;
 canvas.addEventListener("mousedown", (ev) => {
   if (ev.button !== 0 || !(state.tool === "sketch" || state.tool === "editVertex") || !edit.verts.length) return;
   const r = canvas.getBoundingClientRect(); const px = ev.clientX - r.left, py = ev.clientY - r.top;
   let hit = -1, hd = 9;
   edit.verts.forEach(([e, n], i) => { const p = map.project(toLL(e, n)); const d = Math.hypot(p.x - px, p.y - py); if (d < hd) { hd = d; hit = i; } });
-  if (hit >= 0) { ev.preventDefault(); ev.stopPropagation(); vtxDrag = hit; edit.sel = hit; drawSketch(); }
+  if (hit >= 0) { ev.preventDefault(); ev.stopPropagation(); vtxDrag = hit; vtxDragFrom = [...edit.verts[hit]]; edit.sel = hit; drawSketch(); }
 });
 window.addEventListener("mousemove", (ev) => {
   if (vtxDrag == null) return;
@@ -3185,7 +3193,7 @@ window.addEventListener("mousemove", (ev) => {
   if (edit.snapping) { const s = snapUTM(pt); if (s) [E, N] = s; }
   edit.verts[vtxDrag] = [E, N]; drawSketch(); refreshSketchProps();
 });
-window.addEventListener("mouseup", () => { if (vtxDrag != null) { vtxDrag = null; suppressClickUntil = Date.now() + 250; updateEditorButtons(); } });
+window.addEventListener("mouseup", () => { if (vtxDrag != null) { const to = edit.verts[vtxDrag]; if (to && vtxDragFrom) { movePointId(vtxDragFrom[0], vtxDragFrom[1], to[0], to[1]); refreshSketchProps(); } vtxDrag = null; vtxDragFrom = null; suppressClickUntil = Date.now() + 250; updateEditorButtons(); } });
 
 // --- Create Features window (templates + construction tools) ---
 function openCreateFeatures() {
@@ -3350,6 +3358,13 @@ async function registryConfirmDialog(jobId, opts = {}) {
 }
 
 // --- Edit Sketch Properties window (live X/Y vertex table) ---
+// A new corner's beacon number, typed or corrected here. A corner on a fabric beacon has that
+// beacon's number: it is not typed.
+function numberBox(i, placeholder) {
+  const typed = pointIds.get(ptKey(...edit.verts[i])) || "";
+  return h("input", { value: typed, placeholder: typed ? "" : placeholder, style: "width:96px", title: "The beacon number from the survey plan; offered at commit", autocomplete: "off",
+    oninput: (e) => { const v = e.target.value.trim(), [E, N] = edit.verts[i]; if (v) rememberPointId(E, N, v); else forgetPointId(E, N); } });
+}
 function openSketchProps() {
   const tbl = h("table", { class: "legs" }, h("tr", {}, h("th", {}, "#"), h("th", {}, "Beacon"), h("th", {}, "X (Easting)"), h("th", {}, "Y (Northing)"), h("th", {}, "")));
   const known = sketchIdent.key === vertsKey(edit.verts) ? sketchIdent.list : null;
@@ -3357,11 +3372,13 @@ function openSketchProps() {
   edit.verts.forEach(([E, N], i) => {
     const id = known && known[i];
     const bcell = h("td", { class: id ? `src-${id.source}` : "muted", title: id ? (id.source === "shared" ? `Shared corner (${id.shared_with.join(", ")})` : CORNER_SOURCE[id.source]) : "Checking…" },
-      id ? cornerLabel(id, id.source !== "beacon" && !pointIds.get(ptKey(id.easting, id.northing)) ? ++newNo : 0) : "…");
+      !id ? "…" : id.source === "beacon" ? id.beacon_number : numberBox(i, cornerLabel(id, !pointIds.get(ptKey(E, N)) ? ++newNo : 0)));
     const x = h("input", { type: "number", step: "0.001", value: E.toFixed(3), style: "width:92px" });
     const y = h("input", { type: "number", step: "0.001", value: N.toFixed(3), style: "width:92px" });
-    x.oninput = () => { const v = parseFloat(x.value); if (isFinite(v)) { edit.verts[i][0] = v; drawSketch(); } };
-    y.oninput = () => { const v = parseFloat(y.value); if (isFinite(v)) { edit.verts[i][1] = v; drawSketch(); } };
+    // The number stays with the corner as it is corrected.
+    const setXY = (k, v) => { const [e0, n0] = edit.verts[i]; edit.verts[i][k] = v; movePointId(e0, n0, edit.verts[i][0], edit.verts[i][1]); drawSketch(); };
+    x.oninput = () => { const v = parseFloat(x.value); if (isFinite(v)) setXY(0, v); };
+    y.oninput = () => { const v = parseFloat(y.value); if (isFinite(v)) setXY(1, v); };
     const tr = h("tr", { class: i === edit.sel ? "selrow" : "" }, h("td", { class: "n" }, String(i + 1)), bcell, h("td", {}, x), h("td", {}, y),
       h("td", {}, h("button", { title: "Delete vertex", onclick: () => { edit.verts.splice(i, 1); edit.sel = Math.min(edit.sel, edit.verts.length - 1); drawSketch(); openSketchProps(); updateEditorButtons(); } }, "✕")));
     tr.addEventListener("click", (ev) => { if (!/INPUT|BUTTON/.test(ev.target.tagName)) { edit.sel = i; drawSketch(); openSketchProps(); } });
