@@ -232,7 +232,9 @@ pub async fn login(State(state): State<AppState>, Json(req): Json<LoginRequest>)
     sqlx::query("DELETE FROM cadastre.login_throttle WHERE login = $1").bind(&short).execute(&mut *tx).await?;
     sqlx::query("INSERT INTO cadastre.user_session (token_hash, sid, view, expires_at, source, registry_admin, registry_staff) VALUES ($1, $2, $3, now() + make_interval(hours => $4), $5, $6, $7)")
         .bind(auth::token_hash(&token)).bind(sid).bind(view.key()).bind(hours).bind(source).bind(extra.admin).bind(extra.staff).execute(&mut *tx).await?;
-    let must_change: bool = if from_registry { false } else {
+    let must_change: bool = if from_registry {
+        sqlx::query_scalar("SELECT EXISTS (SELECT 1 FROM cadastre.registry_password_reset WHERE login = $1)").bind(&short).fetch_one(&mut *tx).await?
+    } else {
         sqlx::query_scalar("UPDATE cadastre.user_credential SET last_login = now() WHERE sid = $1 RETURNING must_change").bind(sid).fetch_one(&mut *tx).await?
     };
     audit::append(&mut tx, &code, "auth_login", "auth", Some(&code), json!({ "view": view.key(), "remember": req.remember, "source": source })).await?;
@@ -267,14 +269,14 @@ pub struct ChangePasswordRequest {
     responses((status = 200), (status = 400, description = "The new password is refused"), (status = 401, description = "Wrong current password")))]
 pub async fn change_password(State(state): State<AppState>, session: Option<Extension<LocalSession>>, headers: HeaderMap, Json(req): Json<ChangePasswordRequest>) -> ApiResult<Json<Value>> {
     let Some(Extension(s)) = session else { return Err(AppError::Conflict("sign-in is not turned on on this server".into())) };
-    if s.from_registry {
-        return Err(AppError::Conflict("Your password is your Registry password: change it in the Registry.".into()));
-    }
     if let Some(why) = password_problem(&req.new_password, &s.code) {
         return Err(AppError::BadRequest(why.into()));
     }
     if req.new_password == req.current_password {
         return Err(AppError::BadRequest("Choose a password different from the current one.".into()));
+    }
+    if s.from_registry {
+        return change_registry_password(&state, &s.code, req.current_password, req.new_password).await;
     }
     let hash: String = sqlx::query_scalar("SELECT password_hash FROM cadastre.user_credential WHERE sid = $1").bind(s.sid).fetch_one(&state.pool).await?;
     if !verify_blocking(req.current_password, hash).await? {
@@ -287,6 +289,24 @@ pub async fn change_password(State(state): State<AppState>, session: Option<Exte
         .bind(s.sid).bind(new_hash).bind(&s.code).execute(&mut *tx).await?;
     sqlx::query("DELETE FROM cadastre.user_session WHERE sid = $1 AND token_hash <> $2").bind(s.sid).bind(keep).execute(&mut *tx).await?;
     audit::append(&mut tx, &s.code, "auth_password_changed", "auth", Some(&s.code), json!({})).await?;
+    tx.commit().await?;
+    Ok(Json(json!({ "ok": true })))
+}
+
+/// A Registry user's password changes in the Registry, in their own session there.
+async fn change_registry_password(state: &AppState, code: &str, current: String, new: String) -> ApiResult<Json<Value>> {
+    let service = LrsConfig::from_env().ok_or_else(|| AppError::Conflict("the Registry connection is not configured on this server".into()))?;
+    let own = LrsConfig { user: code.to_string(), password: current.clone(), ..service };
+    let session = Session::start(&own).await.map_err(|e| match e {
+        LrsError::Fault(_) => AppError::Unauthorized("The current password is not correct.".into()),
+        other => AppError::UnprocessableEntity(format!("the Registry could not be reached: {other}")),
+    })?;
+    let changed = session.change_password(code, &current, &new).await;
+    session.end().await;
+    changed.map_err(|e| AppError::UnprocessableEntity(format!("the Registry did not change the password: {e}")))?;
+    let mut tx = state.pool.begin().await?;
+    sqlx::query("DELETE FROM cadastre.registry_password_reset WHERE login = lower($1)").bind(code).execute(&mut *tx).await?;
+    audit::append(&mut tx, code, "auth_password_changed", "auth", Some(code), json!({ "source": "registry" })).await?;
     tx.commit().await?;
     Ok(Json(json!({ "ok": true })))
 }

@@ -18,6 +18,9 @@ use tokio::net::TcpStream;
 const SOAP: &str = "http://schemas.xmlsoap.org/soap/envelope/";
 const AUTH: &str = "http://www.alfresco.org/ws/service/authentication/1.0";
 const ACS: &str = "http://www.alfresco.org/ws/service/accesscontrol/1.0";
+const ADM: &str = "http://www.alfresco.org/ws/service/administration/1.0";
+/// Alfresco's content model: the properties of a person.
+const CM: &str = "http://www.alfresco.org/model/content/1.0";
 const DOM: &str = "http://www.landsystems.com/domainmodel-service/1.0";
 const LRS: &str = "http://www.landsystems.com/lrs/service";
 const WSSE: &str = "http://docs.oasis-open.org/wss/2004/01/oasis-200401-wss-wssecurity-secext-1.0.xsd";
@@ -203,6 +206,29 @@ impl Session {
         );
         let xml = soap(&self.cfg, "AccessControlService", &format!("{ACS}/getParentAuthorities"), &self.security_header(), &body).await?;
         Ok(xml.split("GROUP_").skip(1).filter_map(|t| t.split('<').next()).map(|n| format!("GROUP_{}", n.replace("&amp;", "&"))).collect())
+    }
+
+    /// Change a Registry password (`AdministrationService`). The session is the user's own, so the
+    /// Registry checks the old password itself.
+    pub async fn change_password(&self, username: &str, old: &str, new: &str) -> Result<(), LrsError> {
+        let body = format!(
+            "<adm:changePassword xmlns:adm=\"{ADM}\"><adm:userName>{}</adm:userName><adm:oldPassword>{}</adm:oldPassword><adm:newPassword>{}</adm:newPassword></adm:changePassword>",
+            escape(username), escape(old), escape(new)
+        );
+        soap(&self.cfg, "AdministrationService", &format!("{ADM}/changePassword"), &self.security_header(), &body).await?;
+        Ok(())
+    }
+
+    /// Create a Registry user with no groups (`AdministrationService`). Needs an administrator's session.
+    pub async fn create_user(&self, username: &str, password: &str, first_name: &str, last_name: &str) -> Result<(), LrsError> {
+        let prop = |name: &str, value: &str| format!(
+            "<adm:properties xmlns:cms=\"{CMS}\"><cms:name>{{{CM}}}{name}</cms:name><cms:isMultiValue>false</cms:isMultiValue><cms:value>{}</cms:value></adm:properties>", escape(value));
+        let body = format!(
+            "<adm:createUsers xmlns:adm=\"{ADM}\"><adm:newUsers><adm:userName>{}</adm:userName><adm:password>{}</adm:password>{}{}{}</adm:newUsers></adm:createUsers>",
+            escape(username), escape(password), prop("userName", username), prop("firstName", first_name), prop("lastName", last_name)
+        );
+        soap(&self.cfg, "AdministrationService", &format!("{ADM}/createUsers"), &self.security_header(), &body).await?;
+        Ok(())
     }
 
     /// The Registry clock minus this machine's, in seconds.
