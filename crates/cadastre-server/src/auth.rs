@@ -207,7 +207,8 @@ fn roles_of(a: Access) -> Vec<String> {
 
 async fn load_session(pool: &sqlx::PgPool, token: &str) -> Result<Option<LocalSession>, sqlx::Error> {
     let row = sqlx::query(
-        "SELECT p.sid, p.code, s.source = 'registry' AS from_registry, s.registry_admin, s.registry_staff, COALESCE(c.must_change, false) AS must_change \
+        "SELECT p.sid, p.code, s.source = 'registry' AS from_registry, s.registry_admin, s.registry_staff, COALESCE(c.must_change, false) AS must_change, \
+         EXISTS (SELECT 1 FROM cadastre.registry_password_reset r WHERE r.login = lower(p.code)) AS registry_reset \
          FROM cadastre.user_session s JOIN cadastre.principal p ON p.sid = s.sid LEFT JOIN cadastre.user_credential c ON c.sid = s.sid \
          WHERE s.token_hash = $1 AND s.expires_at > now() AND p.is_user AND NOT p.is_locked AND (s.source = 'registry' OR c.sid IS NOT NULL)")
         .bind(token_hash(token)).fetch_optional(pool).await?;
@@ -217,7 +218,7 @@ async fn load_session(pool: &sqlx::PgPool, token: &str) -> Result<Option<LocalSe
     let from_registry: bool = r.get("from_registry");
     let access = Access { admin: local.admin || r.get::<bool, _>("registry_admin"), staff: local.staff || r.get::<bool, _>("registry_staff") };
     let user = AuthUser { subject: code.clone(), username: Some(code.clone()), roles: roles_of(access) };
-    Ok(Some(LocalSession { sid, code, must_change: !from_registry && r.get::<bool, _>("must_change"), from_registry, access, user }))
+    Ok(Some(LocalSession { sid, code, must_change: r.get::<bool, _>(if from_registry { "registry_reset" } else { "must_change" }), from_registry, access, user }))
 }
 
 /// Reachable without signing in: the sign-in page, health checks, and what the Registry and
