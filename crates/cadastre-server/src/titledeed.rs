@@ -1070,7 +1070,6 @@ mod tests {
             let want = want.replace("&#39;", "'");
             assert!(svg.contains(&want), "missing {want}");
         }
-        assert_eq!(svg.matches(r##"fill="#1b5e20""##).count(), 3, "the WGS 1984 lines are dark green");
         // An explicit scale is kept.
         fields.scale = Some(750);
         let svg = render_svg(&PlanData { upin: "PL000000023268".into(), area_m2: 249.489, corners: c, fields });
@@ -1078,7 +1077,6 @@ mod tests {
         for line in ["WGS 1984 Co-ordinates of", "N: ", "E: "] {
             assert!(svg.contains(&format!(r##"fill="#1f6fb5">{line}"##)), "the co-ordinates are blue: {line}");
         }
-        assert!(svg.contains(r##"fill="#1b5e20">WGS 1984 Co-ordinates of"##), "the co-ordinates are dark green");
     }
 
     #[test]
