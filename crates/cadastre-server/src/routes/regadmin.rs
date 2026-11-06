@@ -17,6 +17,7 @@ use axum::{Json, Router};
 use serde::Deserialize;
 use serde_json::{json, Value};
 
+use crate::audit;
 use crate::auth::AuthUser;
 use crate::error::{ApiResult, AppError};
 use crate::regadmin::{self, CreateGroup, CreateUser, RegistryGroup, RegistryUser, UpdateUser};
@@ -43,6 +44,15 @@ fn map(e: regadmin::RegAdminError) -> AppError {
 /// The configured Registry SQL connection, or a clear error when the dashboard is off.
 fn cfg(state: &AppState) -> Result<&crate::config::RegistrySqlConfig, AppError> {
     state.config.registry_sql.as_ref().ok_or_else(|| map(regadmin::RegAdminError::NotConfigured))
+}
+
+/// The connection for a change only the `plagis_admin` procedures can make.
+fn procedures(state: &AppState) -> Result<&crate::config::RegistrySqlConfig, AppError> {
+    let c = cfg(state)?;
+    if c.direct {
+        return Err(AppError::Conflict("This change needs the plagis_admin procedures, which are not installed yet. Only adding a user works for now.".into()));
+    }
+    Ok(c)
 }
 
 /// The audit actor: the signed-in username (falls back to the subject).
@@ -95,6 +105,12 @@ pub async fn create_user(State(state): State<AppState>, user: AuthUser, Json(req
     write_config()?;
     let (sql, by) = (cfg(&state)?, actor(&user));
     with_forced_change(&state.pool, &req.user_name, &by, async { regadmin::create_user(sql, &req, &by).await.map_err(map) }).await?;
+    // The procedures log to the Registry's audit table; without them the record is kept here.
+    if sql.direct {
+        let mut tx = state.pool.begin().await?;
+        audit::append(&mut tx, &by, "registry_user_created", "auth", Some(&req.user_name.trim().to_lowercase()), json!({ "ref_user": req.ref_user, "units": req.extra_groups })).await?;
+        tx.commit().await?;
+    }
     Ok(Json(json!({ "user_name": req.user_name, "note": RESTART_NOTE })))
 }
 
@@ -102,7 +118,7 @@ pub async fn create_user(State(state): State<AppState>, user: AuthUser, Json(req
 pub async fn create_group(State(state): State<AppState>, user: AuthUser, Json(req): Json<CreateGroup>) -> ApiResult<Json<Value>> {
     user.require_role("admin")?;
     write_config()?;
-    regadmin::create_group(cfg(&state)?, &req, &actor(&user)).await.map_err(map)?;
+    regadmin::create_group(procedures(&state)?, &req, &actor(&user)).await.map_err(map)?;
     Ok(Json(json!({ "group_name": format!("GROUP_{}", req.display_name.trim()), "note": RESTART_NOTE })))
 }
 
@@ -115,7 +131,7 @@ pub struct GroupBody {
 pub async fn add_to_group(State(state): State<AppState>, user: AuthUser, Path(name): Path<String>, Json(req): Json<GroupBody>) -> ApiResult<Json<Value>> {
     user.require_role("admin")?;
     write_config()?;
-    regadmin::add_to_group(cfg(&state)?, &name, &req.group, &actor(&user)).await.map_err(map)?;
+    regadmin::add_to_group(procedures(&state)?, &name, &req.group, &actor(&user)).await.map_err(map)?;
     Ok(Json(json!({ "note": RESTART_NOTE })))
 }
 
@@ -123,7 +139,7 @@ pub async fn add_to_group(State(state): State<AppState>, user: AuthUser, Path(na
 pub async fn remove_from_group(State(state): State<AppState>, user: AuthUser, Path((name, group)): Path<(String, String)>) -> ApiResult<Json<Value>> {
     user.require_role("admin")?;
     write_config()?;
-    regadmin::remove_from_group(cfg(&state)?, &name, &group, &actor(&user)).await.map_err(map)?;
+    regadmin::remove_from_group(procedures(&state)?, &name, &group, &actor(&user)).await.map_err(map)?;
     Ok(Json(json!({ "note": RESTART_NOTE })))
 }
 
@@ -136,7 +152,7 @@ pub struct PasswordBody {
 pub async fn reset_password(State(state): State<AppState>, user: AuthUser, Path(name): Path<String>, Json(req): Json<PasswordBody>) -> ApiResult<Json<Value>> {
     user.require_role("admin")?;
     write_config()?;
-    let (sql, by) = (cfg(&state)?, actor(&user));
+    let (sql, by) = (procedures(&state)?, actor(&user));
     with_forced_change(&state.pool, &name, &by, async { regadmin::reset_password(sql, &name, &req.password, &by).await.map_err(map) }).await?;
     Ok(Json(json!({ "note": RESTART_NOTE })))
 }
@@ -150,7 +166,7 @@ pub struct EnabledBody {
 pub async fn set_enabled(State(state): State<AppState>, user: AuthUser, Path(name): Path<String>, Json(req): Json<EnabledBody>) -> ApiResult<Json<Value>> {
     user.require_role("admin")?;
     write_config()?;
-    regadmin::set_enabled(cfg(&state)?, &name, req.enabled, &actor(&user)).await.map_err(map)?;
+    regadmin::set_enabled(procedures(&state)?, &name, req.enabled, &actor(&user)).await.map_err(map)?;
     Ok(Json(json!({ "note": RESTART_NOTE })))
 }
 
@@ -158,7 +174,7 @@ pub async fn set_enabled(State(state): State<AppState>, user: AuthUser, Path(nam
 pub async fn update_user(State(state): State<AppState>, user: AuthUser, Path(name): Path<String>, Json(req): Json<UpdateUser>) -> ApiResult<Json<Value>> {
     user.require_role("admin")?;
     write_config()?;
-    regadmin::update_user(cfg(&state)?, &name, &req, &actor(&user)).await.map_err(map)?;
+    regadmin::update_user(procedures(&state)?, &name, &req, &actor(&user)).await.map_err(map)?;
     Ok(Json(json!({ "note": RESTART_NOTE })))
 }
 

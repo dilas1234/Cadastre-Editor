@@ -23,6 +23,13 @@ pub struct RegistrySqlConfig {
     pub database: String,
     pub username: String,
     pub password: String,
+    /// Use TLS. SQL Server 2012 RTM offers only TLS 1.0, which rustls refuses, so that server needs
+    /// `CADASTRE_REGISTRY_SQL_ENCRYPT=off`: the login and every value then cross the LAN unprotected.
+    pub encrypt: bool,
+    /// Work without the `plagis_admin` procedures (`CADASTRE_REGISTRY_SQL_DIRECT=1`): read the
+    /// Alfresco tables and create users with SQL from this server, which needs a login that can
+    /// write those tables, such as `sa`. Everything else then waits for the procedures.
+    pub direct: bool,
 }
 
 impl std::fmt::Debug for RegistrySqlConfig {
@@ -33,22 +40,32 @@ impl std::fmt::Debug for RegistrySqlConfig {
             .field("database", &self.database)
             .field("username", &self.username)
             .field("password", &"****")
+            .field("encrypt", &self.encrypt)
+            .field("direct", &self.direct)
             .finish()
     }
 }
 
+/// Encryption stays on unless it is plainly turned off, so a mistyped value cannot weaken it.
+fn encrypt_setting(value: Option<&str>) -> bool {
+    !value.is_some_and(|v| matches!(v.trim().to_ascii_lowercase().as_str(), "off" | "false" | "0"))
+}
+
 impl RegistrySqlConfig {
-    /// `CADASTRE_REGISTRY_SQL_HOST`, `_USER`, `_PASSWORD` are required; `_PORT` (default 1433) and
-    /// `_DATABASE` (default `LRS43`) are optional. `None` when any required var is unset — the
-    /// Registry-admin dashboard is then off.
+    /// `CADASTRE_REGISTRY_SQL_HOST`, `_USER`, `_PASSWORD` are required; `_PORT` (default 1433),
+    /// `_DATABASE` (default `LRS43`) and `_ENCRYPT` (default on) are optional. Each connection
+    /// value falls back to its `CADASTRE_LRS_SQL_*` name (`_DB` for the database). `None` when any
+    /// required var is unset — the Registry-admin dashboard is then off.
     pub fn from_env() -> Option<Self> {
         let get = |k: &str| env::var(k).ok().map(|v| v.trim().to_string()).filter(|v| !v.is_empty());
         Some(Self {
-            host: get("CADASTRE_REGISTRY_SQL_HOST")?,
-            port: get("CADASTRE_REGISTRY_SQL_PORT").and_then(|v| v.parse().ok()).unwrap_or(1433),
-            database: get("CADASTRE_REGISTRY_SQL_DATABASE").unwrap_or_else(|| "LRS43".to_string()),
-            username: get("CADASTRE_REGISTRY_SQL_USER")?,
-            password: get("CADASTRE_REGISTRY_SQL_PASSWORD")?,
+            host: get("CADASTRE_REGISTRY_SQL_HOST").or_else(|| get("CADASTRE_LRS_SQL_HOST"))?,
+            port: get("CADASTRE_REGISTRY_SQL_PORT").or_else(|| get("CADASTRE_LRS_SQL_PORT")).and_then(|v| v.parse().ok()).unwrap_or(1433),
+            database: get("CADASTRE_REGISTRY_SQL_DATABASE").or_else(|| get("CADASTRE_LRS_SQL_DB")).unwrap_or_else(|| "LRS43".to_string()),
+            username: get("CADASTRE_REGISTRY_SQL_USER").or_else(|| get("CADASTRE_LRS_SQL_USER"))?,
+            password: get("CADASTRE_REGISTRY_SQL_PASSWORD").or_else(|| get("CADASTRE_LRS_SQL_PASSWORD"))?,
+            encrypt: encrypt_setting(get("CADASTRE_REGISTRY_SQL_ENCRYPT").as_deref()),
+            direct: get("CADASTRE_REGISTRY_SQL_DIRECT").is_some_and(|v| v == "1" || v.eq_ignore_ascii_case("true")),
         })
     }
 }
@@ -166,4 +183,19 @@ fn catalog_config_path() -> Option<PathBuf> {
 /// Treat an empty or whitespace-only env var as unset.
 fn non_empty(v: Option<String>) -> Option<String> {
     v.filter(|s| !s.trim().is_empty())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn registry_sql_encryption_is_off_only_when_plainly_asked() {
+        for v in ["off", "OFF", " false ", "0"] {
+            assert!(!encrypt_setting(Some(v)), "{v}");
+        }
+        for v in [None, Some("on"), Some("of"), Some("no"), Some("")] {
+            assert!(encrypt_setting(v), "{v:?}");
+        }
+    }
 }
