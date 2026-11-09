@@ -3,6 +3,7 @@
 pub mod audit;
 pub mod beacons;
 pub mod catalog;
+pub mod charting;
 pub mod completed;
 pub mod editor;
 pub mod login;
@@ -232,6 +233,7 @@ pub fn router(state: AppState) -> Router {
             delete(sessions::release_lock),
         );
 
+    let router = router.merge(charting::routes());
     // Registry (LRS43) user administration — only compiled with the `registry-admin` feature.
     #[cfg(feature = "registry-admin")]
     let router = router.merge(regadmin::routes());

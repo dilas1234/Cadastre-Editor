@@ -117,6 +117,12 @@ pub struct WfJobDetailDto {
     pub can_complete: bool,
     /// The current task's steps and the tools each enables.
     pub steps: Vec<WfStepDto>,
+    /// When the current task can send the job on to plotting (Search Cadastre for Parcels →
+    /// Plot Parcel), that task's steps too, so a parcel not yet in the cadastre can be drawn
+    /// without first moving the job. Steps the current task already has are left out.
+    pub plot_steps: Vec<WfStepDto>,
+    /// The task `plot_steps` come from.
+    pub plot_task: Option<WfTaskRefDto>,
     /// Task history, oldest first.
     pub history: Vec<WfTaskInstanceDto>,
     /// Registry properties and parcel links, as Aumentum stored them (XML).
@@ -438,6 +444,8 @@ async fn load_detail(state: &AppState, id: i32) -> ApiResult<WfJobDetailDto> {
         (true, Some(cur)) => (wfengine::next_tasks(&edges, cur), wfengine::can_complete(&edges, end_task, cur)),
         _ => (vec![], false),
     };
+    let steps = if job.is_open { steps_of(&state.pool, job.current_task_id).await? } else { vec![] };
+    let (plot_task, plot_steps) = plot_tools(&state.pool, &steps, &next_tasks).await?;
     let next_tasks = task_refs(&state.pool, &next_tasks).await?;
     let history = sqlx::query(
         "SELECT ti.id, ti.task_id, t.name AS task, ti.sid, COALESCE(p.name, p.code) AS assigned_to, ti.assigned, ti.started, ti.ended, ti.comment \
@@ -460,7 +468,6 @@ async fn load_detail(state: &AppState, id: i32) -> ApiResult<WfJobDetailDto> {
         comment: r.get("comment"),
     })
     .collect();
-    let steps = if job.is_open { steps_of(&state.pool, job.current_task_id).await? } else { vec![] };
     Ok(WfJobDetailDto {
         lrs_properties: row.get("lrs_properties"),
         link_parcels_properties: row.get("link_parcels_properties"),
@@ -468,8 +475,32 @@ async fn load_detail(state: &AppState, id: i32) -> ApiResult<WfJobDetailDto> {
         next_tasks,
         can_complete,
         steps,
+        plot_steps,
+        plot_task,
         history,
     })
+}
+
+/// Aumentum's "Construct Parcel" step: the task that carries it is where parcels are plotted.
+const CONSTRUCT_PARCEL_STEP: i32 = 1019;
+
+/// The plotting task among `next` (the tasks the current one may send the job to) and its steps,
+/// minus those the current task already has (Load_Region and Load Region are the same step).
+/// Nothing when the current task plots itself or cannot reach plotting in one move.
+async fn plot_tools(pool: &sqlx::PgPool, current: &[WfStepDto], next: &[i32]) -> ApiResult<(Option<WfTaskRefDto>, Vec<WfStepDto>)> {
+    if current.is_empty() || current.iter().any(|s| s.id == CONSTRUCT_PARCEL_STEP) {
+        return Ok((None, vec![]));
+    }
+    let norm = |n: &str| n.replace('_', " ").to_lowercase();
+    for &task in next {
+        let steps = steps_of(pool, Some(task)).await?;
+        if !steps.iter().any(|s| s.id == CONSTRUCT_PARCEL_STEP) {
+            continue;
+        }
+        let extra = steps.into_iter().filter(|s| !current.iter().any(|c| c.id == s.id || norm(&c.name) == norm(&s.name))).collect();
+        return Ok((task_refs(pool, &[task]).await?.into_iter().next(), extra));
+    }
+    Ok((None, vec![]))
 }
 
 async fn graph(pool: &sqlx::PgPool, job_type_id: i32) -> ApiResult<(Vec<Edge>, Option<i32>)> {

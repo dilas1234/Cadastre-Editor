@@ -61,6 +61,26 @@ fn levels(path: &Path) -> Result<Vec<(u32, u32)>> {
     Ok(out)
 }
 
+/// The extent from a world file beside the raster (`.tfw`, `.tifw`, `.wld`): the old cadastral
+/// sheets are plain TIFFs placed this way. Lines: x size, two rotations, y size (negative), then
+/// the map position of the centre of the top-left pixel. A rotated sheet is refused, because an
+/// overview is placed by its extent and would land in the wrong spot.
+fn world_file_bbox(main: &Path, width: u32, height: u32) -> Result<[f64; 4]> {
+    let none = || Error::new(ErrorKind::InvalidData, "not georeferenced (no ModelPixelScale/Tiepoint, no world file)");
+    let text = ["tfw", "tifw", "wld", "TFW", "TIFW", "WLD"].iter()
+        .find_map(|e| std::fs::read_to_string(main.with_extension(e)).ok()).ok_or_else(none)?;
+    let v: Vec<f64> = text.split_whitespace().filter_map(|t| t.parse().ok()).collect();
+    let [a, d, b, e, c, f] = v[..] else { return Err(none()) };
+    if d != 0.0 || b != 0.0 {
+        return Err(Error::new(ErrorKind::InvalidData, "rotated world file: not supported"));
+    }
+    if a <= 0.0 || e >= 0.0 {
+        return Err(none());
+    }
+    let (minx, maxy) = (c - a / 2.0, f - e / 2.0);
+    Ok([minx, maxy + height as f64 * e, minx + width as f64 * a, maxy])
+}
+
 /// Read georeferencing from the main file's header and decide if a preview is feasible.
 pub fn read_info(main: &Path) -> Result<RasterInfo> {
     let mut d = open(main)?;
@@ -80,7 +100,7 @@ pub fn read_info(main: &Path) -> Result<RasterInfo> {
             let maxy = y - j * sy;
             [minx, maxy - height as f64 * sy, minx + width as f64 * sx, maxy]
         }
-        _ => return Err(Error::new(ErrorKind::InvalidData, "not georeferenced (no ModelPixelScale/Tiepoint)")),
+        _ => world_file_bbox(main, width, height)?,
     };
 
     // GeoKeyDirectory (34735): [ver, rev, minor, nkeys] then nkeys quads [key, loc, count, value].

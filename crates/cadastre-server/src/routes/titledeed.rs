@@ -119,6 +119,13 @@ async fn job_parcels(state: &AppState, id: i32) -> ApiResult<(Vec<String>, Optio
     Ok((upins, file_no, txn))
 }
 
+/// What the Registry holds for a file (read-only), and a note if it could not be read.
+pub(crate) async fn registry_file_details(txn: Option<&str>, file_no: Option<&str>) -> (PlanFields, String) {
+    let mut f = PlanFields::default();
+    let note = registry_prefill(&mut f, None, txn, file_no).await;
+    (f, note)
+}
+
 /// Registry prefill (read-only). Errors are reported, not fatal: the form can still be filled.
 async fn registry_prefill(f: &mut PlanFields, su_id: Option<String>, txn: Option<&str>, file_no: Option<&str>) -> String {
     let Some(cfg) = LrsConfig::from_env() else { return "off".into() };

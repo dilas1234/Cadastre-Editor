@@ -195,9 +195,9 @@ const VIEWS = {
   sysadmin: { label: "Sysadmin", path: "/sys-editor", all: true, panel: null },
   digitising: { label: "Digitising", path: "/digitising", features: ["digitise", "edit", "workflow", "registry", "tasks", "completed"], panel: "workflow" },
   titledeed: { label: "Title Deed", path: "/title-deed", features: ["titledeed", "workflow", "registry", "completed"], panel: "queue" },
-  reporting: { label: "Reporting & Chat", path: "/reporting", features: ["completed", "reports"], panel: "completed" },
+  reporting: { label: "Charting and Reporting", path: "/reporting", features: ["completed", "reports", "charting"], panel: "charting" },
 };
-const VIEW_FOR = { digitise: "Digitising", edit: "Digitising", titledeed: "Title Deed", admin: "Sysadmin", reports: "Reporting & Chat" };
+const VIEW_FOR = { digitise: "Digitising", edit: "Digitising", titledeed: "Title Deed", admin: "Sysadmin", reports: "Charting and Reporting" };
 // The view comes from the address each unit is given: /digitising, /title-deed, /reporting, and
 // /sys-editor for the system administrator.
 const currentView = (() => {
@@ -406,6 +406,7 @@ map.once("style.load", async () => {
   await Promise.all([loadParcels(true), loadBeacons(), loadJobs()]);
   renderGraphics();
   buildTOC(); buildCatalog();
+  if (can("charting") && !viewDef.all) chartBaseMap();
   await restoreSession();
   // A unit's view opens on its own panel (unless a refresh put another one back).
   const restored = savedSession?.panel && savedSession.panel !== "toc";
@@ -413,6 +414,7 @@ map.once("style.load", async () => {
     try {
       if (viewDef.panel === "workflow") await openWorkflow();
       else if (viewDef.panel === "queue") { done.source = "queue"; await openCompleted(); }
+      else if (viewDef.panel === "charting") { done.source = "charting"; await openCompleted(); }
       else if (viewDef.panel === "completed") await openCompleted();
     } catch (e) { console.warn("view panel", e); }
   }
@@ -1032,7 +1034,7 @@ function removeDynLayer(l) {
 // Put rasters just above the base imagery so cadastral vectors stay on top.
 const firstVectorLayer = () => ["parcels-fill", "drafts-fill", "beacons-pt"].find((id) => map.getLayer(id));
 async function addRasterLayer(node) {
-  const { folder, path, name } = node;
+  const { folder, path, name, max = 2048 } = node;
   status(`Adding ${name}…`);
   let info;
   try { info = await api(`/api/v1/catalog/raster/info?folder=${folder}&path=${encodeURIComponent(path)}`); }
@@ -1045,7 +1047,7 @@ async function addRasterLayer(node) {
   const id = "r" + dynSeq++;
   const srcId = "rsrc-" + id, lyrId = "rlyr-" + id;
   if (info.decodable) {
-    const url = `/api/v1/catalog/raster/overview?folder=${folder}&path=${encodeURIComponent(path)}&max=2048`;
+    const url = `/api/v1/catalog/raster/overview?folder=${folder}&path=${encodeURIComponent(path)}&max=${max}`;
     map.addSource(srcId, { type: "image", url, coordinates: [tl, tr, br, bl] });
     map.addLayer({ id: lyrId, type: "raster", source: srcId, paint: { "raster-opacity": 1 } }, firstVectorLayer());
     state.dynLayers.unshift({ id, name, kind: "raster", map: [lyrId], src: srcId, bbox: [tl, tr, br, bl], visible: true, unc: catUNC(node), icon: "raster", ovUrl: url, background: null });
@@ -4109,7 +4111,7 @@ function showCompleted(on) {
   body.classList.toggle("hidden", !on);
   const title = document.querySelector("#tocPane .paneHead > span");
   if (on) {
-    if (title) title.textContent = "Completed Jobs";
+    if (title) title.textContent = done.source === "charting" ? "Charting Queue" : "Completed Jobs";
     ["wfBody", "tasksBody", "regBody", "tocBody"].forEach((id) => $(id).classList.add("hidden"));
     document.querySelector("#tocPane .hscroll").classList.add("hidden");
   } else if (!tasksOpen() && !wfOpen() && !regOpen()) {
@@ -4142,6 +4144,8 @@ function historyText(e) {
     case "beacon_number_changed": return `Beacon number corrected: ${d.from || "(none)"} to ${d.to}: ${d.reason || ""}`;
     case "wf_commit_reverted": return `Commit undone (${d.upin || ""})`;
     case "wf_job_area_save": return "Job area saved";
+    case "charting_report_saved": return `Survey report saved (version ${d.version ?? "?"})`;
+    case "charting_report_signed": return d.part === "final" ? "Final Survey Report signed" : "Survey report: charting part signed";
     case "precheck_acknowledged": return `System check warnings accepted: ${d.reason || ""}`;
     case "duplicate_upin_found": return `Duplicate UPIN reported: ${d.upin || ""}`;
     default: return e.text || e.kind.replace(/_/g, " ");
@@ -4211,8 +4215,172 @@ function queueCard(f) {
       h("div", {}, h("i", {}, "Plan"), plan)),
     h("div", { class: "regCardFoot" }, h("span", { class: "regLinks" }, ...actions)));
 }
+/* =====================================================================================
+ * Charting and Reporting (docs/charting-and-reporting.docx). The officer checks the committed
+ * parcel against the old scanned cadastral sheets, then fills the Survey Report on Right of
+ * Occupancy; the charting officer signs the first part and a second officer the final part.
+ * ===================================================================================== */
+const chart = { files: [], total: 0, stage: "to_chart", err: "" };
+const CHART_STAGES = [["to_chart", "To chart"], ["to_report", "To report"], ["to_finalise", "To finalise"], ["done", "Done"], ["", "All"]];
+const CHART_STATE = { none: "To chart", draft: "To report", charted: "To finalise", final: "Done" };
+// [key, type, label, shown only when [question, answer]]
+const CHART_HEAD = [["officer_name", "text", "Charting officer"], ["rank", "text", "Rank"], ["ref_no", "text", "Ref no"], ["property_no", "text", "Property No"],
+  ["applicant", "text", "Name of Applicant"], ["area", "text", "Area (Sq.m)"], ["location", "text", "Place / Location"]];
+const CHART_FIELDS = [
+  ["identified", "yn", "1. Have you correctly identified this land?"],
+  ["ground_open", "yn", "2. Is the ground open?"], ["ground_detail", "text", "What title or application lies on the land", ["ground_open", "No"]],
+  ["beaconed", "yn", "3. Is the plot completely beaconed?"], ["tracing_no", "text", "(a) Tracing No", ["beaconed", "Yes"]], ["deposited_plan_no", "text", "(b) Deposited plan No", ["beaconed", "Yes"]],
+  ["government_item_no", "text", "(c) Lies on Government property, item No", ["beaconed", "Yes"]], ["separate_survey", "yn", "(d) Separate survey is required", ["beaconed", "Yes"]],
+  ["town_plan", "yn", "4. Does it lie in an area covered by a Town Plan?"], ["tpo_no", "text", "TPO No", ["town_plan", "Yes"]],
+  ["contravenes", "yn", "(a) Does the shape contravene the TOP plan?", ["town_plan", "Yes"]], ["land_use", "text", "(b) The application is for", ["town_plan", "Yes"]],
+  ["under_title", "yn", "5. Is the plot held under title?"], ["title_detail", "text", "Revoked/expired details", ["under_title", "Yes"]], ["title_no", "text", "Title No", ["under_title", "Yes"]],
+  ["rail", "yn", "6. Does a rail line traverse the plot?"], ["major_road", "yn", "7. Is the plot on a major road?"], ["settlement", "yn", "8. Is the plot in a settlement area?"],
+];
+const CHART_FINAL = [
+  ["officer_name", "text", "Officer"], ["rank", "text", "Rank"], ["ground_opened", "yn", "The ground is opened"],
+  ["satisfactory", "yn", "1. The application is completely satisfactory with regards to survey requirement"], ["satisfactory_detail", "text", "Why not", ["satisfactory", "No"]],
+  ["description", "text", "2. The correct description of the plot is"], ["check_survey", "yn", "3. Check survey will be necessary on approval"],
+  ["in_addition", "text", "4. In addition"], ["recommended", "yn", "5. The application is recommended to proceed to title"], ["recommended_detail", "text", "Subject to", ["recommended", "Yes"]],
+];
+async function chartLoad() {
+  done.busy = true; chart.err = ""; renderCompleted();
+  try {
+    const r = await api("/api/v1/charting/files?" + new URLSearchParams({ q: done.q, stage: chart.stage }));
+    chart.files = r.files; chart.total = r.total;
+  } catch (e) { chart.err = e.message; }
+  done.busy = false; done.loaded = true; renderCompleted();
+}
+function chartList(box) {
+  box.append(h("div", { class: "regTabs" }, ...CHART_STAGES.map(([k, l]) => h("span", { class: "regTab" + (chart.stage === k ? " sel" : ""), onclick: () => { chart.stage = k; chartLoad(); } }, l))));
+  box.append(h("div", { class: "muted", style: "margin:4px 8px" }, done.busy ? "Loading…" : `${chart.total.toLocaleString()} file(s)${chart.files.length < chart.total ? `, showing ${chart.files.length}: search to narrow` : ""}`));
+  if (chart.err) box.append(h("div", { style: "margin:0 8px 4px;color:#b00" }, chart.err));
+  for (const f of chart.files) box.append(chartCard(f));
+}
+function chartCard(f) {
+  const upin = f.upins[0];
+  return h("div", { class: "regCard " + (f.state === "final" ? "job" : "wait") },
+    h("div", { class: "regCardTop" }, h("span", { class: "regUpin" }, f.property_number || f.name || `#${f.id}`), h("span", { class: "regPill ok" }, CHART_STATE[f.state] || f.state)),
+    h("div", { class: "muted" }, `${f.upins.join(", ")}${f.transaction_number ? " · " + f.transaction_number : ""}`),
+    h("div", { class: "regCardFoot" }, h("span", { class: "regLinks" }, regLink("Chart", "Zoom to the parcel, show its beacons and find its scanned sheets", () => chartOpen(upin)),
+      regLink("Report", "The Survey Report on Right of Occupancy", () => chartReport(f.id)),
+      regLink("Point List", "Beacons, bearings and distances", () => pointListWindow(upin)),
+      regLink("History", "The file's Registry stages and this Cadastre's events", () => historyWindow({ txn: f.transaction_number, job: f.id, upin, title: f.property_number })))));
+}
+// The map of this view: the legacy sheets are its base, with the parcel run against them. Imagery
+// and the control points belong to Digitising and Title Deed; the Table Of Contents still has them.
+function chartBaseMap() {
+  for (const id of ["imagery", "ctrl"]) { const l = findLayer(id); if (l) l.visible = false; }
+  applyVisibility(); buildTOC();
+}
+function chartClearSheets() {
+  for (const l of state.dynLayers.filter((x) => x.sheet)) {
+    l.map.forEach((id) => map.getLayer(id) && map.removeLayer(id));
+    if (map.getSource(l.src)) map.removeSource(l.src);
+  }
+  state.dynLayers = state.dynLayers.filter((x) => !x.sheet); buildTOC();
+}
+async function chartOpen(upin) {
+  chartClearSheets();
+  // Straight to the plot, close enough to read the pen marks on the sheet.
+  try {
+    const r = await api("/api/v1/parcels/search?number=" + encodeURIComponent(upin));
+    if (r.length) { const f = resultFeature(r[0]); zoomToFC({ type: "FeatureCollection", features: [f] }, { animate: false, padding: 120, maxZoom: 20 }); focusParcel(f); selectFeatures([r[0].id]); }
+    else status(`${upin} is not a parcel in this Cadastre.`);
+  } catch (e) { status(e.message); }
+  await showParcelBeacons(upin); await chartSheets(upin);
+}
+// The sheets under the plot come up by themselves, faded just enough to read the parcel on them.
+async function chartSheets(upin) {
+  let r; try { r = await api("/api/v1/charting/sheets?upin=" + encodeURIComponent(upin)); } catch (e) { uiAlert(e.message); return; }
+  const fade = (v) => state.dynLayers.filter((l) => l.kind === "raster").forEach((l) => l.map.forEach((id) => map.getLayer(id) && map.setPaintProperty(id, "raster-opacity", v)));
+  const opacity = h("input", { type: "range", min: "0.1", max: "1", step: "0.05", value: "0.85", style: "flex:1", oninput: (e) => fade(Number(e.target.value)), "aria-label": "Sheet opacity" });
+  const show = async (s) => {
+    if (state.dynLayers.some((l) => l.sheet && l.name === s.name)) return;
+    await addRasterLayer({ ...s, max: 4096 });
+    const l = state.dynLayers.find((x) => x.name === s.name && x.kind === "raster"); if (l) l.sheet = true;
+    fade(Number(opacity.value));
+  };
+  const list = r.sheets.map((s, i) => h("div", { class: "frow" }, h("span", { style: "flex:1" }, s.name), i < 4 ? null : h("button", { class: "btn", onclick: () => show(s) }, "Show")));
+  const why = r.problems.length ? `The sheet folders could not all be read: ${r.problems.join("; ")}` : `No legacy sheet covers this plot (${r.indexed} georeferenced in the Catalog folders), so it cannot be checked here.`;
+  floatWindow(`Scanned sheets: ${upin}`, h("div", {}, ...(list.length ? list : [h("p", { class: "muted" }, why)]),
+    h("div", { class: "frow", style: "margin-top:8px" }, h("label", {}, "Opacity"), opacity),
+    h("p", { class: "muted" }, "Run the parcel against the sheet: its beacons and outline should agree with the pen marks.")), { id: "chartSheets", width: 340 });
+  for (const s of r.sheets.slice(0, 4)) await show(s);
+}
+function chartField(values, [key, type, label], locked) {
+  const value = values[key] ?? "";
+  const inp = type === "yn"
+    ? h("select", { disabled: locked }, ...["", "Yes", "No"].map((o) => h("option", { value: o, selected: o === value }, o || "—")))
+    : h("input", { value, disabled: locked, style: "width:100%" });
+  return [inp, h("div", { style: "margin:5px 0" }, h("label", { style: "display:block;font-size:12px;color:#555" }, label), inp)];
+}
+function chartPrint(f, a, rep) {
+  const w = window.open("", "_blank"); if (!w) { uiAlert("Allow pop-ups to print the report."); return; }
+  const rows = (fields, v) => fields.map(([k, , l]) => h("tr", {}, h("td", { style: "padding:3px 8px 3px 0" }, l), h("td", { style: "font-weight:bold" }, v[k] || "")));
+  const body = h("div", { style: "font:13px Arial;max-width:720px;margin:auto" }, h("h2", { style: "text-align:center" }, "Survey Report on Right of Occupancy"),
+    h("p", { style: "text-align:center" }, "Survey Ordinance CAP 120"),
+    h("table", {}, ...rows(CHART_HEAD, a.charting)),
+    h("h3", {}, "Charting"), h("table", {}, ...rows(CHART_FIELDS, a.charting)), h("p", {}, `Charting officer: ${a.charting.officer_name || rep?.charted_by || ""}    Date: ${rep?.charted_at ? fmtDT(rep.charted_at) : ""}    Signed: ____________`),
+    h("h3", {}, "Final Survey Report"), h("table", {}, ...rows(CHART_FINAL, a.final)), h("p", {}, `Officer: ${a.final.officer_name || rep?.final_by || ""}    Date: ${rep?.final_at ? fmtDT(rep.final_at) : ""}    Signed: ____________`));
+  w.document.title = `Survey Report ${f.property_number || ""}`;
+  w.document.body.append(w.document.importNode(body, true));
+  w.print();
+}
+async function chartReport(id) {
+  let f; try { f = await api("/api/v1/charting/files/" + id); } catch (e) { uiAlert(e.message); return; }
+  const rep = f.report, st = rep?.state || "none";
+  const saved = rep?.answers || {};
+  const c = { ...(saved.charting || {}) }, fin = { ...(saved.final || {}) };
+  // Filled in advance from the Cadastre and the Registry; the officer confirms or corrects.
+  const reg = f.registry || {};
+  let pts = null; try { pts = await api("/api/v1/parcels/points?upin=" + encodeURIComponent(f.upins[0])); } catch { /* typed instead */ }
+  const series = pts?.points?.map((p) => String(p.beacon || "").match(/^[A-Za-z]+/)?.[0]).filter(Boolean) || [];
+  const fill = { ref_no: f.property_number, property_no: f.property_number, applicant: reg.applicant, location: [reg.address, reg.location, reg.lga].filter(Boolean).join(", "),
+    area: pts?.area_m2 != null ? Number(pts.area_m2).toFixed(3) : "", tracing_no: reg.tracing_no || (new Set(series).size === 1 ? series[0] : ""), deposited_plan_no: reg.plan_no };
+  for (const [k, v] of Object.entries(fill)) if (!c[k] && v) c[k] = v;
+  // The officer filling a part is the signed-in one.
+  const mine = st === "charted" ? fin : st === "final" ? {} : c;
+  if (!mine.officer_name && f.officer?.name) mine.officer_name = f.officer.name;
+  if (!mine.rank && f.officer?.rank) mine.rank = f.officer.rank;
+  const chartLocked = st === "charted" || st === "final", finalLocked = st !== "charted";
+  const head = CHART_HEAD.map((d) => [d[0], chartField(c, d, chartLocked), d[3]]);
+  const parts = CHART_FIELDS.map((d) => [d[0], chartField(c, d, chartLocked), d[3]]);
+  const finals = CHART_FINAL.map((d) => [d[0], chartField(fin, d, finalLocked), d[3]]);
+  // A follow-up shows only when the answer above calls for it, and a hidden one is not kept.
+  const shown = (list, cond) => !cond || list.find(([k]) => k === cond[0])?.[1][0].value === cond[1];
+  const follow = (list) => { const apply = () => list.forEach(([, [, row], cond]) => { row.style.display = shown(list, cond) ? "" : "none"; });
+    list.forEach(([, [i]]) => { if (i.tagName === "SELECT") i.addEventListener("change", apply); }); apply(); };
+  follow(parts); follow(finals);
+  const value = (list, [, [i], cond]) => (shown(list, cond) ? i.value : "");
+  const read = () => { const o = { charting: {}, final: {} }; for (const e of head) o.charting[e[0]] = e[1][0].value; for (const e of parts) o.charting[e[0]] = value(parts, e); for (const e of finals) o.final[e[0]] = value(finals, e); return o; };
+  let version = rep?.version;
+  const save = async () => { const r = await api(`/api/v1/charting/files/${id}/report`, { method: "PUT", body: { answers: read(), version } }); version = r.version; };
+  const act = (fn) => async () => { try { await fn(); } catch (e) { uiAlert(e.message); } };
+  const refresh = async () => { $("chartWin")?.remove(); await chartLoad(); chartReport(id); };
+  const sign = (part, who) => act(async () => {
+    if (!(await uiConfirm(`Sign the ${who} as ${state.me?.username || "the signed-in officer"}? That part can no longer be changed.`))) return;
+    await save(); await api(`/api/v1/charting/files/${id}/sign`, { method: "POST", body: { part } }); notify("Signed."); await refresh();
+  });
+  const scroll = h("div", { style: "max-height:calc(60vh - 56px);overflow:auto;padding-right:6px" },
+    reg.note && reg.note !== "off" && reg.note !== "ok" ? h("div", { class: "muted", style: "color:#a35a00" }, `Registry details not filled: ${reg.note}`) : null,
+    ...head.map(([, [, row]]) => row), h("h4", {}, "Charting"), ...parts.map(([, [, row]]) => row),
+    rep?.charted_by ? h("div", { class: "muted" }, `Signed by ${rep.charted_by}, ${fmtDT(rep.charted_at)}`) : null,
+    h("h4", {}, "Final Survey Report"), finalLocked && st !== "final" ? h("div", { class: "muted" }, "Completed by a second officer once the charting part is signed.") : null, ...finals.map(([, [, row]]) => row),
+    rep?.final_by ? h("div", { class: "muted" }, `Signed by ${rep.final_by}, ${fmtDT(rep.final_at)}`) : null);
+  const buttons = h("div", { class: "frow", style: "margin-top:8px;gap:6px;justify-content:flex-end" },
+    h("span", { class: "muted", style: "margin-right:auto" }, CHART_STATE[st] + (version ? ` · version ${version}` : "")),
+    h("button", { class: "btn", onclick: () => chartPrint(f, read(), rep) }, "Print"),
+    st === "final" ? null : h("button", { class: "btn", onclick: act(async () => { await save(); notify("Saved."); await refresh(); }) }, "Save"),
+    st === "none" || st === "draft" ? h("button", { class: "btn active", onclick: sign("charting", "charting part") }, "Sign charting") : null,
+    st === "charted" ? h("button", { class: "btn active", onclick: sign("final", "Final Survey Report") }, "Sign final") : null);
+  floatWindow(`Survey Report: ${f.property_number || f.name || id}`, h("div", {}, scroll, buttons), { id: "chartWin", width: 560 });
+}
+
 async function doneLoad(reset) {
+  const paneTitle = document.querySelector("#tocPane .paneHead > span");
+  if (paneTitle && doneOpen()) paneTitle.textContent = done.source === "charting" ? "Charting Queue" : "Completed Jobs";
   if (done.source === "queue") { await queueLoad(); return; }
+  if (done.source === "charting") { await chartLoad(); return; }
   if (reset) { done.offset = 0; done.jobs = []; }
   done.busy = true; done.err = ""; renderCompleted();
   try {
@@ -4270,11 +4438,12 @@ function renderCompleted() {
   const run = () => { done.q = q.value.trim(); if (done.source === "queue" && done.queueLoaded) renderCompleted(); else doneLoad(true); };
   q.addEventListener("keydown", (e) => e.key === "Enter" && run());
   const src = h("select", { onchange: (e) => { done.source = e.target.value; doneLoad(true); } },
-    ...[["queue", "Title deed queue (Registry)"], ["", "All completed"], ["cadastre", "Plagis editor"], ["aumentum", "Aumentum"]].map(([v, l]) => h("option", { value: v, selected: done.source === v }, l)));
+    ...[...(can("charting") ? [["charting", "Charting queue"]] : []), ["queue", "Title deed queue (Registry)"], ["", "All completed"], ["cadastre", "Plagis editor"], ["aumentum", "Aumentum"]].map(([v, l]) => h("option", { value: v, selected: done.source === v }, l)));
   box.append(...[h("div", { class: "frow", style: "margin:6px 8px 2px" }, q, h("button", { class: "btn", style: "min-width:0", onclick: run }, "Find"), src),
-    done.source === "queue" ? null : h("div", { class: "muted", style: "margin:0 8px 4px" }, done.busy && !done.jobs.length ? "Loading…" : `${done.total.toLocaleString()} completed job(s)${done.q ? ` matching “${done.q}”` : ""}, newest first`),
-    done.regErr && done.source !== "queue" ? h("div", { class: "muted", style: "margin:0 8px 4px;color:#a35a00" }, `Registry details not shown: ${done.regErr}`) : null,
-    done.err && done.source !== "queue" ? h("div", { style: "margin:0 8px 4px;color:#b00" }, done.err) : null].filter(Boolean));
+    done.source === "queue" || done.source === "charting" ? null : h("div", { class: "muted", style: "margin:0 8px 4px" }, done.busy && !done.jobs.length ? "Loading…" : `${done.total.toLocaleString()} completed job(s)${done.q ? ` matching “${done.q}”` : ""}, newest first`),
+    done.regErr && done.source !== "queue" && done.source !== "charting" ? h("div", { class: "muted", style: "margin:0 8px 4px;color:#a35a00" }, `Registry details not shown: ${done.regErr}`) : null,
+    done.err && done.source !== "queue" && done.source !== "charting" ? h("div", { style: "margin:0 8px 4px;color:#b00" }, done.err) : null].filter(Boolean));
+  if (done.source === "charting") { chartList(box); return; }
   if (done.source === "queue") {
     const qv = normName(done.q);
     const all = done.queue?.files || [];
@@ -4765,6 +4934,24 @@ function renderWorkflow() {
   list.scrollTop = scroll;
   if (wf.detail && wf.detail.job.id === wf.selected) body.append(wfDetailView(wf.detail));
 }
+// A task's steps, each with its tools and the editor action that runs it.
+function wfStepList(steps) {
+  const ol = h("ol", { class: "wfSteps" });
+  for (const s of steps) {
+    // Aumentum tools by name; ArcMap's own built-in tools (not in Aumentum's registry) as a count.
+    const named = s.commands.filter((c) => AUM_TOOL_GUIDS[c] || !c.startsWith("{")).map(wfToolName).filter((v, i, a) => a.indexOf(v) === i);
+    const builtIn = s.commands.filter((c) => c.startsWith("{") && !AUM_TOOL_GUIDS[c]).length;
+    const tools = named.join(" · ") + (builtIn ? `${named.length ? " · " : ""}+ ${builtIn} ArcMap tool${builtIn > 1 ? "s" : ""}` : "");
+    let act = wfStepAction(s);
+    const need = stepFeature(s.id);
+    if (need && !can(need)) act = { label: "—", tip: `Done in the ${VIEW_FOR[need]} view` };
+    ol.append(h("li", {}, h("div", { class: "wfStepHead" }, h("b", {}, s.name),
+        act.run ? h("button", { class: "btn wfStepBtn", title: act.tip, onclick: act.run }, act.label || "Open")
+                : h("span", { class: "muted wfStepNote", title: act.tip }, act.label)),
+      h("div", { class: "muted" }, tools || "—")));
+  }
+  return ol;
+}
 function wfDetailView(d) {
   const j = d.job;
   const box = h("div", { class: "wfDetail" });
@@ -4781,22 +4968,12 @@ function wfDetailView(d) {
     h("span", { class: "muted" }, parcel.properties.parcel_number)));
 
   if (j.is_open && d.steps.length) {
-    box.append(h("div", { class: "wfSub" }, `Steps of "${j.current_task}"`));
-    const ol = h("ol", { class: "wfSteps" });
-    for (const s of d.steps) {
-      // Aumentum tools by name; ArcMap's own built-in tools (not in Aumentum's registry) as a count.
-      const named = s.commands.filter((c) => AUM_TOOL_GUIDS[c] || !c.startsWith("{")).map(wfToolName).filter((v, i, a) => a.indexOf(v) === i);
-      const builtIn = s.commands.filter((c) => c.startsWith("{") && !AUM_TOOL_GUIDS[c]).length;
-      const tools = named.join(" · ") + (builtIn ? `${named.length ? " · " : ""}+ ${builtIn} ArcMap tool${builtIn > 1 ? "s" : ""}` : "");
-      let act = wfStepAction(s);
-      const need = stepFeature(s.id);
-      if (need && !can(need)) act = { label: "—", tip: `Done in the ${VIEW_FOR[need]} view` };
-      ol.append(h("li", {}, h("div", { class: "wfStepHead" }, h("b", {}, s.name),
-          act.run ? h("button", { class: "btn wfStepBtn", title: act.tip, onclick: act.run }, act.label || "Open")
-                  : h("span", { class: "muted wfStepNote", title: act.tip }, act.label)),
-        h("div", { class: "muted" }, tools || "—")));
-    }
-    box.append(ol);
+    box.append(h("div", { class: "wfSub" }, `Steps of "${j.current_task}"`), wfStepList(d.steps));
+    // Search Cadastre for Parcels can send the job on to Plot Parcel: its tools are offered here
+    // too, so a file whose parcel is not in the cadastre yet is drawn without moving the job first.
+    if ((d.plot_steps || []).length) box.append(
+      h("div", { class: "wfSub", title: "The parcel is not in the cadastre yet? Draw it here; Post Parcel & Finish Job takes the job through the plotting tasks." }, `${d.plot_task?.name || "Plot Parcel"} tools`),
+      wfStepList(d.plot_steps));
   }
   if (j.is_open) box.append(wfEditingView(j, wf.selEditing));
   else box.append(h("div", { class: "frow", style: "margin:6px 0;gap:4px" },
