@@ -4541,12 +4541,26 @@ async function aumentumWarning() {
   let s; try { s = await api("/api/v1/aumentum/status"); } catch { return; }
   const down = s.configured && !s.ok;
   let bar = $("aumWarn");
-  if (down && !bar) {
-    bar = h("div", { id: "aumWarn", role: "alert", title: s.reason || "" },
-      h("b", {}, "Aumentum server is not responding."), " New commits are paused until it is back. Please contact the ICT Admin. You can keep working: your drafts stay as they are.");
-    $("toolbars").after(bar);
-  } else if (bar && !down) bar.remove();
-  else if (bar) bar.title = s.reason || "";
+  if (!down) { if (bar) { bar.remove(); try { map.resize(); } catch { /* the map is not ready */ } } return; }
+  // Say where it broke, so whoever fixes it knows which side to look at.
+  const where = s.server ? `Aumentum (${s.server})` : "Aumentum";
+  const what = {
+    settings: "this Cadastre server has no Aumentum login set",
+    unreachable: "this Cadastre server cannot reach it",
+    timeout: "it did not answer in time",
+    "sign-in": "it failed the sign-in",
+    lookup: "it failed the UPIN lookup",
+  }[s.stage] || "it is not answering";
+  const at = s.checked_at ? new Date(s.checked_at).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" }) : null;
+  const body = [
+    h("b", {}, `${where}: ${what}${s.detail ? ` — “${s.detail}”` : ""}.`),
+    " New commits are paused until it is back. You can keep working: your drafts stay as they are.",
+    s.hint ? h("div", { class: "aumHint" }, h("b", {}, "Fix: "), s.hint) : h("div", { class: "aumHint" }, "Please contact the ICT Admin."),
+    h("div", { class: "aumMeta" }, [s.outbound_addr ? `Calling from ${s.outbound_addr}` : null, at ? `checked ${at}` : null].filter(Boolean).join(" · ")),
+  ];
+  if (!bar) { bar = h("div", { id: "aumWarn", role: "alert" }); $("toolbars").after(bar); }
+  bar.title = s.reason || "";
+  bar.replaceChildren(...body);
   try { map.resize(); } catch { /* the map is not ready */ }
 }
 aumentumWarning();
