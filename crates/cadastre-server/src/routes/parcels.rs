@@ -721,6 +721,7 @@ pub async fn parcel_points(State(state): State<AppState>, Query(q): Query<Parcel
         "job_instance_id": job,
         "job_name": row.get::<Option<String>, _>("job_name"),
         "can_correct": why_not.is_none(),
+        "linked": linked,
         "committed_in": if job.is_none() { "aumentum" } else { "cadastre" },
         "why_not": why_not,
         "points": legs.iter().map(|l| serde_json::json!({

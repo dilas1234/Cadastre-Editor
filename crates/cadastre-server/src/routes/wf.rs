@@ -1156,7 +1156,7 @@ pub async fn commit(State(state): State<AppState>, user: AuthUser, Path(id): Pat
     let c = commit_drafts(&mut tx, id, &req).await?;
     let staff = staff_of(&state.pool, req.staff_sid, req.staff_name.as_deref()).await?;
     let who = committed_by(staff.as_deref(), &actor.label);
-    audit::append(&mut tx, &who, "wf_commit", "wf_job_instance", Some(&id.to_string()), json!({ "parcel_numbers": c.numbers, "beacons_added": c.beacons_added, "retired": c.retired, "staff_name": staff, "staff_sid": req.staff_sid, "login": actor.label })).await?;
+    audit::append(&mut tx, &who, "wf_commit", "wf_job_instance", Some(&id.to_string()), json!({ "parcel_numbers": c.numbers, "beacons_added": c.beacons_added, "beacon_notes": c.beacon_notes, "retired": c.retired, "staff_name": staff, "staff_sid": req.staff_sid, "login": actor.label })).await?;
     // A commit is the end of digitising: the job is completed (Correct reopens it).
     let job_type_id: i32 = sqlx::query_scalar("SELECT job_type_id FROM cadastre.wf_job_instance WHERE id = $1").bind(id).fetch_one(&mut *tx).await?;
     let (edges, end_task) = graph(&state.pool, job_type_id).await?;
@@ -1182,6 +1182,8 @@ async fn commit_drafts(tx: &mut sqlx::PgConnection, id: i32, req: &crate::routes
     if drafts == 0 && !crate::routes::mutations::has_pending_retirement(&mut *tx, id).await? {
         return Err(AppError::Conflict("the job has no parcels to commit".into()));
     }
+    // Beacons first: a corner taking an adjoining beacon's position changes the parcel's shape.
+    let beacons = crate::routes::wfbeacons::apply(&mut *tx, job_id, req).await?;
     let allow_overlap: Option<String> = sqlx::query_scalar("SELECT value FROM cadastre.app_setting WHERE key = 'editor.allow_overlap'").fetch_optional(&mut *tx).await?;
     if allow_overlap.as_deref() != Some("1") {
         let clashes: Vec<String> = sqlx::query_scalar(
@@ -1197,20 +1199,21 @@ async fn commit_drafts(tx: &mut sqlx::PgConnection, id: i32, req: &crate::routes
             return Err(AppError::Conflict(format!("parcels may not overlap the fabric (Editor.AllowOverlap = 0); overlaps: {}", clashes.join(", "))));
         }
     }
-    let beacons_added = crate::routes::wfbeacons::apply(&mut *tx, job_id, req).await?;
     // Mutations: parents leave the active fabric before their successors take UPINs.
     let retired = crate::routes::mutations::retire_parents(&mut *tx, id).await?;
     let posted = crate::routes::jobs::post_drafts_with_ids(&mut *tx, job_id).await?;
     crate::routes::mutations::finalise(&mut *tx, id, &posted).await?;
     let numbers: Vec<String> = posted.into_iter().map(|(_, n)| n).collect();
     sqlx::query("UPDATE cadastre.wf_job_instance SET updated = now()::timestamp WHERE id = $1").bind(id).execute(&mut *tx).await?;
-    Ok(Committed { numbers, beacons_added, retired })
+    Ok(Committed { numbers, beacons_added: beacons.added, beacon_notes: beacons.notes, retired })
 }
 
 /// What a commit did: the UPINs given, the beacon numbers added, the parcels retired.
 struct Committed {
     numbers: Vec<String>,
     beacons_added: Vec<String>,
+    /// Numbers matched to an adjoining beacon, or repeated with a reason.
+    beacon_notes: Vec<serde_json::Value>,
     retired: Vec<String>,
 }
 
@@ -1380,7 +1383,7 @@ pub async fn finish(State(state): State<AppState>, user: AuthUser, Path(id): Pat
     let numbers = c.numbers;
     let staff = staff_of(&state.pool, req.staff_sid, req.staff_name.as_deref()).await?;
     let who = committed_by(staff.as_deref(), &actor.label);
-    audit::append(&mut tx, &who, "wf_commit", "wf_job_instance", Some(&id.to_string()), json!({ "parcel_numbers": numbers, "beacons_added": c.beacons_added, "retired": c.retired, "fast_track": true, "staff_name": staff, "staff_sid": req.staff_sid, "login": actor.label })).await?;
+    audit::append(&mut tx, &who, "wf_commit", "wf_job_instance", Some(&id.to_string()), json!({ "parcel_numbers": numbers, "beacons_added": c.beacons_added, "beacon_notes": c.beacon_notes, "retired": c.retired, "fast_track": true, "staff_name": staff, "staff_sid": req.staff_sid, "login": actor.label })).await?;
 
     // Carry on to the end task and complete. Best-effort: the parcels are already posted, so a
     // restricted downstream task simply leaves the job open there rather than failing the post.

@@ -88,6 +88,8 @@ pub fn router(state: AppState) -> Router {
         .route("/api/v1/wf/jobs/{id}/registry/withdraw-plan", post(registry::withdraw_plan))
         .route("/api/v1/wf/jobs/{id}/registry-confirmation", get(precheck::last_confirmation).post(precheck::confirm))
         .route("/api/v1/beacons/identify", post(wfbeacons::identify))
+        .route("/api/v1/wf/jobs/{id}/editing/beacon-check", post(wfbeacons::check))
+        .route("/api/v1/parcels/beacon-number", post(wfbeacons::change_number))
         .route("/api/v1/wf/jobs/{id}/area", put(wf::put_area).delete(wf::delete_area))
         .route("/api/v1/wf/jobs/{id}/area/{action}", post(wf::area_action))
         .route("/api/v1/wf/jobs/{id}/discard", post(wf::discard))

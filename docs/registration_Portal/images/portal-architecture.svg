@@ -1,0 +1,201 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<svg xmlns="http://www.w3.org/2000/svg" width="1700" height="1060" viewBox="0 0 1700 1060">
+<defs><style>
+body{margin:0;background:#fff;font-family:"Segoe UI",Arial,Helvetica,sans-serif}
+.t{font-size:15px;fill:#1b2a3a}.s{font-size:12px;fill:#3d4f61}.h{font-size:20px;font-weight:700;fill:#0f2b46}
+.z{font-size:16px;font-weight:700;letter-spacing:.5px}.n{font-size:12px;font-weight:700;fill:#fff}
+.lab{font-size:11.5px;fill:#24384c}
+</style>
+ <marker id="a" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="#3b5470"/></marker>
+ <marker id="g" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="#1f7a4d"/></marker>
+ <marker id="o" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="#b85c00"/></marker>
+ <filter id="sh" x="-5%" y="-5%" width="110%" height="120%"><feDropShadow dx="0" dy="1.5" stdDeviation="1.5" flood-opacity=".18"/></filter>
+</defs>
+<rect width="1700" height="1060" fill="#ffffff"/>
+<text x="40" y="44" class="h">PLAGIS Land Registration Portal — architecture (paperless lodgement linked to the Aumentum Registry)</text>
+<text x="40" y="68" class="s">Design for review · Existing infrastructure: PostgreSQL on the PLAGIS server, SQL Server LRS43 on 10.10.10.5 (LRSAdmin unchanged) · Numbers (INV, RCT, PLS, PL, PLT) all come from Registry counters</text>
+
+<!-- zones -->
+<rect x="30" y="90" width="330" height="900" rx="14" fill="#f3f6fa" stroke="#9fb3c8" stroke-dasharray="6 4"/>
+<text x="50" y="118" class="z" fill="#41607f">INTERNET</text>
+<rect x="390" y="90" width="520" height="900" rx="14" fill="#eef7f1" stroke="#7fb593" stroke-dasharray="6 4"/>
+<text x="410" y="118" class="z" fill="#2d7a4c">DMZ · PUBLIC PORTAL (HTTPS only)</text>
+<rect x="960" y="90" width="710" height="900" rx="14" fill="#fdf5ea" stroke="#d6a76b" stroke-dasharray="6 4"/>
+<text x="980" y="118" class="z" fill="#a0601a">PLAGIS LAN (no inbound from the Internet)</text>
+<!-- firewall -->
+<rect x="924" y="90" width="22" height="900" fill="#c0392b" opacity=".85"/>
+<text transform="translate(940,640) rotate(-90)" class="n" font-size="13">FIREWALL · Bridge pulls out over HTTPS · no inbound to the LAN</text>
+
+<!-- Internet boxes -->
+<g filter="url(#sh)">
+<rect x="55" y="150" width="280" height="110" rx="10" fill="#fff" stroke="#41607f" stroke-width="1.6"/>
+<text x="75" y="180" class="t" font-weight="700">Applicant / agent</text>
+<text x="75" y="202" class="s">Browser or phone · account with OTP</text>
+<text x="75" y="220" class="s">Online wizard or fillable PDF upload</text>
+<text x="75" y="238" class="s">Uploads documents · pays · tracks file</text>
+
+<rect x="55" y="420" width="280" height="120" rx="10" fill="#fff" stroke="#41607f" stroke-width="1.6"/>
+<text x="75" y="450" class="t" font-weight="700">Payment gateway</text>
+<text x="75" y="472" class="s">Remita (recommended) / Interswitch / Paystack</text>
+<text x="75" y="490" class="s">Payment ref (RRR) · card, transfer, USSD</text>
+<text x="75" y="508" class="s">Webhook + verify API · settlement to State</text>
+<text x="75" y="526" class="s">account per revenue head (fee type)</text>
+
+<rect x="55" y="700" width="280" height="90" rx="10" fill="#fff" stroke="#41607f" stroke-width="1.6"/>
+<text x="75" y="730" class="t" font-weight="700">SMS + e-mail provider</text>
+<text x="75" y="752" class="s">OTP · invoices · e-receipts · status</text>
+<text x="75" y="770" class="s">updates · "action required" alerts</text>
+</g>
+
+<!-- DMZ boxes -->
+<g filter="url(#sh)">
+<rect x="415" y="150" width="470" height="110" rx="10" fill="#fff" stroke="#2d7a4c" stroke-width="1.6"/>
+<text x="435" y="180" class="t" font-weight="700">Portal web app</text>
+<text x="435" y="202" class="s">Wizards for APRO, APSL, APCO, APCA, DEV, PSUR (individual + organisation)</text>
+<text x="435" y="220" class="s">Form built from Registry config: lr_formfield, dictionaries, metadata</text>
+<text x="435" y="238" class="s">Invoices · e-receipts · status tracker · online acceptance of terms</text>
+
+<rect x="415" y="300" width="470" height="150" rx="10" fill="#fff" stroke="#2d7a4c" stroke-width="2.2"/>
+<text x="435" y="330" class="t" font-weight="700">Portal API</text>
+<text x="435" y="352" class="s">Validation · payment states (quoted → invoiced → paid → verified →</text>
+<text x="435" y="370" class="s">confirmed → receipted → posted) · idempotent on gateway reference</text>
+<text x="435" y="388" class="s">Outbox of work for the Bridge (lodge, post payment, accept terms)</text>
+<text x="435" y="406" class="s">Receives gateway webhooks · sends notifications</text>
+<text x="435" y="424" class="s">Portal reference PRT-YYYY-nnnnnn</text>
+
+<rect x="415" y="490" width="225" height="110" rx="10" fill="#fff" stroke="#2d7a4c" stroke-width="1.6"/>
+<path d="M440 512 q 25 -10 50 0 v 50 q -25 10 -50 0 z" fill="#d9efe1" stroke="#2d7a4c"/>
+<ellipse cx="465" cy="512" rx="25" ry="6" fill="#eaf6ee" stroke="#2d7a4c"/>
+<text x="500" y="525" class="t" font-weight="700">Portal DB</text>
+<text x="500" y="545" class="s">PostgreSQL 16</text>
+<text x="500" y="563" class="s">(existing server)</text>
+<text x="430" y="590" class="s">accounts · applications · invoices</text>
+
+<rect x="660" y="490" width="225" height="110" rx="10" fill="#fff" stroke="#2d7a4c" stroke-width="1.6"/>
+<text x="680" y="520" class="t" font-weight="700">Upload store</text>
+<text x="680" y="542" class="s">Virus scan · PDF/A</text>
+<text x="680" y="560" class="s">SHA-256 per file</text>
+<text x="680" y="578" class="s">→ Registry IncomingDocument</text>
+
+<rect x="415" y="640" width="470" height="80" rx="10" fill="#fff" stroke="#2d7a4c" stroke-width="1.6"/>
+<text x="435" y="670" class="t" font-weight="700">Public verify page (QR)</text>
+<text x="435" y="692" class="s">Checks receipts, acknowledgements, digital R of O / C of O — no personal data</text>
+
+<rect x="415" y="760" width="470" height="200" rx="10" fill="#fbfdfb" stroke="#2d7a4c" stroke-width="1.2" stroke-dasharray="4 3"/>
+<text x="435" y="788" class="t" font-weight="700">Applicant journey</text>
+<text x="435" y="812" class="s">① Apply + upload   ② Pre-checks + fee quote (from the Registry)</text>
+<text x="435" y="832" class="s">③ Invoice (INV no.) + gateway reference   ④ Pay</text>
+<text x="435" y="852" class="s">⑤ Webhook + server-to-server verify   ⑥ Accounts confirm</text>
+<text x="435" y="872" class="s">⑦ E-receipt (RCT no.) by SMS + e-mail   ⑧ Bridge lodges in Aumentum</text>
+<text x="435" y="892" class="s">⑨ PLS no. (and PL no. when the file is opened) sent to applicant</text>
+<text x="435" y="912" class="s">⑩ Status mirrored every minute · accept terms · pay C of O fees</text>
+<text x="435" y="932" class="s">⑪ Digital R of O / C of O with QR · collection appointment</text>
+</g>
+
+<!-- LAN boxes -->
+<g filter="url(#sh)">
+<rect x="985" y="150" width="310" height="140" rx="10" fill="#fff" stroke="#a0601a" stroke-width="1.6"/>
+<text x="1005" y="180" class="t" font-weight="700">Back office (browser)</text>
+<text x="1005" y="202" class="s">Intake pre-check (documents)</text>
+<text x="1005" y="220" class="s">Accounts: confirm payments, bulk</text>
+<text x="1005" y="238" class="s">after settlement match · reconciliation</text>
+<text x="1005" y="256" class="s">Exception queue · correction requests</text>
+<text x="1005" y="274" class="s">Sign-in with Registry accounts / groups</text>
+
+<rect x="1325" y="150" width="320" height="140" rx="10" fill="#fff" stroke="#a0601a" stroke-width="1.6"/>
+<text x="1345" y="180" class="t" font-weight="700">Registry Desktop (officers)</text>
+<text x="1345" y="202" class="s">Unchanged: Lands, Survey, SQCO,</text>
+<text x="1345" y="220" class="s">Town Planning, Deeds, Commissioner,</text>
+<text x="1345" y="238" class="s">Governor. Portal files arrive in the</text>
+<text x="1345" y="256" class="s">normal queue, already lodged, scanned</text>
+<text x="1345" y="274" class="s">and paid</text>
+
+<rect x="985" y="330" width="660" height="210" rx="12" fill="#fff" stroke="#a0601a" stroke-width="2.6"/>
+<text x="1005" y="362" class="t" font-weight="700" font-size="17">Registry Bridge  (service on 10.10.10.11, next to the Cadastre server)</text>
+<text x="1005" y="388" class="s">• Pulls work from the portal outbox over outbound HTTPS (15–30 s)</text>
+<text x="1005" y="408" class="s">• Replays the Desktop: startProcessInstance → AcceptApplication (whole batch) → upload documents →</text>
+<text x="1005" y="426" class="s">   lodgement letter → stage rules → completeTask (Lodge, Scan) → post payment → Cashier tasks</text>
+<text x="1005" y="446" class="s">• Same client rules, task locks and transition names as the Desktop · every step checkpointed + idempotent</text>
+<text x="1005" y="466" class="s">• Fee quotes, property / title / blocking / ground-rent checks read from the Registry</text>
+<text x="1005" y="486" class="s">• Mirror: lr_process_history, status, PL no., new fees, outgoing documents → portal (every 60 s)</text>
+<text x="1005" y="506" class="s">• Nightly full reconciliation · exception queue · user "portal-bridge" in Intake, Scanning, Cashier groups</text>
+<text x="1005" y="526" class="s">• Registry adapter: today the JBoss SOAP API; later the Registry replica — portal unchanged</text>
+
+<rect x="985" y="580" width="660" height="230" rx="12" fill="#fff" stroke="#7a3d0c" stroke-width="2.2"/>
+<text x="1005" y="610" class="t" font-weight="700" font-size="17">Aumentum Registry  10.10.10.5  (unchanged)</text>
+<text x="1005" y="634" class="s">JBoss LRS · SOAP /lrs/api: ReceptionService, WorkflowWebService, DomainModelService, CashierService,</text>
+<text x="1005" y="652" class="s">ReportsService, /lrs/upload · jBPM workflow (14 processes) · Alfresco documents (D:\LRS_STORAGE)</text>
+<path d="M1010 680 q 30 -12 60 0 v 70 q -30 12 -60 0 z" fill="#f6e3cc" stroke="#7a3d0c"/>
+<ellipse cx="1040" cy="680" rx="30" ry="7" fill="#fbeedd" stroke="#7a3d0c"/>
+<text x="1085" y="692" class="t" font-weight="700">SQL Server LRS43</text>
+<text x="1085" y="712" class="s">LRSAdmin (unchanged): lr_batch, lr_transaction, parties,</text>
+<text x="1085" y="730" class="s">properties, lr_payment, lr_process_history, lr_simplecounter</text>
+<text x="1085" y="756" class="t" font-weight="700" fill="#2d7a4c">plagis_ext (new schema)</text>
+<text x="1085" y="776" class="s">portal_application · payment_posting (unique) · portal_document ·</text>
+<text x="1085" y="794" class="s">notification_log · bridge_cursor</text>
+
+<rect x="985" y="850" width="660" height="110" rx="10" fill="#fff" stroke="#a0601a" stroke-width="1.6"/>
+<text x="1005" y="880" class="t" font-weight="700">Cadastre  10.10.10.11</text>
+<text x="1005" y="902" class="s">Survey checking, digitising, title deed plan, UPIN — Registry creates the jobs (lr_mc_job)</text>
+<text x="1005" y="920" class="s">and links the UPIN at Raise Title Deed Plan, as today</text>
+<text x="1005" y="938" class="s">Optional: overlap pre-check for new land at application time</text>
+</g>
+
+<!-- arrows -->
+<g fill="none" stroke-width="2">
+<!-- applicant to web -->
+<path d="M335 205 L413 205" stroke="#3b5470" marker-end="url(#a)"/>
+<!-- web to API -->
+<path d="M650 260 L650 298" stroke="#3b5470" marker-end="url(#a)" marker-start="url(#a)"/>
+<!-- API to DB/store -->
+<path d="M527 450 L527 488" stroke="#3b5470" marker-end="url(#a)"/>
+<path d="M772 450 L772 488" stroke="#3b5470" marker-end="url(#a)"/>
+<!-- API to gateway -->
+<path d="M413 395 C 370 395 370 470 337 470" stroke="#1f7a4d" marker-end="url(#g)"/>
+<path d="M337 505 C 380 505 385 420 413 420" stroke="#1f7a4d" marker-end="url(#g)"/>
+<!-- applicant pays gateway -->
+<path d="M195 260 L195 418" stroke="#1f7a4d" marker-end="url(#g)"/>
+<!-- API to SMS -->
+<path d="M413 440 C 360 600 360 720 337 735" stroke="#3b5470" marker-end="url(#a)"/>
+<!-- SMS to applicant -->
+<path d="M90 698 C 40 600 40 300 90 262" stroke="#3b5470" stroke-dasharray="5 4" marker-end="url(#a)"/>
+<!-- bridge pulls from API (outbound) -->
+<path d="M983 420 C 940 420 930 380 887 380" stroke="#b85c00" stroke-width="2.6" marker-end="url(#o)"/>
+<!-- back office to API -->
+<path d="M983 230 C 930 230 930 330 887 330" stroke="#b85c00" marker-end="url(#o)"/>
+<!-- back office to bridge -->
+<path d="M1140 290 L1140 328" stroke="#3b5470" marker-end="url(#a)"/>
+<!-- bridge to registry -->
+<path d="M1260 540 L1260 578" stroke="#7a3d0c" stroke-width="3" marker-end="url(#a)"/>
+<path d="M1420 578 L1420 542" stroke="#7a3d0c" stroke-width="2" stroke-dasharray="5 4" marker-end="url(#a)"/>
+<!-- desktop to registry -->
+<path d="M1600 290 C 1662 360 1662 640 1647 660" stroke="#3b5470" marker-end="url(#a)"/>
+<!-- registry to cadastre -->
+<path d="M1315 810 L1315 848" stroke="#3b5470" marker-end="url(#a)" marker-start="url(#a)"/>
+</g>
+<!-- arrow labels -->
+<g class="lab">
+<rect x="342" y="185" width="68" height="16" fill="#fff"/><text x="345" y="197">① apply</text>
+<rect x="200" y="320" width="62" height="16" fill="#fff"/><text x="203" y="332" fill="#1f7a4d">④ pay</text>
+<text x="343" y="388" fill="#1f7a4d">③ ref</text>
+<text x="343" y="536" fill="#1f7a4d">⑤ webhook</text>
+<text x="343" y="552" fill="#1f7a4d">+ verify</text>
+<text x="40" y="620" fill="#3b5470">⑦ e-receipt,</text>
+<text x="40" y="636" fill="#3b5470">status SMS</text>
+<rect x="893" y="335" width="0" height="0"/>
+<text x="1002" y="318" fill="#b85c00">⑥ confirm</text>
+<text x="887" y="402" fill="#b85c00" font-weight="700">⑧</text><text x="885" y="416" fill="#b85c00" font-weight="700">pull</text>
+<text x="1268" y="565" fill="#7a3d0c" font-weight="700">⑧ lodge (SOAP)</text>
+<text x="1428" y="565" fill="#7a3d0c">⑩ mirror (read)</text>
+<text x="1323" y="838">jobs · UPIN</text>
+</g>
+<!-- legend -->
+<g class="lab">
+<rect x="30" y="1002" width="1640" height="44" rx="8" fill="#f7f9fb" stroke="#d3dbe4"/>
+<line x1="50" y1="1024" x2="90" y2="1024" stroke="#1f7a4d" stroke-width="2" marker-end="url(#g)"/><text x="98" y="1028">payment</text>
+<line x1="170" y1="1024" x2="210" y2="1024" stroke="#b85c00" stroke-width="2.6" marker-end="url(#o)"/><text x="218" y="1028">outbound from the LAN only</text>
+<line x1="410" y1="1024" x2="450" y2="1024" stroke="#7a3d0c" stroke-width="3" marker-end="url(#a)"/><text x="458" y="1028">writes through the Registry's own services (never direct SQL into LRSAdmin)</text>
+<line x1="930" y1="1024" x2="970" y2="1024" stroke="#7a3d0c" stroke-width="2" stroke-dasharray="5 4" marker-end="url(#a)"/><text x="978" y="1028">read-only mirror</text>
+<text x="1120" y="1028">Owner of the file: Portal until lodgement → Bridge while lodging → Registry after</text>
+</g>
+</svg>
