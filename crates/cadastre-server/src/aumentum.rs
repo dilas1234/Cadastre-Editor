@@ -33,6 +33,64 @@ pub struct Health {
     pub ok: bool,
     /// Why not, if not.
     pub reason: Option<String>,
+    /// Where it failed: `settings` (this server's), `unreachable`, `timeout`, `sign-in` or `lookup`.
+    pub stage: Option<String>,
+    /// Aumentum's own error text (its SOAP fault), when it gave one.
+    pub detail: Option<String>,
+    /// What to do about it, for the known causes.
+    pub hint: Option<String>,
+    /// The job service asked (host[:port]).
+    pub server: Option<String>,
+    /// The address this server calls from (`CADASTRE_OUTBOUND_ADDR`), if one is set.
+    pub outbound_addr: Option<String>,
+    /// When the answer was found (it is reused for up to a minute).
+    pub checked_at: Option<chrono::DateTime<chrono::Utc>>,
+}
+
+/// Why Aumentum could not be asked: the step, Aumentum's own words, and the message a commit shows.
+struct Failure {
+    stage: &'static str,
+    detail: Option<String>,
+    message: String,
+}
+
+impl Failure {
+    fn new(stage: &'static str, detail: Option<String>, message: String) -> Self {
+        Self { stage, detail, message }
+    }
+}
+
+/// The innermost message of a SOAP fault ("Server was unable to process request. ---> No such
+/// host is known" gives "No such host is known").
+fn fault(body: &str) -> Option<String> {
+    let start = body.find("<faultstring>")? + "<faultstring>".len();
+    let end = start + body[start..].find("</faultstring>")?;
+    let text = body[start..end].replace("&gt;", ">").replace("&lt;", "<").replace("&quot;", "\"").replace("&apos;", "'").replace("&amp;", "&");
+    let inner = text.rsplit("--->").next().unwrap_or(&text).trim().trim_end_matches('.').to_string();
+    (!inner.is_empty()).then_some(inner)
+}
+
+/// What to do, for the causes seen on this network.
+fn hint(f: &Failure) -> Option<String> {
+    let d = f.detail.as_deref().unwrap_or("").to_lowercase();
+    if d.contains("no such host is known") {
+        let from = std::env::var("CADASTRE_OUTBOUND_ADDR").ok().filter(|s| !s.trim().is_empty());
+        return Some(match from {
+            None => "Aumentum looks up the caller's address in DNS and found no name for this server's. Set CADASTRE_OUTBOUND_ADDR to an address of this server that has a DNS name (10.10.10.11 is plagis30.plagis.com) and restart it.".into(),
+            Some(a) => format!("Aumentum looks up the caller's address in DNS and found no name for {a}. Give {a} a DNS name, or set CADASTRE_OUTBOUND_ADDR to an address of this server that has one."),
+        });
+    }
+    match f.stage {
+        "settings" => Some("Set CADASTRE_MC_SERVICE_USER / CADASTRE_MC_SERVICE_PASSWORD in this server's settings and restart it.".into()),
+        "unreachable" | "timeout" => Some("Check that this server can reach Aumentum's job service (network, firewall, IIS on the Aumentum server).".into()),
+        _ => None,
+    }
+}
+
+/// host[:port] of a URL, for display.
+fn host_of(url: &str) -> Option<String> {
+    let rest = url.split("://").nth(1).unwrap_or(url);
+    rest.split('/').next().filter(|h| !h.is_empty()).map(str::to_string)
 }
 
 /// Asked at most once a minute, however many editors are open.
@@ -46,17 +104,19 @@ const PROBE_UPIN: &str = "PL000000000000";
 
 /// Sign in and ask about a UPIN, as a commit does: Aumentum has been seen to sign in and then
 /// answer every lookup with HTTP 500.
-async fn probe() -> Result<(), String> {
-    let Some(check) = UpinCheck::connect().await? else { return Ok(()) };
-    let asked = check.issued(PROBE_UPIN).await;
+async fn probe() -> Result<(), Failure> {
+    let Some(check) = UpinCheck::sign_in().await? else { return Ok(()) };
+    let asked = check.lookup(PROBE_UPIN).await;
     check.close().await;
     asked.map(|_| ())
 }
 
 /// Whether Aumentum answers, from a check at most a minute old.
 pub async fn health() -> Health {
+    let server = std::env::var("CADASTRE_AUMENTUM_JOBSERVICE_URL").ok().and_then(|u| host_of(u.trim()));
+    let outbound_addr = std::env::var("CADASTRE_OUTBOUND_ADDR").ok().map(|s| s.trim().to_string()).filter(|s| !s.is_empty());
     if !UpinCheck::configured() {
-        return Health { configured: false, ok: true, reason: None };
+        return Health { configured: false, ok: true, reason: None, stage: None, detail: None, hint: None, server, outbound_addr, checked_at: None };
     }
     let mut cached = HEALTH.lock().await;
     if let Some((at, h)) = cached.as_ref() {
@@ -65,8 +125,19 @@ pub async fn health() -> Health {
         }
     }
     let answer = tokio::time::timeout(std::time::Duration::from_secs(HEALTH_TIMEOUT_SECS), probe()).await
-        .unwrap_or_else(|_| Err("Aumentum did not answer in time".into()));
-    let h = Health { configured: true, ok: answer.is_ok(), reason: answer.err() };
+        .unwrap_or_else(|_| Err(Failure::new("timeout", None, format!("Aumentum did not answer within {HEALTH_TIMEOUT_SECS} s"))));
+    let failure = answer.err();
+    let h = Health {
+        configured: true,
+        ok: failure.is_none(),
+        hint: failure.as_ref().and_then(hint),
+        stage: failure.as_ref().map(|f| f.stage.to_string()),
+        detail: failure.as_ref().and_then(|f| f.detail.clone()),
+        reason: failure.map(|f| f.message),
+        server,
+        outbound_addr,
+        checked_at: Some(chrono::Utc::now()),
+    };
     *cached = Some((std::time::Instant::now(), h.clone()));
     h
 }
@@ -79,36 +150,76 @@ impl UpinCheck {
 
     /// Signed in to Aumentum's job service, or `Ok(None)` when the check is not configured.
     pub async fn connect() -> Result<Option<Self>, String> {
+        Self::sign_in().await.map_err(|f| f.message)
+    }
+
+    /// Whether Aumentum has an attribute record for this UPIN (in any status).
+    pub async fn issued(&self, upin: &str) -> Result<bool, String> {
+        self.lookup(upin).await.map_err(|f| f.message)
+    }
+
+    async fn sign_in() -> Result<Option<Self>, Failure> {
         let Some(url) = std::env::var("CADASTRE_AUMENTUM_JOBSERVICE_URL").ok().map(|s| s.trim().to_string()).filter(|s| !s.is_empty()) else {
             return Ok(None);
         };
         let get = |k: &str| std::env::var(k).ok().filter(|v| !v.is_empty());
         let (Some(user), Some(pw)) = (get("CADASTRE_MC_SERVICE_USER"), get("CADASTRE_MC_SERVICE_PASSWORD")) else {
-            return Err("the Aumentum UPIN check needs CADASTRE_MC_SERVICE_USER / _PASSWORD".into());
+            return Err(Failure::new("settings", None, "the Aumentum UPIN check needs CADASTRE_MC_SERVICE_USER / _PASSWORD".into()));
         };
         let body = envelope("Authenticate", &format!("<user>{}</user><password>{}</password>", escape(&user), escape(&pw)));
         let r = http(&url, "POST", &[("Content-Type", "text/xml; charset=utf-8".into()), ("SOAPAction", format!("\"{NS}Authenticate\""))], &body)
             .await
-            .map_err(|e| format!("Aumentum could not be asked whether the UPIN is free ({e}); nothing was committed. Please contact the ICT Admin."))?;
+            .map_err(|e| Failure::new("unreachable", Some(e.to_string()),
+                format!("Aumentum could not be asked whether the UPIN is free ({e}); nothing was committed. Please contact the ICT Admin.")))?;
         match (r.body.contains("<AuthenticateResult>true</AuthenticateResult>"), r.cookie) {
             (true, Some(cookie)) => Ok(Some(Self { url, cookie })),
-            _ => Err("Aumentum's job service refused the sign-in for the UPIN check; nothing was committed. Please contact the ICT Admin.".into()),
+            _ => {
+                let detail = fault(&r.body);
+                let said = detail.as_deref().map(|d| format!(" (HTTP {}: {d})", r.status)).unwrap_or_default();
+                Err(Failure::new("sign-in", detail,
+                    format!("Aumentum's job service refused the sign-in for the UPIN check{said}; nothing was committed. Please contact the ICT Admin.")))
+            }
         }
     }
 
-    /// Whether Aumentum has an attribute record for this UPIN (in any status).
-    pub async fn issued(&self, upin: &str) -> Result<bool, String> {
+    async fn lookup(&self, upin: &str) -> Result<bool, Failure> {
         let body = envelope("GetParcelAttributesByUPIN", &format!("<regionName>Plateau_State</regionName><upin>{}</upin>", escape(upin)));
         let r = http(&self.url, "POST", &[("Content-Type", "text/xml; charset=utf-8".into()), ("SOAPAction", format!("\"{NS}GetParcelAttributesByUPIN\"")), ("Cookie", self.cookie.clone())], &body)
             .await
-            .map_err(|e| format!("Aumentum could not be asked whether {upin} is free ({e}); nothing was committed. Please contact the ICT Admin."))?;
+            .map_err(|e| Failure::new("unreachable", Some(e.to_string()),
+                format!("Aumentum could not be asked whether {upin} is free ({e}); nothing was committed. Please contact the ICT Admin.")))?;
         if r.status != 200 {
-            return Err(format!("Aumentum answered HTTP {} when asked about {upin}; nothing was committed. Please contact the ICT Admin.", r.status));
+            let detail = fault(&r.body);
+            let said = detail.as_deref().map(|d| format!(": {d}")).unwrap_or_default();
+            return Err(Failure::new("lookup", detail,
+                format!("Aumentum answered HTTP {} when asked about {upin}{said}; nothing was committed. Please contact the ICT Admin.", r.status)));
         }
         Ok(r.body.contains("<FieldName>UPIN</FieldName>"))
     }
 
     pub async fn close(self) {
         let _ = http(&self.url, "POST", &[("Content-Type", "text/xml; charset=utf-8".into()), ("SOAPAction", format!("\"{NS}LogOut\"")), ("Cookie", self.cookie.clone())], &envelope("LogOut", "")).await;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn fault_gives_aumentums_innermost_message() {
+        let body = "<soap:Fault><faultcode>soap:Server</faultcode><faultstring>Server was unable to process request. ---&gt; No such host is known</faultstring></soap:Fault>";
+        assert_eq!(fault(body).as_deref(), Some("No such host is known"));
+        let body = "<faultstring>Invalid operation, the user credentials are not valid or the user is not authenticated</faultstring>";
+        assert_eq!(fault(body).as_deref(), Some("Invalid operation, the user credentials are not valid or the user is not authenticated"));
+        assert_eq!(fault("<html>500</html>"), None);
+    }
+
+    #[test]
+    fn no_such_host_points_at_the_outbound_address() {
+        let f = Failure::new("sign-in", Some("No such host is known".into()), String::new());
+        assert!(hint(&f).is_some_and(|h| h.contains("CADASTRE_OUTBOUND_ADDR")));
+        assert!(hint(&Failure::new("lookup", Some("Object reference not set".into()), String::new())).is_none());
+        assert_eq!(host_of("http://10.10.10.6/ApplicationServerAdmin/WebServices/LRSWebServices.asmx").as_deref(), Some("10.10.10.6"));
     }
 }
