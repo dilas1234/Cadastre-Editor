@@ -1105,6 +1105,16 @@ async fn aumentum_workflow_follows_the_task_graph() {
     sqlx::query("INSERT INTO cadastre.wf_step (id, name, commands) VALUES ($1, 'Generate Title Deed Plan', ARRAY['{0FF462C4-AB8B-4735-B153-11284B5B2E6E}'])")
         .bind(b).execute(&pool).await.unwrap();
     sqlx::query("INSERT INTO cadastre.wf_task_step (task_id, step_id, ord) VALUES ($1, $2, 1)").bind(plan).bind(b).execute(&pool).await.unwrap();
+    // Search has Load Region; Plot Parcel has Load_Region (the same step, Aumentum spells it two
+    // ways) and Construct Parcel (Aumentum's step 1019, shared by every plotting task).
+    sqlx::query("INSERT INTO cadastre.wf_step (id, name, commands) VALUES (1019, 'Construct Parcel', ARRAY[]::text[]) ON CONFLICT (id) DO NOTHING")
+        .execute(&pool).await.unwrap();
+    for (step, name) in [(b + 1, "Load Region"), (b + 2, "Load_Region")] {
+        sqlx::query("INSERT INTO cadastre.wf_step (id, name, commands) VALUES ($1, $2, ARRAY[]::text[])").bind(step).bind(name).execute(&pool).await.unwrap();
+    }
+    for (task, step, ord) in [(search, b + 1, 1), (plot, b + 2, 1), (plot, 1019, 2)] {
+        sqlx::query("INSERT INTO cadastre.wf_task_step (task_id, step_id, ord) VALUES ($1, $2, $3)").bind(task).bind(step).bind(ord).execute(&pool).await.unwrap();
+    }
     sqlx::query("INSERT INTO cadastre.wf_job_type (id, name, start_task_id, end_task_id) VALUES ($1, 'Deed Plan (test)', $2, $3)")
         .bind(b).bind(search).bind(plan).execute(&pool).await.unwrap();
     for (from, to) in [(search, plot), (search, plan), (plot, review), (review, commit), (review, plot), (commit, plan)] {
@@ -1120,6 +1130,11 @@ async fn aumentum_workflow_follows_the_task_graph() {
     assert!(id as i32 > max_before, "new job ids continue above existing (imported) ones");
     assert_eq!(job["job"]["current_task_id"], search);
     assert_eq!(job["job"]["status_label"], "In progress");
+    // Search can send the job to Plot Parcel, so Plot Parcel's tools are offered at Search too,
+    // without the Load Region step Search already has.
+    assert_eq!(job["plot_task"]["id"], plot, "{job}");
+    let plot_ids: Vec<i64> = job["plot_steps"].as_array().unwrap().iter().map(|s| s["id"].as_i64().unwrap()).collect();
+    assert_eq!(plot_ids, vec![1019]);
 
     let adv_url = format!("/api/v1/wf/jobs/{id}/advance");
     let adv = |body: Value| send(&app, "POST", &adv_url, None, Some(body));
@@ -1128,6 +1143,8 @@ async fn aumentum_workflow_follows_the_task_graph() {
     assert_eq!(st, StatusCode::CONFLICT);
     let (st, d) = adv(json!({"to_task_id": plot})).await;
     assert_eq!(st, StatusCode::OK, "{d}");
+    assert!(d["plot_steps"].as_array().unwrap().is_empty(), "Plot Parcel carries its own tools: {d}");
+    assert!(d["plot_task"].is_null());
     let (_, d) = adv(json!({})).await; // the only path
     assert_eq!(d["job"]["current_task_id"], review);
     let (_, d) = adv(json!({"to_task_id": plot, "comment": "replot"})).await; // rework

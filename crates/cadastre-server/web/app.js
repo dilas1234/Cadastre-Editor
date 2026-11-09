@@ -4689,6 +4689,24 @@ function renderWorkflow() {
   list.scrollTop = scroll;
   if (wf.detail && wf.detail.job.id === wf.selected) body.append(wfDetailView(wf.detail));
 }
+// A task's steps, each with its tools and the editor action that runs it.
+function wfStepList(steps) {
+  const ol = h("ol", { class: "wfSteps" });
+  for (const s of steps) {
+    // Aumentum tools by name; ArcMap's own built-in tools (not in Aumentum's registry) as a count.
+    const named = s.commands.filter((c) => AUM_TOOL_GUIDS[c] || !c.startsWith("{")).map(wfToolName).filter((v, i, a) => a.indexOf(v) === i);
+    const builtIn = s.commands.filter((c) => c.startsWith("{") && !AUM_TOOL_GUIDS[c]).length;
+    const tools = named.join(" · ") + (builtIn ? `${named.length ? " · " : ""}+ ${builtIn} ArcMap tool${builtIn > 1 ? "s" : ""}` : "");
+    let act = wfStepAction(s);
+    const need = stepFeature(s.id);
+    if (need && !can(need)) act = { label: "—", tip: `Done in the ${VIEW_FOR[need]} view` };
+    ol.append(h("li", {}, h("div", { class: "wfStepHead" }, h("b", {}, s.name),
+        act.run ? h("button", { class: "btn wfStepBtn", title: act.tip, onclick: act.run }, act.label || "Open")
+                : h("span", { class: "muted wfStepNote", title: act.tip }, act.label)),
+      h("div", { class: "muted" }, tools || "—")));
+  }
+  return ol;
+}
 function wfDetailView(d) {
   const j = d.job;
   const box = h("div", { class: "wfDetail" });
@@ -4705,22 +4723,12 @@ function wfDetailView(d) {
     h("span", { class: "muted" }, parcel.properties.parcel_number)));
 
   if (j.is_open && d.steps.length) {
-    box.append(h("div", { class: "wfSub" }, `Steps of "${j.current_task}"`));
-    const ol = h("ol", { class: "wfSteps" });
-    for (const s of d.steps) {
-      // Aumentum tools by name; ArcMap's own built-in tools (not in Aumentum's registry) as a count.
-      const named = s.commands.filter((c) => AUM_TOOL_GUIDS[c] || !c.startsWith("{")).map(wfToolName).filter((v, i, a) => a.indexOf(v) === i);
-      const builtIn = s.commands.filter((c) => c.startsWith("{") && !AUM_TOOL_GUIDS[c]).length;
-      const tools = named.join(" · ") + (builtIn ? `${named.length ? " · " : ""}+ ${builtIn} ArcMap tool${builtIn > 1 ? "s" : ""}` : "");
-      let act = wfStepAction(s);
-      const need = stepFeature(s.id);
-      if (need && !can(need)) act = { label: "—", tip: `Done in the ${VIEW_FOR[need]} view` };
-      ol.append(h("li", {}, h("div", { class: "wfStepHead" }, h("b", {}, s.name),
-          act.run ? h("button", { class: "btn wfStepBtn", title: act.tip, onclick: act.run }, act.label || "Open")
-                  : h("span", { class: "muted wfStepNote", title: act.tip }, act.label)),
-        h("div", { class: "muted" }, tools || "—")));
-    }
-    box.append(ol);
+    box.append(h("div", { class: "wfSub" }, `Steps of "${j.current_task}"`), wfStepList(d.steps));
+    // Search Cadastre for Parcels can send the job on to Plot Parcel: its tools are offered here
+    // too, so a file whose parcel is not in the cadastre yet is drawn without moving the job first.
+    if ((d.plot_steps || []).length) box.append(
+      h("div", { class: "wfSub", title: "The parcel is not in the cadastre yet? Draw it here; Post Parcel & Finish Job takes the job through the plotting tasks." }, `${d.plot_task?.name || "Plot Parcel"} tools`),
+      wfStepList(d.plot_steps));
   }
   if (j.is_open) box.append(wfEditingView(j, wf.selEditing));
   else box.append(h("div", { class: "frow", style: "margin:6px 0;gap:4px" },
