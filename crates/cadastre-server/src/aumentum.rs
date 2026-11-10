@@ -14,9 +14,21 @@
 
 use crate::lrs::{escape, http};
 
+/// A signed-in Aumentum session. Commits and the duplicate-UPIN watch share one (`SESSION`):
+/// Aumentum opens an ArcSDE connection for a session's lookups and does not give it back when the
+/// session signs out, so a session per check fills ArcSDE's connections; one kept session holds one.
 pub struct UpinCheck {
     url: String,
     cookie: String,
+}
+
+/// The shared session (url, cookie), signed in on first use and again when Aumentum drops it.
+static SESSION: tokio::sync::Mutex<Option<(String, String)>> = tokio::sync::Mutex::const_new(None);
+
+/// Aumentum's answer to a session it no longer knows (expired, or the service restarted).
+fn session_lost(f: &Failure) -> bool {
+    let d = f.detail.as_deref().unwrap_or("").to_lowercase();
+    d.contains("not authenticated") || d.contains("credentials are not valid") || d.contains("session")
 }
 
 const NS: &str = "http://tempuri.org/";
@@ -139,7 +151,7 @@ fn recent_lookup_failure() -> Option<Failure> {
 /// lookup Aumentum signs in for and then fails is still reported, from the last real lookup.
 async fn probe() -> Result<(), Failure> {
     let Some(check) = UpinCheck::sign_in().await? else { return Ok(()) };
-    check.close().await;
+    check.sign_out().await;
     match recent_lookup_failure() {
         Some(f) => Err(f),
         None => Ok(()),
@@ -184,14 +196,39 @@ impl UpinCheck {
         std::env::var("CADASTRE_AUMENTUM_JOBSERVICE_URL").ok().is_some_and(|s| !s.trim().is_empty())
     }
 
-    /// Signed in to Aumentum's job service, or `Ok(None)` when the check is not configured.
+    /// The shared session to Aumentum's job service (signed in if there is none yet), or
+    /// `Ok(None)` when the check is not configured.
     pub async fn connect() -> Result<Option<Self>, String> {
-        Self::sign_in().await.map_err(|f| f.message)
+        Self::shared().await.map_err(|f| f.message)
     }
 
-    /// Whether Aumentum has an attribute record for this UPIN (in any status).
+    async fn shared() -> Result<Option<Self>, Failure> {
+        let mut session = SESSION.lock().await;
+        let url = std::env::var("CADASTRE_AUMENTUM_JOBSERVICE_URL").ok().map(|s| s.trim().to_string()).unwrap_or_default();
+        if let Some((u, cookie)) = session.as_ref().filter(|(u, _)| *u == url) {
+            return Ok(Some(Self { url: u.clone(), cookie: cookie.clone() }));
+        }
+        let fresh = Self::sign_in().await?;
+        *session = fresh.as_ref().map(|c| (c.url.clone(), c.cookie.clone()));
+        Ok(fresh)
+    }
+
+    /// Whether Aumentum has an attribute record for this UPIN (in any status). A session Aumentum
+    /// has dropped is signed in again once, and the question asked again.
     pub async fn issued(&self, upin: &str) -> Result<bool, String> {
-        self.lookup(upin).await.map_err(|f| f.message)
+        match self.lookup(upin).await {
+            Err(f) if session_lost(&f) => {
+                {
+                    let mut session = SESSION.lock().await;
+                    if session.as_ref().is_some_and(|(_, c)| *c == self.cookie) {
+                        *session = None;
+                    }
+                }
+                let again = Self::shared().await.map_err(|f| f.message)?.ok_or("the Aumentum UPIN check is not configured")?;
+                again.lookup(upin).await.map_err(|f| f.message)
+            }
+            r => r.map_err(|f| f.message),
+        }
     }
 
     async fn sign_in() -> Result<Option<Self>, Failure> {
@@ -239,7 +276,11 @@ impl UpinCheck {
         Ok(r.body.contains("<FieldName>UPIN</FieldName>"))
     }
 
-    pub async fn close(self) {
+    /// Done with the check. The shared session stays signed in for the next one (see `UpinCheck`).
+    pub async fn close(self) {}
+
+    /// Sign out (the health probe's own session, which never looks anything up).
+    async fn sign_out(self) {
         let _ = http(&self.url, "POST", &[("Content-Type", "text/xml; charset=utf-8".into()), ("SOAPAction", format!("\"{NS}LogOut\"")), ("Cookie", self.cookie.clone())], &envelope("LogOut", "")).await;
     }
 }

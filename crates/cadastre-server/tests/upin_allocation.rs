@@ -230,3 +230,74 @@ async fn the_watch_flags_a_upin_aumentum_issued_after_it_was_given_here() {
     assert!(s["duplicates"].as_array().unwrap().iter().any(|d| d["upin"] == json!(upin)), "{s}");
     std::env::remove_var("CADASTRE_AUMENTUM_JOBSERVICE_URL");
 }
+
+/// An Aumentum that counts sign-ins and sign-outs and knows only its newest session: a lookup on
+/// any other session gets the fault Aumentum gives a session it no longer knows.
+async fn counting_aumentum(signins: Arc<std::sync::atomic::AtomicUsize>, signouts: Arc<std::sync::atomic::AtomicUsize>, valid: Arc<std::sync::atomic::AtomicUsize>) -> String {
+    use std::sync::atomic::Ordering::SeqCst;
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        loop {
+            let Ok((mut sock, _)) = listener.accept().await else { break };
+            let (signins, signouts, valid) = (signins.clone(), signouts.clone(), valid.clone());
+            tokio::spawn(async move {
+                let mut buf = Vec::new();
+                let mut tmp = [0u8; 4096];
+                loop {
+                    let n = sock.read(&mut tmp).await.unwrap_or(0);
+                    if n == 0 { break; }
+                    buf.extend_from_slice(&tmp[..n]);
+                    let t = String::from_utf8_lossy(&buf);
+                    if let Some(i) = t.find("\r\n\r\n") {
+                        let len = t[..i].lines().find_map(|l| l.to_ascii_lowercase().strip_prefix("content-length:").map(|v| v.trim().parse::<usize>().unwrap_or(0))).unwrap_or(0);
+                        if buf.len() >= i + 4 + len { break; }
+                    }
+                }
+                let req = String::from_utf8_lossy(&buf).to_string();
+                let (status, cookie, body) = if req.contains("<Authenticate") {
+                    let n = signins.fetch_add(1, SeqCst) + 1;
+                    valid.store(n, SeqCst);
+                    ("200 OK", format!("Set-Cookie: ASP.NET_SessionId=s{n}; path=/\r\n"), "<AuthenticateResult>true</AuthenticateResult>".to_string())
+                } else if req.contains("<LogOut") {
+                    signouts.fetch_add(1, SeqCst);
+                    ("200 OK", String::new(), String::new())
+                } else if req.contains(&format!("ASP.NET_SessionId=s{}", valid.load(SeqCst))) {
+                    ("200 OK", String::new(), String::new())
+                } else {
+                    ("500 Internal Server Error", String::new(), "<soap:Fault><faultstring>Invalid operation, the user credentials are not valid or the user is not authenticated</faultstring></soap:Fault>".to_string())
+                };
+                let resp = format!("HTTP/1.1 {status}\r\nContent-Type: text/xml\r\n{cookie}Content-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len());
+                let _ = sock.write_all(resp.as_bytes()).await;
+            });
+        }
+    });
+    format!("http://{addr}/ApplicationServerAdmin/WebServices/LRSWebServices.asmx")
+}
+
+#[tokio::test]
+async fn commits_share_one_aumentum_session() {
+    // Aumentum keeps an ArcSDE connection per lookup session (64 filled ArcSDE on 2026-11-10):
+    // commits reuse one session, never sign out, and sign in again only when Aumentum drops it.
+    use std::sync::atomic::{AtomicUsize, Ordering::SeqCst};
+    let Some(db_url) = test_db_url() else { return };
+    let _g = SERIAL.lock().await;
+    let app = app(&db_url).await;
+    std::env::set_var("CADASTRE_MC_SERVICE_USER", "administrator");
+    std::env::set_var("CADASTRE_MC_SERVICE_PASSWORD", "test");
+    let (signins, signouts, valid) = (Arc::new(AtomicUsize::new(0)), Arc::new(AtomicUsize::new(0)), Arc::new(AtomicUsize::new(0)));
+    std::env::set_var("CADASTRE_AUMENTUM_JOBSERVICE_URL", counting_aumentum(signins.clone(), signouts.clone(), valid.clone()).await);
+    let x = 600_000.0 + (seed() % 5_000) as f64 * 100.0;
+    for k in 0..3 {
+        post_one(app.clone(), x + k as f64 * 100.0, 8_800_000.0).await.expect("commit");
+    }
+    assert_eq!((signins.load(SeqCst), signouts.load(SeqCst)), (1, 0), "three commits, one session, kept");
+
+    // Aumentum restarted: the old session is unknown to it. The next commit signs in once more.
+    valid.store(0, SeqCst);
+    post_one(app.clone(), x + 300.0, 8_800_000.0).await.expect("commit after Aumentum dropped the session");
+    assert_eq!((signins.load(SeqCst), signouts.load(SeqCst)), (2, 0));
+    post_one(app.clone(), x + 400.0, 8_800_000.0).await.expect("commit");
+    assert_eq!(signins.load(SeqCst), 2, "and keeps the new one");
+    std::env::remove_var("CADASTRE_AUMENTUM_JOBSERVICE_URL");
+}
