@@ -518,6 +518,77 @@ fn end_move(svg: &mut String) {
     svg.push_str("</g>\n");
 }
 
+/// A side too short to carry its bearing and distance, written in the corner table instead.
+struct ShortSide {
+    from: String,
+    to: String,
+    degrees: String,
+    minutes: String,
+    distance: String,
+}
+
+/// Width of `s` in Arial at `size` mm (its advance widths, in ems). Close enough to set columns:
+/// the digits are all one width, so right-aligned numbers line up exactly whatever the estimate.
+fn text_width(s: &str, size: f64) -> f64 {
+    s.chars().map(|c| match c {
+        '0'..='9' => 0.556,
+        '.' | ',' | ' ' | ':' => 0.278,
+        '\'' => 0.191,
+        '°' => 0.4,
+        '-' => 0.333,
+        'm' | 'M' | 'W' => 0.833,
+        'I' | 'i' | 'l' | 'j' => 0.25,
+        c if c.is_ascii_uppercase() => 0.722,
+        _ => 0.556,
+    }).sum::<f64>() * size
+}
+
+/// The short sides as a table in the lower right of the frame, last side lowest:
+/// `FROM - TO = 33° 41' @ 1.43m`, each part in its own column. Names are left-aligned, numbers
+/// right-aligned (so the degrees end together and the distances' decimal points line up). The
+/// whole table moves as one (`short`).
+fn short_sides_table(svg: &mut String, f: &PlanFields, rows: &[ShortSide]) {
+    if rows.is_empty() {
+        return;
+    }
+    const SIZE: f64 = 2.6;
+    const ROW: f64 = 4.0;
+    const GAP: f64 = 1.0;
+    let widest = |pick: fn(&ShortSide) -> &str| rows.iter().map(|r| text_width(pick(r), SIZE)).fold(0.0, f64::max);
+    let (w_from, w_to) = (widest(|r| &r.from), widest(|r| &r.to));
+    let (w_deg, w_min, w_dist) = (widest(|r| &r.degrees), widest(|r| &r.minutes), widest(|r| &r.distance));
+    let (w_dash, w_eq, w_at) = (text_width("-", SIZE), text_width("=", SIZE).max(1.5), text_width("@", SIZE).max(2.6));
+    // Column positions from the left edge of the table.
+    let c_dash = w_from + GAP + w_dash / 2.0; // middle
+    let c_to = c_dash + w_dash / 2.0 + GAP; // start
+    let c_eq = c_to + w_to + GAP + w_eq / 2.0; // middle
+    let c_deg = c_eq + w_eq / 2.0 + GAP + w_deg; // end
+    let c_min = c_deg + GAP + w_min; // end
+    let c_at = c_min + GAP + w_at / 2.0; // middle
+    let c_dist = c_at + w_at / 2.0 + GAP + w_dist; // end
+    let right = FRAME.2 - 2.0;
+    let left = right - c_dist;
+    let bottom = FRAME.3 - 2.5;
+    let top = bottom - (rows.len() - 1) as f64 * ROW;
+    begin_move(svg, f, "short", (left + c_dist / 2.0, (top + bottom) / 2.0));
+    for (j, r) in rows.iter().rev().enumerate() {
+        let y = bottom - j as f64 * ROW;
+        for (x, anchor, cell) in [
+            (left, "start", esc(&r.from)),
+            (left + c_dash, "middle", "-".to_string()),
+            (left + c_to, "start", esc(&r.to)),
+            (left + c_eq, "middle", "=".to_string()),
+            (left + c_deg, "end", r.degrees.clone()),
+            (left + c_min, "end", r.minutes.clone()),
+            (left + c_at, "middle", "@".to_string()),
+            (left + c_dist, "end", r.distance.clone()),
+        ] {
+            text(svg, x, y, SIZE, anchor, "", &cell);
+        }
+    }
+    end_move(svg);
+}
+
 /// A colour as it may go on the sheet: `#rrggbb`, nothing else.
 fn safe_color(c: Option<&str>) -> Option<&str> {
     c.map(str::trim).filter(|c| c.len() == 7 && c.starts_with('#') && c[1..].chars().all(|h| h.is_ascii_hexdigit()))
@@ -895,7 +966,7 @@ pub fn render_svg(d: &PlanData) -> String {
         let pts: String = p.iter().map(|q| format!("{:.2},{:.2}", q.0, q.1)).collect::<Vec<_>>().join(" ");
         let _ = writeln!(s, r#"<polygon points="{pts}" fill="none" stroke="{LINE}" stroke-width="0.45"/>"#);
     }
-    let mut short: Vec<(usize, String)> = Vec::new();
+    let mut short: Vec<ShortSide> = Vec::new();
     for i in 0..p.len() {
         let (a, b) = (p[i], p[(i + 1) % p.len()]);
         if p.len() < 2 || (i == p.len() - 1 && p.len() == 2) {
@@ -915,7 +986,13 @@ pub fn render_svg(d: &PlanData) -> String {
         let reads_from_a = if dx.abs() > 1e-6 { dx > 0.0 } else { a.1 < b.1 };
         let (t_deg, t_min) = if reads_from_a { (0.2, 0.8) } else { (0.8, 0.2) };
         if paper_len < SHORT_SIDE_MM && p.len() >= 3 {
-            short.push((i, format!("{} - {} = {deg}° {min:02}' @ {dist:.2}m", esc(&corners[i].name), esc(&corners[(i + 1) % corners.len()].name))));
+            short.push(ShortSide {
+                from: corners[i].name.clone(),
+                to: corners[(i + 1) % corners.len()].name.clone(),
+                degrees: format!("{deg}°"),
+                minutes: format!("{min:02}'"),
+                distance: format!("{dist:.2}m"),
+            });
             continue;
         }
         for (key, t, off, label) in [("degrees", t_deg, out, format!("{deg}°")), ("minutes", t_min, out, format!("{min:02}'")), ("distance", 0.5, -out, format!("{dist:.2}m"))] {
@@ -947,7 +1024,7 @@ pub fn render_svg(d: &PlanData) -> String {
     let file_no = if f.plan_no.as_deref().unwrap_or("").is_empty() { title_no.clone() } else { up(&f.plan_no) };
     begin_move(&mut s, f, "parcel", (pcx, pcy + 1.0));
     text(&mut s, pcx, pcy - 0.8, 2.6, "middle", "", &file_no);
-    text(&mut s, pcx, pcy + 2.8, 2.6, "middle", "", &format!("{} Sq.m", area3(d.area_m2)));
+    text(&mut s, pcx, pcy + 2.8, 2.6, "middle", "", &parcel_area(d.area_m2));
     end_move(&mut s);
 
     // The officer's own text.
@@ -965,12 +1042,9 @@ pub fn render_svg(d: &PlanData) -> String {
         end_move(&mut s);
     }
 
-    // Short sides, bottom-right inside the frame (the last one lowest).
-    for (j, (i, line)) in short.iter().rev().enumerate() {
-        begin_move(&mut s, f, &format!("short:{i}"), (FRAME.2 - 2.0, FRAME.3 - 2.5 - j as f64 * 4.0));
-        text(&mut s, FRAME.2 - 2.0, FRAME.3 - 2.5 - j as f64 * 4.0, 2.6, "end", "", line);
-        end_move(&mut s);
-    }
+    // Short sides, bottom-right inside the frame (the last one lowest), as one table that moves as
+    // a block: every column lines up from row to row.
+    short_sides_table(&mut s, f, &short);
 
     // Footer.
     let fx0 = 12.0;
@@ -1009,6 +1083,16 @@ fn area_line(m2: f64) -> String {
         format!("AREA {} SQUARE METERS", area3(m2))
     } else {
         format!("AREA {:.4} HECTARES", (m2 + 1e-7).floor() / 10_000.0)
+    }
+}
+
+/// The area in the middle of the parcel: square metres below one hectare, hectares only from
+/// there up, the same figure as the header's `area_line`.
+fn parcel_area(m2: f64) -> String {
+    if m2 < 10_000.0 {
+        format!("{} Sq.m", area3(m2))
+    } else {
+        format!("{:.4} Ha", (m2 + 1e-7).floor() / 10_000.0)
     }
 }
 
@@ -1149,6 +1233,11 @@ mod tests {
         assert_eq!(area_line(9_999.999), "AREA 9999.999 SQUARE METERS");
         assert_eq!(area_line(10_000.0), "AREA 1.0000 HECTARES");
         assert_eq!(area_line(25_437.9), "AREA 2.5437 HECTARES");
+        assert_eq!(parcel_area(9_999.999), "9999.999 Sq.m");
+        assert_eq!(parcel_area(10_000.0), "1.0000 Ha");
+        assert_eq!(parcel_area(25_437.9), "2.5437 Ha");
+        let svg = render_svg(&PlanData { upin: "X".into(), area_m2: 25_437.9, corners: pl68374(), fields: PlanFields::default() });
+        assert!(svg.contains(">2.5437 Ha<") && !svg.contains("Sq.m"), "a big parcel shows hectares only in its middle");
     }
 
     #[test]
@@ -1156,10 +1245,50 @@ mod tests {
         // PL68374 at 1:500: N9997V → N9998V is 3.78 m (7.6 mm on paper), as its printed plan.
         let fields = PlanFields { scale: Some(500), ..Default::default() };
         let svg = render_svg(&PlanData { upin: "X".into(), area_m2: 902.203, corners: pl68374(), fields });
-        assert!(svg.contains(r#"x="196.00" y="225.50" font-size="2.6" text-anchor="end""#), "the lower-right corner");
-        assert!(svg.contains(">N9997V - N9998V = 282° 27' @ 3.78m<"));
-        assert!(!svg.contains(">3.78m<") && !svg.contains(">282°<"), "not on the side itself");
+        assert!(svg.contains(r#"x="196.00" y="225.50" font-size="2.6" text-anchor="end" >3.78m<"#), "the distance ends at the lower-right corner");
+        let table = short_group(&svg);
+        for cell in [">N9997V<", ">-<", ">N9998V<", ">=<", ">282°<", ">27'<", ">@<", ">3.78m<"] {
+            assert!(table.contains(cell), "{cell} in the corner table");
+        }
+        assert_eq!(svg.matches(">3.78m<").count(), 1, "not on the side itself");
+        assert_eq!(svg.matches(">282°<").count(), 1, "not on the side itself");
         assert!(svg.contains(">29.30m<") && svg.contains(">25.53m<"), "the long sides keep theirs");
+    }
+
+    /// The `<g data-move="short">` group of a rendered plan.
+    fn short_group(svg: &str) -> &str {
+        let start = svg.find(r#"<g data-move="short""#).expect("a short-sides table");
+        &svg[start..start + svg[start..].find("</g>").unwrap()]
+    }
+
+    #[test]
+    fn the_short_sides_table_lines_up_in_columns_and_moves_as_one() {
+        // At 1:5000 every side of PL68374 is short: five rows, degrees of 2 and 3 digits.
+        let plan = |label_moves| PlanData { upin: "X".into(), area_m2: 902.203, corners: pl68374(), fields: PlanFields { scale: Some(5000), label_moves, ..Default::default() } };
+        let svg = render_svg(&plan(BTreeMap::new()));
+        let table = short_group(&svg);
+        // Each cell as (x, y, anchor, text).
+        let cells: Vec<(String, String, String, String)> = table.lines().filter(|l| l.starts_with("<text")).map(|l| {
+            let attr = |name: &str| l.split(&format!(r#"{name}=""#)).nth(1).and_then(|r| r.split('"').next()).unwrap_or("").to_string();
+            let txt = l.split('>').nth(1).and_then(|r| r.split('<').next()).unwrap_or("").to_string();
+            (attr("x"), attr("y"), attr("text-anchor"), txt)
+        }).collect();
+        let rows: std::collections::BTreeSet<&str> = cells.iter().map(|c| c.1.as_str()).collect();
+        assert_eq!(rows.len(), 5, "one row per side");
+        assert_eq!(cells.len(), 5 * 8, "eight cells a row");
+        // Column k of every row is at the same x with the same alignment.
+        for k in 0..8 {
+            let col: std::collections::BTreeSet<(&str, &str)> = cells.iter().skip(k).step_by(8).map(|c| (c.0.as_str(), c.2.as_str())).collect();
+            assert_eq!(col.len(), 1, "column {k} lines up: {col:?}");
+        }
+        let anchors: Vec<&str> = cells[..8].iter().map(|c| c.2.as_str()).collect();
+        assert_eq!(anchors, ["start", "middle", "start", "middle", "end", "end", "middle", "end"], "names left, numbers right");
+        assert!(cells.iter().any(|c| c.3.ends_with('°') && c.3.trim_end_matches('°').len() == 3), "a three-digit bearing");
+        assert!(cells.iter().all(|c| c.0.parse::<f64>().unwrap() >= FRAME.0 && c.0.parse::<f64>().unwrap() <= FRAME.2), "inside the frame");
+        // One drag moves the whole table; the old per-line keys are gone.
+        assert!(!svg.contains(r#"data-move="short:"#));
+        let moved = render_svg(&plan(BTreeMap::from([("short".to_string(), [-20.0, -5.0])])));
+        assert!(moved.contains(r#"<g data-move="short" transform="translate(-20.00 -5.00)""#));
     }
 
     #[test]
@@ -1240,7 +1369,7 @@ mod tests {
         let before = render_svg(&plan(BTreeMap::new()));
         assert_eq!(before.matches(" h2 M").count(), 5, "a + at each beacon");
         assert!(!before.contains("l2 2"), "no x");
-        for key in ["beacon:0", "degrees:0", "minutes:0", "distance:0", "short:3", "parcel"] {
+        for key in ["beacon:0", "degrees:0", "minutes:0", "distance:0", "short", "parcel"] {
             assert!(before.contains(&format!(r#"data-move="{key}""#)), "{key} can be dragged");
         }
         let after = render_svg(&plan(BTreeMap::from([("beacon:0".to_string(), [3.5, -2.0])])));
