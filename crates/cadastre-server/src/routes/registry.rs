@@ -648,6 +648,8 @@ async fn plan_documents(session: &Session, transaction_id: i64, doc_type: &str) 
 /// sent before are marked as replaced (their Comments); nothing in the Registry is deleted. A job
 /// under plan correction (`correct_plan`) always sends this way, with the reason in the Comments:
 /// the plan it replaces may have been filed by Aumentum, so only the Registry knows of it.
+/// Once the plan is filed the job is completed (`complete_with_plan`): the Registry reads the job
+/// when its stage is completed and refuses while it is open.
 #[utoipa::path(post, path = "/api/v1/wf/jobs/{id}/registry/send-plan", tag = "registry", request_body = SendPlanRequest,
     params(("id" = i32, Path, description = "Job instance id")),
     responses((status = 200), (status = 400, description = "No transaction on the job, or not a PDF/JPG of this job"),
@@ -724,14 +726,11 @@ pub async fn send_plan(State(state): State<AppState>, user: AuthUser, Path(id): 
         "document_type": doc_type, "page_type": page_type, "resend": resend, "comments": comments, "replaced": replaced, "replace_note": replace_note,
         "reason": correction.as_ref().map(|c| c.reason.clone()),
     })).await?;
-    // A job opened for the correction ends with it; a job that was already open carries on.
-    let completed = match &correction {
-        Some(c) if c.created_job => complete_correction_job(&mut tx, &actor.label, id).await?,
-        _ => false,
-    };
+    // The plan is filed: the job ends with it (a job already completed stays as it is).
+    let ended = complete_with_plan(&mut tx, &actor.label, id, if resend { "resend" } else { "send" }).await?;
     tx.commit().await?;
     Ok(Json(serde_json::json!({ "transaction_number": t.transaction_number, "file_name": sent_name, "document_type": doc_type,
-        "resend": resend, "replaced": replaced, "replace_note": replace_note, "job_completed": completed })))
+        "resend": resend, "replaced": replaced, "replace_note": replace_note, "job_completed": ended.completed, "job_left_open": ended.left_open })))
 }
 
 /// The Comments of a corrected plan in the Registry (the Registry keeps 240 characters).
@@ -742,19 +741,75 @@ fn corrected_comments(stamp: &str, reason: Option<&str>) -> String {
     }
 }
 
-/// Complete a job opened for a plan correction, once the plan is sent. Left open if it has drafts.
-async fn complete_correction_job(tx: &mut sqlx::PgConnection, actor: &str, id: i32) -> ApiResult<bool> {
+/// What `complete_with_plan` did with the job.
+struct PlanJobEnd {
+    /// The job was completed now.
+    completed: bool,
+    /// Why an open job was left open (uncommitted parcels, a parcel retirement).
+    left_open: Option<String>,
+}
+
+/// The job ends with its plan, as in Aumentum (Send image, then complete Generate Title Deed Plan):
+/// the open task is closed and the job is completed (3, "Waiting for LRS Commit") with its end
+/// date. The Registry reads the job (`lr_mc_job`, refreshed by GetJobInstance) when an officer
+/// completes the stage, and refuses while it has no end date ("Aumentum Cadastre contains not
+/// completed 'Deed Plan Creationv2' Job Instance"). A job already closed is left as it is; a job
+/// with uncommitted parcels or a parcel retirement is left open, with the reason.
+async fn complete_with_plan(tx: &mut sqlx::PgConnection, actor: &str, id: i32, via: &str) -> ApiResult<PlanJobEnd> {
+    let row = sqlx::query("SELECT j.current_task_id, s.is_open FROM cadastre.wf_job_instance j JOIN cadastre.wf_job_status s ON s.code = j.status WHERE j.id = $1 FOR UPDATE OF j")
+        .bind(id).fetch_optional(&mut *tx).await?.ok_or_else(|| AppError::NotFound(format!("job instance {id}")))?;
+    let (task, open): (Option<i32>, bool) = (row.get(0), row.get(1));
+    if !open {
+        return Ok(PlanJobEnd { completed: false, left_open: None });
+    }
     let drafts: i64 = sqlx::query_scalar("SELECT count(*) FROM cadastre.parcel p JOIN cadastre.wf_job_instance w ON w.cadastre_job_id = p.job_id WHERE w.id = $1 AND p.status = 'draft'")
         .bind(id).fetch_one(&mut *tx).await?;
     if drafts > 0 {
-        return Ok(false);
+        return Ok(PlanJobEnd { completed: false, left_open: Some(format!("the job has {drafts} uncommitted parcel(s): commit or discard them, then Complete job")) });
+    }
+    if crate::routes::mutations::has_pending_retirement(&mut *tx, id).await? {
+        return Ok(PlanJobEnd { completed: false, left_open: Some("the job has a parcel retirement waiting: commit or discard it, then Complete job".into()) });
     }
     sqlx::query("UPDATE cadastre.wf_task_instance SET ended = now()::timestamp, started = COALESCE(started, now()::timestamp) WHERE job_instance_id = $1 AND ended IS NULL")
         .bind(id).execute(&mut *tx).await?;
     sqlx::query("UPDATE cadastre.wf_job_instance SET status = 3, ended = now()::timestamp, updated = now()::timestamp WHERE id = $1")
         .bind(id).execute(&mut *tx).await?;
-    audit::append(&mut *tx, actor, "wf_complete", "wf_job_instance", Some(&id.to_string()), serde_json::json!({ "plan_correction": true })).await?;
-    Ok(true)
+    audit::append(&mut *tx, actor, "wf_complete", "wf_job_instance", Some(&id.to_string()), serde_json::json!({ "plan_sent": true, "via": via, "at_task": task })).await?;
+    Ok(PlanJobEnd { completed: true, left_open: None })
+}
+
+#[derive(Debug, Serialize, ToSchema)]
+pub struct CompletePlanJobDto {
+    pub job_instance_id: i32,
+    pub completed: bool,
+}
+
+/// Complete a job whose plan was sent (Send plan completes it; this is for a job left open, e.g.
+/// one sent before that rule, or one that still had uncommitted parcels then). Refused when no
+/// plan was sent from the job, when it is closed already, or while it has uncommitted parcels.
+#[utoipa::path(post, path = "/api/v1/wf/jobs/{id}/registry/complete", tag = "registry",
+    params(("id" = i32, Path, description = "Job instance id")),
+    responses((status = 200, body = CompletePlanJobDto), (status = 404, description = "No such job"),
+              (status = 409, description = "No plan sent from the job, closed already, or uncommitted parcels")))]
+pub async fn complete_plan_job(State(state): State<AppState>, user: AuthUser, Path(id): Path<i32>) -> ApiResult<Json<CompletePlanJobDto>> {
+    let actor = crate::routes::wf::resolve_actor(&state, &user).await?;
+    let mut tx = state.pool.begin().await?;
+    let sent: bool = sqlx::query_scalar(
+        "SELECT EXISTS (SELECT 1 FROM cadastre.audit_log s WHERE s.entity = 'wf_job_instance' AND s.entity_id = $1 AND s.action = 'registry_plan_sent' \
+           AND s.id > COALESCE((SELECT max(w.id) FROM cadastre.audit_log w WHERE w.entity = 'wf_job_instance' AND w.entity_id = $1 AND w.action = 'registry_plan_withdrawn'), 0))")
+        .bind(id.to_string()).fetch_one(&mut *tx).await?;
+    if !sent {
+        return Err(AppError::Conflict("no title deed plan has been sent from this job: send the plan first".into()));
+    }
+    let ended = complete_with_plan(&mut tx, &actor.label, id, "complete").await?;
+    if let Some(why) = ended.left_open {
+        return Err(AppError::Conflict(format!("the job is not completed: {why}")));
+    }
+    if !ended.completed {
+        return Err(AppError::Conflict("the job is already closed".into()));
+    }
+    tx.commit().await?;
+    Ok(Json(CompletePlanJobDto { job_instance_id: id, completed: true }))
 }
 
 #[derive(Debug, Clone, Serialize)]

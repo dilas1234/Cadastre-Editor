@@ -168,6 +168,7 @@ pub fn router(state: AppState) -> Router {
         .route("/api/v1/registry/parcels/{upin}/events", get(registry::parcel_events))
         .route("/api/v1/wf/jobs/{id}/registry/send-plan", post(registry::send_plan))
         .route("/api/v1/wf/jobs/{id}/registry/sent", get(registry::sent_plans))
+        .route("/api/v1/wf/jobs/{id}/registry/complete", post(registry::complete_plan_job))
         .route("/api/v1/wf/jobs/{id}/registry/plan-correction", get(registry::plan_correction))
         .route("/api/v1/registry/correct-plan", post(registry::correct_plan))
         .route(
