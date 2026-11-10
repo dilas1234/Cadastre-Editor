@@ -2124,6 +2124,20 @@ async fn registry_write_back_like_aumentum() {
     assert!(doc[0].contains("referenceid</cms:name><cms:isMultiValue xsi:nil=\"true\"/><cms:value>10000000777</cms:value>"));
     let (_, sent) = send(&app, "GET", &format!("/api/v1/wf/jobs/{job}/registry/sent"), None, None).await;
     assert_eq!(sent.as_array().unwrap().len(), 1);
+    // The job ends with its plan: the Registry refuses its stage while the job has no end date.
+    assert_eq!(r["job_completed"].as_bool(), Some(true), "{r}");
+    let (status, ended): (i16, Option<chrono::NaiveDateTime>) = sqlx::query_as("SELECT status, ended FROM cadastre.wf_job_instance WHERE id = $1")
+        .bind(job as i32).fetch_one(&pool).await.unwrap();
+    assert!(status == 3 && ended.is_some(), "completed with an end date: {status} {ended:?}");
+    let (st, r) = send(&app, "POST", &format!("/api/v1/wf/jobs/{job}/registry/complete"), None, None).await;
+    assert_eq!(st, StatusCode::CONFLICT, "closed already: {r}");
+    // Complete job: a job left open after its plan was sent (sent before the rule) is completed;
+    // a job with no plan sent is refused.
+    let (st, r) = send(&app, "POST", &format!("/api/v1/wf/jobs/{job2}/registry/complete"), None, None).await;
+    assert_eq!(st, StatusCode::CONFLICT, "no plan sent from it: {r}");
+    sqlx::query("UPDATE cadastre.wf_job_instance SET status = 2, ended = NULL WHERE id = $1").bind(job as i32).execute(&pool).await.unwrap();
+    let (st, r) = send(&app, "POST", &format!("/api/v1/wf/jobs/{job}/registry/complete"), None, None).await;
+    assert_eq!((st, r["completed"].as_bool()), (StatusCode::OK, Some(true)), "{r}");
 
     // Sent once: a second plain send is refused; Resend corrected plan files the new PDF as
     // corrected and marks the earlier plan document as replaced (nothing deleted).

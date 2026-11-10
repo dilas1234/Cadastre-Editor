@@ -4616,7 +4616,18 @@ async function regSendPlan(fileId, fileName, resend) {
     if (r.replace_note) notify(`${done} Note: ${r.replace_note}.`, "warn");
     else notify(r.resend ? `${done} ${r.replaced.length} earlier plan(s) marked as replaced.` : done);
     if (r.job_completed) notify(`${done} ${reg.job.name || "The job"} is completed.`);
+    else if (r.job_left_open) notify(`${done} ${reg.job.name || "The job"} is still open: ${r.job_left_open}.`, "warn");
     await regSetJob(reg.job.id);
+  });
+}
+// Complete a job whose plan was sent: the Registry will not complete its stage while the job is open.
+async function regCompleteJob() {
+  const j = reg.job;
+  if (!(await uiConfirm(`Complete ${j.name || "Job " + j.id}?\nIts plan was sent to ${j.lrs_transaction_number}. Completing the job lets the Registry complete its stage.`, { ok: "Complete job" }))) return;
+  await regRun("Complete job", async () => {
+    await api(`/api/v1/wf/jobs/${j.id}/registry/complete`, { method: "POST" });
+    notify(`${j.name || "The job"} is completed.`);
+    await regSetJob(j.id);
   });
 }
 // ---- view ---------------------------------------------------------------------------------
@@ -4866,6 +4877,11 @@ function regSendView(box, writes) {
       : sentHere
       ? "A plan was sent before. The corrected PDF is filed as \"Survey Plan (corrected)\" and the earlier plan is marked as replaced; nothing is deleted."
       : "Filed in the transaction as a Title Deed Plan (\"Survey Plan\"), as a PDF.")));
+  if (reg.sent.length && j.is_open) {
+    box.append(h("div", { class: "regSendBar" },
+      h("button", { class: "regAct primary big", disabled: reg.busy, onclick: () => regCompleteJob() }, reg.busy ? "Working…" : "Complete job"),
+      h("div", { class: "muted", style: "color:#a60" }, "The plan was sent, but the job is still open. The Registry will not complete its stage (\"contains not completed 'Deed Plan Creationv2' Job Instance\") until the job is completed.")));
+  }
   if (reg.sent.length) {
     box.append(h("div", { class: "regDayHead" }, "Sent"));
     for (const x of reg.sent) {
