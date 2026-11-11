@@ -25,10 +25,15 @@ pub struct UpinCheck {
 /// The shared session (url, cookie), signed in on first use and again when Aumentum drops it.
 static SESSION: tokio::sync::Mutex<Option<(String, String)>> = tokio::sync::Mutex::const_new(None);
 
-/// Aumentum's answer to a session it no longer knows (expired, or the service restarted).
-fn session_lost(f: &Failure) -> bool {
+/// Whether a fresh session may get an answer the kept one did not: Aumentum's fault for a session
+/// it no longer knows (expired, or the service restarted), and "Object reference not set", which
+/// it also gives a session IIS still accepts after the AUMENTUM CADASTRE Server service restarted
+/// behind it. The same fault with ArcSDE out of connections fails again on the fresh session, and
+/// costs no connection, since none can be opened.
+fn fresh_session_may_help(f: &Failure) -> bool {
     let d = f.detail.as_deref().unwrap_or("").to_lowercase();
     d.contains("not authenticated") || d.contains("credentials are not valid") || d.contains("session")
+        || (f.stage == "lookup" && d.contains("object reference not set"))
 }
 
 const NS: &str = "http://tempuri.org/";
@@ -213,11 +218,12 @@ impl UpinCheck {
         Ok(fresh)
     }
 
-    /// Whether Aumentum has an attribute record for this UPIN (in any status). A session Aumentum
-    /// has dropped is signed in again once, and the question asked again.
+    /// Whether Aumentum has an attribute record for this UPIN (in any status). When the kept
+    /// session fails in a way a fresh one may not (`fresh_session_may_help`), it is dropped, a new
+    /// one signed in, and the question asked once more.
     pub async fn issued(&self, upin: &str) -> Result<bool, String> {
         match self.lookup(upin).await {
-            Err(f) if session_lost(&f) => {
+            Err(f) if fresh_session_may_help(&f) => {
                 {
                     let mut session = SESSION.lock().await;
                     if session.as_ref().is_some_and(|(_, c)| *c == self.cookie) {
@@ -308,6 +314,16 @@ mod tests {
         assert_eq!((f.stage, f.detail.as_deref()), ("lookup", Some("Object reference not set to an instance of an object")));
         note_lookup(Ok(()));
         assert!(recent_lookup_failure().is_none(), "a later success clears it");
+    }
+
+    #[test]
+    fn which_failures_a_fresh_session_is_tried_for() {
+        let f = |stage, d: &str| Failure::new(stage, Some(d.into()), String::new());
+        assert!(fresh_session_may_help(&f("lookup", "Invalid operation, the user credentials are not valid or the user is not authenticated")));
+        assert!(fresh_session_may_help(&f("lookup", "Object reference not set to an instance of an object")));
+        assert!(!fresh_session_may_help(&f("sign-in", "Object reference not set to an instance of an object")));
+        assert!(!fresh_session_may_help(&f("lookup", "Timeout expired")));
+        assert!(!fresh_session_may_help(&Failure::new("lookup", None, String::new())));
     }
 
     #[test]

@@ -232,15 +232,16 @@ async fn the_watch_flags_a_upin_aumentum_issued_after_it_was_given_here() {
 }
 
 /// An Aumentum that counts sign-ins and sign-outs and knows only its newest session: a lookup on
-/// any other session gets the fault Aumentum gives a session it no longer knows.
-async fn counting_aumentum(signins: Arc<std::sync::atomic::AtomicUsize>, signouts: Arc<std::sync::atomic::AtomicUsize>, valid: Arc<std::sync::atomic::AtomicUsize>) -> String {
+/// any other session gets the fault Aumentum gives a session it no longer knows, or, with
+/// `null_ref` set, the "Object reference not set" it gives one its service lost behind IIS.
+async fn counting_aumentum(signins: Arc<std::sync::atomic::AtomicUsize>, signouts: Arc<std::sync::atomic::AtomicUsize>, valid: Arc<std::sync::atomic::AtomicUsize>, null_ref: Arc<std::sync::atomic::AtomicBool>) -> String {
     use std::sync::atomic::Ordering::SeqCst;
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
     tokio::spawn(async move {
         loop {
             let Ok((mut sock, _)) = listener.accept().await else { break };
-            let (signins, signouts, valid) = (signins.clone(), signouts.clone(), valid.clone());
+            let (signins, signouts, valid, null_ref) = (signins.clone(), signouts.clone(), valid.clone(), null_ref.clone());
             tokio::spawn(async move {
                 let mut buf = Vec::new();
                 let mut tmp = [0u8; 4096];
@@ -264,6 +265,8 @@ async fn counting_aumentum(signins: Arc<std::sync::atomic::AtomicUsize>, signout
                     ("200 OK", String::new(), String::new())
                 } else if req.contains(&format!("ASP.NET_SessionId=s{}", valid.load(SeqCst))) {
                     ("200 OK", String::new(), String::new())
+                } else if null_ref.load(SeqCst) {
+                    ("500 Internal Server Error", String::new(), "<soap:Fault><faultstring>Server was unable to process request. ---&gt; Object reference not set to an instance of an object.</faultstring></soap:Fault>".to_string())
                 } else {
                     ("500 Internal Server Error", String::new(), "<soap:Fault><faultstring>Invalid operation, the user credentials are not valid or the user is not authenticated</faultstring></soap:Fault>".to_string())
                 };
@@ -286,7 +289,8 @@ async fn commits_share_one_aumentum_session() {
     std::env::set_var("CADASTRE_MC_SERVICE_USER", "administrator");
     std::env::set_var("CADASTRE_MC_SERVICE_PASSWORD", "test");
     let (signins, signouts, valid) = (Arc::new(AtomicUsize::new(0)), Arc::new(AtomicUsize::new(0)), Arc::new(AtomicUsize::new(0)));
-    std::env::set_var("CADASTRE_AUMENTUM_JOBSERVICE_URL", counting_aumentum(signins.clone(), signouts.clone(), valid.clone()).await);
+    let null_ref = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    std::env::set_var("CADASTRE_AUMENTUM_JOBSERVICE_URL", counting_aumentum(signins.clone(), signouts.clone(), valid.clone(), null_ref.clone()).await);
     let x = 600_000.0 + (seed() % 5_000) as f64 * 100.0;
     for k in 0..3 {
         post_one(app.clone(), x + k as f64 * 100.0, 8_800_000.0).await.expect("commit");
@@ -299,5 +303,12 @@ async fn commits_share_one_aumentum_session() {
     assert_eq!((signins.load(SeqCst), signouts.load(SeqCst)), (2, 0));
     post_one(app.clone(), x + 400.0, 8_800_000.0).await.expect("commit");
     assert_eq!(signins.load(SeqCst), 2, "and keeps the new one");
+
+    // The Aumentum service restarted behind IIS: the old session gets "Object reference not set"
+    // (PL000000023900, 2026-11-10). The commit signs in once more and goes through.
+    null_ref.store(true, SeqCst);
+    valid.store(0, SeqCst);
+    post_one(app.clone(), x + 500.0, 8_800_000.0).await.expect("commit after an Object reference fault");
+    assert_eq!((signins.load(SeqCst), signouts.load(SeqCst)), (3, 0));
     std::env::remove_var("CADASTRE_AUMENTUM_JOBSERVICE_URL");
 }
