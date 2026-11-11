@@ -101,6 +101,9 @@ fn hint(f: &Failure) -> Option<String> {
     if f.stage == "lookup" && d.contains("object reference not set") {
         return Some("Aumentum signed in but could not open its geodatabase. On the Aumentum server, ArcSDE's log (sde_sde.log) usually says \"Maximum number of connections to instance exceeded\": restarting the ArcSDE service, then the AUMENTUM CADASTRE Server service, frees them.".into());
     }
+    if f.stage == "lookup" && d.contains("no answer to the upin lookup") {
+        return Some("This server reached Aumentum and signed in, but the lookup never answered: Aumentum is waiting on its geodatabase. On the Aumentum server, count the ArcSDE connections (tasklist /fi \"imagename eq gsrvr.exe\" | find /c \"gsrvr\"); near 64, restart the ArcSDE service, then the AUMENTUM CADASTRE Server service.".into());
+    }
     match f.stage {
         "settings" => Some("Set CADASTRE_MC_SERVICE_USER / CADASTRE_MC_SERVICE_PASSWORD in this server's settings and restart it.".into()),
         "unreachable" | "timeout" => Some("Check that this server can reach Aumentum's job service (network, firewall, IIS on the Aumentum server).".into()),
@@ -271,8 +274,13 @@ impl UpinCheck {
         let body = envelope("GetParcelAttributesByUPIN", &format!("<regionName>Plateau_State</regionName><upin>{}</upin>", escape(upin)));
         let r = http(&self.url, "POST", &[("Content-Type", "text/xml; charset=utf-8".into()), ("SOAPAction", format!("\"{NS}GetParcelAttributesByUPIN\"")), ("Cookie", self.cookie.clone())], &body)
             .await
-            .map_err(|e| Failure::new("unreachable", Some(e.to_string()),
-                format!("Aumentum could not be asked whether {upin} is free ({e}); nothing was committed. Please contact the ICT Admin.")))?;
+            .map_err(|e| match e {
+                // Signed in, then no answer: Aumentum was reached, its lookup hung (not the network).
+                crate::lrs::LrsError::Http(ref m) if m == "timed out" => Failure::new("lookup", Some("no answer to the UPIN lookup".into()),
+                    format!("Aumentum accepted the sign-in but did not answer when asked about {upin}; nothing was committed. Please contact the ICT Admin.")),
+                e => Failure::new("unreachable", Some(e.to_string()),
+                    format!("Aumentum could not be asked whether {upin} is free ({e}); nothing was committed. Please contact the ICT Admin.")),
+            })?;
         if r.status != 200 {
             let detail = fault(&r.body);
             let said = detail.as_deref().map(|d| format!(": {d}")).unwrap_or_default();
@@ -332,6 +340,7 @@ mod tests {
         assert!(hint(&f).is_some_and(|h| h.contains("CADASTRE_OUTBOUND_ADDR")));
         assert!(hint(&Failure::new("lookup", Some("Object reference not set to an instance of an object".into()), String::new())).is_some_and(|h| h.contains("ArcSDE")));
         assert!(hint(&Failure::new("lookup", Some("Timeout expired".into()), String::new())).is_none());
+        assert!(hint(&Failure::new("lookup", Some("no answer to the UPIN lookup".into()), String::new())).is_some_and(|h| h.contains("gsrvr")));
         assert_eq!(host_of("http://10.10.10.6/ApplicationServerAdmin/WebServices/LRSWebServices.asmx").as_deref(), Some("10.10.10.6"));
     }
 }
