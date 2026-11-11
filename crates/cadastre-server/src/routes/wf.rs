@@ -1186,13 +1186,17 @@ async fn commit_drafts(tx: &mut sqlx::PgConnection, id: i32, req: &crate::routes
     let beacons = crate::routes::wfbeacons::apply(&mut *tx, job_id, req).await?;
     let allow_overlap: Option<String> = sqlx::query_scalar("SELECT value FROM cadastre.app_setting WHERE key = 'editor.allow_overlap'").fetch_optional(&mut *tx).await?;
     if allow_overlap.as_deref() != Some("1") {
-        let clashes: Vec<String> = sqlx::query_scalar(
+        // As the system check: a strip narrower than the overlap width (5 cm) is a shared boundary.
+        let width = crate::routes::precheck::overlap_min_width(&mut *tx).await?;
+        let clashes: Vec<String> = sqlx::query_scalar(&format!(
             "SELECT DISTINCT p.parcel_number FROM cadastre.parcel d JOIN cadastre.parcel p \
-               ON p.status = 'posted' AND p.geom && d.geom AND ST_Area(ST_Intersection(p.geom, d.geom)) > 0.01 AND NOT (p.parcel_number = ANY($2)) \
+               ON p.status = 'posted' AND p.geom && d.geom AND {} AND NOT (p.parcel_number = ANY($2)) \
              WHERE d.job_id = $1 AND d.status = 'draft' ORDER BY 1 LIMIT 20",
-        )
+            crate::routes::precheck::counts_sql("p.geom", "d.geom", "$3"),
+        ))
         .bind(job_id)
         .bind(&mutated)
+        .bind(width)
         .fetch_all(&mut *tx)
         .await?;
         if !clashes.is_empty() {

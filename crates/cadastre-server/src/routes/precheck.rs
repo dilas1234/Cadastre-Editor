@@ -10,6 +10,10 @@
 //! | `transaction`    | the job's Registry transaction is still Active                             | fail   |
 //! | `near_miss`      | gaps under 10 cm against committed neighbours                              | warn   |
 //!
+//! An overlap counts only when it is wider than `editor.overlap_min_width_m` (5 cm): a thinner one
+//! is a shared boundary drawn a little differently (the same beacons, typed from the survey plan,
+//! against a neighbour's stored line), not land taken twice. It is named in the check's detail.
+//!
 //! Parcels this job's mutations replace (split, merge, re-survey …) are not counted against it.
 //! A source that cannot be reached is a warning, not a pass: the officer must say why to go on.
 
@@ -28,6 +32,24 @@ use crate::state::AppState;
 
 /// Overlaps smaller than this (m²) are drawing noise, as in the commit's rule.
 const MIN_OVERLAP_M2: f64 = 0.01;
+/// Overlaps narrower than this (m) are a shared boundary drawn a little differently, not an
+/// overlap (`editor.overlap_min_width_m`).
+const OVERLAP_MIN_WIDTH_M: f64 = 0.05;
+
+/// The width an overlap must exceed to count (`editor.overlap_min_width_m`, 0 to 1 m; default 5 cm).
+pub async fn overlap_min_width(conn: &mut sqlx::PgConnection) -> ApiResult<f64> {
+    let v: Option<String> = sqlx::query_scalar("SELECT value FROM cadastre.app_setting WHERE key = 'editor.overlap_min_width_m'")
+        .fetch_optional(conn).await?;
+    Ok(v.and_then(|v| v.trim().parse().ok()).filter(|w: &f64| (0.0..1.0).contains(w)).unwrap_or(OVERLAP_MIN_WIDTH_M))
+}
+
+/// SQL: whether the overlap of `a` and `b` counts: more than 0.01 m² and, somewhere, wider than
+/// `width` (a SQL expression, in metres). Shrinking the overlap by half the width on every side
+/// leaves nothing of a strip thinner than that.
+pub fn counts_sql(a: &str, b: &str, width: &str) -> String {
+    format!("(ST_Area(ST_Intersection({a}, {b})) > {MIN_OVERLAP_M2} \
+             AND NOT ST_IsEmpty(ST_Buffer(ST_CollectionExtract(ST_Intersection({a}, {b}), 3), -({width}) / 2.0)))")
+}
 /// Gaps narrower than this (m) to a committed neighbour are reported as near misses.
 const NEAR_MISS_M: f64 = 0.10;
 
@@ -68,6 +90,15 @@ pub struct PrecheckRequest {
 
 fn item(check: &str, label: &str, result: &str, detail: impl Into<String>, upins: Vec<String>) -> PrecheckItem {
     PrecheckItem { check: check.into(), label: label.into(), result: result.into(), detail: detail.into(), upins }
+}
+
+/// For a passing overlap check: the shared-boundary differences it let through, if any.
+fn sliver_note(slivers: &[(String, f64)], width: f64) -> String {
+    if slivers.is_empty() {
+        return String::new();
+    }
+    let d = slivers.iter().take(6).map(|(u, a)| format!("{u} ({a:.2} m²)")).collect::<Vec<_>>().join(", ");
+    format!(" Boundary differences narrower than {:.0} cm with {d} are not counted as overlaps.", width * 100.0)
 }
 
 fn list(u: &[String]) -> String {
@@ -112,15 +143,20 @@ pub async fn run(state: &AppState, id: i32, vertices: &[[f64; 2]], editing_id: O
     let g = "ST_MakeValid(ST_SetSRID(ST_GeomFromGeoJSON($1), 32632))";
     let mut items = Vec::new();
 
+    let width = overlap_min_width(&mut conn).await?;
+    let mut slivers: Vec<(String, f64)> = Vec::new();
+
     // 1. Overlap with parcels committed here.
-    let ours: Vec<(String, f64)> = sqlx::query_as(&format!(
-        "SELECT p.parcel_number, ST_Area(ST_Intersection(p.geom, {g})) AS a FROM cadastre.parcel p \
+    let rows: Vec<(String, f64, bool)> = sqlx::query_as(&format!(
+        "SELECT p.parcel_number, ST_Area(ST_Intersection(p.geom, {g})) AS a, {} AS counts FROM cadastre.parcel p \
          WHERE p.status = 'posted' AND p.geom && {g} AND NOT (p.parcel_number = ANY($2)) \
-           AND ST_Area(ST_Intersection(p.geom, {g})) > $3 ORDER BY a DESC LIMIT 50"))
-        .bind(&shape).bind(&mutated).bind(MIN_OVERLAP_M2).fetch_all(&mut *conn).await?;
+           AND ST_Area(ST_Intersection(p.geom, {g})) > $3 ORDER BY a DESC LIMIT 50", counts_sql("p.geom", g, "$4")))
+        .bind(&shape).bind(&mutated).bind(MIN_OVERLAP_M2).bind(width).fetch_all(&mut *conn).await?;
+    let ours: Vec<(String, f64)> = rows.iter().filter(|r| r.2).map(|r| (r.0.clone(), r.1)).collect();
+    slivers.extend(rows.iter().filter(|r| !r.2).map(|r| (r.0.clone(), r.1)));
     let our_upins: Vec<String> = ours.iter().map(|o| o.0.clone()).collect();
     items.push(if ours.is_empty() {
-        item("fabric_overlap", "Overlap with this Cadastre", "pass", "No committed parcel is overlapped.", vec![])
+        item("fabric_overlap", "Overlap with this Cadastre", "pass", format!("No committed parcel is overlapped.{}", sliver_note(&slivers, width)), vec![])
     } else {
         let d = ours.iter().take(6).map(|(u, a)| format!("{u} ({a:.2} m²)")).collect::<Vec<_>>().join(", ");
         item("fabric_overlap", "Overlap with this Cadastre", "fail", format!("The parcel overlaps {d}."), our_upins.clone())
@@ -136,6 +172,7 @@ pub async fn run(state: &AppState, id: i32, vertices: &[[f64; 2]], editing_id: O
         .bind(pe).bind(pn).bind(&mutated).fetch_all(&mut *conn).await?;
     let mut aum_upins: Vec<String> = Vec::new();
     let mut aum_at_point: Vec<String> = Vec::new();
+    let mut aum_slivers: Vec<(String, f64)> = Vec::new();
     let aum_item = {
         let env: (f64, f64, f64, f64) = {
             let r = sqlx::query(&format!("SELECT ST_XMin(b) x0, ST_YMin(b) y0, ST_XMax(b) x1, ST_YMax(b) y1 FROM (SELECT Box2D({g}) b) s")).bind(&shape).fetch_one(&mut *conn).await?;
@@ -159,19 +196,21 @@ pub async fn run(state: &AppState, id: i32, vertices: &[[f64; 2]], editing_id: O
                         if !rings.is_array() || (!upin.is_empty() && mutated.contains(&upin)) { continue; }
                         let other = json!({ "type": "Polygon", "coordinates": rings }).to_string();
                         let r = sqlx::query(&format!(
-                            "SELECT ST_Area(ST_Intersection(o, {g})) AS a, ST_Contains(o, ST_SetSRID(ST_MakePoint($3, $4), 32632)) AS at_point \
-                             FROM (SELECT ST_MakeValid(ST_SetSRID(ST_GeomFromGeoJSON($2), 32632)) AS o) s"))
-                            .bind(&shape).bind(&other).bind(pe).bind(pn).fetch_one(&mut *conn).await;
+                            "SELECT ST_Area(ST_Intersection(o, {g})) AS a, ST_Contains(o, ST_SetSRID(ST_MakePoint($3, $4), 32632)) AS at_point, {} AS counts \
+                             FROM (SELECT ST_MakeValid(ST_SetSRID(ST_GeomFromGeoJSON($2), 32632)) AS o) s", counts_sql("o", g, "$5")))
+                            .bind(&shape).bind(&other).bind(pe).bind(pn).bind(width).fetch_one(&mut *conn).await;
                         let Ok(r) = r else { continue };
                         let a: f64 = r.get::<Option<f64>, _>("a").unwrap_or(0.0);
                         let label = if upin.is_empty() { "an Aumentum parcel without UPIN".to_string() } else { upin.clone() };
                         if r.get::<Option<bool>, _>("at_point").unwrap_or(false) && !aum_at_point.contains(&label) { aum_at_point.push(label.clone()); }
-                        if a > MIN_OVERLAP_M2 && !hits.iter().any(|h| h.0 == label) { hits.push((label, a)); }
+                        let counts = r.get::<Option<bool>, _>("counts").unwrap_or(false);
+                        if counts && !hits.iter().any(|h| h.0 == label) { hits.push((label, a)); }
+                        else if !counts && a > MIN_OVERLAP_M2 && !aum_slivers.iter().any(|h: &(String, f64)| h.0 == label) { aum_slivers.push((label, a)); }
                     }
                     hits.sort_by(|a, b| b.1.total_cmp(&a.1));
                     aum_upins = hits.iter().map(|h| h.0.clone()).collect();
                     if hits.is_empty() {
-                        item("aumentum", "Overlap with Aumentum", "pass", "No parcel in Aumentum is overlapped.", vec![])
+                        item("aumentum", "Overlap with Aumentum", "pass", format!("No parcel in Aumentum is overlapped.{}", sliver_note(&aum_slivers, width)), vec![])
                     } else {
                         let d = hits.iter().take(6).map(|(u, a)| format!("{u} ({a:.2} m²)")).collect::<Vec<_>>().join(", ");
                         item("aumentum", "Overlap with Aumentum", "fail", format!("The parcel overlaps Aumentum's {d}."), aum_upins.clone())

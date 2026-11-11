@@ -2453,3 +2453,64 @@ async fn registry_map_like_aumentum_gisviewer() {
 fn urlencoding(s: &str) -> String {
     s.bytes().map(|b| if b.is_ascii_alphanumeric() || b"-_.~".contains(&b) { (b as char).to_string() } else { format!("%{b:02X}") }).collect()
 }
+
+/// A neighbour sharing a boundary, typed a little differently (a strip under 5 cm wide), is not an
+/// overlap: the Orthophoto badge and the system check pass it and name it. A real overlap still fails.
+#[tokio::test]
+async fn a_shared_boundary_drawn_a_little_differently_is_not_an_overlap() {
+    let Some(db_url) = test_db_url() else {
+        eprintln!("skipping: CADASTRE_TEST_DATABASE_URL not set");
+        return;
+    };
+    let app = routes::router(state_with(AuthMode::Disabled, None, &db_url).await);
+    let pool = sqlx::PgPool::connect(&db_url).await.unwrap();
+    sqlx::query("UPDATE cadastre.app_setting SET value = '0.05' WHERE key = 'editor.overlap_min_width_m'").execute(&pool).await.unwrap();
+    let b = 200_000 + (rand_12() % 700_000) as i32 * 10 + 7;
+    sqlx::query("INSERT INTO cadastre.wf_task (id, name) VALUES ($1, 'Construct Parcel')").bind(b).execute(&pool).await.unwrap();
+    sqlx::query("INSERT INTO cadastre.wf_job_type (id, name, start_task_id, end_task_id) VALUES ($1, 'Overlap width (test)', $1, $1)")
+        .bind(b).execute(&pool).await.unwrap();
+    let (_, d) = send(&app, "POST", "/api/v1/wf/jobs", None, Some(json!({"job_type_id": b, "name": "Job-OVW"}))).await;
+    let id = d["job"]["id"].as_i64().unwrap();
+
+    // The committed neighbour: a 20 m square, somewhere no other test draws.
+    let x0 = 150_000.0 + ((b / 10) % 60_000) as f64 * 10.0;
+    let y0 = 9_200_000.0;
+    let (_, job) = send(&app, "POST", "/api/v1/jobs", None, Some(json!({"reference": format!("OVW-{b}"), "job_type": "capture"}))).await;
+    let job_id = job["id"].as_str().unwrap().to_string();
+    let (st, p) = send(&app, "POST", &format!("/api/v1/jobs/{job_id}/parcels"), None, Some(json!({"geometry": square(x0, y0, 20.0)}))).await;
+    assert_eq!(st, StatusCode::CREATED, "{p}");
+    for action in ["submit", "start_review", "approve"] {
+        send(&app, "POST", &format!("/api/v1/jobs/{job_id}/transition"), None, Some(json!({ "action": action }))).await;
+    }
+    let (st, r) = send(&app, "POST", &format!("/api/v1/jobs/{job_id}/post"), None, None).await;
+    assert_eq!(st, StatusCode::OK, "{r}");
+    let neighbour = r["parcel_numbers"][0].as_str().unwrap().to_string();
+
+    // The new parcel east of it, its west side `into` metres inside the neighbour's east side.
+    let east = |into: f64| { let x = x0 + 20.0 - into; vec![[x, y0], [x + 20.0, y0], [x + 20.0, y0 + 20.0], [x, y0 + 20.0]] };
+    let check_url = format!("/api/v1/wf/jobs/{id}/precheck");
+    let precheck = |v: Vec<[f64; 2]>| send(&app, "POST", &check_url, None, Some(json!({"vertices": v})));
+    let fabric = |r: &Value| r["items"].as_array().unwrap().iter().find(|i| i["check"] == "fabric_overlap").cloned().unwrap();
+
+    // 2 cm along a 20 m side (0.4 m², 40 times the old 0.01 m² limit): a shared boundary.
+    let (st, o) = send(&app, "POST", "/api/v1/parcels/overlaps", None, Some(json!({"vertices": east(0.02)}))).await;
+    assert_eq!(st, StatusCode::OK, "{o}");
+    assert_eq!((o["free"].as_bool(), o["overlaps"].as_array().map(Vec::len)), (Some(true), Some(0)), "{o}");
+    let (_, r) = precheck(east(0.02)).await;
+    let f = fabric(&r);
+    assert_eq!(f["result"], "pass", "{r}");
+    assert!(f["detail"].as_str().unwrap().contains(&neighbour) && f["detail"].as_str().unwrap().contains("5 cm"), "{f}");
+
+    // 20 cm: land taken twice.
+    let (_, o) = send(&app, "POST", "/api/v1/parcels/overlaps", None, Some(json!({"vertices": east(0.20)}))).await;
+    assert_eq!(o["overlaps"][0]["upin"], json!(neighbour), "{o}");
+    let (_, r) = precheck(east(0.20)).await;
+    assert_eq!(fabric(&r)["result"], "fail", "{r}");
+    assert_eq!(r["ok"], json!(false));
+
+    // Width 0: every overlap over 0.01 m² counts, as before.
+    sqlx::query("UPDATE cadastre.app_setting SET value = '0' WHERE key = 'editor.overlap_min_width_m'").execute(&pool).await.unwrap();
+    let (_, r) = precheck(east(0.02)).await;
+    sqlx::query("UPDATE cadastre.app_setting SET value = '0.05' WHERE key = 'editor.overlap_min_width_m'").execute(&pool).await.unwrap();
+    assert_eq!(fabric(&r)["result"], "fail", "{r}");
+}
