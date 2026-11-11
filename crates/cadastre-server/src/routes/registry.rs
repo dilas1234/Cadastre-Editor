@@ -720,11 +720,20 @@ pub async fn send_plan(State(state): State<AppState>, user: AuthUser, Path(id): 
     .await;
     session.end().await;
     let (t, replaced, replace_note) = result?;
+    // What the job's plans print typed over the computed values, so the record shows what went out.
+    let typed_over: Vec<serde_json::Value> = sqlx::query_as::<_, (String, serde_json::Value)>("SELECT upin, fields FROM cadastre.title_deed_plan WHERE wf_job_instance_id = $1")
+        .bind(id).fetch_all(&state.pool).await.unwrap_or_default().into_iter()
+        .flat_map(|(upin, f)| {
+            let styles = f.get("styles").and_then(|v| v.as_object()).cloned().unwrap_or_default();
+            styles.into_iter().filter(|(_, st)| st.get("was").is_some_and(|w| !w.is_null()) && st.get("text").is_some_and(|w| !w.is_null()))
+                .map(move |(key, st)| serde_json::json!({ "upin": upin, "key": key, "typed": st["text"], "calculated": st["was"] }))
+        })
+        .collect();
     let mut tx = state.pool.begin().await?;
     audit::append(&mut tx, &actor.label, "registry_plan_sent", "wf_job_instance", Some(&id.to_string()), serde_json::json!({
         "transaction_number": t.transaction_number, "file_id": req.file_id, "file_name": sent_name, "source_file": name, "bytes": pdf.len(),
         "document_type": doc_type, "page_type": page_type, "resend": resend, "comments": comments, "replaced": replaced, "replace_note": replace_note,
-        "reason": correction.as_ref().map(|c| c.reason.clone()),
+        "reason": correction.as_ref().map(|c| c.reason.clone()), "overrides": typed_over,
     })).await?;
     // The plan is filed: the job ends with it (a job already completed stays as it is).
     let ended = complete_with_plan(&mut tx, &actor.label, id, if resend { "resend" } else { "send" }).await?;

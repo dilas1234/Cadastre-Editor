@@ -5454,6 +5454,10 @@ function tdShow(feats) {
 // The road or feature copied in the plan editor; it stays for the next plan opened.
 let tdClip = null;
 const TD_SCALES = [250, 500, 750, 1000, 1250, 1500, 2000, 2500, 3000, 4000, 5000, 7500, 10000, 25000];
+// The plan form's fields, by the name the sheet gives them (data-field).
+const FIELD_NAMES = { region: "Region", location: "Location", plan_no: "Plan no.", tracing_no: "Tracing no.", scale: "Scale", title_no: "Title no.",
+  address: "Address", lga: "L.G. area", holder: "Holder", surveyed_by: "Surveyed by", survey_date: "Survey date", prepared_by: "Prepared by",
+  plotted_by: "Plotted by", checked_by: "Checked by", surveyor_general: "Surveyor-General" };
 async function titleDeedDialog(jobId, upin) {
   let d;
   try { d = await api(`/api/v1/wf/jobs/${jobId}/titledeed` + (upin ? `?upin=${encodeURIComponent(upin)}` : "")); }
@@ -5473,6 +5477,16 @@ async function titleDeedDialog(jobId, upin) {
   // Access roads: any number of sides (two neighbouring sides meet in a junction on the sheet).
   const roadSet = new Set((f.road_sides && f.road_sides.length) ? f.road_sides : (f.road_side != null ? [f.road_side] : []));
   const sideText = (i) => `Side ${i + 1}: ${nameOf(i)} → ${nameOf((i + 1) % n)}`;
+  // What a label of the sheet is, in words (its data-move or data-cell key).
+  const labelName = (key) => {
+    const [k, a, b] = key.split(":"), part = { degrees: "Bearing degrees", minutes: "Bearing minutes", distance: "Distance" };
+    if (k in part) return `${part[k]}, ${sideText(Number(a))}`;
+    if (k === "short") return b ? `${part[b]}, ${sideText(Number(a))} (corner table)` : "Short sides table";
+    if (k === "grid") return `Grid value (${a === "e" ? "Easting" : "Northing"})`;
+    return { area: "Area (header)", parcel_area: "Area (middle of the parcel)", file_no: "File no. (middle of the parcel)", coord: "WGS 1984 co-ordinates",
+      sheet_no: "Sheet no.", computation: "Computation note", roads_survey: "Roads note", sg_title: "SURVEYOR-GENERAL", sg_date: "DATE", bar: "Scale bar figure",
+      north: "North arrow letter", upin: "UPIN", ...FIELD_NAMES }[k] || key;
+  };
   const roadBoxes = p.corners.map((c, i) => h("input", { type: "checkbox", checked: roadSet.has(i) }));
   const roadLabels = p.corners.map((c, i) => h("span", {}, sideText(i)));
   const road = h("div", { style: "width:100%;max-height:90px;overflow:auto" },
@@ -5550,28 +5564,47 @@ async function titleDeedDialog(jobId, upin) {
     return out;
   };
   const msg = h("div", { style: "min-height:1.2em;margin:4px 0" });
+  // The sheet's labels typed over the calculated values, and those the co-ordinates have overtaken.
+  const typedLine = h("div", { style: "margin-bottom:6px" });
+  const showTyped = (list) => {
+    const old = (list || []).filter((o) => o.stale);
+    typedLine.style.color = old.length ? "#900" : "#a35a00";
+    typedLine.textContent = !list?.length ? ""
+      : old.length ? `${old.length} typed value(s) on the sheet no longer match the co-ordinates: ${old.map((o) => `${labelName(o.key)} (typed ${o.typed}, now ${o.calculated})`).join("; ")}. Check them in Edit plan.`
+      : `${list.length} label(s) on the sheet typed over the calculated value: ${list.map((o) => labelName(o.key)).join(", ")}.`;
+  };
   const save = async () => {
     const r = await api(`/api/v1/wf/jobs/${jobId}/titledeed`, { method: "PUT", body: { upin: p.upin, fields: collect() } });
     msg.style.color = "#060"; msg.textContent = "Saved with the job.";
+    styles = { ...(r.saved?.styles || {}) }; // with what the sheet computed when each was typed
+    moves = { ...(r.saved?.label_moves || moves) };
+    showTyped(r.overrides);
     return r;
   };
+  showTyped(d.overrides);
   // Edit plan: the sheet full size, as a drawing tool. Roads and other features are drawn on it as
-  // curves or straight lines, and reshaped by their points; labels are dragged, recoloured and
-  // retyped; text can be added. The beacons and the bearings, distances and area stay as computed
-  // from the registered co-ordinates. Nothing is saved until Done: the sheet redraws from the
-  // server's preview, and Undo / Cancel work on the editor's own copy.
+  // curves or straight lines, and reshaped by their points; every label is dragged, recoloured and
+  // retyped (a form label changes its form field; a computed one, an area, bearing or distance, is
+  // typed over and outlined, and the save records it; never the UPIN); text can be added. The
+  // beacons themselves stay where the co-ordinates put them. Nothing is saved until Done: the sheet
+  // redraws from the server's preview, and Undo / Cancel work on the editor's own copy.
   const edit = async () => {
     const fail = (e) => { msg.style.color = "#900"; msg.textContent = e.message; hint.textContent = "The sheet could not be redrawn: " + e.message; };
     const SVG = "http://www.w3.org/2000/svg";
     const page = h("div", { class: "peSheet" });
     const hint = h("div", { style: "min-height:1.3em" });
+    const staleBar = h("div", { class: "peBar", style: "display:none" });
     let el = null, ui = null, zoom = 1, sel = null, node = null, drag = null, draw = null, seq = 0, tool = "select", space = false, pivot = null;
     // What Undo and Cancel put back.
-    const snap = () => JSON.stringify({ feats, moves, styles, notes, names: names.map((x) => x.value), sides: roadBoxes.map((b) => b.checked) });
+    const snap = () => JSON.stringify({ feats, moves, styles, notes, names: names.map((x) => x.value), sides: roadBoxes.map((b) => b.checked),
+      form: Object.fromEntries(keys.map((k) => [k, fields[k].value])), lga: lga.value, scale: scale.value });
     const restore = (j) => {
       const v = JSON.parse(j);
       feats.splice(0, feats.length, ...v.feats); notes.splice(0, notes.length, ...v.notes);
       moves = v.moves; styles = v.styles;
+      for (const k of keys) fields[k].value = v.form?.[k] ?? fields[k].value;
+      if (v.lga != null) lga.value = v.lga;
+      if (v.scale != null) scale.value = v.scale;
       names.forEach((x, i) => { x.value = v.names[i]; x.dispatchEvent(new Event("input")); });
       roadBoxes.forEach((b, i) => { b.checked = v.sides[i]; });
       renderFeats();
@@ -5608,6 +5641,25 @@ async function titleDeedDialog(jobId, upin) {
       ui = document.createElementNS(SVG, "g");
       el.append(ui);
       overlay();
+      markOverrides();
+    };
+    // Labels typed over the calculated values: outlined on the screen only (orange; red once the
+    // co-ordinates give another value), and listed in the bar when any is out of date.
+    const markOverrides = () => {
+      if (!el?.isConnected) return;
+      const typed = [...el.querySelectorAll("[data-override]")];
+      for (const t of typed) {
+        const bb = t.getBBox(), stale = t.hasAttribute("data-stale");
+        (t.tagName === "text" ? t.parentNode : t).append(svgEl("rect", { x: bb.x - 0.6, y: bb.y - 0.4, width: bb.width + 1.2, height: bb.height + 0.8, fill: "none",
+          stroke: stale ? "#d00" : "#f80", "stroke-width": 0.3, "stroke-dasharray": "1 0.6", "pointer-events": "none" }));
+      }
+      const old = typed.filter((t) => t.hasAttribute("data-stale"));
+      const name = (t) => labelName(t.getAttribute("data-move") || t.getAttribute("data-cell"));
+      staleBar.style.display = typed.length ? "" : "none";
+      staleBar.style.color = old.length ? "#ff8a80" : "#ffb74d";
+      staleBar.textContent = old.length
+        ? `${old.length} typed value(s) no longer match the co-ordinates: ${old.map((t) => `${name(t)} (typed ${t.textContent.trim()}, now ${t.getAttribute("data-calc")})`).join("; ")}.`
+        : `${typed.length} label(s) typed over the calculated value, outlined in orange (on the screen only): ${typed.map(name).join(", ")}.`;
     };
     // Paper mm <-> ground co-ordinates, through the sheet's data-grid.
     const grid = () => el.getAttribute("data-grid").split(" ").map(Number);
@@ -5763,7 +5815,15 @@ async function titleDeedDialog(jobId, upin) {
       x.points = x.points.map((q) => { const [a, b] = toPaper(q); return toGround([a + dx, b + dy]); });
       show().catch(fail);
     };
-    const styleOf = (key) => (styles[key] ||= { color: null, text: null });
+    const styleOf = (key) => (styles[key] ||= { color: null, text: null, was: null });
+    // Words typed over a computed label: kept as an override (the server notes what the sheet
+    // computed then); typed as computed, or blank, there is none.
+    const setTyped = (key, v, calcd) => {
+      v = v.trim();
+      if (!v || v === calcd) { if (styles[key]) { styles[key].text = null; styles[key].was = null; tidyStyle(key); } return; }
+      const st = styleOf(key);
+      if (st.text !== v) { st.text = v; st.was = null; }
+    };
     const tidyStyle = (key) => { if (styles[key] && !styles[key].color && !styles[key].text && !styles[key].angle) delete styles[key]; };
     // Rotate: a line or road turns about its pivot (the middle, or where it is dragged to), and
     // its points are stored turned; a label or text turns about the place it is written. Angles
@@ -5831,12 +5891,34 @@ async function titleDeedDialog(jobId, upin) {
         rows.push(h("button", { class: "btn", onclick: removeSelected }, "Delete text"));
       } else {
         const key = sel.key, [kind, idx] = key.split(":"), i = Number(idx);
-        rows.push(h("b", {}, "Label"));
+        const g = el?.querySelector(`[data-move="${key}"]`);
+        rows.push(h("b", {}, ["beacon", "road", "feature"].includes(kind) ? "Label" : labelName(key)));
         const words = (value, set) => rows.push(prop("Words", h("input", { value, style: wide, onchange: (e) => { mark(); set(e.target.value.trim()); changed(); } })));
+        const say = (text, colour = "#ccc") => rows.push(h("p", { style: `color:${colour};line-height:1.4` }, text));
+        // Words over a computed label, with what the sheet computes and a way back to it.
+        const typedOver = (k, calcd, title, stale) => {
+          rows.push(prop(title, h("input", { value: styles[k]?.text || calcd, style: wide, onchange: (e) => { mark(); setTyped(k, e.target.value, calcd); changed(); } })));
+          if (!styles[k]?.text) { say(`Calculated: ${calcd}`); return; }
+          say(`Typed over the calculated ${calcd}. It prints as typed; saving records the change.`, "#ffb74d");
+          if (stale) say(`The co-ordinates have changed since it was typed (then ${styles[k].was || "?"}).`, "#ff8a80");
+          rows.push(h("button", { class: "btn", onclick: () => { mark(); setTyped(k, "", calcd); changed(); } }, "Use the calculated value"));
+        };
         if (kind === "beacon") words(names[i].value || p.corners[i].name, (v) => { names[i].value = v === p.corners[i].name ? "" : v; names[i].dispatchEvent(new Event("input")); });
         else if (kind === "road") words(styles[key]?.text || roadLabel.value || "Access Road", (v) => { styleOf(key).text = v || null; tidyStyle(key); });
         else if (kind === "feature") words(feats[i].label || "", (v) => { feats[i].label = v || null; renderFeats(); });
-        else rows.push(h("p", { style: "color:#ccc;line-height:1.4" }, "Computed from the registered co-ordinates, so its words can't be changed. It can be moved and recoloured."));
+        else if (g?.hasAttribute("data-locked")) say("The UPIN can't be typed over: it identifies the parcel in the Registry. It can be moved, recoloured and turned.");
+        else if (g?.getAttribute("data-field")) {
+          const name = g.getAttribute("data-field"), src = name === "lga" ? lga : name === "scale" ? scale : fields[name];
+          const box = src.tagName === "SELECT" ? src.cloneNode(true) : h("input", { placeholder: d.prefill[name] || "", style: wide });
+          box.value = src.value; box.style.cssText = wide;
+          box.addEventListener("change", () => { mark(); src.value = box.value; src.dispatchEvent(new Event("input")); changed(); });
+          rows.push(prop(FIELD_NAMES[name] || name, box));
+          say("From the plan form: typing here changes the form too.");
+        } else if (key === "short") {
+          const cells = [...(g?.querySelectorAll("[data-cell]") || [])];
+          if (!cells.length) say("The table moves as one block.");
+          for (const c of cells) typedOver(c.getAttribute("data-cell"), c.getAttribute("data-calc"), labelName(c.getAttribute("data-cell")), c.hasAttribute("data-stale"));
+        } else if (g?.hasAttribute("data-calc")) typedOver(key, g.getAttribute("data-calc"), "Words", g.hasAttribute("data-stale"));
         rows.push(prop("Colour", colourBox(styles[key]?.color || "#000000", (c) => { mark(); styleOf(key).color = c; changed(); }, () => { mark(); if (styles[key]) { styles[key].color = null; tidyStyle(key); } changed(); })));
         rows.push(prop("Turn (degrees)", h("input", { type: "number", min: -180, max: 180, step: 1, value: styles[key]?.angle ?? 0, style: wide, onchange: (e) => { mark(); styleOf(key).angle = wrap(Number(e.target.value) || 0); tidyStyle(key); changed(); } })));
         rows.push(h("button", { class: "btn", onclick: () => { mark(); delete moves[key]; if (styles[key]) { styles[key].angle = null; tidyStyle(key); } changed(); } }, "Put it back"));
@@ -5983,12 +6065,14 @@ async function titleDeedDialog(jobId, upin) {
         h("button", { class: "btn", title: "Put the plan back as it was when the editor opened", onclick: () => { restore(opened); close(); } }, "Cancel"),
         h("button", { class: "btn", title: "Save the plan with the job", onclick: () => { close(); save().catch(fail); } }, "Done")),
       h("div", { class: "peBar", style: "min-height:24px" }, options),
+      staleBar,
       h("div", { style: "flex:1;display:flex;min-height:0" }, h("div", { class: "peTools" }, ...Object.values(toolBtns)), scroller,
         h("div", { class: "peDock" }, h("div", { class: "peHead" }, "Properties"), panel, h("div", { class: "peHead" }, "Layers"), layers)),
       h("div", { class: "peStatus" }, hint, h("span", { class: "peGap" }), cursorText, scaleText, zoomText));
     setZoom(1); bars(); fillPanel(); setEditTool("select");
     try { await show(); } catch (e) { close(); fail(e); return; }
     document.body.append(ov);
+    markOverrides();
     scroller.addEventListener("wheel", (e) => { if (!e.ctrlKey) return; e.preventDefault(); setZoom(zoom * (e.deltaY < 0 ? 1.15 : 1 / 1.15)); }, { passive: false });
     let pressed = null; // the last point pressed: a second press soon after is a double-click
     page.addEventListener("pointerdown", (e) => {
@@ -6188,6 +6272,7 @@ async function titleDeedDialog(jobId, upin) {
     ...d.upins.map((u) => h("option", { value: u, selected: u === p.upin }, u)))) : null;
   const w = floatWindow(`Title Deed Plan — ${p.upin}`, h("div", {},
     h("div", { style: "margin-bottom:6px" }, reg),
+    typedLine,
     h("div", { class: "muted", style: "margin-bottom:6px" }, `Area ${(Math.floor(p.area_m2 * 1000 + 1e-7) / 1000).toFixed(3)} m² · ${n} beacons, clockwise from the westernmost`),
     pick,
     row("Title no.:", fields.title_no), row("Plan no.:", fields.plan_no), row("Tracing no.:", fields.tracing_no),

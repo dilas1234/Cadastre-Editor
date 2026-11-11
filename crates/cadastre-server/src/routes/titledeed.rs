@@ -28,7 +28,7 @@ use crate::auth::AuthUser;
 use crate::error::{ApiResult, AppError};
 use crate::lrs::{LrsConfig, Session};
 use crate::state::AppState;
-use crate::titledeed::{cap_words, plan_order, render_svg, PlanData, PlanFields, SYMBOLS};
+use crate::titledeed::{cap_words, computed_labels, overrides, plan_order, render_svg, Override, PlanData, PlanFields, SYMBOLS};
 
 #[derive(Debug, Deserialize, IntoParams)]
 pub struct PlanQuery {
@@ -64,6 +64,9 @@ pub struct TitleDeedDto {
     pub registry: String,
     /// The symbols a feature on the plan can use, in the form's order.
     pub symbols: Vec<SymbolDto>,
+    /// Labels the plan prints typed over what the sheet computes; `stale` = the co-ordinates have
+    /// changed since they were typed.
+    pub overrides: Vec<Override>,
 }
 
 #[derive(Debug, Deserialize, ToSchema)]
@@ -207,6 +210,54 @@ fn merge(prefill: &PlanFields, saved: &PlanFields) -> PlanFields {
     pick!(region, location, plan_no, tracing_no, title_no, address, lga, holder, surveyed_by, survey_date, plotted_by, checked_by, surveyor_general, prepared_by)
 }
 
+/// Overrides as they are kept: the words typed over a computed label, with what the sheet computed
+/// when they were typed (`was`, set here, never taken from the browser). Words equal to the computed
+/// ones are no override; the UPIN is never typed over; the middle's old one-block key is split.
+/// Returns what changed since the saved form, for the audit log.
+fn settle_overrides(fields: &mut PlanFields, old: &PlanFields, calc: &std::collections::BTreeMap<String, String>) -> Vec<serde_json::Value> {
+    fields.split_parcel_block();
+    for (key, st) in fields.styles.iter_mut() {
+        let words = st.text.as_deref().map(str::trim).filter(|t| !t.is_empty()).map(str::to_string);
+        let Some(words) = words.filter(|_| key != "upin") else {
+            st.text = None;
+            st.was = None;
+            continue;
+        };
+        match calc.get(key) {
+            // An access road's label, or a label not on the sheet now (the grid turned off).
+            None => {
+                if key.starts_with("road:") { st.was = None; }
+                st.text = Some(words);
+            }
+            Some(c) if *c == words => { st.text = None; st.was = None; }
+            Some(c) => {
+                let kept = old.styles.get(key).filter(|o| o.text.as_deref().map(str::trim) == Some(words.as_str())).and_then(|o| o.was.clone());
+                st.was = Some(kept.unwrap_or_else(|| c.clone()));
+                st.text = Some(words);
+            }
+        }
+    }
+    fields.styles.retain(|_, st| st.color.is_some() || st.text.is_some() || st.angle.is_some());
+    let typed = |f: &PlanFields| -> std::collections::BTreeMap<String, (String, Option<String>)> {
+        f.styles.iter().filter(|(k, st)| !k.starts_with("road:") && st.text.is_some()).map(|(k, st)| (k.clone(), (st.text.clone().unwrap_or_default(), st.was.clone()))).collect()
+    };
+    let (before, after) = (typed(old), typed(fields));
+    let mut changes = Vec::new();
+    for (key, (words, was)) in &after {
+        match before.get(key) {
+            Some((w, _)) if w == words => {}
+            Some((w, _)) => changes.push(serde_json::json!({ "key": key, "change": "changed", "calculated": was, "from": w, "typed": words })),
+            None => changes.push(serde_json::json!({ "key": key, "change": "added", "calculated": was, "typed": words })),
+        }
+    }
+    for (key, (words, was)) in &before {
+        if !after.contains_key(key) {
+            changes.push(serde_json::json!({ "key": key, "change": "removed", "calculated": calc.get(key).or(was.as_ref()), "typed": words }));
+        }
+    }
+    changes
+}
+
 /// The plan. `registry` = ask the Registry for the prefill too, which takes a session of its own;
 /// the sheet's editor, redrawing as the officer works, does without.
 async fn load(state: &AppState, id: i32, want: Option<String>, user: Option<&AuthUser>, registry: bool) -> ApiResult<TitleDeedDto> {
@@ -271,7 +322,9 @@ async fn load(state: &AppState, id: i32, want: Option<String>, user: Option<&Aut
     let mut fields = match &saved { Some(s) => merge(&prefill, s), None => prefill.clone() };
     fields.surveyed_by = fields.surveyed_by.as_deref().map(cap_words);
     let symbols = SYMBOLS.iter().map(|y| SymbolDto { id: y.id.into(), label: y.label.into(), group: y.group.into(), point: y.point, double: y.double, stroke: y.stroke().into() }).collect();
-    Ok(TitleDeedDto { plan: PlanData { upin, area_m2: area, corners, fields }, prefill, saved, upins, registry, symbols })
+    let plan = PlanData { upin, area_m2: area, corners, fields };
+    let overrides = overrides(&plan);
+    Ok(TitleDeedDto { plan, prefill, saved, upins, registry, symbols, overrides })
 }
 
 /// The job's title deed plan: data, prefill and saved form.
@@ -293,6 +346,11 @@ pub async fn put_plan(State(state): State<AppState>, user: AuthUser, Path(id): P
     }
     let mut fields = req.fields;
     fields.surveyed_by = non_empty(fields.surveyed_by).map(|s| cap_words(&s));
+    let before = load(&state, id, Some(upin.clone()), None, false).await?;
+    let old = before.saved.clone().unwrap_or_default();
+    let calc = computed_labels(&PlanData { fields: merge(&before.prefill, &fields), ..before.plan.clone() });
+    let changes = settle_overrides(&mut fields, &old, &calc);
+    let mut tx = state.pool.begin().await?;
     sqlx::query(
         "INSERT INTO cadastre.title_deed_plan (wf_job_instance_id, upin, fields, updated_by) VALUES ($1, $2, $3, $4) \
          ON CONFLICT (wf_job_instance_id, upin) DO UPDATE SET fields = EXCLUDED.fields, updated_by = EXCLUDED.updated_by, updated_at = now()",
@@ -301,8 +359,13 @@ pub async fn put_plan(State(state): State<AppState>, user: AuthUser, Path(id): P
     .bind(&upin)
     .bind(serde_json::to_value(&fields).map_err(|e| AppError::BadRequest(e.to_string()))?)
     .bind(&actor.label)
-    .execute(&state.pool)
+    .execute(&mut *tx)
     .await?;
+    if !changes.is_empty() {
+        crate::audit::append(&mut tx, &actor.label, "title_deed_plan_override", "wf_job_instance", Some(&id.to_string()),
+            serde_json::json!({ "upin": upin, "changes": changes })).await?;
+    }
+    tx.commit().await?;
     Ok(Json(load(&state, id, Some(upin), Some(&user), true).await?))
 }
 
