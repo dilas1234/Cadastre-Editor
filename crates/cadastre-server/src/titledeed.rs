@@ -77,9 +77,12 @@ pub struct PlanNote {
 pub struct LabelStyle {
     /// `#rrggbb`; blank = as the sheet has it.
     pub color: Option<String>,
-    /// The words of an access road's label. Bearings, distances and areas always come from the
-    /// registered co-ordinates, so they have none.
+    /// Words typed over the sheet's own: an access road's label, or an override of a computed or
+    /// fixed label (an area, a distance, "SURVEYOR-GENERAL" …). Never the UPIN.
     pub text: Option<String>,
+    /// For an override: what the sheet computed when it was typed (set by the server on save). If
+    /// the co-ordinates change and the sheet computes something else, the override is stale.
+    pub was: Option<String>,
     /// Turned this many degrees clockwise about where it is written. Only the writing turns.
     pub angle: Option<f64>,
 }
@@ -188,6 +191,21 @@ pub struct PlanFields {
 }
 
 impl PlanFields {
+    /// Plans saved when the middle's file no. and area were one label (`parcel`): its move and
+    /// style go to both of the labels it became.
+    pub fn split_parcel_block(&mut self) {
+        if let Some(m) = self.label_moves.remove("parcel") {
+            for k in ["file_no", "parcel_area"] {
+                self.label_moves.entry(k.into()).or_insert(m);
+            }
+        }
+        if let Some(st) = self.styles.remove("parcel") {
+            for k in ["file_no", "parcel_area"] {
+                self.styles.entry(k.into()).or_insert_with(|| LabelStyle { text: None, was: None, ..st.clone() });
+            }
+        }
+    }
+
     /// The access road sides: `road_sides`, else the legacy `road_side`.
     pub fn roads(&self) -> Vec<usize> {
         let mut v = if self.road_sides.is_empty() { self.road_side.into_iter().collect() } else { self.road_sides.clone() };
@@ -439,8 +457,9 @@ fn esc(s: &str) -> String {
     s.replace('&', "&amp;").replace('<', "&lt;").replace('>', "&gt;").replace('"', "&quot;")
 }
 
-fn up(s: &Option<String>) -> String {
-    esc(&s.clone().unwrap_or_default().to_uppercase())
+/// A form value in capitals, not yet escaped.
+fn upr(s: &Option<String>) -> String {
+    s.clone().unwrap_or_default().to_uppercase()
 }
 
 fn text(svg: &mut String, x: f64, y: f64, size: f64, anchor: &str, extra: &str, s: &str) {
@@ -500,7 +519,12 @@ fn spread_labels(boxes: &mut [LabelBox]) {
 /// Open a label's group, moved, turned and coloured as the officer set it; `data-move` names it
 /// for the sheet's editor, `data-at` is the paper point it turns about. Close it with [`end_move`].
 fn begin_move(svg: &mut String, f: &PlanFields, key: &str, at: Pt) {
-    let _ = write!(svg, r#"<g data-move="{key}""#);
+    begin_move_with(svg, f, key, at, "");
+}
+
+/// [`begin_move`] with more attributes on the group (`attrs` starts with a space).
+fn begin_move_with(svg: &mut String, f: &PlanFields, key: &str, at: Pt, attrs: &str) {
+    let _ = write!(svg, r#"<g data-move="{key}"{attrs}"#);
     let style = f.styles.get(key);
     let shift = f.label_moves.get(key).map(|[dx, dy]| format!("translate({dx:.2} {dy:.2})"));
     let turn = style.and_then(|x| x.angle).filter(|a| a.is_finite() && *a != 0.0).map(|a| format!("rotate({a:.1} {:.2} {:.2})", at.0, at.1));
@@ -518,13 +542,96 @@ fn end_move(svg: &mut String) {
     svg.push_str("</g>\n");
 }
 
+/// A label typed over what the sheet computes, as the plan prints it.
+#[derive(Debug, Clone, PartialEq, Serialize, ToSchema)]
+pub struct Override {
+    /// The label (`distance:2`, `area`, `short:3:degrees` …).
+    pub key: String,
+    /// What the sheet prints: the officer's words.
+    pub typed: String,
+    /// What the sheet computes now.
+    pub calculated: String,
+    /// What it computed when the words were typed, if that is known.
+    pub was: Option<String>,
+    /// The co-ordinates have changed since: `was` is no longer what the sheet computes.
+    pub stale: bool,
+}
+
+/// What the sheet computed while drawing: each overridable label's own words, the overrides it
+/// printed, and whether a bearing or distance was typed over (the computation note then says so).
+#[derive(Default)]
+struct Calc {
+    values: BTreeMap<String, String>,
+    overrides: Vec<Override>,
+    amended: bool,
+}
+
+/// What a label's words are.
+enum Words {
+    /// The officer's form field of that name: typed on the sheet, the field changes.
+    Field(&'static str, String),
+    /// Computed or fixed wording, which the officer may type over (an override).
+    Calc(String),
+    /// Always as computed (the UPIN).
+    Locked(String),
+}
+
+/// The words a label prints, and the attributes that tell the sheet's editor what they are.
+fn words_of(f: &PlanFields, calc: &mut Calc, key: &str, w: Words) -> (String, String) {
+    match w {
+        Words::Field(name, v) => (v, format!(r#" data-field="{name}""#)),
+        Words::Locked(v) => (v, r#" data-locked="1""#.to_string()),
+        Words::Calc(v) => {
+            calc.values.insert(key.to_string(), v.clone());
+            let st = f.styles.get(key);
+            match st.and_then(|x| x.text.as_deref()).map(str::trim).filter(|t| !t.is_empty() && *t != v) {
+                Some(t) => {
+                    let was = st.and_then(|x| x.was.clone());
+                    let stale = was.as_deref().is_some_and(|w| w != v);
+                    calc.overrides.push(Override { key: key.to_string(), typed: t.to_string(), calculated: v.clone(), was, stale });
+                    if key.starts_with("degrees:") || key.starts_with("minutes:") || key.starts_with("distance:") || key.starts_with("short:") {
+                        calc.amended = true;
+                    }
+                    (t.to_string(), format!(r#" data-calc="{}" data-override="1"{}"#, esc(&v), if stale { r#" data-stale="1""# } else { "" }))
+                }
+                None => (v.clone(), format!(r#" data-calc="{}""#, esc(&v))),
+            }
+        }
+    }
+}
+
+/// `extra` without its `fill`, for a label the officer has recoloured (its group carries the colour).
+fn strip_fill(extra: &str) -> String {
+    match extra.find(r#"fill=""#) {
+        Some(i) => {
+            let rest = &extra[i + 6..];
+            let end = rest.find('"').map_or(extra.len(), |j| i + 6 + j + 1);
+            format!("{}{}", &extra[..i], &extra[end..]).trim().to_string()
+        }
+        None => extra.to_string(),
+    }
+}
+
+/// One label of the sheet: its own group (moved, turned, coloured, retyped as the officer set it)
+/// holding its text at (`x`, `y`).
+#[allow(clippy::too_many_arguments)]
+fn put(svg: &mut String, f: &PlanFields, calc: &mut Calc, key: &str, w: Words, x: f64, y: f64, size: f64, anchor: &str, extra: &str) {
+    let (words, attrs) = words_of(f, calc, key, w);
+    let recoloured = safe_color(f.styles.get(key).and_then(|st| st.color.as_deref())).is_some();
+    let extra = if recoloured { strip_fill(extra) } else { extra.to_string() };
+    begin_move_with(svg, f, key, (x, y), &attrs);
+    text(svg, x, y, size, anchor, &extra, &esc(&words));
+    end_move(svg);
+}
+
 /// A side too short to carry its bearing and distance, written in the corner table instead.
 struct ShortSide {
     from: String,
     to: String,
-    degrees: String,
-    minutes: String,
-    distance: String,
+    /// Each value cell: the words it prints, and its attributes (`data-cell` names its override).
+    degrees: (String, String),
+    minutes: (String, String),
+    distance: (String, String),
 }
 
 /// Width of `s` in Arial at `size` mm (its advance widths, in ems). Close enough to set columns:
@@ -556,7 +663,7 @@ fn short_sides_table(svg: &mut String, f: &PlanFields, rows: &[ShortSide]) {
     const GAP: f64 = 1.0;
     let widest = |pick: fn(&ShortSide) -> &str| rows.iter().map(|r| text_width(pick(r), SIZE)).fold(0.0, f64::max);
     let (w_from, w_to) = (widest(|r| &r.from), widest(|r| &r.to));
-    let (w_deg, w_min, w_dist) = (widest(|r| &r.degrees), widest(|r| &r.minutes), widest(|r| &r.distance));
+    let (w_deg, w_min, w_dist) = (widest(|r| &r.degrees.0), widest(|r| &r.minutes.0), widest(|r| &r.distance.0));
     let (w_dash, w_eq, w_at) = (text_width("-", SIZE), text_width("=", SIZE).max(1.5), text_width("@", SIZE).max(2.6));
     // Column positions from the left edge of the table.
     let c_dash = w_from + GAP + w_dash / 2.0; // middle
@@ -573,17 +680,17 @@ fn short_sides_table(svg: &mut String, f: &PlanFields, rows: &[ShortSide]) {
     begin_move(svg, f, "short", (left + c_dist / 2.0, (top + bottom) / 2.0));
     for (j, r) in rows.iter().rev().enumerate() {
         let y = bottom - j as f64 * ROW;
-        for (x, anchor, cell) in [
-            (left, "start", esc(&r.from)),
-            (left + c_dash, "middle", "-".to_string()),
-            (left + c_to, "start", esc(&r.to)),
-            (left + c_eq, "middle", "=".to_string()),
-            (left + c_deg, "end", r.degrees.clone()),
-            (left + c_min, "end", r.minutes.clone()),
-            (left + c_at, "middle", "@".to_string()),
-            (left + c_dist, "end", r.distance.clone()),
+        for (x, anchor, cell, attrs) in [
+            (left, "start", esc(&r.from), ""),
+            (left + c_dash, "middle", "-".to_string(), ""),
+            (left + c_to, "start", esc(&r.to), ""),
+            (left + c_eq, "middle", "=".to_string(), ""),
+            (left + c_deg, "end", esc(&r.degrees.0), r.degrees.1.as_str()),
+            (left + c_min, "end", esc(&r.minutes.0), r.minutes.1.as_str()),
+            (left + c_at, "middle", "@".to_string(), ""),
+            (left + c_dist, "end", esc(&r.distance.0), r.distance.1.as_str()),
         ] {
-            text(svg, x, y, SIZE, anchor, "", &cell);
+            text(svg, x, y, SIZE, anchor, attrs, &cell);
         }
     }
     end_move(svg);
@@ -688,7 +795,25 @@ fn feature_point(svg: &mut String, sym: &Symbol, q: (f64, f64), color: Option<&s
 
 /// The sheet as SVG.
 pub fn render_svg(d: &PlanData) -> String {
-    let f = &d.fields;
+    draw(d).0
+}
+
+/// The labels the sheet prints over what it computes (overrides), stale ones marked.
+pub fn overrides(d: &PlanData) -> Vec<Override> {
+    draw(d).1.overrides
+}
+
+/// What the sheet computes for each label that can be typed over, by label.
+pub fn computed_labels(d: &PlanData) -> BTreeMap<String, String> {
+    draw(d).1.values
+}
+
+fn draw(d: &PlanData) -> (String, Calc) {
+    let mut fields = d.fields.clone();
+    fields.split_parcel_block();
+    let f = &fields;
+    let mut calc = Calc::default();
+    let cl = &mut calc;
     let corners: Vec<Corner> = d.corners.iter().enumerate().map(|(i, c)| {
         let name = f.corner_names.get(i).cloned().flatten().filter(|s| !s.trim().is_empty()).unwrap_or_else(|| c.name.clone());
         Corner { name, ..c.clone() }
@@ -711,12 +836,13 @@ pub fn render_svg(d: &PlanData) -> String {
 
     // Header, left.
     let lx = 50.0;
-    let region = if f.region.as_deref().unwrap_or("").is_empty() { "PLATEAU".to_string() } else { up(&f.region) };
-    text(&mut s, lx, 16.0, 3.2, "middle", r#"font-weight="bold""#, &region);
-    text(&mut s, lx, 21.0, 3.2, "middle", r#"font-weight="bold""#, &up(&f.location));
-    text(&mut s, lx, 26.0, 3.2, "middle", r#"font-weight="bold""#, &format!("PLAN NO. {}", up(&f.plan_no)));
-    text(&mut s, lx, 31.0, 3.2, "middle", r#"font-weight="bold""#, &format!("TRACING NO. {}", up(&f.tracing_no)));
-    text(&mut s, lx, 36.0, 3.2, "middle", r#"font-weight="bold""#, &format!("Scale = 1:{scale}"));
+    const BOLD: &str = r#"font-weight="bold""#;
+    let region = if f.region.as_deref().unwrap_or("").is_empty() { "PLATEAU".to_string() } else { upr(&f.region) };
+    put(&mut s, f, cl, "region", Words::Field("region", region), lx, 16.0, 3.2, "middle", BOLD);
+    put(&mut s, f, cl, "location", Words::Field("location", upr(&f.location)), lx, 21.0, 3.2, "middle", BOLD);
+    put(&mut s, f, cl, "plan_no", Words::Field("plan_no", format!("PLAN NO. {}", upr(&f.plan_no))), lx, 26.0, 3.2, "middle", BOLD);
+    put(&mut s, f, cl, "tracing_no", Words::Field("tracing_no", format!("TRACING NO. {}", upr(&f.tracing_no))), lx, 31.0, 3.2, "middle", BOLD);
+    put(&mut s, f, cl, "scale", Words::Field("scale", format!("Scale = 1:{scale}")), lx, 36.0, 3.2, "middle", BOLD);
     // Scale bar: a round ground length near 40 mm on paper.
     let bar_m = [1.0, 2.0, 5.0, 10.0, 20.0, 25.0, 50.0, 100.0, 200.0, 250.0, 500.0, 1000.0, 2000.0, 5000.0]
         .into_iter().rev().find(|m| m * k <= 40.0).unwrap_or(1.0);
@@ -725,48 +851,52 @@ pub fn render_svg(d: &PlanData) -> String {
         let fill = if i % 2 == 0 { "#000" } else { "#fff" };
         let _ = writeln!(s, r##"<rect x="{:.2}" y="{by}" width="{:.2}" height="1.2" fill="{fill}" stroke="#000" stroke-width="0.2"/>"##, bx + bw * i as f64 / 4.0, bw / 4.0);
     }
-    text(&mut s, bx, by + 4.2, 2.2, "middle", "", "0");
-    text(&mut s, bx + bw, by + 4.2, 2.2, "middle", "", &format!("{} m", bar_m));
+    put(&mut s, f, cl, "bar:0", Words::Calc("0".into()), bx, by + 4.2, 2.2, "middle", "");
+    put(&mut s, f, cl, "bar:len", Words::Calc(format!("{} m", bar_m)), bx + bw, by + 4.2, 2.2, "middle", "");
 
     // North arrow, top centre: the shaft doubled down to its cross, "U.N." either side of the tip.
     let _ = writeln!(s, r##"<g stroke="#000" stroke-width="0.3"><line x1="105" y1="7" x2="105" y2="46"/><line x1="104.4" y1="16.5" x2="104.4" y2="34.5"/><line x1="105.6" y1="16.5" x2="105.6" y2="34.5"/><line x1="97.5" y1="22" x2="112.5" y2="22"/><line x1="98.5" y1="23.2" x2="111.5" y2="23.2"/></g><path d="M105 6 L104 9 L106 9 Z" fill="#000"/>"##);
-    text(&mut s, 104.2, 14.0, 3.0, "end", r#"font-weight="bold""#, "U.");
-    text(&mut s, 105.8, 14.0, 3.0, "start", r#"font-weight="bold""#, "N.");
+    put(&mut s, f, cl, "north:u", Words::Calc("U.".into()), 104.2, 14.0, 3.0, "end", BOLD);
+    put(&mut s, f, cl, "north:n", Words::Calc("N.".into()), 105.8, 14.0, 3.0, "start", BOLD);
 
     // Header, right.
     let rx = 160.0;
-    let title_no = if f.title_no.as_deref().unwrap_or("").is_empty() { up(&f.plan_no) } else { up(&f.title_no) };
-    text(&mut s, rx, 17.0, 4.6, "middle", r#"font-weight="bold""#, &format!("TITLE NO. {title_no}"));
-    text(&mut s, rx, 23.0, 3.0, "middle", r#"font-weight="bold""#, &up(&f.address));
-    let lga = up(&f.lga);
-    text(&mut s, rx, 28.0, 3.0, "middle", r#"font-weight="bold""#, &if lga.is_empty() { String::new() } else { format!("{lga} L.G. AREA") });
-    text(&mut s, rx, 33.0, 3.0, "middle", &format!(r#"font-weight="bold" fill="{RED}""#), &area_line(d.area_m2));
-    text(&mut s, rx, 38.0, 3.0, "middle", &format!(r#"font-weight="bold" fill="{RED}""#), &format!("UPIN {}", esc(&d.upin)));
-    text(&mut s, 105.0, 52.0, 3.4, "middle", r#"font-weight="bold""#, &format!("HOLDER: {}", up(&f.holder)));
+    let title_no = if f.title_no.as_deref().unwrap_or("").is_empty() { upr(&f.plan_no) } else { upr(&f.title_no) };
+    put(&mut s, f, cl, "title_no", Words::Field("title_no", format!("TITLE NO. {title_no}")), rx, 17.0, 4.6, "middle", BOLD);
+    put(&mut s, f, cl, "address", Words::Field("address", upr(&f.address)), rx, 23.0, 3.0, "middle", BOLD);
+    let lga = upr(&f.lga);
+    put(&mut s, f, cl, "lga", Words::Field("lga", if lga.is_empty() { String::new() } else { format!("{lga} L.G. AREA") }), rx, 28.0, 3.0, "middle", BOLD);
+    let red = format!(r#"font-weight="bold" fill="{RED}""#);
+    put(&mut s, f, cl, "area", Words::Calc(area_line(d.area_m2)), rx, 33.0, 3.0, "middle", &red);
+    put(&mut s, f, cl, "upin", Words::Locked(format!("UPIN {}", d.upin)), rx, 38.0, 3.0, "middle", &red);
+    put(&mut s, f, cl, "holder", Words::Field("holder", format!("HOLDER: {}", upr(&f.holder))), 105.0, 52.0, 3.4, "middle", BOLD);
 
     // Frame and grid: as on the printed plans, the ground co-ordinates of the lower-left corner
     // (Easting under it, Northing beside the lower-right corner), then a tick on each edge every
     // `GRID_MM` of paper, labelled outside the frame, in the survey's co-ordinates (UTM).
     let _ = writeln!(s, r##"<rect x="{x0}" y="{y0}" width="{}" height="{}" fill="none" stroke="#1f3f8f" stroke-width="0.5"/>"##, x1 - x0, y1 - y0);
     if f.grid.unwrap_or(true) && !corners.is_empty() {
-        let upward = |s: &mut String, x: f64, y: f64, anchor: &str, label: &str| {
-            let _ = writeln!(s, r#"<text x="{x:.2}" y="{y:.2}" font-size="2" text-anchor="{anchor}" transform="rotate(-90 {x:.2} {y:.2})">{label}</text>"#);
+        let upward = |s: &mut String, cl: &mut Calc, key: &str, x: f64, y: f64, anchor: &str, label: String| {
+            let (words, attrs) = words_of(f, cl, key, Words::Calc(label));
+            begin_move_with(s, f, key, (x, y), &attrs);
+            let _ = writeln!(s, r#"<text x="{x:.2}" y="{y:.2}" font-size="2" text-anchor="{anchor}" transform="rotate(-90 {x:.2} {y:.2})">{}</text>"#, esc(&words));
+            end_move(s);
         };
-        text(&mut s, x0, y1 + 3.0, 2.0, "start", "", &format!("{e_left:.0} mE"));
-        upward(&mut s, x1 + 2.8, y1, "start", &format!("{n_bottom:.0} mN"));
+        put(&mut s, f, cl, "grid:e:0", Words::Calc(format!("{e_left:.0} mE")), x0, y1 + 3.0, 2.0, "start", "");
+        upward(&mut s, cl, "grid:n:0", x1 + 2.8, y1, "start", format!("{n_bottom:.0} mN"));
         for i in 1..=((x1 - x0) / GRID_MM) as u32 {
             let gx = x0 + i as f64 * GRID_MM;
             let label = format!("{:.0} mE", e_left + i as f64 * GRID_MM / k);
             let _ = writeln!(s, r##"<g stroke="#1f3f8f" stroke-width="0.3"><line x1="{gx:.2}" y1="{y0}" x2="{gx:.2}" y2="{:.2}"/><line x1="{gx:.2}" y1="{y1}" x2="{gx:.2}" y2="{:.2}"/></g>"##, y0 + 3.0, y1 - 3.0);
-            text(&mut s, gx, y0 - 1.2, 2.0, "middle", "", &label);
-            text(&mut s, gx, y1 + 3.0, 2.0, "middle", "", &label);
+            put(&mut s, f, cl, &format!("grid:e:{i}:top"), Words::Calc(label.clone()), gx, y0 - 1.2, 2.0, "middle", "");
+            put(&mut s, f, cl, &format!("grid:e:{i}:bottom"), Words::Calc(label), gx, y1 + 3.0, 2.0, "middle", "");
         }
         for i in 1..=((y1 - y0) / GRID_MM) as u32 {
             let gy = y1 - i as f64 * GRID_MM;
             let label = format!("{:.0} mN", n_bottom + i as f64 * GRID_MM / k);
             let _ = writeln!(s, r##"<g stroke="#1f3f8f" stroke-width="0.3"><line x1="{x0}" y1="{gy:.2}" x2="{:.2}" y2="{gy:.2}"/><line x1="{x1}" y1="{gy:.2}" x2="{:.2}" y2="{gy:.2}"/></g>"##, x0 + 3.0, x1 - 3.0);
-            upward(&mut s, x0 - 1.2, gy, "middle", &label);
-            upward(&mut s, x1 + 2.8, gy, "middle", &label);
+            upward(&mut s, cl, &format!("grid:n:{i}:left"), x0 - 1.2, gy, "middle", label.clone());
+            upward(&mut s, cl, &format!("grid:n:{i}:right"), x1 + 2.8, gy, "middle", label);
         }
     }
 
@@ -986,18 +1116,25 @@ pub fn render_svg(d: &PlanData) -> String {
         let reads_from_a = if dx.abs() > 1e-6 { dx > 0.0 } else { a.1 < b.1 };
         let (t_deg, t_min) = if reads_from_a { (0.2, 0.8) } else { (0.8, 0.2) };
         if paper_len < SHORT_SIDE_MM && p.len() >= 3 {
+            let cell = |cl: &mut Calc, part: &str, v: String| {
+                let key = format!("short:{i}:{part}");
+                let (words, attrs) = words_of(f, cl, &key, Words::Calc(v));
+                (words, format!(r#"data-cell="{key}"{attrs}"#))
+            };
             short.push(ShortSide {
                 from: corners[i].name.clone(),
                 to: corners[(i + 1) % corners.len()].name.clone(),
-                degrees: format!("{deg}°"),
-                minutes: format!("{min:02}'"),
-                distance: format!("{dist:.2}m"),
+                degrees: cell(cl, "degrees", format!("{deg}°")),
+                minutes: cell(cl, "minutes", format!("{min:02}'")),
+                distance: cell(cl, "distance", format!("{dist:.2}m")),
             });
             continue;
         }
         for (key, t, off, label) in [("degrees", t_deg, out, format!("{deg}°")), ("minutes", t_min, out, format!("{min:02}'")), ("distance", 0.5, -out, format!("{dist:.2}m"))] {
-            begin_move(&mut s, f, &format!("{key}:{i}"), (a.0 + (b.0 - a.0) * t, a.1 + (b.1 - a.1) * t));
-            along(&mut s, a, b, t, off, 2.6, &label);
+            let key = format!("{key}:{i}");
+            let (words, attrs) = words_of(f, cl, &key, Words::Calc(label));
+            begin_move_with(&mut s, f, &key, (a.0 + (b.0 - a.0) * t, a.1 + (b.1 - a.1) * t), &attrs);
+            along(&mut s, a, b, t, off, 2.6, &words);
             end_move(&mut s);
         }
     }
@@ -1021,11 +1158,10 @@ pub fn render_svg(d: &PlanData) -> String {
         text(&mut s, x, b.y, BEACON_SIZE, anchor, HALO, &esc(&c.name));
         end_move(&mut s);
     }
-    let file_no = if f.plan_no.as_deref().unwrap_or("").is_empty() { title_no.clone() } else { up(&f.plan_no) };
-    begin_move(&mut s, f, "parcel", (pcx, pcy + 1.0));
-    text(&mut s, pcx, pcy - 0.8, 2.6, "middle", "", &file_no);
-    text(&mut s, pcx, pcy + 2.8, 2.6, "middle", "", &parcel_area(d.area_m2));
-    end_move(&mut s);
+    // The middle: the file no. and the area, each its own label.
+    let file_no = if f.plan_no.as_deref().unwrap_or("").is_empty() { title_no.clone() } else { upr(&f.plan_no) };
+    put(&mut s, f, cl, "file_no", Words::Calc(file_no), pcx, pcy - 0.8, 2.6, "middle", "");
+    put(&mut s, f, cl, "parcel_area", Words::Calc(parcel_area(d.area_m2)), pcx, pcy + 2.8, 2.6, "middle", "");
 
     // The officer's own text.
     for (i, note) in f.notes.iter().enumerate() {
@@ -1048,32 +1184,43 @@ pub fn render_svg(d: &PlanData) -> String {
 
     // Footer.
     let fx0 = 12.0;
+    let blue = format!(r#"font-weight="bold" fill="{COORD_BLUE}""#);
     if let Some(o) = corners.first() {
-        text(&mut s, fx0, 236.0, 2.8, "start", &format!(r#"font-weight="bold" fill="{COORD_BLUE}""#), &format!("WGS 1984 Co-ordinates of {}", esc(&o.name)));
-        text(&mut s, fx0, 240.5, 2.8, "start", &format!(r#"font-weight="bold" fill="{COORD_BLUE}""#), &format!("N: {:.3}m", o.n));
-        text(&mut s, fx0, 245.0, 2.8, "start", &format!(r#"font-weight="bold" fill="{COORD_BLUE}""#), &format!("E: {:.3}m", o.e));
+        put(&mut s, f, cl, "coord:title", Words::Calc(format!("WGS 1984 Co-ordinates of {}", o.name)), fx0, 236.0, 2.8, "start", &blue);
+        put(&mut s, f, cl, "coord:n", Words::Calc(format!("N: {:.3}m", o.n)), fx0, 240.5, 2.8, "start", &blue);
+        put(&mut s, f, cl, "coord:e", Words::Calc(format!("E: {:.3}m", o.e)), fx0, 245.0, 2.8, "start", &blue);
     }
-    text(&mut s, fx0, 251.0, 2.8, "start", r#"font-weight="bold""#, &format!("SURVEYED BY: {}", esc(&cap_words(f.surveyed_by.as_deref().unwrap_or("")))));
-    text(&mut s, fx0, 256.0, 2.8, "start", r#"font-weight="bold""#, &format!("SURVEY DATE: {}", esc(f.survey_date.as_deref().unwrap_or(""))));
+    put(&mut s, f, cl, "surveyed_by", Words::Field("surveyed_by", format!("SURVEYED BY: {}", cap_words(f.surveyed_by.as_deref().unwrap_or("")))), fx0, 251.0, 2.8, "start", BOLD);
+    put(&mut s, f, cl, "survey_date", Words::Field("survey_date", format!("SURVEY DATE: {}", f.survey_date.as_deref().unwrap_or(""))), fx0, 256.0, 2.8, "start", BOLD);
     if let Some(o) = corners.first() {
-        text(&mut s, fx0, 261.0, 2.8, "start", r#"font-weight="bold""#, &format!("SHEET NO. {}", sheet_no(o.e, o.n).replace('-', " - ")));
+        put(&mut s, f, cl, "sheet_no", Words::Calc(format!("SHEET NO. {}", sheet_no(o.e, o.n).replace('-', " - "))), fx0, 261.0, 2.8, "start", BOLD);
     }
     let prepared = f.prepared_by.clone().filter(|p| !p.trim().is_empty()).unwrap_or_else(|| "MLSTP".into());
-    text(&mut s, fx0, 266.0, 2.8, "start", r#"font-weight="bold""#, &format!("Prepared By {}", esc(&prepared)));
-    text(&mut s, 92.0, 238.0, 2.5, "middle", "", "All bearings and distances shown on this plan");
-    text(&mut s, 92.0, 241.5, 2.5, "middle", "", "have been computed from Registered Co-ordinates.");
-    text(&mut s, 92.0, 245.0, 2.5, "middle", "", "Roads shown are not as a result of accurate survey");
-    text(&mut s, 92.0, 255.0, 2.8, "middle", r#"font-weight="bold""#, &format!("PLOTTED BY: {}", up(&f.plotted_by)));
-    text(&mut s, 92.0, 264.0, 2.8, "middle", r#"font-weight="bold""#, &format!("CHECKED BY: {}", up(&f.checked_by)));
+    put(&mut s, f, cl, "prepared_by", Words::Field("prepared_by", format!("Prepared By {prepared}")), fx0, 266.0, 2.8, "start", BOLD);
+    // The computation note. A bearing or distance typed over the computed one is no longer
+    // "computed from Registered Co-ordinates": the note then says that some were amended.
+    let amended = cl.amended;
+    let note: &[&str] = if amended {
+        &["Bearings and distances shown on this plan have", "been computed from Registered Co-ordinates,", "except where amended by the plotting officer."]
+    } else {
+        &["All bearings and distances shown on this plan", "have been computed from Registered Co-ordinates."]
+    };
+    for (j, line) in note.iter().enumerate() {
+        let key = if j == 2 { "computation:amended".to_string() } else { format!("computation:{j}") };
+        put(&mut s, f, cl, &key, Words::Calc(line.to_string()), 92.0, 238.0 + 3.5 * j as f64, 2.5, "middle", "");
+    }
+    put(&mut s, f, cl, "roads_survey", Words::Calc("Roads shown are not as a result of accurate survey".into()), 92.0, 238.0 + 3.5 * note.len() as f64, 2.5, "middle", "");
+    put(&mut s, f, cl, "plotted_by", Words::Field("plotted_by", format!("PLOTTED BY: {}", upr(&f.plotted_by))), 92.0, 255.0, 2.8, "middle", BOLD);
+    put(&mut s, f, cl, "checked_by", Words::Field("checked_by", format!("CHECKED BY: {}", upr(&f.checked_by))), 92.0, 264.0, 2.8, "middle", BOLD);
     let sx = 168.0;
     let _ = writeln!(s, r##"<line x1="140" y1="247" x2="196" y2="247" stroke="#000" stroke-width="0.25" stroke-dasharray="1 0.8"/>"##);
-    text(&mut s, sx, 251.0, 2.8, "middle", r#"font-weight="bold""#, &up(&f.surveyor_general));
-    text(&mut s, sx, 255.0, 2.8, "middle", r#"font-weight="bold""#, "SURVEYOR-GENERAL");
+    put(&mut s, f, cl, "surveyor_general", Words::Field("surveyor_general", upr(&f.surveyor_general)), sx, 251.0, 2.8, "middle", BOLD);
+    put(&mut s, f, cl, "sg_title", Words::Calc("SURVEYOR-GENERAL".into()), sx, 255.0, 2.8, "middle", BOLD);
     let _ = writeln!(s, r##"<line x1="140" y1="262" x2="196" y2="262" stroke="#000" stroke-width="0.25" stroke-dasharray="1 0.8"/>"##);
-    text(&mut s, sx, 266.0, 2.8, "middle", r#"font-weight="bold""#, "DATE");
+    put(&mut s, f, cl, "sg_date", Words::Calc("DATE".into()), sx, 266.0, 2.8, "middle", BOLD);
     let _ = W;
     s.push_str("</svg>\n");
-    s
+    (s, calc)
 }
 
 /// The area line of the header: square metres below one hectare, hectares from there up (4
@@ -1245,7 +1392,8 @@ mod tests {
         // PL68374 at 1:500: N9997V → N9998V is 3.78 m (7.6 mm on paper), as its printed plan.
         let fields = PlanFields { scale: Some(500), ..Default::default() };
         let svg = render_svg(&PlanData { upin: "X".into(), area_m2: 902.203, corners: pl68374(), fields });
-        assert!(svg.contains(r#"x="196.00" y="225.50" font-size="2.6" text-anchor="end" >3.78m<"#), "the distance ends at the lower-right corner");
+        let line = svg.lines().find(|l| l.contains(r#"data-calc="3.78m">3.78m<"#)).expect("the short side's distance");
+        assert!(line.contains(r#"x="196.00" y="225.50" font-size="2.6" text-anchor="end" data-cell="short:"#) && line.contains(":distance"), "the distance ends at the lower-right corner: {line}");
         let table = short_group(&svg);
         for cell in [">N9997V<", ">-<", ">N9998V<", ">=<", ">282°<", ">27'<", ">@<", ">3.78m<"] {
             assert!(table.contains(cell), "{cell} in the corner table");
@@ -1369,7 +1517,7 @@ mod tests {
         let before = render_svg(&plan(BTreeMap::new()));
         assert_eq!(before.matches(" h2 M").count(), 5, "a + at each beacon");
         assert!(!before.contains("l2 2"), "no x");
-        for key in ["beacon:0", "degrees:0", "minutes:0", "distance:0", "short", "parcel"] {
+        for key in ["beacon:0", "degrees:0", "minutes:0", "distance:0", "short", "file_no", "parcel_area", "area", "upin", "holder", "sg_title", "grid:e:0"] {
             assert!(before.contains(&format!(r#"data-move="{key}""#)), "{key} can be dragged");
         }
         let after = render_svg(&plan(BTreeMap::from([("beacon:0".to_string(), [3.5, -2.0])])));
@@ -1563,9 +1711,9 @@ mod tests {
         let plain = editor_plan();
         let mut d = editor_plan();
         d.fields.features.push(PlanFeature { symbol: "road_access".into(), smooth: true, points: vec![[990.0, 1060.0], [1020.0, 1070.0], [1050.0, 1060.0]], ..Default::default() });
-        d.fields.styles.insert("distance:0".into(), LabelStyle { color: Some("#ff0000".into()), text: Some("99.99m".into()), ..Default::default() });
+        d.fields.styles.insert("distance:0".into(), LabelStyle { color: Some("#ff0000".into()), ..Default::default() });
         let (a, b) = (render_svg(&plain), render_svg(&d));
-        assert!(b.contains("40.00m") && !b.contains("99.99m"));
+        assert!(b.contains("40.00m"));
         let beacons = |svg: &str| svg.lines().filter(|l| l.contains(" h2 M")).map(str::to_string).collect::<Vec<_>>();
         assert_eq!(beacons(&a), beacons(&b));
         assert_eq!(beacons(&b).len(), 4);
@@ -1601,5 +1749,99 @@ mod tests {
         assert_eq!(super::area3(249.4899), "249.489");
         assert_eq!(super::area3(528.215), "528.215");
         assert_eq!(super::area3(100.0), "100.000");
+    }
+
+    fn typed(text: &str, was: Option<&str>) -> LabelStyle {
+        LabelStyle { text: Some(text.into()), was: was.map(str::to_string), ..Default::default() }
+    }
+
+    #[test]
+    fn computed_labels_can_be_typed_over_and_say_so() {
+        let mut d = editor_plan();
+        for (key, words) in [("area", "AREA 1600.5 SQUARE METERS"), ("parcel_area", "1600.5 Sq.m"), ("sg_title", "SURVEYOR GENERAL"), ("grid:e:0", "999 mE")] {
+            d.fields.styles.insert(key.into(), typed(words, None));
+        }
+        let svg = render_svg(&d);
+        assert!(svg.contains(">AREA 1600.5 SQUARE METERS<") && !svg.contains(">AREA 1600.000 SQUARE METERS<"), "the header area as typed");
+        assert!(svg.contains(r#"<g data-move="area" data-calc="AREA 1600.000 SQUARE METERS" data-override="1""#), "the editor sees what it replaced");
+        assert!(svg.contains(">1600.5 Sq.m<") && svg.contains(">SURVEYOR GENERAL<") && svg.contains(">999 mE<"));
+        let o = overrides(&d);
+        assert_eq!(o.len(), 4);
+        assert!(o.iter().all(|x| !x.stale), "nothing known to have changed");
+        // Typed the same as computed: not an override.
+        d.fields.styles.insert("area".into(), typed("AREA 1600.000 SQUARE METERS", None));
+        assert_eq!(overrides(&d).len(), 3);
+    }
+
+    #[test]
+    fn an_override_is_stale_once_the_coordinates_give_another_value() {
+        let mut d = editor_plan();
+        d.fields.styles.insert("distance:0".into(), typed("40.10m", Some("40.00m")));
+        assert!(!overrides(&d)[0].stale);
+        assert!(!render_svg(&d).contains("data-stale"));
+        // The parcel is corrected: side 1 is now 41 m.
+        d.corners[1].e = 1041.0;
+        let o = overrides(&d);
+        assert_eq!((o[0].key.as_str(), o[0].typed.as_str(), o[0].calculated.as_str(), o[0].stale), ("distance:0", "40.10m", "41.00m", true));
+        assert!(render_svg(&d).contains(r#"data-calc="41.00m" data-override="1" data-stale="1""#));
+    }
+
+    #[test]
+    fn the_upin_is_never_typed_over() {
+        let mut d = editor_plan();
+        d.fields.styles.insert("upin".into(), typed("UPIN PL999", None));
+        let svg = render_svg(&d);
+        assert!(svg.contains(">UPIN PL1<") && !svg.contains("PL999"));
+        assert!(svg.contains(r#"<g data-move="upin" data-locked="1""#));
+        assert!(overrides(&d).is_empty());
+    }
+
+    #[test]
+    fn a_typed_bearing_or_distance_changes_the_computation_note() {
+        let mut d = editor_plan();
+        let svg = render_svg(&d);
+        assert!(svg.contains(">All bearings and distances shown on this plan<") && !svg.contains("amended"));
+        // An area typed over: bearings and distances are still all computed.
+        d.fields.styles.insert("area".into(), typed("AREA 1 SQUARE METERS", None));
+        assert!(!render_svg(&d).contains("amended"));
+        d.fields.styles.insert("minutes:2".into(), typed("01'", None));
+        let svg = render_svg(&d);
+        for line in [">Bearings and distances shown on this plan have<", ">been computed from Registered Co-ordinates,<", ">except where amended by the plotting officer.<", ">Roads shown are not as a result of accurate survey<"] {
+            assert!(svg.contains(line), "{line}");
+        }
+        assert!(!svg.contains(">All bearings"));
+        // A typed cell of the short-sides table counts too.
+        let mut d = PlanData { upin: "X".into(), area_m2: 902.203, corners: pl68374(), fields: PlanFields { scale: Some(500), ..Default::default() } };
+        let key = computed_labels(&d).into_keys().find(|k| k.starts_with("short:") && k.ends_with(":distance")).expect("a short side");
+        d.fields.styles.insert(key.clone(), typed("3.80m", None));
+        let svg = render_svg(&d);
+        assert!(short_group(&svg).contains(&format!(r#"data-cell="{key}" data-calc="3.78m" data-override="1">3.80m<"#)));
+        assert!(svg.contains("amended by the plotting officer"));
+    }
+
+    #[test]
+    fn form_labels_name_their_field_and_a_recoloured_label_drops_its_own_colour() {
+        let mut d = editor_plan();
+        d.fields.holder = Some("Ada Musa".into());
+        d.fields.styles.insert("area".into(), LabelStyle { color: Some("#00aa00".into()), ..Default::default() });
+        let svg = render_svg(&d);
+        assert!(svg.contains(r#"<g data-move="holder" data-field="holder""#) && svg.contains(">HOLDER: ADA MUSA<"));
+        let area = svg.lines().find(|l| l.contains(">AREA 1600.000 SQUARE METERS<")).unwrap();
+        assert!(!area.contains("fill="), "the group's green shows, not the sheet's red: {area}");
+        assert!(svg.contains(r##"<g data-move="area" data-calc="AREA 1600.000 SQUARE METERS" fill="#00aa00""##));
+    }
+
+    #[test]
+    fn a_plan_saved_with_the_middle_as_one_block_keeps_both_lines_where_they_were() {
+        let mut d = editor_plan();
+        d.fields.label_moves.insert("parcel".into(), [4.0, -3.0]);
+        let svg = render_svg(&d);
+        for key in ["file_no", "parcel_area"] {
+            assert!(svg.contains(&format!(r#"<g data-move="{key}" data-calc"#)) && svg.contains(&format!(r#"data-move="{key}""#)));
+        }
+        assert_eq!(svg.matches("translate(4.00 -3.00)").count(), 2);
+        let mut f = d.fields.clone();
+        f.split_parcel_block();
+        assert!(!f.label_moves.contains_key("parcel") && f.label_moves["file_no"] == [4.0, -3.0]);
     }
 }

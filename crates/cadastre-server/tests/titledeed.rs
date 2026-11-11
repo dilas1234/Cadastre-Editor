@@ -203,3 +203,66 @@ async fn a_closed_jobs_file_keeps_its_transaction_for_plan_correction() {
     let (_, c, _) = send(&router, "GET", &format!("/api/v1/wf/jobs/{job}/registry/plan-correction"), None).await;
     assert_eq!(c["correction"], Value::Null, "the plan sent ends the correction");
 }
+
+/// Words typed over the sheet's computed labels are kept with what the sheet computed then, the
+/// UPIN never is, and each change is in the audit log.
+#[tokio::test]
+async fn typed_over_labels_are_kept_with_the_computed_value_and_audited() {
+    let Some(url) = test_db_url() else {
+        eprintln!("skipped: CADASTRE_TEST_DATABASE_URL not set");
+        return;
+    };
+    std::env::remove_var("CADASTRE_REGISTRY_URL");
+    std::env::remove_var("CADASTRE_AUMENTUM_JOBSERVICE_URL");
+    let (router, pool) = app(&url).await;
+    sqlx::query("INSERT INTO cadastre.wf_task (id, name) VALUES ($1, 'Title deed test task') ON CONFLICT (id) DO NOTHING").bind(TASK).execute(&pool).await.unwrap();
+    sqlx::query("INSERT INTO cadastre.wf_job_type (id, name, start_task_id, end_task_id) VALUES ($1, 'Title deed test', $2, $2) ON CONFLICT (id) DO NOTHING")
+        .bind(TYPE).bind(TASK).execute(&pool).await.unwrap();
+    let seed = (std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos() % 5_000) as f64;
+    let (x, y) = (200_000.0 + seed * 100.0, 9_060_000.0);
+    let (job, cid) = wf_job(&router, "PLTD3").await;
+    let upin = commit_rect(&router, job, &cid, x, y).await;
+    let url = format!("/api/v1/wf/jobs/{job}/titledeed");
+    let audits = |action: &'static str| {
+        let pool = pool.clone();
+        async move {
+            sqlx::query_scalar::<_, serde_json::Value>("SELECT payload FROM cadastre.audit_log WHERE entity = 'wf_job_instance' AND entity_id = $1 AND action = $2 ORDER BY id")
+                .bind(job.to_string()).bind(action).fetch_all(&pool).await.unwrap()
+        }
+    };
+
+    // The header area typed over; the UPIN and a distance typed as computed are not overrides; the
+    // browser's own `was` is not believed; the middle's old one-block move is split.
+    let styles = json!({
+        "area": {"text": "AREA 200.5 SQUARE METERS", "was": "made up"},
+        "upin": {"text": "UPIN PL999"},
+        "distance:0": {"text": "10.00m"},
+    });
+    let (st, s, _) = send(&router, "PUT", &url, Some(json!({"upin": upin, "fields": {"styles": styles, "label_moves": {"parcel": [2.0, 1.0]}}}))).await;
+    assert_eq!(st, StatusCode::OK, "{s}");
+    let kept = &s["saved"]["styles"];
+    assert_eq!(kept["area"], json!({"color": null, "text": "AREA 200.5 SQUARE METERS", "was": "AREA 200.000 SQUARE METERS", "angle": null}));
+    assert!(kept.get("upin").is_none() && kept.get("distance:0").is_none(), "{kept}");
+    assert_eq!(s["saved"]["label_moves"], json!({"file_no": [2.0, 1.0], "parcel_area": [2.0, 1.0]}));
+    assert_eq!(s["overrides"], json!([{"key": "area", "typed": "AREA 200.5 SQUARE METERS", "calculated": "AREA 200.000 SQUARE METERS", "was": "AREA 200.000 SQUARE METERS", "stale": false}]));
+    let a = audits("title_deed_plan_override").await;
+    assert_eq!(a.len(), 1);
+    assert_eq!(a[0]["changes"], json!([{"key": "area", "change": "added", "calculated": "AREA 200.000 SQUARE METERS", "typed": "AREA 200.5 SQUARE METERS"}]));
+    let (_, _, svg) = send(&router, "GET", &format!("{url}.svg"), None).await;
+    assert!(svg.contains(">AREA 200.5 SQUARE METERS<") && svg.contains(&format!(">UPIN {upin}<")));
+
+    // Saved again unchanged: nothing new in the log. A distance typed over: the note says so.
+    let fields = |styles: Value| json!({"upin": upin, "fields": {"styles": styles}});
+    send(&router, "PUT", &url, Some(fields(json!({"area": {"text": "AREA 200.5 SQUARE METERS"}})))).await;
+    assert_eq!(audits("title_deed_plan_override").await.len(), 1);
+    send(&router, "PUT", &url, Some(fields(json!({"area": {"text": "AREA 200.5 SQUARE METERS"}, "distance:0": {"text": "10.05m"}})))).await;
+    let (_, _, svg) = send(&router, "GET", &format!("{url}.svg"), None).await;
+    assert!(svg.contains(">10.05m<") && svg.contains("except where amended by the plotting officer."));
+
+    // Put back: the override goes, and the log says so.
+    send(&router, "PUT", &url, Some(fields(json!({})))).await;
+    let a = audits("title_deed_plan_override").await;
+    assert_eq!(a.len(), 3);
+    let removed: Vec<&str> = a[2]["changes"].as_array().unwrap().iter().map(|c| { assert_eq!(c["change"], "removed"); c["key"].as_str().unwrap() }).collect();
+    assert_eq!(removed, ["area", "distance:0"]);
+}
