@@ -122,6 +122,38 @@ pub fn jpeg_size(jpeg: &[u8]) -> Option<(u32, u32, u8)> {
     None
 }
 
+/// The sheet JPEG inside a PDF made by `jpeg_a4_pdf` (Attach as PDF): the first image XObject
+/// stored as DCTDecode, byte for byte. `None` for a PDF made elsewhere (no such image, or one
+/// whose length is not given directly), so the caller can say the PDF has no picture to send.
+pub fn jpeg_in_pdf(pdf: &[u8]) -> Option<Vec<u8>> {
+    let find = |hay: &[u8], needle: &[u8], from: usize| hay.get(from..)?.windows(needle.len()).position(|w| w == needle).map(|p| p + from);
+    let mut from = 0;
+    while let Some(at) = find(pdf, b"/Subtype/Image", from) {
+        from = at + 1;
+        let dict_start = pdf[..at].windows(2).rposition(|w| w == b"<<")?;
+        let dict_end = find(pdf, b">>", at)?;
+        let dict = &pdf[dict_start..dict_end];
+        if find(dict, b"/DCTDecode", 0).is_none() {
+            continue;
+        }
+        let l = find(dict, b"/Length ", 0)? + 8;
+        let digits: Vec<u8> = dict[l..].iter().copied().take_while(u8::is_ascii_digit).collect();
+        // An indirect length ("/Length 7 0 R") is not followed.
+        let rest = &dict[l + digits.len()..];
+        if rest.first().is_some_and(u8::is_ascii_whitespace) && rest.iter().find(|c| !c.is_ascii_whitespace()).is_some_and(u8::is_ascii_digit) {
+            continue;
+        }
+        let len: usize = std::str::from_utf8(&digits).ok()?.parse().ok()?;
+        let s = find(pdf, b"stream", dict_end)? + 6;
+        let s = s + if pdf.get(s..s + 2) == Some(b"\r\n") { 2 } else { 1 };
+        let jpeg = pdf.get(s..s + len)?;
+        if jpeg_size(jpeg).is_some() {
+            return Some(jpeg.to_vec());
+        }
+    }
+    None
+}
+
 /// A one-page A4 PDF showing a JPEG (the title deed sheet) fitted to the page, centred, aspect
 /// kept. The JPEG is embedded as it is (DCTDecode), so the PDF is exactly the sheet officers
 /// preview. Errors if `jpeg` is not a JPEG.
@@ -198,6 +230,19 @@ mod tests {
         assert_eq!(jpeg_size(b"%PDF-1.4"), None);
         assert_eq!(jpeg_size(b"\x89PNG\r\n"), None);
         assert!(jpeg_a4_pdf(b"\x89PNG\r\n").is_err());
+    }
+
+    #[test]
+    fn the_sheet_jpeg_comes_back_out_of_its_pdf() {
+        let j = tiny_jpeg();
+        assert_eq!(jpeg_in_pdf(&jpeg_a4_pdf(&j).unwrap()).as_deref(), Some(j.as_slice()));
+        // A PDF without an embedded JPEG (text only), or with an indirect length: nothing.
+        let mut page = Page::default();
+        page.text(72.0, 800.0, 14.0, "no picture");
+        assert_eq!(jpeg_in_pdf(&page.into_pdf()), None);
+        let indirect = String::from_utf8_lossy(&jpeg_a4_pdf(&j).unwrap()).replacen(&format!("/Length {}>>", j.len()), "/Length 9 0 R>>", 1).into_bytes();
+        assert_eq!(jpeg_in_pdf(&indirect), None);
+        assert_eq!(jpeg_in_pdf(b"not a pdf"), None);
     }
 
     #[test]

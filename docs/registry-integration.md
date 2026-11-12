@@ -155,9 +155,16 @@ Only on a user's action, and only with `CADASTRE_REGISTRY_WRITE=1`:
   files it on the job; a JPG attached by hand is turned into a one-page A4 PDF first; PNG is
   refused). Only Active transactions are accepted, never `P-`. The PDF is uploaded with
   `PUT /lrs/upload/{guid}.pdf?ticket=…`, then `SaveEntity` adds an `IncomingDocument` of type
-  `SurveyPlanFromMC` (`sd_titledeedPlan`), Comments "Survey Plan", one page of type `attachment`
-  (isattachment True). The Registry's page types are `image` and `attachment` (its data model);
-  setting `aumentum.Integration.PlanPageType` switches back to `image` if the Registry wants it.
+  `SurveyPlanFromMC` (`sd_titledeedPlan`), Comments "Survey Plan", with two pages: first the
+  sheet's JPEG as an `image` page (isattachment False), then the PDF as an `attachment` page
+  (isattachment True). The Registry shows image pages only; a PDF on its own is a file to open, so
+  a plan sent as a PDF alone (before 12 Nov 2026, e.g. PL66724) shows no picture. The JPEG is the
+  one *Attach as PDF* embedded in the PDF, taken out byte for byte (`pdf::jpeg_in_pdf`), uploaded
+  as `{guid}.jpg`. A PDF made elsewhere has no such JPEG: it is sent alone and the officer is told.
+  A JPEG over the Registry's image limit (`scan.MaxImageSize`, 1024 KB) is not sent either; Attach
+  as PDF lowers the JPEG quality until the sheet fits. Settings: `aumentum.Integration.PlanImage`
+  is `page` (default, as above), `document` (the JPEG and the PDF as two documents of the same
+  type) or `off` (PDF only); `aumentum.Integration.PlanPageType` is the PDF page's type.
 * **Resend corrected plan** (same call, `"resend": true`): once a plan has been sent to the
   transaction, a plain send is refused (409) so it does not collect duplicates by accident. A resend
   files the corrected PDF as "Survey Plan (corrected, <date>)", then marks the plans filed before

@@ -2112,14 +2112,21 @@ async fn registry_write_back_like_aumentum() {
     assert_eq!(st, StatusCode::OK, "{r}");
     assert_eq!((r["file_name"].as_str(), r["resend"].as_bool()), (Some("PL777.pdf"), Some(false)));
     let uploads: Vec<String> = fake.seen.lock().unwrap().iter().filter(|(l, _)| l.starts_with("PUT")).map(|(l, b)| format!("{l}|{b}")).collect();
-    assert_eq!(uploads.len(), 1);
+    // The PDF, then the sheet's JPEG taken out of it (what the Registry shows).
+    assert_eq!(uploads.len(), 2);
     assert!(uploads[0].contains("/lrs/upload/") && uploads[0].contains(".pdf?ticket=TICKET-1&encoding=UTF%2D8"), "{}", uploads[0]);
     assert!(uploads[0].contains("|%PDF-1.4") && uploads[0].contains("/Filter/DCTDecode") && uploads[0].contains("fake-jpeg"), "the JPG inside a PDF");
+    assert!(uploads[1].contains(".jpg?ticket=TICKET-1") && !uploads[1].contains("%PDF") && uploads[1].contains("fake-jpeg"), "the JPEG on its own: {}", uploads[1]);
+    assert_eq!((r["image_name"].as_str(), r["image_note"].is_null()), (Some("PL777.jpg"), true), "{r}");
     let doc: Vec<String> = fake.bodies("IncomingDocument").into_iter().filter(|b| b.contains("SaveEntity")).collect();
-    assert_eq!(doc.len(), 1);
+    assert_eq!(doc.len(), 1, "one document");
     assert!(doc[0].contains("<lrs:name>DocumentType</lrs:name><lrs:value>sd_titledeedPlan</lrs:value>"));
     assert!(doc[0].contains("<lrs:name>Comments</lrs:name><lrs:value>Survey Plan</lrs:value>"));
-    assert!(doc[0].contains("PL777.pdf") && doc[0].contains("<lrs:type>attachment</lrs:type>"), "a PDF attachment page");
+    assert!(doc[0].contains("<lrs:name>PageCount</lrs:name><lrs:value>2</lrs:value>"), "two pages");
+    let pages: Vec<&str> = doc[0].split("<lrs:pages>").skip(1).collect();
+    assert_eq!(pages.len(), 2);
+    assert!(pages[0].contains("PL777.jpg") && pages[0].contains("<lrs:type>image</lrs:type>"), "first the picture, an image page: {}", pages[0]);
+    assert!(pages[1].contains("PL777.pdf") && pages[1].contains("<lrs:type>attachment</lrs:type>"), "then the PDF, an attachment page: {}", pages[1]);
     assert!(doc[0].contains("<cms:value>workspace://SpacesStore/fake-content</cms:value>"), "the uploaded content");
     assert!(doc[0].contains("referenceid</cms:name><cms:isMultiValue xsi:nil=\"true\"/><cms:value>10000000777</cms:value>"));
     let (_, sent) = send(&app, "GET", &format!("/api/v1/wf/jobs/{job}/registry/sent"), None, None).await;

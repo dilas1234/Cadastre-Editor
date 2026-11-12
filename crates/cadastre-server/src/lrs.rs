@@ -404,23 +404,45 @@ pub fn entity_xml(class: &str, properties: &[(&str, Option<&str>)]) -> String {
 /// uploaded content. The Registry's page types are `image` (Aumentum's JPG plan) and
 /// `attachment` (a file kept as it is: the PDF plan); isattachment follows the page type.
 pub fn incoming_document_xml(doc_type: &str, transaction_id: i64, file_name: &str, uploaded: &str, submission: &str, comments: &str, page_type: &str) -> String {
-    let page_type = if page_type == "image" { "image" } else { "attachment" };
-    let content_props = [
-        named_value(&format!("{{{LRS_CORE}}}referenceid"), &transaction_id.to_string()),
-        named_value(&format!("{{{LRS_CORE}}}isattachment"), if page_type == "attachment" { "True" } else { "False" }),
-        named_value(&format!("{{{LRS_CORE}}}pagename"), file_name),
-        named_value(&format!("{{{LRS_CORE}}}pageindex"), "0"),
-        named_value(&format!("{{{CMS}}}content"), uploaded),
-    ]
-    .concat();
+    incoming_document_pages_xml(doc_type, transaction_id, &[DocPage { name: file_name, uploaded, kind: page_type }], submission, comments)
+}
+
+/// One page of a document: its file name, the upload answer and its type (`image` or
+/// `attachment`).
+pub struct DocPage<'a> {
+    pub name: &'a str,
+    pub uploaded: &'a str,
+    pub kind: &'a str,
+}
+
+/// An `IncomingDocument` with several pages in order (index 0, 1, …), as the Registry's scanning
+/// files them: each page has its own name, content, type and isattachment; PageCount is the
+/// number of pages. The document's content carries the first page's properties, as with one page.
+/// The title deed plan goes as the sheet's JPEG (`image`, which the Registry shows) followed by
+/// the PDF (`attachment`).
+pub fn incoming_document_pages_xml(doc_type: &str, transaction_id: i64, pages: &[DocPage], submission: &str, comments: &str) -> String {
+    let props = |i: usize, p: &DocPage| {
+        let attachment = p.kind != "image";
+        [
+            named_value(&format!("{{{LRS_CORE}}}referenceid"), &transaction_id.to_string()),
+            named_value(&format!("{{{LRS_CORE}}}isattachment"), if attachment { "True" } else { "False" }),
+            named_value(&format!("{{{LRS_CORE}}}pagename"), p.name),
+            named_value(&format!("{{{LRS_CORE}}}pageindex"), &i.to_string()),
+            named_value(&format!("{{{CMS}}}content"), p.uploaded),
+        ]
+        .concat()
+    };
+    let content_props = pages.first().map(|p| props(0, p)).unwrap_or_default();
+    let page_xml: String = pages.iter().enumerate().map(|(i, p)| format!(
+        "<lrs:pages><lrs:status>added</lrs:status><lrs:reference xsi:nil=\"true\"/>{}<lrs:type>{}</lrs:type></lrs:pages>",
+        props(i, p), if p.kind == "image" { "image" } else { "attachment" })).collect();
     format!(
         "<int:entities xsi:type=\"lrs:DocumentEntity\"><lrs:className>com.landsystems.lrs.model.IncomingDocument</lrs:className><lrs:status>added</lrs:status>{}{}{}{}\
-         <lrs:content><lrs:status>saved</lrs:status><lrs:reference xsi:nil=\"true\"/>{content_props}\
-         <lrs:pages><lrs:status>added</lrs:status><lrs:reference xsi:nil=\"true\"/>{content_props}<lrs:type>{page_type}</lrs:type></lrs:pages></lrs:content></int:entities>",
+         <lrs:content><lrs:status>saved</lrs:status><lrs:reference xsi:nil=\"true\"/>{content_props}{page_xml}</lrs:content></int:entities>",
         entity_value("DocumentType", Some(doc_type)),
         entity_value("Comments", Some(comments)),
         entity_value("Submission", Some(submission)),
-        entity_value("PageCount", Some("1")),
+        entity_value("PageCount", Some(&pages.len().to_string())),
     )
 }
 
@@ -450,6 +472,18 @@ mod tests {
         assert!(p.contains("<lrs:name>Comments</lrs:name><lrs:value>Survey Plan (corrected)</lrs:value>"));
         // Anything but "image" is sent as an attachment (the Registry knows only these two).
         assert!(incoming_document_xml("t", 1, "a.pdf", "r", "s", "c", "pdf").contains("<lrs:type>attachment</lrs:type>"));
+        // The plan as the sheet's JPEG (shown by the Registry) and the PDF: one document, two pages.
+        let two = incoming_document_pages_xml("sd_titledeedPlan", 42, &[DocPage { name: "PL1.jpg", uploaded: "ref-j", kind: "image" }, DocPage { name: "PL1.pdf", uploaded: "ref-p", kind: "attachment" }], "s", "Survey Plan");
+        assert!(two.contains("<lrs:name>PageCount</lrs:name><lrs:value>2</lrs:value>"));
+        let pages: Vec<&str> = two.split("<lrs:pages>").skip(1).collect();
+        assert_eq!(pages.len(), 2);
+        assert!(pages[0].contains("PL1.jpg") && pages[0].contains("ref-j") && pages[0].contains("pageindex</cms:name><cms:isMultiValue xsi:nil=\"true\"/><cms:value>0<")
+            && pages[0].contains("isattachment</cms:name><cms:isMultiValue xsi:nil=\"true\"/><cms:value>False<") && pages[0].contains("<lrs:type>image</lrs:type>"));
+        assert!(pages[1].contains("PL1.pdf") && pages[1].contains("ref-p") && pages[1].contains("pageindex</cms:name><cms:isMultiValue xsi:nil=\"true\"/><cms:value>1<")
+            && pages[1].contains("isattachment</cms:name><cms:isMultiValue xsi:nil=\"true\"/><cms:value>True<") && pages[1].contains("<lrs:type>attachment</lrs:type>"));
+        // One page is exactly the document sent before.
+        assert_eq!(incoming_document_xml("t", 1, "a.pdf", "r", "s", "c", "attachment"),
+            incoming_document_pages_xml("t", 1, &[DocPage { name: "a.pdf", uploaded: "r", kind: "attachment" }], "s", "c"));
     }
 
     #[test]

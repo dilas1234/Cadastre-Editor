@@ -4608,11 +4608,12 @@ async function regSendPlan(fileId, fileName, resend) {
   const asPdf = /\.pdf$/i.test(fileName) ? fileName : fileName.replace(/\.[^.]+$/, "") + ".pdf";
   const ask = resend
     ? `Resend the corrected plan ${asPdf} to Registry transaction ${t}?\n\nIt is filed as "Survey Plan (corrected)", and the plan sent before is marked as replaced. Nothing is deleted in the Registry.`
-    : `Send the plan ${asPdf} to Registry transaction ${t}?\nIt is filed in the transaction as a Title Deed Plan (PDF).`;
+    : `Send the plan ${asPdf} to Registry transaction ${t}?\nIt is filed in the transaction as a Title Deed Plan: a picture of the sheet (JPEG, which the Registry shows) and the PDF.`;
   if (!(await uiConfirm(ask, { ok: resend ? "Resend" : "Send" }))) return;
   await regRun(resend ? "Resend plan" : "Send plan", async () => {
     const r = await api(`/api/v1/wf/jobs/${reg.job.id}/registry/send-plan`, { method: "POST", body: { file_id: fileId, resend: !!resend } });
-    const done = `${r.file_name} ${r.resend ? "resent (corrected)" : "sent"} to ${r.transaction_number}.`;
+    const done = `${r.file_name}${r.image_name ? ` and ${r.image_name}` : ""} ${r.resend ? "resent (corrected)" : "sent"} to ${r.transaction_number}.`;
+    if (r.image_note) notify(`${done} Note: ${r.image_note}`, "warn");
     if (r.replace_note) notify(`${done} Note: ${r.replace_note}.`, "warn");
     else notify(r.resend ? `${done} ${r.replaced.length} earlier plan(s) marked as replaced.` : done);
     if (r.job_completed) notify(`${done} ${reg.job.name || "The job"} is completed.`);
@@ -6259,12 +6260,17 @@ async function titleDeedDialog(jobId, upin) {
       const c = document.createElement("canvas"); c.width = 1654; c.height = 2339;
       const g = c.getContext("2d"); g.fillStyle = "#fff"; g.fillRect(0, 0, c.width, c.height); g.drawImage(img, 0, 0, c.width, c.height);
       URL.revokeObjectURL(url);
-      const blob = await new Promise((ok) => c.toBlob(ok, "image/jpeg", 0.92));
+      // The Registry takes an image page up to 1024 KB: lower the quality until the sheet fits.
+      let blob;
+      for (const q of [0.92, 0.85, 0.75, 0.65, 0.55]) {
+        blob = await new Promise((ok) => c.toBlob(ok, "image/jpeg", q));
+        if (blob.size <= 1000 * 1024) break;
+      }
       const name = `Title Deed Plan ${(fields.title_no.value || p.upin).trim()}.pdf`;
       await authReady;
       const r = await fetch(`/api/v1/wf/jobs/${jobId}/titledeed.pdf?name=${encodeURIComponent(name)}`, { method: "POST", body: blob, headers: { "content-type": "image/jpeg", ...authHeaders() } });
       if (!r.ok) throw new Error((await r.json().catch(() => ({}))).message || r.statusText);
-      msg.style.color = "#060"; msg.textContent = `${name} attached to the job. Send plan files it with the Registry transaction (or Resend corrected plan, if a plan was sent before).`;
+      msg.style.color = "#060"; msg.textContent = `${name} attached to the job. Send plan files it, with the picture of the sheet the Registry shows, in the Registry transaction (or Resend corrected plan, if a plan was sent before).`;
       if (wf.detail?.job?.id === jobId) await wfSelect(jobId);
     } catch (e) { msg.style.color = "#900"; msg.textContent = "Plan PDF: " + e.message; }
   };
