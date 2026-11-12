@@ -642,9 +642,11 @@ async fn plan_documents(session: &Session, transaction_id: i64, doc_type: &str) 
 
 /// Send the title deed plan to the job's Registry transaction (Aumentum SendImageCommand →
 /// SendImageForm → PersistDocumentInRegistry): Active transactions only, not a P- transaction.
-/// The plan always goes as a PDF, uploaded and filed in the transaction as a new incoming
-/// document of type SurveyPlanFromMC (sd_titledeedPlan) with an `attachment` page (setting
-/// `aumentum.Integration.PlanPageType`). With `resend`, the corrected plan is filed and the plans
+/// The plan goes as the PDF and, for a PDF made by Attach as PDF, the sheet's JPEG inside it: one
+/// new incoming document of type SurveyPlanFromMC (sd_titledeedPlan) with the JPEG as an `image`
+/// page (the Registry shows image pages, not PDFs) and the PDF as an `attachment` page (setting
+/// `aumentum.Integration.PlanPageType`). Setting `aumentum.Integration.PlanImage`: `page` (the
+/// default, as above), `document` (the JPEG and the PDF as two documents) or `off` (PDF only). With `resend`, the corrected plan is filed and the plans
 /// sent before are marked as replaced (their Comments); nothing in the Registry is deleted. A job
 /// under plan correction (`correct_plan`) always sends this way, with the reason in the Comments:
 /// the plan it replaces may have been filed by Aumentum, so only the Registry knows of it.
@@ -678,6 +680,9 @@ pub async fn send_plan(State(state): State<AppState>, user: AuthUser, Path(id): 
         return Err(AppError::BadRequest("that file is not attached to this job".into()));
     }
     let (sent_name, pdf) = plan_as_pdf(&name, &bytes)?;
+    let image_mode = registry_sync::setting(&state.pool, "aumentum.Integration.PlanImage").await?.map(|v| v.trim().to_lowercase()).unwrap_or_else(|| "page".into());
+    let (jpeg, image_note) = plan_picture(&image_mode, &sent_name, &pdf);
+    let jpeg_name = format!("{}.jpg", sent_name.rsplit_once('.').map_or(sent_name.as_str(), |(stem, _)| stem));
     let doc_type = registry_sync::setting(&state.pool, "aumentum.Integration.SurveyPlanFromMC").await?.unwrap_or_else(|| "sd_titledeedPlan".into());
     let page_type = registry_sync::setting(&state.pool, "aumentum.Integration.PlanPageType").await?.unwrap_or_else(|| "attachment".into());
     let resend = (req.resend && sent_before.is_some()) || correction.is_some();
@@ -695,7 +700,21 @@ pub async fn send_plan(State(state): State<AppState>, user: AuthUser, Path(id): 
         let earlier = if resend { Some(plan_documents(&session, t.id, &doc_type).await) } else { None };
         let uploaded = session.upload("pdf", &pdf).await.map_err(registry_err)?;
         let submission = now.format("%Y-%m-%dT%H:%M:%S%.3f%:z").to_string();
-        session.save_entity(t.id, &lrs::incoming_document_xml(&doc_type, t.id, &sent_name, &uploaded, &submission, &comments, &page_type)).await.map_err(registry_err)?;
+        let pdf_page = lrs::DocPage { name: &sent_name, uploaded: &uploaded, kind: &page_type };
+        match &jpeg {
+            // The sheet's JPEG as an image page (what the Registry shows), the PDF after it.
+            Some(j) => {
+                let picture = session.upload("jpg", j).await.map_err(registry_err)?;
+                let image_page = lrs::DocPage { name: &jpeg_name, uploaded: &picture, kind: "image" };
+                if image_mode == "document" {
+                    session.save_entity(t.id, &lrs::incoming_document_pages_xml(&doc_type, t.id, &[image_page], &submission, &comments)).await.map_err(registry_err)?;
+                    session.save_entity(t.id, &lrs::incoming_document_pages_xml(&doc_type, t.id, &[pdf_page], &submission, &comments)).await.map_err(registry_err)?;
+                } else {
+                    session.save_entity(t.id, &lrs::incoming_document_pages_xml(&doc_type, t.id, &[image_page, pdf_page], &submission, &comments)).await.map_err(registry_err)?;
+                }
+            }
+            None => session.save_entity(t.id, &lrs::incoming_document_pages_xml(&doc_type, t.id, &[pdf_page], &submission, &comments)).await.map_err(registry_err)?,
+        }
         // Mark the earlier plans as replaced. The corrected plan is filed already, so a failure
         // here is reported, not fatal.
         let (mut replaced, mut replace_note) = (Vec::<String>::new(), None::<String>);
@@ -734,12 +753,32 @@ pub async fn send_plan(State(state): State<AppState>, user: AuthUser, Path(id): 
         "transaction_number": t.transaction_number, "file_id": req.file_id, "file_name": sent_name, "source_file": name, "bytes": pdf.len(),
         "document_type": doc_type, "page_type": page_type, "resend": resend, "comments": comments, "replaced": replaced, "replace_note": replace_note,
         "reason": correction.as_ref().map(|c| c.reason.clone()), "overrides": typed_over,
+        "image_mode": image_mode, "image_name": jpeg.as_ref().map(|_| &jpeg_name), "image_bytes": jpeg.as_ref().map(Vec::len), "image_note": image_note,
     })).await?;
     // The plan is filed: the job ends with it (a job already completed stays as it is).
     let ended = complete_with_plan(&mut tx, &actor.label, id, if resend { "resend" } else { "send" }).await?;
     tx.commit().await?;
     Ok(Json(serde_json::json!({ "transaction_number": t.transaction_number, "file_name": sent_name, "document_type": doc_type,
-        "resend": resend, "replaced": replaced, "replace_note": replace_note, "job_completed": ended.completed, "job_left_open": ended.left_open })))
+        "resend": resend, "replaced": replaced, "replace_note": replace_note, "job_completed": ended.completed, "job_left_open": ended.left_open,
+        "image_name": jpeg.as_ref().map(|_| &jpeg_name), "image_note": image_note })))
+}
+
+/// The Registry's largest image page (`lr_setting scan.MaxImageSize` = 1024 KB).
+const MAX_IMAGE_PAGE: usize = 1024 * 1024;
+
+/// The picture of the plan the Registry shows, sent with the PDF: the sheet's JPEG inside a PDF
+/// made by Attach as PDF. `None` with the reason when there is none to send: the setting
+/// `aumentum.Integration.PlanImage` is `off`, the PDF was made elsewhere (no JPEG in it), or the
+/// JPEG is over the Registry's image limit. The PDF is sent either way.
+fn plan_picture(mode: &str, pdf_name: &str, pdf: &[u8]) -> (Option<Vec<u8>>, Option<String>) {
+    if mode == "off" {
+        return (None, Some("the picture of the plan is not sent (setting aumentum.Integration.PlanImage is off): the Registry has the PDF only".into()));
+    }
+    match crate::pdf::jpeg_in_pdf(pdf) {
+        None => (None, Some(format!("{pdf_name} was not made by Attach as PDF, so there is no picture of the sheet in it: the Registry has the PDF only and shows no image. Use Title Deed Plan → Attach as PDF to send a plan the Registry shows."))),
+        Some(j) if j.len() > MAX_IMAGE_PAGE => (None, Some(format!("the picture of the sheet is {} KB, over the Registry's 1024 KB for an image: the Registry has the PDF only. Attach as PDF again to make a smaller one.", j.len().div_ceil(1024)))),
+        Some(j) => (Some(j), None),
+    }
 }
 
 /// The Comments of a corrected plan in the Registry (the Registry keeps 240 characters).
