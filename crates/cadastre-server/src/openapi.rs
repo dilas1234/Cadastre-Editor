@@ -90,7 +90,7 @@ use crate::routes::{
         crate::routes::registry::find,
         crate::routes::registry::parcel_work,
         crate::routes::registry::start_digitising,
-        crate::routes::completed::correct_aumentum,
+        crate::routes::completed::correct_aumentum, crate::routes::correction::correct,
         crate::routes::registry::transaction,
         crate::routes::registry::link,
         crate::routes::registry::unlink,

@@ -1156,7 +1156,7 @@ pub async fn commit(State(state): State<AppState>, user: AuthUser, Path(id): Pat
     let c = commit_drafts(&mut tx, id, &req).await?;
     let staff = staff_of(&state.pool, req.staff_sid, req.staff_name.as_deref()).await?;
     let who = committed_by(staff.as_deref(), &actor.label);
-    audit::append(&mut tx, &who, "wf_commit", "wf_job_instance", Some(&id.to_string()), json!({ "parcel_numbers": c.numbers, "beacons_added": c.beacons_added, "beacon_notes": c.beacon_notes, "retired": c.retired, "staff_name": staff, "staff_sid": req.staff_sid, "login": actor.label })).await?;
+    audit::append(&mut tx, &who, "wf_commit", "wf_job_instance", Some(&id.to_string()), json!({ "parcel_numbers": c.numbers, "beacons_added": c.beacons_added, "beacon_notes": c.beacon_notes, "retired": c.retired, "corrected": c.corrected, "staff_name": staff, "staff_sid": req.staff_sid, "login": actor.label })).await?;
     // A commit is the end of digitising: the job is completed (Correct reopens it).
     let job_type_id: i32 = sqlx::query_scalar("SELECT job_type_id FROM cadastre.wf_job_instance WHERE id = $1").bind(id).fetch_one(&mut *tx).await?;
     let (edges, end_task) = graph(&state.pool, job_type_id).await?;
@@ -1165,7 +1165,10 @@ pub async fn commit(State(state): State<AppState>, user: AuthUser, Path(id): Pat
     }
     tx.commit().await?;
     // On commit the UPIN goes onto the Registry file (with its link date), as Map → Connect would.
-    let registry_links = crate::routes::registry::link_after_commit(&state, &who, id, &c.numbers).await;
+    // A corrected parcel the Registry already holds keeps that link: nothing to write again.
+    let held: Vec<String> = sqlx::query_scalar("SELECT upin FROM cadastre.registry_property WHERE upin = ANY($1)").bind(&c.corrected).fetch_all(&state.pool).await?;
+    let to_link: Vec<String> = c.numbers.iter().filter(|n| !held.contains(n)).cloned().collect();
+    let registry_links = crate::routes::registry::link_after_commit(&state, &who, id, &to_link).await;
     Ok(Json(WfCommitDto { parcel_numbers: c.numbers, beacons_added: c.beacons_added, retired: c.retired, editing: editing_info(&state, id).await?, registry_links }))
 }
 
@@ -1182,6 +1185,12 @@ async fn commit_drafts(tx: &mut sqlx::PgConnection, id: i32, req: &crate::routes
     if drafts == 0 && !crate::routes::mutations::has_pending_retirement(&mut *tx, id).await? {
         return Err(AppError::Conflict("the job has no parcels to commit".into()));
     }
+    // Corrections (a draft carrying its UPIN): the shape it replaces is not an overlap, and its
+    // corners come off before the beacons are matched (beacons kept in place keep their numbers).
+    let corrected = crate::routes::correction::correcting_upins(&mut *tx, job_id, &mutated).await?;
+    let tol = crate::routes::wfbeacons::tolerance(&mut *tx).await?;
+    crate::routes::correction::release_corners(&mut *tx, job_id, &corrected, tol).await?;
+    let not_overlaps: Vec<String> = mutated.iter().chain(corrected.iter()).cloned().collect();
     // Beacons first: a corner taking an adjoining beacon's position changes the parcel's shape.
     let beacons = crate::routes::wfbeacons::apply(&mut *tx, job_id, req).await?;
     let allow_overlap: Option<String> = sqlx::query_scalar("SELECT value FROM cadastre.app_setting WHERE key = 'editor.allow_overlap'").fetch_optional(&mut *tx).await?;
@@ -1195,7 +1204,7 @@ async fn commit_drafts(tx: &mut sqlx::PgConnection, id: i32, req: &crate::routes
             crate::routes::precheck::counts_sql("p.geom", "d.geom", "$3"),
         ))
         .bind(job_id)
-        .bind(&mutated)
+        .bind(&not_overlaps)
         .bind(width)
         .fetch_all(&mut *tx)
         .await?;
@@ -1205,11 +1214,12 @@ async fn commit_drafts(tx: &mut sqlx::PgConnection, id: i32, req: &crate::routes
     }
     // Mutations: parents leave the active fabric before their successors take UPINs.
     let retired = crate::routes::mutations::retire_parents(&mut *tx, id).await?;
+    crate::routes::correction::supersede(&mut *tx, job_id, &corrected).await?;
     let posted = crate::routes::jobs::post_drafts_with_ids(&mut *tx, job_id).await?;
     crate::routes::mutations::finalise(&mut *tx, id, &posted).await?;
     let numbers: Vec<String> = posted.into_iter().map(|(_, n)| n).collect();
     sqlx::query("UPDATE cadastre.wf_job_instance SET updated = now()::timestamp WHERE id = $1").bind(id).execute(&mut *tx).await?;
-    Ok(Committed { numbers, beacons_added: beacons.added, beacon_notes: beacons.notes, retired })
+    Ok(Committed { numbers, beacons_added: beacons.added, beacon_notes: beacons.notes, retired, corrected })
 }
 
 /// What a commit did: the UPINs given, the beacon numbers added, the parcels retired.
@@ -1219,6 +1229,8 @@ struct Committed {
     /// Numbers matched to an adjoining beacon, or repeated with a reason.
     beacon_notes: Vec<serde_json::Value>,
     retired: Vec<String>,
+    /// Parcels corrected under their own UPIN (the old shape kept as history).
+    corrected: Vec<String>,
 }
 
 

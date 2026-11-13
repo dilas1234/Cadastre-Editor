@@ -1323,29 +1323,56 @@ async fn job_editing_follows_job_area_and_commit_rules() {
     // A commit is the end of digitising: the job is completed.
     let job_status: i16 = sqlx::query_scalar("SELECT status FROM cadastre.wf_job_instance WHERE id = $1").bind(id as i32).fetch_one(&pool).await.unwrap();
     assert_eq!(job_status, 3, "committed means completed");
-    // Correct: the job reopens at its commit task with the parcel back as a draft that keeps its
-    // UPIN; the beacons its commit added come off (handed back by coordinates); committing again
-    // gives the same UPIN.
+    // Correct: the file's job reopens at its commit task with a copy of the parcel as a draft under
+    // the same UPIN; the committed shape and its attribute record (the Registry link) stay until
+    // the correction is committed. A linked parcel is corrected too: nothing is unlinked.
     let fix = c["parcel_numbers"][0].as_str().unwrap().to_string();
+    let (object_id, before_link): (i32, Option<String>) = sqlx::query_as("SELECT object_id, lrs_id FROM cadastre.parcel_attribute WHERE upin = $1").bind(&fix).fetch_one(&pool).await.unwrap();
+    sqlx::query("UPDATE cadastre.parcel_attribute SET lrs_id = $2, linkage_status = 1, linkage_date = '20260101' WHERE object_id = $1")
+        .bind(object_id).bind(format!("PLT-{tag}")).execute(&pool).await.unwrap();
     let (st, r) = send(&app, "POST", &format!("/api/v1/wf/jobs/{id}/correct"), None, Some(json!({"upin": fix, "reason": " "}))).await;
     assert_eq!(st, StatusCode::BAD_REQUEST, "a reason is required: {r}");
+    let (_, pl) = send(&app, "GET", &format!("/api/v1/parcels/points?upin={fix}"), None, None).await;
+    assert_eq!((pl["can_correct"].as_bool(), pl["linked"].as_bool()), (Some(true), Some(true)), "a linked parcel can be corrected: {pl}");
     let (st, r) = send(&app, "POST", &format!("/api/v1/wf/jobs/{id}/correct"), None, Some(json!({"upin": fix, "reason": "corner moved"}))).await;
     assert_eq!(st, StatusCode::OK, "{r}");
+    assert_eq!((r["job_instance_id"].as_i64(), r["created"].as_bool()), (Some(id), Some(false)), "the file's own job reopens, no new job: {r}");
     let handed: Vec<Value> = r["beacons"].as_array().unwrap().clone();
-    assert!(!handed.is_empty(), "the beacons the commit added are handed back: {r}");
-    let (status, number): (String, Option<String>) = sqlx::query_as("SELECT status, parcel_number FROM cadastre.parcel WHERE id = $1::uuid")
-        .bind(r["parcel_id"].as_str().unwrap()).fetch_one(&pool).await.unwrap();
-    assert_eq!((status.as_str(), number.as_deref()), ("draft", Some(fix.as_str())), "a draft that keeps its UPIN");
+    assert!(!handed.is_empty(), "the committed shape's beacons are handed back by coordinates: {r}");
+    let copy = r["parcel_id"].as_str().unwrap().to_string();
+    let shapes: Vec<(String, Option<String>)> = sqlx::query_as("SELECT status, parcel_number FROM cadastre.parcel WHERE parcel_number = $1 ORDER BY status")
+        .bind(&fix).fetch_all(&pool).await.unwrap();
+    assert_eq!(shapes.iter().map(|s| s.0.as_str()).collect::<Vec<_>>(), vec!["draft", "posted"], "a draft copy beside the committed shape, same UPIN");
     let job_status: i16 = sqlx::query_scalar("SELECT status FROM cadastre.wf_job_instance WHERE id = $1").bind(id as i32).fetch_one(&pool).await.unwrap();
     assert_eq!(job_status, 2, "the job is open again");
-    let attrs: i64 = sqlx::query_scalar("SELECT count(*) FROM cadastre.parcel_attribute WHERE upin = $1").bind(&fix).fetch_one(&pool).await.unwrap();
-    assert_eq!(attrs, 0, "its attribute record moves back to the draft");
-    let (st, r) = send(&app, "POST", &format!("/api/v1/wf/jobs/{id}/correct"), None, Some(json!({"upin": fix, "reason": "again"}))).await;
-    assert_eq!(st, StatusCode::CONFLICT, "not a committed parcel any more: {r}");
+    let link: Option<String> = sqlx::query_scalar("SELECT lrs_id FROM cadastre.parcel_attribute WHERE object_id = $1").bind(object_id).fetch_one(&pool).await.unwrap();
+    assert_eq!(link, Some(format!("PLT-{tag}")), "the attribute record and its Registry link stay");
+    let (st, again) = send(&app, "POST", "/api/v1/wf/correct", None, Some(json!({"upin": fix, "reason": "again"}))).await;
+    assert_eq!(st, StatusCode::OK, "{again}");
+    assert_eq!((again["parcel_id"].as_str(), again["resumed"].as_bool(), again["job_instance_id"].as_i64()), (Some(copy.as_str()), Some(true), Some(id)),
+        "Correct again carries on in the same job with the same copy: {again}");
+    let (st, ov) = send(&app, "POST", "/api/v1/parcels/overlaps", None, Some(json!({"vertices": pts_of(&pool, &copy).await, "editing_id": copy}))).await;
+    assert_eq!(st, StatusCode::OK, "{ov}");
+    assert!(ov["overlaps"].as_array().unwrap().is_empty(), "the parcel's own committed shape is not an overlap of its correction: {ov}");
+    // Move one corner (not the shared pillar) 0.3 m inwards: it takes its number again there, and
+    // the beacon its commit added at the old place goes; the pre-commit check does not call that
+    // number taken.
+    let (moved_no, mseq, me, mn): (String, i32, f64, f64) = sqlx::query_as(
+        "SELECT b.number, pc.seq, ST_X(b.geom), ST_Y(b.geom) FROM cadastre.parcel_corner pc JOIN cadastre.beacon b ON b.id = pc.beacon_id \
+         JOIN cadastre.parcel p ON p.id = pc.parcel_id WHERE p.parcel_number = $1 AND p.status = 'posted' AND pc.seq >= 2 AND b.number <> $2 ORDER BY pc.seq LIMIT 1")
+        .bind(&fix).bind(format!("{tag}X")).fetch_one(&pool).await.unwrap();
+    let (cx, cy): (f64, f64) = sqlx::query_as("SELECT ST_X(ST_Centroid(geom)), ST_Y(ST_Centroid(geom)) FROM cadastre.parcel WHERE id = $1::uuid").bind(&copy).fetch_one(&pool).await.unwrap();
+    let k = 0.3 / (cx - me).hypot(cy - mn);
+    let (ne, nn) = (me + (cx - me) * k, mn + (cy - mn) * k);
+    sqlx::query("UPDATE cadastre.parcel SET geom = ST_MakePolygon(ST_SetPoint(ST_ExteriorRing(ST_GeometryN(ST_Multi(geom), 1)), $2, ST_SetSRID(ST_MakePoint($3, $4), ST_SRID(geom)))) WHERE id = $1::uuid")
+        .bind(&copy).bind(mseq - 1).bind(ne).bind(nn).execute(&pool).await.unwrap();
+    let (st, bc) = send(&app, "POST", &format!("/api/v1/wf/jobs/{id}/editing/beacon-check"), None, Some(json!({"beacons": [{"easting": ne, "northing": nn, "number": moved_no}]}))).await;
+    assert_eq!(st, StatusCode::OK, "{bc}");
+    assert!(bc.as_array().unwrap().is_empty(), "the corner's own number is not taken: {bc}");
     let (_, pts) = send(&app, "GET", &format!("/api/v1/wf/jobs/{id}/editing/corners"), None, None).await;
     let retyped: Vec<Value> = pts.as_array().unwrap().iter().filter(|p| p["beacon_id"].is_null()).map(|p| {
         let n = handed.iter().find(|b| (b["easting"].as_f64().unwrap() - p["easting"].as_f64().unwrap()).abs() < 0.002
-            && (b["northing"].as_f64().unwrap() - p["northing"].as_f64().unwrap()).abs() < 0.002).map(|b| b["number"].clone()).unwrap();
+            && (b["northing"].as_f64().unwrap() - p["northing"].as_f64().unwrap()).abs() < 0.002).map(|b| b["number"].clone()).unwrap_or_else(|| json!(moved_no));
         json!({"easting": p["easting"], "northing": p["northing"], "number": n})
     }).collect();
     // Committed by: a staff member added to the users list (numbered from 1,000,000), then picked.
@@ -1363,6 +1390,30 @@ async fn job_editing_follows_job_area_and_commit_rules() {
         .bind(id.to_string()).fetch_one(&pool).await.unwrap();
     assert_eq!((who.as_str(), psid), (staff_name.as_str(), Some(sid)), "the commit is recorded under the picked user (name and id)");
     assert_eq!(c2["parcel_numbers"], json!([fix]), "committed again with the same UPIN");
+    let shapes: Vec<String> = sqlx::query_scalar("SELECT status FROM cadastre.parcel WHERE parcel_number = $1 ORDER BY status").bind(&fix).fetch_all(&pool).await.unwrap();
+    assert_eq!(shapes, vec!["posted", "superseded"], "the corrected shape is live, the old one kept as history under the same UPIN");
+    let at: Vec<(f64, f64)> = sqlx::query_as("SELECT ST_X(geom), ST_Y(geom) FROM cadastre.beacon WHERE number = $1").bind(&moved_no).fetch_all(&pool).await.unwrap();
+    assert!(at.len() == 1 && (at[0].0 - ne).abs() < 0.002 && (at[0].1 - nn).abs() < 0.002, "the moved corner keeps its number, at its new place only: {at:?}");
+    let rec: (i32, Option<String>, Option<i16>, Option<uuid::Uuid>) = sqlx::query_as("SELECT object_id, lrs_id, linkage_status, parcel_id FROM cadastre.parcel_attribute WHERE upin = $1")
+        .bind(&fix).fetch_one(&pool).await.unwrap();
+    assert_eq!((rec.0, rec.1.clone(), rec.2), (object_id, Some(format!("PLT-{tag}")), Some(1)), "the same attribute record, still linked");
+    assert_eq!(rec.3.map(|u| u.to_string()), Some(copy.clone()), "the record points at the live shape");
+    sqlx::query("UPDATE cadastre.parcel_attribute SET lrs_id = $2, linkage_status = 0, linkage_date = NULL WHERE object_id = $1")
+        .bind(object_id).bind(before_link).execute(&pool).await.unwrap();
+    // A parcel archived (by mistake) with nothing committed in its place comes back by Correct,
+    // in its own job, under its UPIN.
+    let lost = c["parcel_numbers"][1].as_str().unwrap().to_string();
+    sqlx::query("UPDATE cadastre.parcel SET status = 'archived' WHERE parcel_number = $1 AND status = 'posted'").bind(&lost).execute(&pool).await.unwrap();
+    let (_, pl) = send(&app, "GET", &format!("/api/v1/parcels/points?upin={lost}"), None, None).await;
+    assert_eq!((pl["archived"].as_bool(), pl["can_correct"].as_bool()), (Some(true), Some(true)), "{pl}");
+    let (st, r) = send(&app, "POST", "/api/v1/wf/correct", None, Some(json!({"upin": lost, "reason": "archived in error"}))).await;
+    assert_eq!(st, StatusCode::OK, "{r}");
+    assert_eq!((r["job_instance_id"].as_i64(), r["reinstated"].as_bool()), (Some(id), Some(true)), "{r}");
+    let (st, c3) = send(&app, "POST", &format!("/api/v1/wf/jobs/{id}/commit"), None, Some(json!({"beacons": []}))).await;
+    assert_eq!(st, StatusCode::OK, "{c3}");
+    assert_eq!(c3["parcel_numbers"], json!([lost]), "back under the same UPIN");
+    let shapes: Vec<String> = sqlx::query_scalar("SELECT status FROM cadastre.parcel WHERE parcel_number = $1 ORDER BY status").bind(&lost).fetch_all(&pool).await.unwrap();
+    assert_eq!(shapes, vec!["archived", "posted"], "live again; the archived shape stays as history");
     let pillar: i64 = sqlx::query_scalar("SELECT count(*) FROM cadastre.beacon WHERE number = $1").bind(format!("{tag}X")).fetch_one(&pool).await.unwrap();
     assert_eq!(pillar, 1, "the shared pillar (not added by the commit) is never removed by Correct");
     let job_status: i16 = sqlx::query_scalar("SELECT status FROM cadastre.wf_job_instance WHERE id = $1").bind(id as i32).fetch_one(&pool).await.unwrap();
@@ -2520,4 +2571,11 @@ async fn a_shared_boundary_drawn_a_little_differently_is_not_an_overlap() {
     let (_, r) = precheck(east(0.02)).await;
     sqlx::query("UPDATE cadastre.app_setting SET value = '0.05' WHERE key = 'editor.overlap_min_width_m'").execute(&pool).await.unwrap();
     assert_eq!(fabric(&r)["result"], "fail", "{r}");
+}
+
+/// A parcel's exterior ring as vertices (UTM), without the closing repeat.
+async fn pts_of(pool: &sqlx::PgPool, id: &str) -> Vec<[f64; 2]> {
+    let pts: Vec<(f64, f64)> = sqlx::query_as("SELECT ST_X(d.geom), ST_Y(d.geom) FROM cadastre.parcel p, ST_DumpPoints(ST_ExteriorRing(ST_GeometryN(ST_Multi(p.geom), 1))) d WHERE p.id = $1::uuid ORDER BY d.path")
+        .bind(id).fetch_all(pool).await.unwrap();
+    pts[..pts.len() - 1].iter().map(|(x, y)| [*x, *y]).collect()
 }

@@ -19,7 +19,7 @@ pub struct GeoJsonQuery {
     pub bbox: Option<String>,
     /// Max features (default 3000).
     pub limit: Option<i64>,
-    /// Status filter: `posted` (default), `draft`, `submitted`, `historic`, `archived`, `retired` (both), or `all`.
+    /// Status filter: `posted` (default), `draft`, `submitted`, `historic`, `archived`, `retired` (both), `superseded` (replaced by a correction, same UPIN), or `all`.
     pub status: Option<String>,
     /// Restrict to one job's parcels (uuid).
     pub job: Option<String>,
@@ -36,7 +36,7 @@ pub async fn parcels_geojson(
     let status_clause = match q.status.as_deref() {
         None | Some("posted") => " AND p.status = 'posted'".to_string(),
         Some("all") => String::new(),
-        Some(s @ ("draft" | "submitted" | "historic" | "archived")) => format!(" AND p.status = '{s}'"),
+        Some(s @ ("draft" | "submitted" | "historic" | "archived" | "superseded")) => format!(" AND p.status = '{s}'"),
         // Retired shapes (Phase 4 history): replaced by a mutation, or archived.
         Some("retired") => " AND p.status IN ('historic', 'archived')".to_string(),
         Some(_) => return Err(crate::error::AppError::BadRequest("invalid status".into())),

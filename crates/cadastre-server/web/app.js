@@ -1516,16 +1516,17 @@ async function pointListWindow(upin, draft) {
 }
 async function correctAndRecommit(upin) {
   let d; try { d = await api("/api/v1/parcels/points?upin=" + encodeURIComponent(upin)); } catch (e) { uiAlert(e.message); return; }
-  if (!d.can_correct) { await uiAlert(`${upin} cannot be corrected here: ${d.why_not}.`, { title: "Correct & Recommit", kind: "warn" }); return; }
-  const aum = d.committed_in === "aumentum";
-  const reason = await uiPrompt(aum
-    ? `Correct ${upin}?\n\nIt was committed in Aumentum. Its file's job is opened here (the open one, or a new Job-<file number> on its Active Registry transaction) with ${upin} back as a draft that keeps its UPIN, and its points open for correction. Then Finish Sketch, check, save the attributes and commit again. The correction is in the file's history. Reason:`
-    : `Correct ${upin} (${d.job_name || "job " + d.job_instance_id})?\n\nThe job is reopened with ${upin} back as a draft that keeps its UPIN, and its points open for correction. Then Finish Sketch, check, save the attributes and commit again. Reason:`, "", { title: "Correct & Recommit", ok: "Reopen and correct" });
+  if (!d.can_correct) { await uiAlert(`${upin} cannot be corrected here: ${d.why_not}.`, { title: "Correct", kind: "warn" }); return; }
+  const where = d.correcting_in ? `It is already being corrected in ${d.correcting_in}: that job opens again.`
+    : `The file's own job is reopened at its commit step${d.job_name ? ` (${d.job_name})` : ""}; a job is made only if the file has none here.`;
+  const reason = await uiPrompt(`Correct ${upin}?${d.archived ? `\n\n${upin} was archived in Aumentum with no reason and nothing in its place: Correct brings it back.` : ""}\n\n${where} A copy of the parcel opens for correction under the same UPIN${d.linked ? ", and its Registry link stays (nothing is unlinked)" : ""}. The current shape stays on the map until you commit. Then Finish Sketch, check, save the attributes, commit, and resend the plan if one was sent.\n\nReason:`,
+    "", { title: "Correct", ok: "Reopen and correct", multiline: true });
   if (!reason || !reason.trim()) return;
   let r;
-  try { r = await api(aum ? "/api/v1/wf/correct-aumentum" : `/api/v1/wf/jobs/${d.job_instance_id}/correct`, { method: "POST", body: { upin, reason: reason.trim() } }); }
+  try { r = await api("/api/v1/wf/correct", { method: "POST", body: { upin, reason: reason.trim() } }); }
   catch (e) { uiAlert("Correct refused: " + e.message); return; }
-  if (aum) { d.job_instance_id = r.job_instance_id; notify(`${upin}: ${r.created ? "new job" : "the file's open job"} ${r.job_name} (${r.transaction_number}).`); }
+  d.job_instance_id = r.job_instance_id;
+  notify(`${upin}: ${r.created ? "the file had no job here, so " + r.job_name + " was made" : (r.resumed ? "carrying on in " : "reopened ") + r.job_name}${r.transaction_number ? " (" + r.transaction_number + ")" : ""}.`);
   for (const b of r.beacons || []) rememberPointId(b.easting, b.northing, b.number);
   // Keep the numbers of beacons shared with neighbours too (they stay in the fabric and are matched again).
   for (const p of d.points) if (!/^P\d+$/.test(p.beacon)) rememberPointId(p.easting, p.northing, p.beacon);
@@ -1533,10 +1534,10 @@ async function correctAndRecommit(upin) {
   await wfResume(d.job_instance_id);
   await loadDrafts(); await loadParcels(false);
   const draft = state.drafts.features.find((x) => String(x.properties.id) === String(r.parcel_id));
-  if (!draft) { notify(`${upin} is a draft again; open the job and use the Edit tool on it.`, "warn"); return; }
+  if (!draft) { notify(`${upin} is open for correction; open the job and use the Edit tool on it.`, "warn"); return; }
   editDraftFeature(draft); setTool("editVertex");
   orthoSketchChanged();
-  notify(`${upin} is a draft again (it keeps its UPIN). Correct the points (drag, or retype in Edit Sketch Properties), then Finish Sketch.`);
+  notify(`${upin} is open for correction (same UPIN; the committed shape stays until you commit). Correct the points (drag, or retype in Edit Sketch Properties), then Finish Sketch.`);
 }
 // Correct a title deed plan that came back: the parcel, its UPIN and its link stay; the plan is
 // redone (scale, form) and resent. The server allows it for a linked parcel at Raise Title Deed Plan.
@@ -4414,7 +4415,7 @@ function doneCard(j) {
   if (mine && upins.length && can("titledeed")) actions.push(regLink("Title deed plan", "Open the title deed plan (form, sheet, PDF, send)", () => titleDeedDialog(j.id, upins[0])));
   if (mine && plan && plan.action === "registry_plan_sent" && can("titledeed")) actions.push(regLink("Withdraw plan", "Mark the plan sent to the Registry as withdrawn (the parcel and UPIN stay)", () => doneWithdraw(j)));
   if (mine && upins.length && parcels.some((p) => !p.linked) && j.transaction_number && can("admin")) actions.push(regLink("Link now", "Write the UPIN and link date onto the Registry file (as on commit)", () => doneLinkNow(j)));
-  if (j.can_correct && upins.length && can("digitise")) actions.push(regLink("Correct", "Reopen the job to fix the parcel (same UPIN), then commit again and resend the plan", () => doneCorrect(j, parcels)));
+  if (j.can_correct && upins.length && can("digitise")) actions.push(regLink("Correct", "Reopen the file's job to fix the parcel (same UPIN, the Registry link stays), then commit again and resend the plan", () => doneCorrect(j, parcels)));
   const conf = j.confirmation;
   return h("div", { class: "regCard " + (mine ? "job" : "gone"), title: "Double-click to zoom", ondblclick: () => firstUpin && registryZoom(firstUpin) },
     h("div", { class: "regCardTop" }, h("span", { class: "regUpin" }, j.property_number || j.name || "#" + j.id),
@@ -4484,16 +4485,7 @@ async function doneCorrect(j, parcels) {
     const pick = await uiPrompt(`Which parcel of ${j.name} to correct? (${parcels.map((p) => p.upin).join(", ")})`, upin, { title: "Correct" });
     if (!pick) return; upin = pick.trim().toUpperCase();
   }
-  if (j.source === "aumentum") { await correctAndRecommit(upin); done.loaded = false; return; }
-  const reason = await uiPrompt(`Correct ${upin}?\n\nThe job is reopened at its commit step with ${upin} back as a draft (it keeps this UPIN). Fix the shape, beacons or attributes, commit again, then resend the corrected plan. Refused if the parcel is linked in the Registry (unlink it there first). Reason:`, "", { title: "Correct", ok: "Reopen to correct" });
-  if (!reason || !reason.trim()) return;
-  try {
-    const r = await api(`/api/v1/wf/jobs/${j.id}/correct`, { method: "POST", body: { upin, reason: reason.trim() } });
-    for (const b of r.beacons || []) rememberPointId(b.easting, b.northing, b.number);
-    done.loaded = false;
-    await openWorkflow(); await wfSelect(j.id); await wfWorkOn(j.id);
-    notify(`${upin} is a draft of ${j.name} again (it keeps its UPIN). Fix it, then Commit; resend the corrected plan after.`);
-  } catch (e) { uiAlert("Correct refused: " + e.message); }
+  await correctAndRecommit(upin); done.loaded = false;
 }
 
 /* =====================================================================================
@@ -4803,7 +4795,7 @@ function regFindView(box) {
         regMetaRow({ ...f, upin })),
       h("div", { class: "regCardFoot" }, h("span", { class: "regLinks" },
         regLink("Zoom", "Zoom to the parcel", () => registryZoom(upin), !upin),
-        done && !f.job_instance_id && can("digitise") ? regLink("Correct", "Correct & Recommit: the parcel keeps its UPIN and its history", () => correctAndRecommit(upin)) : null,
+        done && upin && can("digitise") ? regLink("Correct", "Reopen the file's job with the parcel to fix: same UPIN, the Registry link stays", () => correctAndRecommit(upin)) : null,
         linked && active && here.length && can("titledeed") ? regLink("Correct plan", "The plan came back: give the reason, change it and resend it (the parcel stays)", () => correctPlan(f.upin, f.transaction_number)) : null), main)));
   }
 }

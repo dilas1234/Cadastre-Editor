@@ -375,9 +375,31 @@ because Aumentum's parcels have no corner records. Both are kept in the commit's
 number box for each new corner, and the number stays with the corner when its coordinates are corrected;
 a corner on a fabric beacon shows that beacon's number. On a draft, the Point List's Edit Points and beacon
 number boxes. After commit, Edit on a Point List row corrects a wrong number with a reason
-(`POST /api/v1/parcels/beacon-number`), and wrong coordinates go through Correct & Recommit. Both are
-refused once the parcel is linked in the Registry: it is unlinked there first. A number on a beacon
-shared with a linked parcel is refused too, as it would change that file.
+(`POST /api/v1/parcels/beacon-number`); that Edit is refused once the parcel is linked in the
+Registry, and a number on a beacon shared with a linked parcel is refused too, as it would change that file.
+
+**Correct (one file, one UPIN, one job).** Wrong coordinates, shape or attributes after commit go through
+Correct (`POST /api/v1/wf/correct`; also from a job, `/wf/jobs/{id}/correct`). It reopens the file's own
+job at its commit task: the job that committed the parcel, else the file's latest job here (an open one
+first); a job is made on the file's Registry transaction only when the file has none. A copy of the
+parcel opens as a draft under the same UPIN, so nothing is archived and no new UPIN is given. The
+committed shape stays live (map, Registry map, attribute record) until the correction is committed; then
+it is kept as history (`superseded`) and the corrected shape takes its place. The attribute record stays,
+so the Registry link (LRSID, LinkageStatus, link date) is never broken and a **linked parcel needs no
+unlink**; the corrected plan is resent with Correct plan. A parcel archived in Aumentum with no reason and
+nothing committed in its place is brought back the same way. The system check does not count the
+parcel's own shape (here or in Aumentum) or its own Registry property against it, and a closed
+transaction only warns. Corners kept in place keep their beacons; a moved corner takes its number again
+(the beacon its earlier commit added at the old place is removed). Still refused: split / merge lineage
+(a mutation job), and a parcel archived on purpose (with a reason). Correct again on the same parcel
+carries on in the same job.
+
+**Only the file's current UPIN is corrected.** Aumentum archived a wrong parcel and digitised it again under
+a new UPIN, so about 1,100 files hold several UPINs. The current one is the file's live UPIN; an archived
+UPIN never comes back while the file has one ("it is an old UPIN of file …; the file's current UPIN is …").
+With nothing live, it is the UPIN the Registry holds, else the file's most recent. Several live UPINs on
+different land are separate plots, each current; several on the same land are duplicates, and only the one
+the Registry holds is current. With none held, Correct waits until the duplicate is retired.
 
 If Aumentum cannot answer the UPIN check, commits are refused and Digitising, Title Deed and Sysadmin
 show a red warning to contact the ICT Admin (`GET /api/v1/aumentum/status`: signs in and asks about a

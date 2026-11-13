@@ -160,7 +160,7 @@ pub fn azimuth_bearing(from: (f64, f64), to: (f64, f64)) -> (f64, String, String
 pub async fn parcel_legs(pool: &sqlx::PgPool, upin: &str) -> Result<Vec<Leg>, sqlx::Error> {
     use sqlx::Row;
     let rows = sqlx::query(
-        "WITH g AS (SELECT (ST_Dump(geom)).geom AS poly FROM cadastre.parcel WHERE parcel_number = $1 AND status = 'posted' LIMIT 1), \
+        "WITH g AS (SELECT (ST_Dump(geom)).geom AS poly FROM cadastre.parcel WHERE parcel_number = $1 AND status IN ('posted', 'archived') ORDER BY (status = 'posted') DESC, updated_at DESC LIMIT 1), \
               v AS (SELECT (d).path[1] AS i, (d).geom AS pt FROM (SELECT ST_DumpPoints(ST_ExteriorRing(poly)) AS d FROM g) x) \
          SELECT ST_X(pt) AS e, ST_Y(pt) AS n, (SELECT b.number FROM cadastre.beacon b WHERE ST_DWithin(b.geom, ST_Transform(pt, ST_SRID(b.geom)), 0.05) \
                 ORDER BY ST_Distance(b.geom, ST_Transform(pt, ST_SRID(b.geom))) LIMIT 1) AS name FROM v ORDER BY i",

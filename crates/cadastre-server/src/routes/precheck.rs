@@ -114,13 +114,27 @@ pub async fn run(state: &AppState, id: i32, vertices: &[[f64; 2]], editing_id: O
     let (cadastre_job, txn) = job.ok_or_else(|| AppError::NotFound(format!("job instance {id}")))?;
     let property_number: Option<String> = sqlx::query_scalar("SELECT property_number FROM cadastre.wf_job_linkage WHERE wf_job_instance_id = $1")
         .bind(id).fetch_optional(&mut *conn).await?.flatten();
-    let mutated = crate::routes::mutations::pending_parents(&mut conn, id).await?;
+    let mut mutated = crate::routes::mutations::pending_parents(&mut conn, id).await?;
+    // Corrections (drafts carrying their UPIN): the parcel's own committed shape, here and in
+    // Aumentum, and its own Registry property are not counted against it.
+    let (corrected, only_corrections) = match cadastre_job {
+        Some(j) => {
+            let c = crate::routes::correction::correcting_upins(&mut conn, j, &mutated).await?;
+            let fresh: i64 = sqlx::query_scalar("SELECT count(*) FROM cadastre.parcel WHERE job_id = $1 AND status = 'draft' AND parcel_number IS NULL")
+                .bind(j).fetch_one(&mut *conn).await?;
+            let only = !c.is_empty() && fresh == 0;
+            (c, only)
+        }
+        None => (Vec::new(), false),
+    };
+    mutated.extend(corrected.iter().cloned());
     // Parcels this same job committed earlier (a job with several parcels): not a title clash.
-    let own_posted: Vec<String> = match cadastre_job {
+    let mut own_posted: Vec<String> = match cadastre_job {
         Some(j) => sqlx::query_scalar("SELECT parcel_number FROM cadastre.parcel WHERE job_id = $1 AND status = 'posted' AND parcel_number IS NOT NULL")
             .bind(j).fetch_all(&mut *conn).await?,
         None => Vec::new(),
     };
+    own_posted.extend(corrected.iter().cloned());
 
     // The shape to check, as GeoJSON in EPSG:32632.
     let shape: Option<String> = if vertices.len() >= 3 {
@@ -265,6 +279,9 @@ pub async fn run(state: &AppState, id: i32, vertices: &[[f64; 2]], editing_id: O
             Ok(Some(t)) => {
                 txn_item = match &t.refused {
                     None => item("transaction", "Registry transaction", "pass", format!("{} is {}.", t.transaction_number, t.status), vec![]),
+                    // A correction keeps its UPIN and link: a closed file can still have its shape fixed.
+                    Some(why) if only_corrections => item("transaction", "Registry transaction", "warn",
+                        format!("{why} This is a correction under the same UPIN, so its Registry link stays and it can be committed."), vec![]),
                     Some(why) => item("transaction", "Registry transaction", "fail", why.clone(), vec![]),
                 };
                 let prop = t.properties.iter()

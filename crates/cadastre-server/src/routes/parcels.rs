@@ -526,6 +526,9 @@ pub async fn search_parcels(
     }
     if let Some(status) = q.status.as_deref().filter(|s| !s.is_empty()) {
         qb.push(" AND p.status = ").push_bind(status.to_string());
+    } else {
+        // A shape a correction replaced (same UPIN) only when asked for.
+        qb.push(" AND p.status <> 'superseded'");
     }
     if let Some(bbox) = q.bbox.as_deref().filter(|s| !s.is_empty()) {
         let (minx, miny, maxx, maxy) = parse_bbox(bbox)?;
@@ -661,7 +664,7 @@ pub async fn sketch_overlaps(State(state): State<AppState>, Json(req): Json<Sket
          LEFT JOIN cadastre.registry_property r ON r.upin = p.parcel_number \
          LEFT JOIN LATERAL (SELECT lrs_id, property_number FROM cadastre.parcel_attribute y WHERE y.upin = p.parcel_number AND y.linkage_status = 1 \
                             AND (y.status = '0' OR y.status IS NULL) LIMIT 1) x ON true \
-         WHERE ($2::uuid IS NULL OR p.id <> $2) \
+         WHERE ($2::uuid IS NULL OR (p.id <> $2 AND p.parcel_number IS DISTINCT FROM (SELECT e.parcel_number FROM cadastre.parcel e WHERE e.id = $2))) \
          ORDER BY a DESC LIMIT 30",
         crate::routes::precheck::counts_sql("p.geom", "s.g", "$3"),
     ))
@@ -694,7 +697,9 @@ pub struct ParcelPointsQuery {
 
 /// A committed parcel's point list (right-click → Point List / Show Beacons): each corner's beacon
 /// (or P-number), coordinates, and the bearing and distance to the next corner, with the area; and
-/// whether it can be corrected here (Correct & Recommit) or, if not, why.
+/// whether it can be corrected here (Correct: the file's job reopened with a copy under the same
+/// UPIN, linked or not) or, if not, why. A parcel archived in Aumentum with no reason and nothing
+/// committed in its place is listed too, and can be brought back by Correct.
 #[utoipa::path(get, path = "/api/v1/parcels/points", tag = "parcels", params(ParcelPointsQuery), responses((status = 200), (status = 404)))]
 pub async fn parcel_points(State(state): State<AppState>, Query(q): Query<ParcelPointsQuery>) -> ApiResult<Json<serde_json::Value>> {
     let upin = q.upin.trim().to_uppercase();
@@ -704,20 +709,27 @@ pub async fn parcel_points(State(state): State<AppState>, Query(q): Query<Parcel
                 (SELECT w.name FROM cadastre.wf_job_instance w WHERE p.job_id IS NOT NULL AND w.cadastre_job_id = p.job_id ORDER BY w.id DESC LIMIT 1) AS job_name, \
                 EXISTS (SELECT 1 FROM cadastre.parcel_attribute a WHERE a.upin = p.parcel_number AND (a.linkage_status = 1 OR a.lrs_id IS NOT NULL)) \
                   OR EXISTS (SELECT 1 FROM cadastre.registry_property r WHERE r.upin = p.parcel_number) AS linked, \
-                EXISTS (SELECT 1 FROM cadastre.parcel_lineage l WHERE l.parcel_id = p.id OR l.parent_id = p.id OR l.upin = p.parcel_number OR l.parent_upin = p.parcel_number) AS lineage \
-         FROM cadastre.parcel p WHERE p.parcel_number = $1 AND p.status = 'posted' LIMIT 1",
+                EXISTS (SELECT 1 FROM cadastre.parcel_lineage l WHERE l.parcel_id = p.id OR l.parent_id = p.id OR l.upin = p.parcel_number OR l.parent_upin = p.parcel_number) AS lineage, \
+                p.status = 'archived' AS archived, \
+                (SELECT NULLIF(trim(a.archive_reason), '') FROM cadastre.parcel_attribute a WHERE a.upin = p.parcel_number \
+                   ORDER BY (a.status = '0' OR a.status IS NULL) DESC, a.object_id DESC LIMIT 1) AS archive_reason, \
+                (SELECT w.name FROM cadastre.parcel d JOIN cadastre.wf_job_instance w ON w.cadastre_job_id = d.job_id \
+                   WHERE d.parcel_number = p.parcel_number AND d.status = 'draft' ORDER BY w.id DESC LIMIT 1) AS correcting_in \
+         FROM cadastre.parcel p WHERE p.parcel_number = $1 AND p.status IN ('posted', 'archived') ORDER BY (p.status = 'posted') DESC, p.updated_at DESC LIMIT 1",
     )
     .bind(&upin)
     .fetch_optional(&state.pool)
     .await?
-    .ok_or_else(|| AppError::NotFound(format!("{upin} is not a committed parcel")))?;
+    .ok_or_else(|| AppError::NotFound(format!("{upin} has no committed or archived shape in this Cadastre")))?;
     let legs = crate::report::parcel_legs(&state.pool, &upin).await?;
     let job: Option<i32> = row.get("job_instance_id");
     let (linked, lineage): (bool, bool) = (row.get::<Option<bool>, _>("linked").unwrap_or(false), row.get::<Option<bool>, _>("lineage").unwrap_or(false));
-    // A parcel committed in Aumentum (no job here) is corrected in its file's job (correct-aumentum).
-    let why_not = if linked { Some("it is linked in the Registry: unlink it there first") }
-        else if lineage { Some("it has split / merge history: correct it with a mutation job") }
-        else { None };
+    // Linked or not, Correct keeps the UPIN, so the Registry link stays.
+    let archived = row.get::<Option<bool>, _>("archived").unwrap_or(false);
+    let archive_reason: Option<String> = row.get("archive_reason");
+    let why_not: Option<String> = if lineage { Some("it has split / merge history: correct it with a mutation job".into()) }
+        else if archived && archive_reason.is_some() { Some(format!("it was archived on purpose ({})", archive_reason.as_deref().unwrap_or_default())) }
+        else { crate::routes::correction::why_not_current(&state.pool, &upin).await? };
     Ok(Json(serde_json::json!({
         "upin": upin,
         "area_m2": row.get::<Option<f64>, _>("area"),
@@ -728,6 +740,8 @@ pub async fn parcel_points(State(state): State<AppState>, Query(q): Query<Parcel
         "linked": linked,
         "committed_in": if job.is_none() { "aumentum" } else { "cadastre" },
         "why_not": why_not,
+        "archived": archived,
+        "correcting_in": row.get::<Option<String>, _>("correcting_in"),
         "points": legs.iter().map(|l| serde_json::json!({
             "beacon": l.from, "easting": (l.from_e * 1000.0).round() / 1000.0, "northing": (l.from_n * 1000.0).round() / 1000.0,
             "to": l.to, "distance": (l.distance * 1000.0).round() / 1000.0, "bearing": l.bearing,
