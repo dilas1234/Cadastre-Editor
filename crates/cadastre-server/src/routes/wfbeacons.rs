@@ -118,7 +118,7 @@ async fn setting(conn: &mut sqlx::PgConnection, key: &str) -> ApiResult<Option<S
     Ok(sqlx::query_scalar("SELECT value FROM cadastre.app_setting WHERE key = $1").bind(key).fetch_optional(conn).await?)
 }
 
-async fn tolerance(conn: &mut sqlx::PgConnection) -> ApiResult<f64> {
+pub(crate) async fn tolerance(conn: &mut sqlx::PgConnection) -> ApiResult<f64> {
     Ok(setting(conn, "commit.beacon_tolerance_m").await?.and_then(|v| v.trim().parse().ok()).filter(|t: &f64| *t > 0.0 && *t < 1.0).unwrap_or(0.05))
 }
 
@@ -470,6 +470,10 @@ pub async fn check(State(state): State<AppState>, Path(id): Path<i32>, Json(req)
     let tol = tolerance(&mut conn).await?;
     let limit = adjoining_limit(&mut conn).await?;
     let points = corner_points(&mut conn, job_id, tol).await?;
+    // A correction's own beacons that its commit lets go (a moved corner taking its number again).
+    let mutated = crate::routes::mutations::pending_parents(&mut conn, id).await?;
+    let corrected = crate::routes::correction::correcting_upins(&mut conn, job_id, &mutated).await?;
+    let released = crate::routes::correction::releasable_beacons(&mut conn, job_id, &corrected, tol).await?;
     let mut out = Vec::new();
     for b in &req.beacons {
         let number = b.number.trim();
@@ -477,7 +481,7 @@ pub async fn check(State(state): State<AppState>, Path(id): Path<i32>, Json(req)
             continue;
         }
         let Some(i) = points.iter().position(|p| p.beacon.is_none() && (p.e - b.easting).hypot(p.n - b.northing) <= tol) else { continue };
-        out.extend(conflict(&mut conn, i, &points[i], number, limit).await?);
+        out.extend(conflict(&mut conn, i, &points[i], number, limit).await?.filter(|c| !released.contains(&c.beacon_id)));
     }
     Ok(Json(out))
 }
