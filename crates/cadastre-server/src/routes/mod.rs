@@ -4,6 +4,7 @@ pub mod audit;
 pub mod beacons;
 pub mod catalog;
 pub mod charting;
+pub mod charting_checks;
 pub mod completed;
 pub mod editor;
 pub mod login;

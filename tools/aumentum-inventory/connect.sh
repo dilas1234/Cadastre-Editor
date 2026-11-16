@@ -3,12 +3,13 @@
 # Inside the session the folder appears as \\tsclient\inventory (also under "This PC").
 # Usage: ./connect.sh            (prompts for the password)
 set -euo pipefail
-HOST="${RDP_HOST:-10.10.10.4}"
+HOST="${RDP_HOST:-10.10.10.5}"
 USER_NAME="${RDP_USER:-Administrator@plagis.com}"
 DIR="$(cd "$(dirname "$0")" && pwd)"
 read -rsp "Password for $USER_NAME@$HOST: " PASS; echo
 echo "Connecting... inside the session open:  \\\\tsclient\\inventory\\RUN-ME.cmd"
-EXTRA="${RDP_EXTRA:-}"
+# 10.10.10.5 only offers legacy TLS (like .6 and .2) and Kerberos hangs, so both are relaxed by default.
+EXTRA="${RDP_EXTRA-/tls-seclevel:0 /auth-pkg-list:ntlm,!kerberos}"
 if command -v xfreerdp3 >/dev/null; then
   RDP=xfreerdp3
 elif command -v xfreerdp >/dev/null; then

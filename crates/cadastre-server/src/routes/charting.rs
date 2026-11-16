@@ -44,7 +44,7 @@ pub struct FilesQuery {
 
 // Completed jobs with the file number and UPINs, as `completed::list` reads them. Until PLAGIS
 // names the stage, every completed file counts as ready for charting.
-const FILES: &str = "WITH base AS ( \
+pub(crate) const FILES: &str = "WITH base AS ( \
     SELECT j.id, j.name, j.lrs_transaction_number AS txn, j.cadastre_job_id, j.ended, \
            COALESCE(NULLIF(btrim(l.property_number), ''), substring(j.name from '^Job-(.+)$')) AS pn \
     FROM cadastre.wf_job_instance j LEFT JOIN cadastre.wf_job_linkage l ON l.wf_job_instance_id = j.id WHERE j.status = 3 \
@@ -254,7 +254,18 @@ pub async fn sign(State(state): State<AppState>, user: AuthUser, Path(id): Path<
     let part = &answers[&req.part];
     sqlx::query("UPDATE cadastre.principal SET name = $2, job_title = $3 WHERE is_user AND NOT is_system AND lower(code) = lower($1)")
         .bind(&by).bind(part["officer_name"].as_str().map(str::trim)).bind(part["rank"].as_str().map(str::trim)).execute(&mut *tx).await?;
-    audit::append(&mut tx, &by, "charting_report_signed", "wf_job_instance", Some(&id.to_string()), json!({ "part": req.part })).await?;
+    // What the Cadastre suggested when the charting part was signed, kept with the signature.
+    let suggested = if req.part == "charting" {
+        let f = sqlx::query(&format!("{FILES} SELECT upins, pn FROM file WHERE id = $1")).bind(id).fetch_optional(&state.pool).await?;
+        match f {
+            Some(f) => crate::routes::charting_checks::run(&state.pool, &f.get::<Vec<String>, _>("upins"), f.get::<Option<String>, _>("pn").as_deref()).await
+                .map(|c| json!(c)).unwrap_or_else(|e| json!({ "error": e.to_string() })),
+            None => Value::Null,
+        }
+    } else {
+        Value::Null
+    };
+    audit::append(&mut tx, &by, "charting_report_signed", "wf_job_instance", Some(&id.to_string()), json!({ "part": req.part, "checks": suggested })).await?;
     tx.commit().await?;
     Ok(Json(json!({ "state": next })))
 }
@@ -349,6 +360,7 @@ pub fn routes() -> Router<AppState> {
         .route("/api/v1/charting/files", get(files))
         .route("/api/v1/charting/files/{id}", get(file))
         .route("/api/v1/charting/files/{id}/report", put(save))
+        .route("/api/v1/charting/files/{id}/checks", get(crate::routes::charting_checks::checks))
         .route("/api/v1/charting/files/{id}/sign", post(sign))
         .route("/api/v1/charting/sheets", get(sheets))
 }
