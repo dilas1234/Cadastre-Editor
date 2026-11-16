@@ -4335,6 +4335,8 @@ async function chartReport(id) {
   // Filled in advance from the Cadastre and the Registry; the officer confirms or corrects.
   const reg = f.registry || {};
   let pts = null; try { pts = await api("/api/v1/parcels/points?upin=" + encodeURIComponent(f.upins[0])); } catch { /* typed instead */ }
+  // The automatic checks (C3): a suggested answer per question, with its evidence.
+  let checks = [], checkErr = ""; try { checks = (await api(`/api/v1/charting/files/${id}/checks`)).checks; } catch (e) { checkErr = e.message; }
   const series = pts?.points?.map((p) => String(p.beacon || "").match(/^[A-Za-z]+/)?.[0]).filter(Boolean) || [];
   const fill = { ref_no: f.property_number, property_no: f.property_number, applicant: reg.applicant, location: [reg.address, reg.location, reg.lga].filter(Boolean).join(", "),
     area: pts?.area_m2 != null ? Number(pts.area_m2).toFixed(3) : "", tracing_no: reg.tracing_no || (new Set(series).size === 1 ? series[0] : ""), deposited_plan_no: reg.plan_no };
@@ -4352,6 +4354,22 @@ async function chartReport(id) {
   const follow = (list) => { const apply = () => list.forEach(([, [, row], cond]) => { row.style.display = shown(list, cond) ? "" : "none"; });
     list.forEach(([, [i]]) => { if (i.tagName === "SELECT") i.addEventListener("change", apply); }); apply(); };
   follow(parts); follow(finals);
+  // Each question shows what the Cadastre suggests and why; Use puts it in, the officer decides.
+  const input = (k) => parts.find(([key]) => key === k)?.[1][0];
+  const useCheck = (c, onlyBlank) => {
+    const set = (k, v) => { const i = input(k); if (!i || (onlyBlank && i.value)) return; i.value = v; i.dispatchEvent(new Event("change")); };
+    if (c.value) set(c.field, c.value);
+    for (const [k, v] of Object.entries(c.follow || {})) set(k, v);
+  };
+  for (const c of checks) {
+    const row = parts.find(([k]) => k === c.field)?.[1][1]; if (!row) continue;
+    const tone = c.result === "suggested" ? "#3a6ea5" : "#a35a00";
+    row.append(h("div", { style: `font-size:11px;color:#444;background:#f6f8fb;border-left:3px solid ${tone};padding:3px 6px;margin-top:3px` },
+      c.value ? h("b", {}, `Suggested: ${c.value}. `) : h("b", { style: `color:${tone}` }, c.result === "no_layer" ? "Not checked. " : "No suggestion. "),
+      c.evidence,
+      c.value && !chartLocked ? h("button", { class: "btn", style: "margin-left:6px;padding:0 6px;font-size:11px", title: "Put this answer in", onclick: () => useCheck(c, false) }, "Use") : null));
+  }
+  const fillAll = () => { checks.forEach((c) => useCheck(c, true)); notify("Suggested answers filled where the form was blank: check each against the sheet."); };
   const value = (list, [, [i], cond]) => (shown(list, cond) ? i.value : "");
   const read = () => { const o = { charting: {}, final: {} }; for (const e of head) o.charting[e[0]] = e[1][0].value; for (const e of parts) o.charting[e[0]] = value(parts, e); for (const e of finals) o.final[e[0]] = value(finals, e); return o; };
   let version = rep?.version;
@@ -4364,12 +4382,14 @@ async function chartReport(id) {
   });
   const scroll = h("div", { style: "max-height:calc(60vh - 56px);overflow:auto;padding-right:6px" },
     reg.note && reg.note !== "off" && reg.note !== "ok" ? h("div", { class: "muted", style: "color:#a35a00" }, `Registry details not filled: ${reg.note}`) : null,
+    checkErr ? h("div", { class: "muted", style: "color:#a35a00" }, `The automatic checks could not run: ${checkErr}`) : null,
     ...head.map(([, [, row]]) => row), h("h4", {}, "Charting"), ...parts.map(([, [, row]]) => row),
     rep?.charted_by ? h("div", { class: "muted" }, `Signed by ${rep.charted_by}, ${fmtDT(rep.charted_at)}`) : null,
     h("h4", {}, "Final Survey Report"), finalLocked && st !== "final" ? h("div", { class: "muted" }, "Completed by a second officer once the charting part is signed.") : null, ...finals.map(([, [, row]]) => row),
     rep?.final_by ? h("div", { class: "muted" }, `Signed by ${rep.final_by}, ${fmtDT(rep.final_at)}`) : null);
   const buttons = h("div", { class: "frow", style: "margin-top:8px;gap:6px;justify-content:flex-end" },
     h("span", { class: "muted", style: "margin-right:auto" }, CHART_STATE[st] + (version ? ` · version ${version}` : "")),
+    !chartLocked && checks.some((c) => c.value) ? h("button", { class: "btn", title: "Fill the blank questions with the Cadastre's suggestions", onclick: fillAll }, "Fill suggested") : null,
     h("button", { class: "btn", onclick: () => chartPrint(f, read(), rep) }, "Print"),
     st === "final" ? null : h("button", { class: "btn", onclick: act(async () => { await save(); notify("Saved."); await refresh(); }) }, "Save"),
     st === "none" || st === "draft" ? h("button", { class: "btn active", onclick: sign("charting", "charting part") }, "Sign charting") : null,
