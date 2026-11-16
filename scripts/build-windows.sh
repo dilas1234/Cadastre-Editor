@@ -17,7 +17,9 @@ export CARGO_TARGET_X86_64_WIN7_WINDOWS_GNU_LINKER="${CARGO_TARGET_X86_64_WIN7_W
 command -v "$CARGO_TARGET_X86_64_WIN7_WINDOWS_GNU_LINKER" >/dev/null \
   || { echo "missing $CARGO_TARGET_X86_64_WIN7_WINDOWS_GNU_LINKER: sudo apt install gcc-mingw-w64-x86-64" >&2; exit 1; }
 
-cargo +nightly build --release --target "$TARGET" -Z build-std=std,panic_abort -p cadastre-server
+# --no-default-features: this kit stays TLS-free (NFR-02), so it leaves out `registry-admin`
+# (Users & Units answers 501 with the reason). Every other build has it by default.
+cargo +nightly build --release --target "$TARGET" -Z build-std=std,panic_abort -p cadastre-server --no-default-features
 
 EXE="target/$TARGET/release/cadastre-server.exe"
 

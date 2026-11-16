@@ -11,10 +11,12 @@ description = "PLAGIS Cadastre Editor REST API server (axum + PostGIS + Keycloak
 workspace = true
 
 [features]
-# Off by default so the standard (win7 server target, NFR-02) build stays TLS-free.
 # `registry-admin` adds the tiberius write-path to the Aumentum Registry's SQL Server
-# (LRS43), used by the Sysadmin "Users & Units" dashboard. tiberius needs rustls for the
-# SQL Server login handshake, so enable this only on a build whose host can run it.
+# (LRS43), used by the Sysadmin "Users & Units" dashboard (/user-management). ON by default:
+# a plain `cargo build` (as on production 10.10.10.11) dropped it more than once, and the
+# dashboard then failed with 404s. Only the TLS-free Windows 2012 R2 kit (win7 target, NFR-02)
+# turns it off, explicitly, with --no-default-features in scripts/build-windows.sh.
+default = ["registry-admin"]
 registry-admin = ["dep:tiberius", "dep:tokio-util", "dep:futures-util"]
 
 [dependencies]

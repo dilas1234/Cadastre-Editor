@@ -59,6 +59,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let listener = tokio::net::TcpListener::bind(&bind_addr).await?;
     tracing::info!("cadastre-server listening on http://{bind_addr} (docs at /swagger-ui)");
+    // Which build this is, in the log, so a build without Users & Units is seen at start.
+    if cfg!(feature = "registry-admin") {
+        tracing::info!("Users & Units (registry-admin): built in");
+    } else {
+        tracing::warn!("Users & Units (registry-admin): NOT built in, /user-management will answer 501; rebuild with the default features");
+    }
 
     axum::serve(listener, app)
         .with_graceful_shutdown(shutdown_signal())

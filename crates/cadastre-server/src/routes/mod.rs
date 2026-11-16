@@ -238,13 +238,28 @@ pub fn router(state: AppState) -> Router {
         );
 
     let router = router.merge(charting::routes());
-    // Registry (LRS43) user administration — only compiled with the `registry-admin` feature.
+    // Registry (LRS43) user administration — only compiled with the `registry-admin` feature
+    // (on by default). A build without it says so instead of a bare 404.
     #[cfg(feature = "registry-admin")]
     let router = router.merge(regadmin::routes());
+    #[cfg(not(feature = "registry-admin"))]
+    let router = router
+        .route("/api/v1/admin/registry/{*rest}", axum::routing::any(registry_admin_missing))
+        .route("/api/v1/admin/registry", axum::routing::any(registry_admin_missing));
 
     router
         // gzip for clients that ask (the map's GeoJSON and beacon lists shrink several-fold).
         .layer(tower_http::compression::CompressionLayer::new())
         .layer(TraceLayer::new_for_http())
         .with_state(state)
+}
+
+/// Users & Units on a build without `registry-admin` (only the Windows 2012 R2 kit): a clear 501
+/// in place of the 404s that left the dashboard broken with no reason given.
+#[cfg(not(feature = "registry-admin"))]
+async fn registry_admin_missing() -> (axum::http::StatusCode, axum::Json<serde_json::Value>) {
+    (axum::http::StatusCode::NOT_IMPLEMENTED, axum::Json(serde_json::json!({
+        "error": "Not Implemented", "status": 501,
+        "message": "Users & Units is not in this build: the server was built without the registry-admin feature. Rebuild with the default features (plain `cargo build --release -p cadastre-server`).",
+    })))
 }
