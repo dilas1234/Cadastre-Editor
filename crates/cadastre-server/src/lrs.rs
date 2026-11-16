@@ -428,7 +428,10 @@ pub fn incoming_document_pages_xml(doc_type: &str, transaction_id: i64, pages: &
             named_value(&format!("{{{LRS_CORE}}}isattachment"), if attachment { "True" } else { "False" }),
             named_value(&format!("{{{LRS_CORE}}}pagename"), p.name),
             named_value(&format!("{{{LRS_CORE}}}pageindex"), &i.to_string()),
-            named_value(&format!("{{{CMS}}}content"), p.uploaded),
+            // The content model's cm:content (CM), not the web-service namespace (CMS): under CMS
+            // Alfresco keeps the upload answer as a plain text property, the page has no file, and
+            // the Registry shows "page not found" (every plan sent 2–16 Nov 2026).
+            named_value(&format!("{{{CM}}}content"), p.uploaded),
         ]
         .concat()
     };
@@ -462,7 +465,8 @@ mod tests {
         assert!(d.contains("<lrs:name>Comments</lrs:name><lrs:value>Survey Plan</lrs:value>"));
         assert!(d.contains("<cms:name>{http://www.landsystems.com/lrs/model/core/1.0}referenceid</cms:name><cms:isMultiValue xsi:nil=\"true\"/><cms:value>42</cms:value>"));
         assert!(d.contains("PL68955 &amp; co.jpg"), "names escaped");
-        assert!(d.contains("<cms:name>{http://www.alfresco.org/ws/model/content/1.0}content</cms:name><cms:isMultiValue xsi:nil=\"true\"/><cms:value>ref-1</cms:value>"));
+        assert!(d.contains("<cms:name>{http://www.alfresco.org/model/content/1.0}content</cms:name><cms:isMultiValue xsi:nil=\"true\"/><cms:value>ref-1</cms:value>"));
+        assert!(!d.contains("ws/model/content/1.0}content"), "the page's file is cm:content, or the Registry finds no page");
         assert!(d.ends_with("<lrs:type>image</lrs:type></lrs:pages></lrs:content></int:entities>"));
         assert!(d.contains("isattachment</cms:name><cms:isMultiValue xsi:nil=\"true\"/><cms:value>False</cms:value>"));
         // The PDF plan: an attachment page, flagged as an attachment, with the officer's comment.
