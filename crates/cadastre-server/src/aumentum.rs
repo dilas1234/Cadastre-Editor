@@ -88,6 +88,11 @@ fn fault(body: &str) -> Option<String> {
     (!inner.is_empty()).then_some(inner)
 }
 
+/// How ArcSDE's connections were freed on 10.10.10.6 (2026-11-18). Restarting the services alone
+/// left all 64 `gsrvr.exe`; the service names there are `sde` (not `esri_sde`) and
+/// `ILS MultiCadastre Server` (shown as AUMENTUM CADASTRE Server), which may need `sc start` twice.
+const FREE_ARCSDE: &str = "Count the ArcSDE connections in an admin prompt: tasklist /fi \"imagename eq gsrvr.exe\" | find /c \"gsrvr\". Near 64: taskkill /f /im gsrvr.exe (editors save first; ArcSDE itself, service \"sde\", keeps running), then sc stop \"ILS MultiCadastre Server\" and sc start \"ILS MultiCadastre Server\" (shown as AUMENTUM CADASTRE Server) until sc query says RUNNING. This warning clears by itself within a few minutes.";
+
 /// What to do, for the causes seen on this network.
 fn hint(f: &Failure) -> Option<String> {
     let d = f.detail.as_deref().unwrap_or("").to_lowercase();
@@ -99,10 +104,10 @@ fn hint(f: &Failure) -> Option<String> {
         });
     }
     if f.stage == "lookup" && d.contains("object reference not set") {
-        return Some("Aumentum signed in but could not open its geodatabase. On the Aumentum server, ArcSDE's log (sde_sde.log) usually says \"Maximum number of connections to instance exceeded\": restarting the ArcSDE service, then the AUMENTUM CADASTRE Server service, frees them.".into());
+        return Some(format!("Aumentum signed in but could not open its geodatabase. On the Aumentum server, ArcSDE's log (sde_sde.log) usually says \"Maximum number of connections to instance exceeded\". {FREE_ARCSDE}"));
     }
     if f.stage == "lookup" && d.contains("no answer to the upin lookup") {
-        return Some("This server reached Aumentum and signed in, but the lookup never answered: Aumentum is waiting on its geodatabase. On the Aumentum server, count the ArcSDE connections (tasklist /fi \"imagename eq gsrvr.exe\" | find /c \"gsrvr\"); near 64, restart the ArcSDE service, then the AUMENTUM CADASTRE Server service.".into());
+        return Some(format!("This server reached Aumentum and signed in, but the lookup never answered: Aumentum is waiting on its geodatabase. {FREE_ARCSDE}"));
     }
     match f.stage {
         "settings" => Some("Set CADASTRE_MC_SERVICE_USER / CADASTRE_MC_SERVICE_PASSWORD in this server's settings and restart it.".into()),
@@ -127,13 +132,15 @@ static HEALTH: tokio::sync::Mutex<Option<(std::time::Instant, Health)>> = tokio:
 
 /// A real lookup's outcome is reported for this long (the duplicate-UPIN watch asks every 15 min).
 const LOOKUP_FRESH_SECS: u64 = 1200;
-/// The last UPIN lookup a commit or the duplicate-UPIN watch made: `Err` if Aumentum failed it.
-static LAST_LOOKUP: std::sync::Mutex<Option<(std::time::Instant, Result<(), Failure>)>> = std::sync::Mutex::new(None);
+/// The last UPIN lookup a commit or the duplicate-UPIN watch made, the UPIN it asked about, and
+/// `Err` if Aumentum failed it.
+static LAST_LOOKUP: std::sync::Mutex<Option<Lookup>> = std::sync::Mutex::new(None);
+type Lookup = (std::time::Instant, String, Result<(), Failure>);
 
-fn note_lookup(outcome: Result<(), Failure>) {
+fn note_lookup(upin: &str, outcome: Result<(), Failure>) {
     let failed = outcome.is_err();
     if let Ok(mut last) = LAST_LOOKUP.lock() {
-        *last = Some((std::time::Instant::now(), outcome));
+        *last = Some((std::time::Instant::now(), upin.to_string(), outcome));
     }
     // The warning follows at once: a cached answer that now says the opposite is dropped.
     if let Ok(mut cached) = HEALTH.try_lock() {
@@ -147,8 +154,50 @@ fn note_lookup(outcome: Result<(), Failure>) {
 fn recent_lookup_failure() -> Option<Failure> {
     let last = LAST_LOOKUP.lock().ok()?;
     match last.as_ref()? {
-        (at, Err(f)) if at.elapsed().as_secs() < LOOKUP_FRESH_SECS => Some(f.clone()),
+        (at, _, Err(f)) if at.elapsed().as_secs() < LOOKUP_FRESH_SECS => Some(f.clone()),
         _ => None,
+    }
+}
+
+/// At most one recheck this often, and none after the failure is `LOOKUP_FRESH_SECS` old: a
+/// failed recheck is not recorded, so one real failure leads to four rechecks at most.
+const RECHECK_SECS: u64 = 300;
+static LAST_RECHECK: std::sync::Mutex<Option<std::time::Instant>> = std::sync::Mutex::new(None);
+
+/// The UPIN to ask again, if the last real lookup failed recently and no recheck ran lately
+/// (claims the slot, so concurrent probes do not both ask).
+fn recheck_due() -> Option<String> {
+    let last = LAST_LOOKUP.lock().ok()?;
+    let upin = match last.as_ref()? {
+        (at, upin, Err(_)) if at.elapsed().as_secs() < LOOKUP_FRESH_SECS => upin.clone(),
+        _ => return None,
+    };
+    let mut rechecked = LAST_RECHECK.lock().ok()?;
+    if rechecked.is_some_and(|t| t.elapsed().as_secs() < RECHECK_SECS) {
+        return None;
+    }
+    *rechecked = Some(std::time::Instant::now());
+    Some(upin)
+}
+
+/// Aumentum signs in again after a failed lookup: ask that UPIN once more, on the shared session
+/// (a fresh one only for the faults `issued` retries), so a success clears the warning within
+/// minutes of a fix, not when the next commit or the 15-minute duplicate-UPIN watch happens to
+/// ask. Only a success is recorded (see `RECHECK_SECS`).
+async fn recheck(upin: String) {
+    let Ok(Some(check)) = UpinCheck::shared().await else { return };
+    let answer = match check.ask(&upin).await {
+        Err(f) if fresh_session_may_help(&f) => {
+            check.forget().await;
+            match UpinCheck::shared().await {
+                Ok(Some(again)) => again.ask(&upin).await,
+                _ => return,
+            }
+        }
+        r => r,
+    };
+    if answer.is_ok() {
+        note_lookup(&upin, Ok(()));
     }
 }
 
@@ -156,10 +205,16 @@ fn recent_lookup_failure() -> Option<Failure> {
 /// connection for every lookup session and does not give it back: a probe a minute filled
 /// ArcSDE's 64 connections in under two hours ("Maximum number of connections to instance
 /// exceeded", 2026-11-10), after which every lookup failed. Sign-in does not touch ArcSDE. A
-/// lookup Aumentum signs in for and then fails is still reported, from the last real lookup.
+/// lookup Aumentum signs in for and then fails is still reported, from the last real lookup,
+/// and asked once more (`recheck`) so the warning clears soon after Aumentum is fixed.
 async fn probe() -> Result<(), Failure> {
     let Some(check) = UpinCheck::sign_in().await? else { return Ok(()) };
     check.sign_out().await;
+    // In the background: a slow lookup must not turn this answer into a timeout. A success drops
+    // the cached warning (`note_lookup`), so the editor's next poll finds Aumentum back.
+    if let Some(upin) = recheck_due() {
+        tokio::spawn(recheck(upin));
+    }
     match recent_lookup_failure() {
         Some(f) => Err(f),
         None => Ok(()),
@@ -227,16 +282,19 @@ impl UpinCheck {
     pub async fn issued(&self, upin: &str) -> Result<bool, String> {
         match self.lookup(upin).await {
             Err(f) if fresh_session_may_help(&f) => {
-                {
-                    let mut session = SESSION.lock().await;
-                    if session.as_ref().is_some_and(|(_, c)| *c == self.cookie) {
-                        *session = None;
-                    }
-                }
+                self.forget().await;
                 let again = Self::shared().await.map_err(|f| f.message)?.ok_or("the Aumentum UPIN check is not configured")?;
                 again.lookup(upin).await.map_err(|f| f.message)
             }
             r => r.map_err(|f| f.message),
+        }
+    }
+
+    /// Drop this session as the shared one (if it still is), so the next use signs in afresh.
+    async fn forget(&self) {
+        let mut session = SESSION.lock().await;
+        if session.as_ref().is_some_and(|(_, c)| *c == self.cookie) {
+            *session = None;
         }
     }
 
@@ -266,7 +324,7 @@ impl UpinCheck {
 
     async fn lookup(&self, upin: &str) -> Result<bool, Failure> {
         let asked = self.ask(upin).await;
-        note_lookup(asked.as_ref().map(|_| ()).map_err(Failure::clone));
+        note_lookup(upin, asked.as_ref().map(|_| ()).map_err(Failure::clone));
         asked
     }
 
@@ -313,16 +371,24 @@ mod tests {
     }
 
     #[test]
-    fn the_last_real_lookup_is_what_the_probe_reports() {
-        note_lookup(Ok(()));
+    fn the_last_real_lookup_is_what_the_probe_reports_and_rechecks() {
+        let _serial = RECHECK_TEST.lock().unwrap();
+        note_lookup("PL/1/1", Ok(()));
         assert!(recent_lookup_failure().is_none());
+        assert!(recheck_due().is_none(), "nothing to recheck after a success");
         let max = Failure::new("lookup", Some("Object reference not set to an instance of an object".into()), "Aumentum answered HTTP 500".into());
-        note_lookup(Err(max));
+        note_lookup("PL/1/2", Err(max));
         let f = recent_lookup_failure().expect("a failed lookup is reported");
         assert_eq!((f.stage, f.detail.as_deref()), ("lookup", Some("Object reference not set to an instance of an object")));
-        note_lookup(Ok(()));
+        *LAST_RECHECK.lock().unwrap() = None;
+        assert_eq!(recheck_due().as_deref(), Some("PL/1/2"), "the failed UPIN is asked again");
+        assert!(recheck_due().is_none(), "at most one recheck per RECHECK_SECS");
+        note_lookup("PL/1/2", Ok(()));
         assert!(recent_lookup_failure().is_none(), "a later success clears it");
     }
+
+    /// The tests above share LAST_LOOKUP / LAST_RECHECK.
+    static RECHECK_TEST: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
     #[test]
     fn which_failures_a_fresh_session_is_tried_for() {
@@ -340,7 +406,8 @@ mod tests {
         assert!(hint(&f).is_some_and(|h| h.contains("CADASTRE_OUTBOUND_ADDR")));
         assert!(hint(&Failure::new("lookup", Some("Object reference not set to an instance of an object".into()), String::new())).is_some_and(|h| h.contains("ArcSDE")));
         assert!(hint(&Failure::new("lookup", Some("Timeout expired".into()), String::new())).is_none());
-        assert!(hint(&Failure::new("lookup", Some("no answer to the UPIN lookup".into()), String::new())).is_some_and(|h| h.contains("gsrvr")));
+        let full = hint(&Failure::new("lookup", Some("no answer to the UPIN lookup".into()), String::new())).unwrap();
+        assert!(full.contains("taskkill /f /im gsrvr.exe") && full.contains("ILS MultiCadastre Server") && !full.contains("esri_sde"));
         assert_eq!(host_of("http://10.10.10.6/ApplicationServerAdmin/WebServices/LRSWebServices.asmx").as_deref(), Some("10.10.10.6"));
     }
 }
