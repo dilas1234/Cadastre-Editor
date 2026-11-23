@@ -135,6 +135,7 @@ pub enum View {
     Digitising,
     TitleDeed,
     Reporting,
+    Verification,
 }
 
 impl View {
@@ -144,22 +145,23 @@ impl View {
             "digitising" => Some(Self::Digitising),
             "titledeed" => Some(Self::TitleDeed),
             "reporting" => Some(Self::Reporting),
+            "verification" => Some(Self::Verification),
             _ => None,
         }
     }
     pub fn key(self) -> &'static str {
-        match self { Self::Sysadmin => "sysadmin", Self::Digitising => "digitising", Self::TitleDeed => "titledeed", Self::Reporting => "reporting" }
+        match self { Self::Sysadmin => "sysadmin", Self::Digitising => "digitising", Self::TitleDeed => "titledeed", Self::Reporting => "reporting", Self::Verification => "verification" }
     }
     pub fn path(self) -> &'static str {
-        match self { Self::Sysadmin => "/sys-editor", Self::Digitising => "/digitising", Self::TitleDeed => "/title-deed", Self::Reporting => "/reporting" }
+        match self { Self::Sysadmin => "/sys-editor", Self::Digitising => "/digitising", Self::TitleDeed => "/title-deed", Self::Reporting => "/reporting", Self::Verification => "/verification" }
     }
     pub fn label(self) -> &'static str {
-        match self { Self::Sysadmin => "Sysadmin", Self::Digitising => "Digitising", Self::TitleDeed => "Title Deed", Self::Reporting => "Charting and Reporting" }
+        match self { Self::Sysadmin => "Sysadmin", Self::Digitising => "Digitising", Self::TitleDeed => "Title Deed", Self::Reporting => "Charting and Reporting", Self::Verification => "Checking and Data Verification" }
     }
     pub fn allowed(self, a: Access) -> bool {
         match self {
             Self::Sysadmin => a.admin,
-            Self::Digitising | Self::TitleDeed => a.admin || a.staff,
+            Self::Digitising | Self::TitleDeed | Self::Verification => a.admin || a.staff,
             Self::Reporting => true,
         }
     }
@@ -236,7 +238,7 @@ pub fn may_reach(path: &str, method: &Method, a: Access) -> bool {
     let staff = a.admin || a.staff;
     match path {
         "/sys-editor" | "/user-management" => return a.admin,
-        "/digitising" | "/editor" | "/title-deed" => return staff,
+        "/digitising" | "/editor" | "/title-deed" | "/verification" => return staff,
         _ => {}
     }
     if path.starts_with("/api/v1/admin") || path.starts_with("/api/v1/audit") || path.starts_with("/swagger-ui") || path.starts_with("/api-docs") {
@@ -290,11 +292,11 @@ mod tests {
     #[test]
     fn views_follow_the_groups() {
         assert!(View::Sysadmin.allowed(ADMIN) && !View::Sysadmin.allowed(STAFF) && !View::Sysadmin.allowed(OTHER));
-        for v in [View::Digitising, View::TitleDeed] {
+        for v in [View::Digitising, View::TitleDeed, View::Verification] {
             assert!(v.allowed(ADMIN) && v.allowed(STAFF) && !v.allowed(OTHER));
         }
         assert!(View::Reporting.allowed(OTHER));
-        for k in ["sysadmin", "digitising", "titledeed", "reporting"] {
+        for k in ["sysadmin", "digitising", "titledeed", "reporting", "verification"] {
             assert_eq!(View::parse(k).unwrap().key(), k);
         }
         assert_eq!(View::parse("root"), None);
@@ -307,6 +309,8 @@ mod tests {
         assert!(!may_reach("/api/v1/admin/security", &get, STAFF) && !may_reach("/api/v1/audit", &get, STAFF));
         assert!(!may_reach("/swagger-ui/", &get, STAFF));
         assert!(may_reach("/title-deed", &get, STAFF) && !may_reach("/title-deed", &get, OTHER));
+        assert!(may_reach("/verification", &get, STAFF) && !may_reach("/verification", &get, OTHER));
+        assert!(may_reach("/api/v1/verification/check", &post, STAFF) && !may_reach("/api/v1/verification/check", &post, OTHER));
         assert!(may_reach("/reporting", &get, OTHER));
         assert!(may_reach("/api/v1/jobs", &get, OTHER) && !may_reach("/api/v1/jobs", &post, OTHER));
         assert!(may_reach("/api/v1/jobs", &post, STAFF));
