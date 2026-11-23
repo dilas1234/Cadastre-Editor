@@ -130,7 +130,7 @@ async function api(path, opts = {}) {
   }
   const text = await r.text();
   let data = null; try { data = text ? JSON.parse(text) : null; } catch { data = text; }
-  if (!r.ok) throw new Error((data && data.message) || `${r.status} ${r.statusText}`);
+  if (!r.ok) { const err = new Error((data && data.message) || `${r.status} ${r.statusText}`); err.status = r.status; throw err; }
   return data;
 }
 const fmt3 = (v) => Number(v).toFixed(3);
@@ -254,7 +254,7 @@ function resolveCrs(epsg) {
 function ensureProj(epsg) { return resolveCrs(epsg).code; }
 
 // Digitizing / edit session (ArcMap Editor). Vertices are kept in EPSG:32632 metres.
-const edit = { active: false, template: "parcel", geomType: "polygon", construction: "polygon", verts: [], sel: -1, snapping: true, editingId: null,
+const edit = { active: false, template: "parcel", geomType: "polygon", construction: "polygon", verts: [], sel: -1, snapping: true, editingId: null, editingJob: null,
   cut: [], tracing: false, trace: null };
 // Beacon numbers that came with typed / pasted points ("CA6782 492951.814 1088827.672"), keyed by
 // coordinates to the mm; the Beacon Numbers window at commit offers them for those corners.
@@ -449,8 +449,11 @@ async function loadHistory() {
   if (seq === historySeq) map.getSource("history")?.setData(fc);
 }
 async function loadDrafts() {
-  state.drafts = state.job ? asFC(await api(`/api/v1/parcels.geojson?status=draft&limit=5000&job=${state.job.id}`).catch(() => empty())) : empty();
+  let ok = !!state.job;
+  state.drafts = state.job ? asFC(await api(`/api/v1/parcels.geojson?status=draft&limit=5000&job=${state.job.id}`).catch(() => { ok = false; return empty(); })) : empty();
+  state.draftsJob = ok ? state.job.id : null; // the job whose drafts are known to be complete
   map.getSource("drafts") && map.getSource("drafts").setData(state.drafts);
+  releaseMissingDraft();
 }
 function fcBounds(fc, regionOnly = false) {
   const b = new maplibregl.LngLatBounds(); let n = 0;
@@ -1305,6 +1308,7 @@ function editDraftFeature(d) {
   selectTemplate("parcel");
   edit.verts = ring.slice(0, -1).map(([x, y]) => toUTM(x, y).map((v) => Math.round(v * 1000) / 1000));
   edit.editingId = d.properties.id; edit.sel = -1;
+  edit.editingJob = state.job ? { id: state.job.id, reference: state.job.reference } : null;
   drawSketch(); openSketchProps(); updateEditorButtons();
   status(`Editing draft parcel corners (${edit.verts.length}). Drag them, or retype them in Edit Sketch Properties; Finish Sketch saves.`);
 }
@@ -2239,6 +2243,10 @@ async function selectJob(id) {
   if (state.job && state.drafts.features.length) zoomToFC(state.drafts);
   updateJobButtons(); buildTOC(); buildCatalog(); renderTask();
   status(state.job ? `Job ${state.job.reference}: ${state.job.status}` : "");
+  if (editingOtherJob()) {
+    refreshSketchProps();
+    notify(`The sketch is still editing a draft parcel of ${edit.editingJob.reference}. Go back to ${edit.editingJob.reference} to save it, or Cancel Edit before drawing for ${state.job ? state.job.reference : "another job"}.`, "warn");
+  }
 }
 const canDo = (action) => !!state.job && state.workflow.transitions.some((t) => t.from_stage === state.job.status && t.action === action);
 function updateJobButtons() {
@@ -2566,7 +2574,22 @@ function drawSketch() {
   map.getSource("sketch")?.setData({ type: "FeatureCollection", features: feats });
   orthoSketchChanged();
 }
-function clearSketch() { edit.verts = []; edit.sel = -1; edit.editingId = null; edit.splitMode = false; edit.trace = null; map.getSource("sketch")?.setData(empty()); orthoSketchChanged(); }
+function clearSketch() { edit.verts = []; edit.sel = -1; edit.editingId = null; edit.editingJob = null; edit.splitMode = false; edit.trace = null; map.getSource("sketch")?.setData(empty()); orthoSketchChanged(); }
+// A corner edit belongs to its draft's job: saved under any other job it would miss the draft
+// ("draft parcel … in job … not found"), so it is held until that job is selected again.
+function editingOtherJob() { return !!(edit.editingId && edit.editingJob && state.job?.id !== edit.editingJob.id); }
+// The edited draft is no longer a draft of its own job (committed, deleted or separated since):
+// drop the link and keep the shape, so Finish Sketch saves it as a new draft after the full checks
+// (which, with no draft being edited, compare it against that old parcel too).
+function releaseMissingDraft() {
+  if (!edit.editingId || !edit.editingJob || state.draftsJob !== edit.editingJob.id) return false;
+  if (state.drafts.features.some((f) => String(f.properties.id) === String(edit.editingId))) return false;
+  const ref = edit.editingJob.reference;
+  edit.editingId = null; edit.editingJob = null;
+  refreshSketchProps(); updateEditorButtons();
+  notify(`The draft parcel this sketch was editing is no longer a draft in ${ref} (committed, deleted or separated). The sketch is kept: Finish Sketch saves it as a new draft.`, "warn");
+  return true;
+}
 function canFinishSketch() { const n = edit.verts.length; return edit.splitMode ? n >= 2 : edit.geomType === "polygon" ? n >= 3 : edit.geomType === "line" ? n >= 2 : n >= 1; }
 async function finishSketch() {
   if (!canFinishSketch()) { status(`Add ${edit.geomType === "polygon" ? "at least 3" : edit.geomType === "line" ? "at least 2" : "a"} vertex(es) before finishing.`); return; }
@@ -2609,7 +2632,7 @@ function digitizeParcel() {
   if (isAutoJobArea(area)) { status("Click the parcel's corners on the map (the job area was made automatically, so there are no plan points to load)."); return; }
   const ring = (area.coordinates?.[0] || []).slice(0, -1).map((c) => [c[0], c[1]]);
   if (ring.length < 3) return;
-  edit.verts = ring; edit.sel = ring.length - 1; edit.editingId = null;
+  edit.verts = ring; edit.sel = ring.length - 1; edit.editingId = null; edit.editingJob = null;
   afterVertexChange(); showSketchExtent(true);
   const named = ring.filter(([e, n]) => pointIds.get(ptKey(e, n))).length;
   notify(`Loaded the ${ring.length} points you entered for the job area${named ? ` (${named} with beacon numbers)` : ""}. Check them, then Finish Sketch.`);
@@ -2803,6 +2826,10 @@ async function ensureJobArea(utm) {
 }
 async function saveSketchParcel() {
   if (!state.job) { uiAlert("Choose a Job Area first — a digitized parcel is saved as a draft under a job."); return; }
+  if (editingOtherJob()) {
+    uiAlert(`This sketch edits a draft parcel of ${edit.editingJob.reference}, but ${state.job.reference} is selected.\nSelect ${edit.editingJob.reference} again (Job box, or Work On This Job) and Save Changes, or Cancel Edit to draw for ${state.job.reference}.`);
+    return;
+  }
   const utm = edit.verts.slice();
   // Verify Points: the digitiser checks every corner (beacon, coordinates) before anything is saved.
   if (!(await verifyPoints(utm))) { status("Back to the sketch: adjust the corners, then Finish Sketch again."); return; }
@@ -2818,7 +2845,13 @@ async function saveSketchParcel() {
     saved = editingId
       ? await api(`/api/v1/jobs/${state.job.id}/parcels/${editingId}`, { method: "PUT", body: { geometry, stated_area: null } })
       : await api(`/api/v1/jobs/${state.job.id}/parcels`, { method: "POST", body: { geometry, stated_area: null } });
-  } catch (e) { uiAlert("Save failed: " + e.message + "\nThe sketch is kept: correct it and Finish Sketch again."); return; }
+  } catch (e) {
+    if (editingId && e.status === 404) {
+      try { await loadDrafts(); } catch { /* fall through to the plain message */ }
+      if (!edit.editingId) { uiAlert(`The draft parcel being edited is no longer a draft in ${state.job.reference}: it was committed, deleted or separated since the edit began.\nThe sketch is kept. Finish Sketch again to save it as a new draft (the checks run again first).`); return; }
+    }
+    uiAlert("Save failed: " + e.message + "\nThe sketch is kept: correct it and Finish Sketch again."); return;
+  }
   const id = saved && saved.id ? saved.id : editingId;
   if (!state.job.reference.startsWith("WF-")) notify(`Parcel saved to ${state.job.reference}, which is not a workflow job. To work as in Aumentum, open the job in the Workflow panel and choose Work On This Job.`, "warn");
   else notify(`${editingId ? "Draft parcel updated" : "Parcel saved as a draft"} in ${state.job.reference}. ${draftNextStep()}`);
@@ -3443,7 +3476,7 @@ function openSketchProps() {
     ev.target.textContent = on ? "Hide coordinate entry" : "Type / paste coordinates…";
   } }, showEntry ? "Hide coordinate entry" : "Type / paste coordinates…");
   const body = h("div", {},
-    h("div", { class: "muted" }, `${edit.editingId ? "Editing draft parcel — " : ""}${edit.template === "jobArea" ? "job area" : edit.geomType} sketch — ${edit.verts.length} vertex(es), WGS 84 / UTM 32N metres`),
+    h("div", { class: "muted" }, `${edit.editingId ? `Editing draft parcel${edit.editingJob ? " of " + edit.editingJob.reference : ""} — ` : ""}${edit.template === "jobArea" ? "job area" : edit.geomType} sketch — ${edit.verts.length} vertex(es), WGS 84 / UTM 32N metres`),
     h("div", { style: "max-height:260px;overflow:auto" }, tbl),
     entryToggle, entry,
     h("div", { class: "taskNav" },
@@ -3454,7 +3487,9 @@ function openSketchProps() {
 }
 function refreshSketchProps() { if ($("sketchPropsWin")) openSketchProps(); }
 async function deleteDraftBeingEdited() {
-  if (!edit.editingId || !state.job || !(await uiConfirm("Delete this draft parcel from the job?", { ok: "Delete", kind: "warn" }))) return;
+  if (!edit.editingId || !state.job) return;
+  if (editingOtherJob()) { uiAlert(`This draft parcel belongs to ${edit.editingJob.reference}: select that job to delete it.`); return; }
+  if (!(await uiConfirm("Delete this draft parcel from the job?", { ok: "Delete", kind: "warn" }))) return;
   try {
     await api(`/api/v1/jobs/${state.job.id}/parcels/${edit.editingId}`, { method: "DELETE" });
     clearSketch(); await loadDrafts(); wfRefreshEditing(); refreshSketchProps(); updateEditorButtons(); status("Draft parcel deleted.");
@@ -6710,7 +6745,7 @@ function snapshotSession() {
     reg: { view: reg.view, txnNo: reg.txn ? reg.txnNo : "" },
     job: state.job?.id || null,
     tool: state.tool,
-    edit: edit.active && edit.verts.length ? { template: edit.template, construction: edit.construction, verts: edit.verts, editingId: edit.editingId } : null,
+    edit: edit.active && edit.verts.length ? { template: edit.template, construction: edit.construction, verts: edit.verts, editingId: edit.editingId, editingJob: edit.editingJob } : null,
   };
 }
 function saveSession() {
@@ -6761,8 +6796,16 @@ async function restoreSession() {
       const verts = (s.edit.verts || []).filter((v) => Array.isArray(v) && v.length >= 2 && v.every(Number.isFinite));
       if (verts.length) {
         edit.verts = verts.map((v) => [v[0], v[1]]); edit.sel = edit.verts.length - 1; edit.editingId = s.edit.editingId || null;
+        // The draft's job; a session saved before this was recorded counts the selected job only
+        // when the draft is among its drafts, else the link is dropped (never guessed).
+        edit.editingJob = s.edit.editingJob || null;
+        if (edit.editingId && !edit.editingJob) {
+          const here = state.job && state.drafts.features.some((f) => String(f.properties.id) === String(edit.editingId));
+          if (here) edit.editingJob = { id: state.job.id, reference: state.job.reference }; else edit.editingId = null;
+        }
+        releaseMissingDraft(); // the draft may have been committed or deleted while the page was away
         afterVertexChange();
-        notes.push(`unfinished sketch (${verts.length} vertices)`);
+        notes.push(`unfinished sketch (${verts.length} vertices)` + (editingOtherJob() ? `, editing a draft of ${edit.editingJob.reference}: select that job to save it` : ""));
       }
     });
     else if (SESSION_TOOLS.includes(s.tool)) setTool(s.tool);
