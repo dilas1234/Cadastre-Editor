@@ -106,15 +106,24 @@ fn list(u: &[String]) -> String {
 }
 
 /// Run every check for job instance `id`, on `vertices` (a sketch) or on the job's draft parcels.
-pub async fn run(state: &AppState, id: i32, vertices: &[[f64; 2]], editing_id: Option<uuid::Uuid>) -> ApiResult<PrecheckReport> {
+/// With no job (the Checking and Data Verification unit's check-only mode) only the land is
+/// checked: overlaps, drop point, title on the overlapped land and gaps; there is no Registry
+/// transaction or property, and nothing of a job is left out.
+pub async fn run(state: &AppState, id: Option<i32>, vertices: &[[f64; 2]], editing_id: Option<uuid::Uuid>) -> ApiResult<PrecheckReport> {
     let mut conn = state.pool.acquire().await?;
-    let job: Option<(Option<uuid::Uuid>, Option<String>)> =
-        sqlx::query_as("SELECT cadastre_job_id, lrs_transaction_number FROM cadastre.wf_job_instance WHERE id = $1")
-            .bind(id).fetch_optional(&mut *conn).await?;
-    let (cadastre_job, txn) = job.ok_or_else(|| AppError::NotFound(format!("job instance {id}")))?;
-    let property_number: Option<String> = sqlx::query_scalar("SELECT property_number FROM cadastre.wf_job_linkage WHERE wf_job_instance_id = $1")
-        .bind(id).fetch_optional(&mut *conn).await?.flatten();
-    let mut mutated = crate::routes::mutations::pending_parents(&mut conn, id).await?;
+    let (cadastre_job, txn, property_number, mut mutated) = match id {
+        Some(id) => {
+            let job: Option<(Option<uuid::Uuid>, Option<String>)> =
+                sqlx::query_as("SELECT cadastre_job_id, lrs_transaction_number FROM cadastre.wf_job_instance WHERE id = $1")
+                    .bind(id).fetch_optional(&mut *conn).await?;
+            let (cadastre_job, txn) = job.ok_or_else(|| AppError::NotFound(format!("job instance {id}")))?;
+            let property_number: Option<String> = sqlx::query_scalar("SELECT property_number FROM cadastre.wf_job_linkage WHERE wf_job_instance_id = $1")
+                .bind(id).fetch_optional(&mut *conn).await?.flatten();
+            let mutated = crate::routes::mutations::pending_parents(&mut conn, id).await?;
+            (cadastre_job, txn, property_number, mutated)
+        }
+        None => (None, None, None, Vec::new()),
+    };
     // Corrections (drafts carrying their UPIN): the parcel's own committed shape, here and in
     // Aumentum, and its own Registry property are not counted against it.
     let (corrected, only_corrections) = match cadastre_job {
@@ -306,10 +315,14 @@ pub async fn run(state: &AppState, id: i32, vertices: &[[f64; 2]], editing_id: O
         item("title", "Title on the land", "fail", format!("A title already exists: {}.", title_fail.join("; ")), title_upins)
     } else if let Some(w) = title_warn {
         item("title", "Title on the land", "warn", format!("No title found on the land, but {}", w.to_lowercase()), vec![])
+    } else if id.is_none() {
+        item("title", "Title on the land", "pass", "No title exists on the land this boundary overlaps.", vec![])
     } else {
         item("title", "Title on the land", "pass", "No title exists on this land, and the Registry property holds no UPIN.", vec![])
     });
-    items.push(txn_item);
+    if id.is_some() {
+        items.push(txn_item);
+    }
 
     // 5. Near misses: tiny gaps to committed neighbours.
     let near: Vec<(String, f64)> = sqlx::query_as(&format!(
@@ -339,7 +352,7 @@ pub fn failures(r: &PrecheckReport) -> String {
 #[utoipa::path(post, path = "/api/v1/wf/jobs/{id}/precheck", tag = "wf", params(("id" = i32, Path, description = "Job instance id")),
     request_body = PrecheckRequest, responses((status = 200, body = PrecheckReport)))]
 pub async fn precheck(State(state): State<AppState>, user: AuthUser, Path(id): Path<i32>, Json(req): Json<PrecheckRequest>) -> ApiResult<Json<PrecheckReport>> {
-    let report = run(&state, id, &req.vertices, req.editing_id).await?;
+    let report = run(&state, Some(id), &req.vertices, req.editing_id).await?;
     if let Some(reason) = req.acknowledge.as_deref().map(str::trim).filter(|r| !r.is_empty()) {
         if !report.ok {
             return Err(AppError::Conflict(format!("The system check failed; this cannot be overridden. {}", failures(&report))));

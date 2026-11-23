@@ -196,9 +196,11 @@ const VIEWS = {
   digitising: { label: "Digitising", path: "/digitising", features: ["digitise", "edit", "workflow", "registry", "tasks", "completed"], panel: "workflow" },
   titledeed: { label: "Title Deed", path: "/title-deed", features: ["titledeed", "workflow", "registry", "completed"], panel: "queue" },
   reporting: { label: "Charting and Reporting", path: "/reporting", features: ["completed", "reports", "charting"], panel: "charting" },
+  verification: { label: "Checking and Data Verification", path: "/verification", features: ["edit", "verify"], panel: "verify" },
 };
-const VIEW_FOR = { digitise: "Digitising", edit: "Digitising", titledeed: "Title Deed", admin: "Sysadmin", reports: "Charting and Reporting" };
-// The view comes from the address each unit is given: /digitising, /title-deed, /reporting, and
+const VIEW_FOR = { digitise: "Digitising", edit: "Digitising", titledeed: "Title Deed", admin: "Sysadmin", reports: "Charting and Reporting", verify: "Checking and Data Verification" };
+// The view comes from the address each unit is given: /digitising, /title-deed, /reporting,
+// /verification, and
 // /sys-editor for the system administrator.
 const currentView = (() => {
   const path = location.pathname.replace(/\/+$/, "");
@@ -206,6 +208,8 @@ const currentView = (() => {
 })();
 const viewDef = VIEWS[currentView];
 const can = (feature) => !!viewDef.all || (viewDef.features || []).includes(feature);
+// Checking and Data Verification: a finished boundary is checked, never saved.
+const VERIFY = currentView === "verification";
 let adminTab = false; try { adminTab = currentView === "sysadmin" || sessionStorage.getItem("cad.adminSwitch") === "1"; } catch { /* storage */ }
 function switchView(v) {
   if (!VIEWS[v]) return;
@@ -416,6 +420,7 @@ map.once("style.load", async () => {
       else if (viewDef.panel === "queue") { done.source = "queue"; await openCompleted(); }
       else if (viewDef.panel === "charting") { done.source = "charting"; await openCompleted(); }
       else if (viewDef.panel === "completed") await openCompleted();
+      else if (viewDef.panel === "verify") openVerification();
     } catch (e) { console.warn("view panel", e); }
   }
   pushHistory();
@@ -2123,7 +2128,7 @@ function openImportDialog() {
   const attrFile = h("input", { type: "file", accept: ".csv,.tsv,.txt,.psv", disabled: true });
   const keyColumn = h("input", { type: "text", placeholder: "auto (e.g. Point)", style: "width:130px", disabled: true });
   const out = h("div", { class: "muted" }, "Choose a file to preview. DXF must be saved as ASCII; drawing units and CRS are not reprojected.");
-  const apply = h("button", { class: "btn", disabled: true }, "Import into job");
+  const apply = h("button", { class: VERIFY ? "btn hidden" : "btn", disabled: true }, "Import into job");
   let current = null;
 
   join.onchange = () => {
@@ -2154,9 +2159,10 @@ function openImportDialog() {
           current = { name: f.name, contents: f.text, crs: crs.value.trim() || null, attributes: null, key_column: null };
           out.innerHTML = ""; out.append(importSummary(result, f.name));
           if (result.kind === "raster") current = null;
+          if (VERIFY && current) out.prepend(verifyImportChoices(result));
         }
         apply.disabled = !(current && state.job);
-        if (current && !state.job) out.append(h("p", { class: "muted" }, "Pick a Job Area to import these features as drafts."));
+        if (current && !state.job && !VERIFY) out.append(h("p", { class: "muted" }, "Pick a Job Area to import these features as drafts."));
       } catch (e) { out.textContent = "Import preview failed: " + e.message; }
     },
   }, "Preview");
@@ -2594,6 +2600,7 @@ function canFinishSketch() { const n = edit.verts.length; return edit.splitMode 
 async function finishSketch() {
   if (!canFinishSketch()) { status(`Add ${edit.geomType === "polygon" ? "at least 3" : edit.geomType === "line" ? "at least 2" : "a"} vertex(es) before finishing.`); return; }
   if (edit.splitMode) { await mutationSplit(); return; }
+  if (VERIFY) { await verifySketch(); return; }
   if (edit.geomType === "polygon" && edit.template === "jobArea") await saveSketchJobArea();
   else if (edit.geomType === "polygon") await saveSketchParcel();
   else if (edit.geomType === "point") await saveSketchPoint();
@@ -3335,6 +3342,92 @@ async function verifyPoints(utm) {
   return true;
 }
 
+// --- Checking and Data Verification (docs/checking-and-data-verification.md) ---
+// The unit checks a surveyor's boundary (from the CAD file or coordinate list, or sketched) before
+// any Digitising job exists: overlaps here and in Aumentum, the drop point, a title on the land and
+// gaps to neighbours. Check-only: nothing is saved, the boundary stays to be adjusted and checked again.
+const verify = { report: null, key: "", corners: 0, area: null, source: "" };
+const ringKey = (v) => v.map(([e, n]) => `${e.toFixed(3)},${n.toFixed(3)}`).join(";");
+function openVerification() {
+  const body = h("div", { id: "verifyBody" });
+  floatWindow("Checking and Data Verification", body, { id: "verifyWin", width: 470 });
+  renderVerification();
+}
+function refreshVerification() { if ($("verifyWin")) renderVerification(); }
+function verifyDraw() {
+  selectTemplate("parcel");
+  if (!edit.active) startEditing("sketch"); else setTool("sketch");
+  status("Click the boundary's corners on the map, or type / paste them in Edit Sketch Properties; then Check Boundary.");
+}
+function verifyClear() { clearSketch(); verify.report = null; verify.key = ""; verify.source = ""; refreshSketchProps(); updateEditorButtons(); }
+function renderVerification() {
+  const body = $("verifyBody"); if (!body) return;
+  body.innerHTML = "";
+  const n = edit.geomType === "polygon" ? edit.verts.length : 0;
+  body.append(
+    h("p", { class: "muted", style: "margin-top:0" }, "Check a surveyor's boundary before it goes to Digitising. Nothing is saved here."),
+    h("div", { class: "frow" },
+      h("button", { class: "btn", title: "Read the surveyor's CAD file (DXF) or coordinate list", onclick: openImportDialog }, "Import CAD / coordinates…"),
+      h("button", { class: "btn", title: "Sketch the boundary on the map, or type its corners", onclick: verifyDraw }, "Draw boundary")),
+    h("div", { class: "frow" },
+      h("button", { class: "btn btnPrimary", disabled: n < 3, onclick: verifySketch }, "Check boundary"),
+      h("button", { class: "btn", disabled: !edit.verts.length && !verify.report, onclick: verifyClear }, "Clear")),
+    h("p", { class: "muted" }, n >= 3 ? `Boundary: ${n} corners, ${area2(sketchAreaM2())} m²${verify.source ? ` (from ${verify.source})` : ""}.` : "No boundary yet: import one or draw it."));
+  const r = verify.report;
+  if (!r) return;
+  const fails = r.items.filter((i) => i.result === "fail").length;
+  const verdict = !r.ok ? `Failed (${fails} problem${fails > 1 ? "s" : ""})` : r.warnings ? "Passed with warnings" : "Passed";
+  const when = new Date(r.checked_at).toLocaleString();
+  body.append(
+    h("p", { style: "margin:8px 0 4px" }, h("b", {}, `Result: ${verdict}`), h("span", { class: "muted" }, ` — ${verify.corners} corners, ${area2(verify.area)} m², checked ${when}`)),
+    precheckTable(r));
+  if (verify.key !== ringKey(edit.verts)) body.insertBefore(h("p", { class: "verifyStale" }, "The boundary has changed since this check: check it again."), body.lastChild);
+}
+async function verifySketch() {
+  if (edit.geomType !== "polygon" || edit.verts.length < 3) { uiAlert("Import or draw a boundary of at least 3 corners first."); return; }
+  const utm = edit.verts.slice();
+  status("Checking the boundary: overlaps here and in Aumentum, drop point, title on the land, gaps to neighbours…");
+  const wait = h("div", { class: "toast" }, "Checking the boundary…"); document.body.append(wait);
+  let report;
+  try { report = await api("/api/v1/verification/check", { method: "POST", body: { vertices: utm } }); }
+  catch (e) { await uiAlert("The check could not run: " + e.message + "\nThe boundary is kept; try again."); return; }
+  finally { wait.remove(); }
+  Object.assign(verify, { report, key: ringKey(utm), corners: utm.length, area: sketchAreaM2() });
+  if (!$("verifyWin")) openVerification(); else renderVerification();
+  if (!report.ok) notify("The boundary failed the check: see Checking and Data Verification. Adjust it and check again.", "warn");
+  else if (report.warnings) notify("The boundary passed with warnings: see Checking and Data Verification.", "warn");
+  else notify("The boundary passed: no overlap, the plot is free, no title on the land, no small gaps.");
+}
+// Import → check: the file's closed boundaries, or its points in file order, become the sketch.
+function verifyLoadRing(ring, source) {
+  const v = ring.map((p) => [Math.round(p.x * 1000) / 1000, Math.round(p.y * 1000) / 1000]);
+  if (v.length > 1 && v[0][0] === v[v.length - 1][0] && v[0][1] === v[v.length - 1][1]) v.pop();
+  if (v.length < 3) { uiAlert("That boundary has fewer than 3 corners."); return; }
+  selectTemplate("parcel");
+  if (!edit.active) startEditing("editVertex");
+  edit.verts = v; edit.sel = -1; edit.editingId = null; edit.editingJob = null;
+  verify.report = null; verify.source = source;
+  afterVertexChange(); showSketchExtent(true);
+  if (!$("verifyWin")) openVerification();
+  verifySketch();
+}
+function verifyImportChoices(result) {
+  const box = h("div", { style: "margin-bottom:8px;padding:6px;border:1px solid #9cc;background:#f3fbfb" }, h("b", {}, "Check a boundary from this file"));
+  const rings = (result.boundaries || []).filter((b) => (b.ring || []).length >= 3);
+  for (const b of rings.slice(0, 30)) {
+    box.append(h("div", { class: "frow" },
+      h("button", { class: "btn", onclick: () => verifyLoadRing(b.ring, `${b.id} (${b.kind})`) }, "Check"),
+      h("span", {}, `${b.id} (${b.kind}) — ${b.ring.length} vertices${b.closed ? "" : ", open"}`)));
+  }
+  const pts = result.points || [];
+  if (pts.length >= 3) box.append(h("div", { class: "frow" },
+    h("button", { class: "btn", onclick: () => verifyLoadRing(pts.map((p) => p.point), `${pts.length} points in file order`) }, "Check"),
+    h("span", {}, `The ${pts.length} points as one boundary, in file order`)));
+  if (!rings.length && pts.length < 3) box.append(h("p", { class: "muted" }, "No closed boundary or coordinate list of 3 or more points in this file."));
+  else box.append(h("p", { class: "muted", style: "margin:4px 0 0" }, "Coordinates are taken as UTM 32N metres (EPSG:32632), as drawn."));
+  return box;
+}
+
 // --- System check (before the next stage, and again at commit on the server) ---
 // Overlaps here and in Aumentum, the drop point (is the plot free?), a title on the land, and the
 // Registry transaction. A failure sends the digitiser back to the sketch; warnings need a reason,
@@ -3480,12 +3573,12 @@ function openSketchProps() {
     h("div", { style: "max-height:260px;overflow:auto" }, tbl),
     entryToggle, entry,
     h("div", { class: "taskNav" },
-      h("button", { class: "btn", disabled: !canFinishSketch(), onclick: finishSketch }, edit.editingId ? "Save Changes" : "Finish Sketch"),
+      h("button", { class: "btn", disabled: !canFinishSketch(), onclick: finishSketch }, VERIFY ? "Check Boundary" : edit.editingId ? "Save Changes" : "Finish Sketch"),
       h("button", { class: "btn", disabled: !edit.verts.length, onclick: deleteSketch }, edit.editingId ? "Cancel Edit" : "Delete Sketch"),
       edit.editingId ? h("button", { class: "btn", onclick: deleteDraftBeingEdited }, "Delete Parcel") : null));
   floatWindow("Edit Sketch Properties", body, { id: "sketchPropsWin", width: 430 });
 }
-function refreshSketchProps() { if ($("sketchPropsWin")) openSketchProps(); }
+function refreshSketchProps() { if ($("sketchPropsWin")) openSketchProps(); if (VERIFY) refreshVerification(); }
 async function deleteDraftBeingEdited() {
   if (!edit.editingId || !state.job) return;
   if (editingOtherJob()) { uiAlert(`This draft parcel belongs to ${edit.editingJob.reference}: select that job to delete it.`); return; }

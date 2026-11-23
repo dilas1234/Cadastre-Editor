@@ -31,6 +31,7 @@ pub mod sessions;
 pub mod survey;
 pub mod survey_tools;
 pub mod tolerances;
+pub mod verification;
 pub mod viewer;
 pub mod wf;
 pub mod wfadmin;
@@ -71,6 +72,7 @@ pub fn router(state: AppState) -> Router {
         .route("/digitising", get(editor::index))
         .route("/title-deed", get(editor::index))
         .route("/reporting", get(editor::index))
+        .route("/verification", get(editor::index))
         .route("/editor/{*path}", get(editor::asset))
         .route("/api/v1/me", get(me::me))
         .route("/api/v1/auth/config", get(me::auth_config))
@@ -85,6 +87,7 @@ pub fn router(state: AppState) -> Router {
         .route("/api/v1/wf/jobs/{id}/editing", get(wf::get_editing).post(wf::start_editing))
         .route("/api/v1/wf/jobs/{id}/editing/corners", get(wfbeacons::corners))
         .route("/api/v1/wf/jobs/{id}/precheck", post(precheck::precheck))
+        .route("/api/v1/verification/check", post(verification::check))
         .route("/api/v1/wf/completed", get(completed::list))
         .route("/api/v1/wf/jobs/{id}/correct", post(completed::correct))
         .route("/api/v1/wf/jobs/{id}/registry/withdraw-plan", post(registry::withdraw_plan))

@@ -2573,6 +2573,60 @@ async fn a_shared_boundary_drawn_a_little_differently_is_not_an_overlap() {
     assert_eq!(fabric(&r)["result"], "fail", "{r}");
 }
 
+/// The Checking and Data Verification unit's check-only mode: a boundary is checked against the
+/// land with no job, nothing is saved, and the job-only Registry transaction check is left out.
+#[tokio::test]
+async fn verification_checks_a_boundary_without_a_job_and_saves_nothing() {
+    let Some(db_url) = test_db_url() else {
+        eprintln!("skipping: CADASTRE_TEST_DATABASE_URL not set");
+        return;
+    };
+    let app = routes::router(state_with(AuthMode::Disabled, None, &db_url).await);
+    let pool = sqlx::PgPool::connect(&db_url).await.unwrap();
+    sqlx::query("UPDATE cadastre.app_setting SET value = '0.05' WHERE key = 'editor.overlap_min_width_m'").execute(&pool).await.unwrap();
+
+    // A committed 20 m square, somewhere no other test draws.
+    let b = 200_000 + (rand_12() % 700_000) as i32 * 10 + 9;
+    let x0 = 150_000.0 + ((b / 10) % 60_000) as f64 * 10.0;
+    let y0 = 9_300_000.0;
+    let (_, job) = send(&app, "POST", "/api/v1/jobs", None, Some(json!({"reference": format!("VER-{b}"), "job_type": "capture"}))).await;
+    let job_id = job["id"].as_str().unwrap().to_string();
+    let (st, p) = send(&app, "POST", &format!("/api/v1/jobs/{job_id}/parcels"), None, Some(json!({"geometry": square(x0, y0, 20.0)}))).await;
+    assert_eq!(st, StatusCode::CREATED, "{p}");
+    for action in ["submit", "start_review", "approve"] {
+        send(&app, "POST", &format!("/api/v1/jobs/{job_id}/transition"), None, Some(json!({ "action": action }))).await;
+    }
+    let (st, r) = send(&app, "POST", &format!("/api/v1/jobs/{job_id}/post"), None, None).await;
+    assert_eq!(st, StatusCode::OK, "{r}");
+    let neighbour = r["parcel_numbers"][0].as_str().unwrap().to_string();
+
+    let east = |into: f64| { let x = x0 + 20.0 - into; vec![[x, y0], [x + 20.0, y0], [x + 20.0, y0 + 20.0], [x, y0 + 20.0]] };
+    let check = |v: Vec<[f64; 2]>| send(&app, "POST", "/api/v1/verification/check", None, Some(json!({"vertices": v})));
+    let find = |r: &Value, c: &str| r["items"].as_array().unwrap().iter().find(|i| i["check"] == c).cloned();
+    let parcels_here = || sqlx::query_scalar::<_, i64>("SELECT count(*) FROM cadastre.parcel WHERE geom && ST_MakeEnvelope($1, $2, $3, $4, 32632)")
+        .bind(x0 - 5.0).bind(y0 - 5.0).bind(x0 + 50.0).bind(y0 + 25.0).fetch_one(&pool);
+    let before = parcels_here().await.unwrap();
+
+    // 1 m into the neighbour: the overlap fails and names it.
+    let (st, r) = check(east(1.0)).await;
+    assert_eq!(st, StatusCode::OK, "{r}");
+    assert_eq!(r["ok"], json!(false), "{r}");
+    let f = find(&r, "fabric_overlap").unwrap();
+    assert_eq!(f["result"], "fail", "{r}");
+    assert_eq!(f["upins"], json!([neighbour]), "{f}");
+    assert!(find(&r, "transaction").is_none(), "no job, so no Registry transaction check: {r}");
+    assert!(find(&r, "title").is_some() && find(&r, "drop_point").is_some() && find(&r, "near_miss").is_some(), "{r}");
+
+    // Sharing the neighbour's east side exactly: no overlap.
+    let (_, r) = check(east(0.0)).await;
+    assert_eq!(find(&r, "fabric_overlap").unwrap()["result"], "pass", "{r}");
+
+    // Fewer than 3 corners is refused; nothing was saved by any check.
+    let (st, _) = check(vec![[x0, y0], [x0 + 1.0, y0]]).await;
+    assert_eq!(st, StatusCode::BAD_REQUEST);
+    assert_eq!(parcels_here().await.unwrap(), before, "a check saves nothing");
+}
+
 /// A parcel's exterior ring as vertices (UTM), without the closing repeat.
 async fn pts_of(pool: &sqlx::PgPool, id: &str) -> Vec<[f64; 2]> {
     let pts: Vec<(f64, f64)> = sqlx::query_as("SELECT ST_X(d.geom), ST_Y(d.geom) FROM cadastre.parcel p, ST_DumpPoints(ST_ExteriorRing(ST_GeometryN(ST_Multi(p.geom), 1))) d WHERE p.id = $1::uuid ORDER BY d.path")

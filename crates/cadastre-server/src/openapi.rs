@@ -28,7 +28,7 @@ use crate::routes::{
         crate::routes::wf::get_job, crate::routes::wf::create_job, crate::routes::wf::advance,
         crate::routes::wf::assign, crate::routes::wf::hold,
         crate::routes::wf::get_editing, crate::routes::wf::start_editing, crate::routes::wf::put_area, crate::routes::wf::area_action,
-        crate::routes::wf::delete_area, crate::routes::wf::discard, crate::routes::wf::commit, crate::routes::wfbeacons::corners, crate::routes::wfbeacons::identify, crate::routes::precheck::precheck, crate::routes::wf::add_principal, crate::routes::completed::list, crate::routes::completed::correct, crate::routes::registry::withdraw_plan, crate::routes::registry::link_problems, crate::routes::registry::title_deed_queue, crate::routes::registry::file_history, crate::routes::registry::link_job, crate::routes::parcels::parcel_metadata, crate::routes::parcels::sketch_overlaps, crate::routes::parcels::parcel_points, crate::routes::precheck::confirm, crate::routes::precheck::last_confirmation, crate::routes::wf::finish, crate::routes::wf::end_job,
+        crate::routes::wf::delete_area, crate::routes::wf::discard, crate::routes::wf::commit, crate::routes::wfbeacons::corners, crate::routes::wfbeacons::identify, crate::routes::precheck::precheck, crate::routes::verification::check, crate::routes::wf::add_principal, crate::routes::completed::list, crate::routes::completed::correct, crate::routes::registry::withdraw_plan, crate::routes::registry::link_problems, crate::routes::registry::title_deed_queue, crate::routes::registry::file_history, crate::routes::registry::link_job, crate::routes::parcels::parcel_metadata, crate::routes::parcels::sketch_overlaps, crate::routes::parcels::parcel_points, crate::routes::precheck::confirm, crate::routes::precheck::last_confirmation, crate::routes::wf::finish, crate::routes::wf::end_job,
         crate::routes::wf::get_linkage, crate::routes::wf::put_linkage, crate::routes::wf::next_upin, crate::routes::titledeed::get_plan, crate::routes::titledeed::put_plan, crate::routes::titledeed::attach_pdf, crate::routes::titledeed::svg, crate::routes::titledeed::preview,
         crate::routes::wfadmin::list_files, crate::routes::wfadmin::get_file, crate::routes::wfadmin::upload_file,
         crate::routes::wfadmin::productivity, crate::routes::wfadmin::notifications, crate::routes::wfadmin::security,
@@ -156,6 +156,7 @@ use crate::routes::{
         (name = "audit", description = "Hash-chained audit log (NFR-07/11)"),
         (name = "output", description = "PDF job reports and site plans (FR-OUT-*)"),
         (name = "import", description = "Promote staged Aumentum imports into the live fabric"),
+        (name = "verification", description = "Checking and Data Verification unit: check a boundary without a job, saving nothing"),
     )
 )]
 pub struct ApiDoc;

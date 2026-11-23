@@ -1144,7 +1144,7 @@ pub async fn commit(State(state): State<AppState>, user: AuthUser, Path(id): Pat
     let actor = resolve_actor(&state, &user).await?;
     // The system check again at commit (overlaps here and in Aumentum, drop point, title, transaction):
     // the land may have been taken since the sketch was checked.
-    let check = crate::routes::precheck::run(&state, id, &[], None).await?;
+    let check = crate::routes::precheck::run(&state, Some(id), &[], None).await?;
     if !check.ok {
         return Err(AppError::Conflict(format!("System check failed, nothing was committed. {}", crate::routes::precheck::failures(&check))));
     }
@@ -1337,7 +1337,7 @@ pub async fn finish(State(state): State<AppState>, user: AuthUser, Path(id): Pat
     let actor = resolve_actor(&state, &user).await?;
     let complete = req.complete.unwrap_or(true);
     // Post & Finish commits too: the same system check first.
-    let check = crate::routes::precheck::run(&state, id, &[], None).await?;
+    let check = crate::routes::precheck::run(&state, Some(id), &[], None).await?;
     if !check.ok {
         return Err(AppError::Conflict(format!("System check failed, nothing was committed. {}", crate::routes::precheck::failures(&check))));
     }

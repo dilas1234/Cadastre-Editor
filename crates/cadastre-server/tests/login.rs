@@ -113,6 +113,7 @@ async fn sign_in_follows_the_groups() {
     assert_eq!(call(&app, "POST", "/api/v1/auth/change-password", Some(&c), Some(change(&temp[&staff], "Plateau2026"))).await.status, StatusCode::OK);
     assert_eq!(call(&app, "GET", "/digitising", Some(&c), None).await.status, StatusCode::OK);
     assert_eq!(call(&app, "GET", "/title-deed", Some(&c), None).await.status, StatusCode::OK);
+    assert_eq!(call(&app, "GET", "/verification", Some(&c), None).await.status, StatusCode::OK);
     assert_eq!(call(&app, "GET", "/sys-editor", Some(&c), None).await.location, "/login?denied=1");
     assert_eq!(call(&app, "GET", "/api/v1/admin/security", Some(&c), None).await.status, StatusCode::FORBIDDEN);
     assert_eq!(call(&app, "GET", "/api/v1/audit", Some(&c), None).await.status, StatusCode::FORBIDDEN);
@@ -131,12 +132,14 @@ async fn sign_in_follows_the_groups() {
     assert_eq!(call(&app, "POST", "/api/v1/auth/change-password", Some(&c), Some(change(&temp[&other], "Plateau2026"))).await.status, StatusCode::OK);
     assert_eq!(call(&app, "GET", "/reporting", Some(&c), None).await.status, StatusCode::OK);
     assert_eq!(call(&app, "GET", "/digitising", Some(&c), None).await.location, "/login?denied=1");
+    assert_eq!(call(&app, "GET", "/verification", Some(&c), None).await.location, "/login?denied=1");
     assert_eq!(call(&app, "POST", "/api/v1/jobs", Some(&c), Some(json!({}))).await.status, StatusCode::FORBIDDEN);
+    assert_eq!(sign_in(&app, &other, "Plateau2026", "verification").await.status, StatusCode::FORBIDDEN);
 
     // Administrators reach everything.
     let c = sign_in(&app, &admin, &temp[&admin], "sysadmin").await.cookie.unwrap();
     assert_eq!(call(&app, "POST", "/api/v1/auth/change-password", Some(&c), Some(change(&temp[&admin], "Plateau2026"))).await.status, StatusCode::OK);
-    for page in ["/sys-editor", "/digitising", "/title-deed", "/reporting"] {
+    for page in ["/sys-editor", "/digitising", "/title-deed", "/reporting", "/verification"] {
         assert_eq!(call(&app, "GET", page, Some(&c), None).await.status, StatusCode::OK, "{page}");
     }
     assert_eq!(call(&app, "GET", "/api/v1/admin/security", Some(&c), None).await.status, StatusCode::OK);
