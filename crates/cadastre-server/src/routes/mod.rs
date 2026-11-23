@@ -219,6 +219,7 @@ pub fn router(state: AppState) -> Router {
         // Survey/CAD/attribute/world-file import (preview then apply to a job)
         .route("/api/v1/import/preview", post(import::preview))
         .route("/api/v1/import/attributes", post(import::attributes))
+        .route("/api/v1/import/cad", post(import::cad).layer(axum::extract::DefaultBodyLimit::max(cadastre_import::conversion::MAX_IMPORT_BYTES)))
         .route("/api/v1/jobs/{id}/import", post(import::import_into_job))
         .route("/api/v1/jobs/{id}/import/feature-class", post(fci::import_feature_class))
         // Edit sessions and locks

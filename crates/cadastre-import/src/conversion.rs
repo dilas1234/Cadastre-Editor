@@ -247,7 +247,10 @@ fn survey_from_coordinates(
 }
 
 fn survey_from_dxf(contents: &str) -> Result<ImportedSurvey, ImportError> {
-    let drawing = dxf::parse(contents)?;
+    Ok(survey_from_drawing(dxf::parse(contents)?))
+}
+
+fn survey_from_drawing(drawing: dxf::DxfDrawing) -> ImportedSurvey {
     let mut survey = ImportedSurvey {
         format: Some(ImportFormat::Dxf),
         warnings: drawing.warnings,
@@ -317,7 +320,7 @@ fn survey_from_dxf(contents: &str) -> Result<ImportedSurvey, ImportError> {
             stated_area: Some(std::f64::consts::PI * circle.radius * circle.radius),
         });
     }
-    Ok(survey)
+    survey
 }
 
 fn survey_from_landxml(contents: &str) -> Result<ImportedSurvey, ImportError> {
@@ -386,6 +389,19 @@ pub fn import_text(
         survey.crs = crs.map(str::to_string);
     }
     Ok(ImportResult::Survey(survey))
+}
+
+/// Import a file from its bytes: binary DXF is read here, anything else as text ([`import_text`]).
+pub fn import_bytes(filename: &str, bytes: &[u8], crs: Option<&str>) -> Result<ImportResult, ImportError> {
+    if bytes.len() > MAX_IMPORT_BYTES {
+        return Err(ImportError::TooLarge { size: bytes.len(), limit: MAX_IMPORT_BYTES });
+    }
+    if bytes.starts_with(dxf::BINARY_SENTINEL) {
+        let mut survey = survey_from_drawing(dxf::parse_bytes(bytes)?);
+        survey.crs = crs.map(str::to_string);
+        return Ok(ImportResult::Survey(survey));
+    }
+    import_text(filename, &String::from_utf8_lossy(bytes), crs)
 }
 
 /// Import a coordinate list and join a separately supplied attribute table onto it.

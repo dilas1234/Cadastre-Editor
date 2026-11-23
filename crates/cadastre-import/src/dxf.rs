@@ -7,8 +7,8 @@
 //! CAD first.
 //!
 //! Supported entities: `POINT`, `LINE`, `LWPOLYLINE`, `POLYLINE`/`VERTEX`/`SEQEND`, `CIRCLE`,
-//! `ARC` and the insertion point of `TEXT`/`MTEXT`/`INSERT`. Binary DXF is rejected with a clear
-//! message rather than misparsed.
+//! `ARC` and the insertion point of `TEXT`/`MTEXT`/`INSERT`. [`parse`] reads ASCII DXF and rejects
+//! binary DXF with a clear message rather than misparsing it; [`parse_bytes`] reads both.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
@@ -147,6 +147,13 @@ pub enum DxfError {
     },
     /// The file ended in the middle of a group pair.
     Truncated,
+    /// A binary DXF group code this reader does not know the value type of.
+    BadBinary {
+        /// Byte offset of the group code.
+        offset: usize,
+        /// The group code.
+        code: i32,
+    },
 }
 
 impl fmt::Display for DxfError {
@@ -160,6 +167,9 @@ impl fmt::Display for DxfError {
                 write!(f, "DXF line {line} is not a group code: `{text}`")
             }
             DxfError::Truncated => write!(f, "DXF ended in the middle of a group pair"),
+            DxfError::BadBinary { offset, code } => {
+                write!(f, "binary DXF: unknown group code {code} at byte {offset}; save the drawing as ASCII DXF")
+            }
         }
     }
 }
@@ -311,9 +321,101 @@ fn entity_pairs(pairs: &[Pair]) -> &[Pair] {
     }
 }
 
+/// The first 22 bytes of every binary DXF file.
+pub const BINARY_SENTINEL: &[u8] = b"AutoCAD Binary DXF\r\n\x1a\0";
+
+/// The value type of a binary DXF group code (DXF Reference, "Group code value types").
+#[derive(Clone, Copy)]
+enum BinType {
+    Str,
+    F64,
+    I16,
+    I32,
+    I64,
+    Bool,
+    Chunk,
+}
+
+fn bin_type(code: i32) -> Option<BinType> {
+    use BinType::*;
+    Some(match code {
+        0..=9 | 100 | 102 | 105 | 300..=309 | 320..=369 | 390..=399 | 410..=419 | 430..=439 | 470..=481 | 999 => Str,
+        1000..=1003 | 1005..=1009 => Str,
+        10..=59 | 110..=149 | 210..=239 | 460..=469 | 1010..=1059 => F64,
+        60..=79 | 170..=179 | 270..=289 | 370..=389 | 400..=409 | 1060..=1070 => I16,
+        90..=99 | 420..=429 | 440..=459 | 1071 => I32,
+        160..=169 => I64,
+        290..=299 => Bool,
+        310..=319 | 1004 => Chunk,
+        _ => return None,
+    })
+}
+
+/// Decode binary DXF group pairs after the sentinel. `wide` group codes are 2 bytes (R13 and
+/// later); otherwise 1 byte, 255 escaping a 2-byte code (R12 and earlier).
+fn binary_pairs(b: &[u8], wide: bool) -> Result<Vec<Pair>, DxfError> {
+    let mut i = 0;
+    let mut pairs = Vec::new();
+    let take = |i: &mut usize, n: usize| -> Result<&[u8], DxfError> {
+        let s = b.get(*i..*i + n).ok_or(DxfError::Truncated)?;
+        *i += n;
+        Ok(s)
+    };
+    while i < b.len() {
+        let at = i;
+        let code = if wide {
+            let c = take(&mut i, 2)?;
+            i16::from_le_bytes([c[0], c[1]]) as i32
+        } else {
+            match take(&mut i, 1)?[0] {
+                255 => { let c = take(&mut i, 2)?; i16::from_le_bytes([c[0], c[1]]) as i32 }
+                c => c as i32,
+            }
+        };
+        let ty = bin_type(code).ok_or(DxfError::BadBinary { offset: at, code })?;
+        let value = match ty {
+            BinType::Str => {
+                let end = b[i..].iter().position(|&c| c == 0).ok_or(DxfError::Truncated)?;
+                let v = String::from_utf8_lossy(&b[i..i + end]).into_owned();
+                i += end + 1;
+                v
+            }
+            BinType::F64 => { let v = take(&mut i, 8)?; f64::from_le_bytes(v.try_into().unwrap()).to_string() }
+            BinType::I16 => { let v = take(&mut i, 2)?; i16::from_le_bytes([v[0], v[1]]).to_string() }
+            BinType::I32 => { let v = take(&mut i, 4)?; i32::from_le_bytes(v.try_into().unwrap()).to_string() }
+            BinType::I64 => { let v = take(&mut i, 8)?; i64::from_le_bytes(v.try_into().unwrap()).to_string() }
+            BinType::Bool => (take(&mut i, 1)?[0] != 0).then_some("1").unwrap_or("0").to_string(),
+            BinType::Chunk => {
+                let n = take(&mut i, 1)?[0] as usize;
+                take(&mut i, n)?.iter().map(|c| format!("{c:02X}")).collect()
+            }
+        };
+        let eof = code == 0 && value == "EOF";
+        pairs.push(Pair { code, value });
+        if eof {
+            break;
+        }
+    }
+    Ok(pairs)
+}
+
+/// Parse a DXF file from its bytes: binary DXF (R12 or later) or ASCII DXF.
+pub fn parse_bytes(bytes: &[u8]) -> Result<DxfDrawing, DxfError> {
+    match bytes.strip_prefix(BINARY_SENTINEL) {
+        Some(body) => {
+            let pairs = binary_pairs(body, true).or_else(|e| binary_pairs(body, false).map_err(|_| e))?;
+            Ok(build(pairs))
+        }
+        None => parse(&String::from_utf8_lossy(bytes)),
+    }
+}
+
 /// Parse an ASCII DXF document.
 pub fn parse(contents: &str) -> Result<DxfDrawing, DxfError> {
-    let pairs = parse_pairs(contents)?;
+    Ok(build(parse_pairs(contents)?))
+}
+
+fn build(pairs: Vec<Pair>) -> DxfDrawing {
     let entities = split_entities(entity_pairs(&pairs));
     let mut drawing = DxfDrawing::default();
     let mut layers = BTreeSet::new();
@@ -472,7 +574,7 @@ pub fn parse(contents: &str) -> Result<DxfDrawing, DxfError> {
             .push(format!("{count} unsupported `{kind}` entities ignored"));
     }
     drawing.layers = layers.into_iter().collect();
-    Ok(drawing)
+    drawing
 }
 
 #[cfg(test)]
@@ -603,6 +705,58 @@ mod tests {
             DxfError::Binary
         );
         assert!(matches!(parse("0\n").unwrap_err(), DxfError::Truncated));
+    }
+
+    /// Encode ASCII pairs as binary DXF (R13+ 2-byte codes, or R12 1-byte codes).
+    fn to_binary(ascii: &str, wide: bool) -> Vec<u8> {
+        let mut out = BINARY_SENTINEL.to_vec();
+        for p in parse_pairs(ascii).unwrap() {
+            if wide { out.extend((p.code as i16).to_le_bytes()); }
+            else if p.code < 255 { out.push(p.code as u8); }
+            else { out.push(255); out.extend((p.code as i16).to_le_bytes()); }
+            match bin_type(p.code).unwrap() {
+                BinType::Str => { out.extend(p.value.as_bytes()); out.push(0); }
+                BinType::F64 => out.extend(p.value.parse::<f64>().unwrap().to_le_bytes()),
+                BinType::I16 => out.extend(p.value.parse::<i16>().unwrap().to_le_bytes()),
+                BinType::I32 => out.extend(p.value.parse::<i32>().unwrap().to_le_bytes()),
+                _ => unreachable!(),
+            }
+        }
+        out
+    }
+
+    #[test]
+    fn reads_binary_dxf_like_ascii() {
+        let mut e = String::new();
+        e.push_str(&pair(0, "LWPOLYLINE"));
+        e.push_str(&pair(8, "PARCEL"));
+        e.push_str(&pair(90, "4"));
+        e.push_str(&pair(70, "1"));
+        for (x, y) in [(493000.125, 1083100.5), (493030.0, 1083100.5), (493030.0, 1083130.0), (493000.125, 1083130.0)] {
+            e.push_str(&pair(10, &x.to_string()));
+            e.push_str(&pair(20, &y.to_string()));
+        }
+        e.push_str(&pair(0, "TEXT"));
+        e.push_str(&pair(8, "BEACON_NO"));
+        e.push_str(&pair(10, "493000.125"));
+        e.push_str(&pair(20, "1083100.5"));
+        e.push_str(&pair(1, "PB 1234"));
+        let ascii = doc(&e);
+        let want = parse(&ascii).unwrap();
+        for wide in [true, false] {
+            let got = parse_bytes(&to_binary(&ascii, wide)).unwrap();
+            assert_eq!(got, want, "wide group codes: {wide}");
+        }
+        assert_eq!(want.closed_boundaries()[0].vertices[0], Point::new(493000.125, 1083100.5));
+        assert_eq!(parse_bytes(ascii.as_bytes()).unwrap(), want, "ASCII through parse_bytes");
+    }
+
+    #[test]
+    fn rejects_truncated_binary_dxf() {
+        let mut b = BINARY_SENTINEL.to_vec();
+        b.extend(10i16.to_le_bytes());
+        b.extend([0, 0, 0]);
+        assert!(parse_bytes(&b).is_err());
     }
 
     #[test]

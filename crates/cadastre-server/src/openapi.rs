@@ -70,6 +70,7 @@ use crate::routes::{
         survey_tools::execute_tool,
         import::preview,
         import::attributes,
+        import::cad,
         import::import_into_job,
         fci::import_feature_class,
         fabric::validate,

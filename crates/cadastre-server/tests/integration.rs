@@ -2633,3 +2633,95 @@ async fn pts_of(pool: &sqlx::PgPool, id: &str) -> Vec<[f64; 2]> {
         .bind(id).fetch_all(pool).await.unwrap();
     pts[..pts.len() - 1].iter().map(|(x, y)| [*x, *y]).collect()
 }
+
+/// POST a file's bytes, as the editor sends a drawing to /import/cad.
+async fn post_file(router: &Router, uri: &str, bytes: Vec<u8>) -> (StatusCode, Value) {
+    let req = Request::builder().method("POST").uri(uri).header(header::CONTENT_TYPE, "application/octet-stream").body(Body::from(bytes)).unwrap();
+    let resp = router.clone().oneshot(req).await.unwrap();
+    let status = resp.status();
+    let b = to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+    (status, serde_json::from_slice(&b).unwrap_or(Value::Null))
+}
+
+/// A DXF whose parcel is four loose LINEs (as survey drawings often are), a closed LWPOLYLINE on
+/// another layer, and a beacon label.
+fn survey_dxf_pairs() -> Vec<(i16, String)> {
+    let mut p: Vec<(i16, String)> = vec![(0, "SECTION".into()), (2, "ENTITIES".into())];
+    let (x, y) = (493_000.0, 1_083_100.0);
+    for ((x1, y1), (x2, y2)) in [((x, y), (x + 30.0, y)), ((x + 30.0, y), (x + 30.0, y + 30.0)), ((x + 30.0, y + 30.0), (x, y + 30.0)), ((x, y + 30.0), (x, y))] {
+        p.extend([(0, "LINE".into()), (8, "BOUNDARY".into()), (10, x1.to_string()), (20, y1.to_string()), (11, x2.to_string()), (21, y2.to_string())]);
+    }
+    p.extend([(0, "LWPOLYLINE".into()), (8, "BUILDING".into()), (90, "4".into()), (70, "1".into())]);
+    for (a, b) in [(5.0, 5.0), (15.0, 5.0), (15.0, 15.0), (5.0, 15.0)] {
+        p.extend([(10, (x + a).to_string()), (20, (y + b).to_string())]);
+    }
+    p.extend([(0, "TEXT".into()), (8, "BEACON_NO".into()), (10, x.to_string()), (20, y.to_string()), (1, "PB 1234".into())]);
+    p.extend([(0, "ENDSEC".into()), (0, "EOF".into())]);
+    p
+}
+fn ascii_dxf(pairs: &[(i16, String)]) -> Vec<u8> {
+    pairs.iter().map(|(c, v)| format!("{c}\n{v}\n")).collect::<String>().into_bytes()
+}
+fn binary_dxf(pairs: &[(i16, String)]) -> Vec<u8> {
+    let mut out = b"AutoCAD Binary DXF\r\n\x1a\0".to_vec();
+    for (c, v) in pairs {
+        out.extend(c.to_le_bytes());
+        match c {
+            10..=59 => out.extend(v.parse::<f64>().unwrap().to_le_bytes()),
+            60..=79 => out.extend(v.parse::<i16>().unwrap().to_le_bytes()),
+            90..=99 => out.extend(v.parse::<i32>().unwrap().to_le_bytes()),
+            _ => { out.extend(v.as_bytes()); out.push(0); }
+        }
+    }
+    out
+}
+
+/// Checking and Data Verification, CAD import: ASCII and binary DXF read alike, a parcel drawn as
+/// loose lines comes back as a closed ring, and a DWG goes through the ODA File Converter.
+#[tokio::test]
+async fn cad_import_reads_dxf_binary_dxf_and_dwg() {
+    let Some(db_url) = test_db_url() else {
+        eprintln!("skipping: CADASTRE_TEST_DATABASE_URL not set");
+        return;
+    };
+    let app = routes::router(state_with(AuthMode::Disabled, None, &db_url).await);
+    let pairs = survey_dxf_pairs();
+    let ring_of = |v: &Value| v["boundaries"].as_array().unwrap().iter().find(|b| b["id"].as_str().unwrap_or("").contains("(from lines)")).cloned();
+
+    let (st, a) = post_file(&app, "/api/v1/import/cad?filename=plan.dxf", ascii_dxf(&pairs)).await;
+    assert_eq!(st, StatusCode::OK, "{a}");
+    assert_eq!((a["source_format"].clone(), a["rings_from_lines"].clone()), (json!("DXF"), json!(1)), "{a}");
+    let ring = ring_of(&a).expect("the four lines make one ring");
+    assert_eq!((ring["kind"].clone(), ring["closed"].clone(), ring["ring"].as_array().unwrap().len()), (json!("BOUNDARY"), json!(true), 4), "{ring}");
+    assert!((ring["stated_area"].as_f64().unwrap() - 900.0).abs() < 0.01, "{ring}");
+    assert!(a["boundaries"].as_array().unwrap().iter().any(|b| b["kind"] == "BUILDING" && b["closed"] == true));
+    assert!(a["points"].as_array().unwrap().iter().any(|p| p["id"] == "PB 1234"));
+
+    let (st, b) = post_file(&app, "/api/v1/import/cad?filename=plan.dxf", binary_dxf(&pairs)).await;
+    assert_eq!(st, StatusCode::OK, "{b}");
+    assert_eq!(b["source_format"], json!("binary DXF"));
+    assert_eq!(b["boundaries"], a["boundaries"], "binary DXF reads as the ASCII one");
+
+    // A DWG: a stand-in converter writes the DXF the real one would.
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = std::env::temp_dir().join(format!("oda-it-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("plan.dxf"), ascii_dxf(&pairs)).unwrap();
+        let fake = dir.join("ODAFileConverter");
+        std::fs::write(&fake, format!("#!/bin/sh\ncp '{}' \"$2/DRAWING.dxf\"\n", dir.join("plan.dxf").display())).unwrap();
+        std::fs::set_permissions(&fake, std::fs::Permissions::from_mode(0o755)).unwrap();
+        std::env::set_var("CADASTRE_ODA_CONVERTER", &fake);
+        let (st, d) = post_file(&app, "/api/v1/import/cad?filename=PLAN.DWG", b"AC1032 not a real drawing".to_vec()).await;
+        let (st_bad, _) = post_file(&app, "/api/v1/import/cad?filename=plan.dwg", b"hello".to_vec()).await;
+        std::env::remove_var("CADASTRE_ODA_CONVERTER");
+        std::fs::remove_dir_all(&dir).unwrap();
+        assert_eq!(st, StatusCode::OK, "{d}");
+        assert_eq!((d["source_format"].clone(), d["rings_from_lines"].clone()), (json!("DWG"), json!(1)), "{d}");
+        assert_eq!(st_bad, StatusCode::BAD_REQUEST, "not a DWG");
+    }
+
+    let (st, _) = post_file(&app, "/api/v1/import/cad?filename=plan.pdf", b"%PDF".to_vec()).await;
+    assert_eq!(st, StatusCode::BAD_REQUEST);
+}
