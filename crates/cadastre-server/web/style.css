@@ -460,3 +460,13 @@ body.view-reporting #map { background: #f3f0e6; }
 /* Check Beacon Numbers */
 .beaconCard { margin-bottom: 8px; padding: 6px 8px; border: 1px solid #ccd; background: #f7f9fc; line-height: 1.5; }
 .beaconCard.warn { border-color: #e0b070; background: #fff8ec; }
+
+/* Layout View (Checking and Data Verification) */
+#mapFrame { position: relative; }
+#layoutPane { position: absolute; inset: 0 0 18px 0; z-index: 20; display: flex; flex-direction: column; background: #9a9a9a; }
+#layBar { display: flex; flex-wrap: wrap; gap: 4px 8px; align-items: center; padding: 5px 8px; background: var(--chrome); border-bottom: 1px solid #a0a0a0; }
+#layBar label { display: inline-flex; align-items: center; gap: 3px; }
+#layPages { flex: 1; overflow: auto; padding: 14px; touch-action: none; }
+.layPage { width: max-content; margin: 0 auto 14px; background: #fff; box-shadow: 0 2px 8px rgba(0,0,0,.45); }
+.layPage:first-child { cursor: grab; }
+.layPage svg { display: block; user-select: none; }

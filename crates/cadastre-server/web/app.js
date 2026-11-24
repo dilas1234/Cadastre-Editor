@@ -520,7 +520,7 @@ const MENUS = () => ({
     "-",
     { label: "Import Survey / CAD / Attributes…", icon: "addData", action: openImportDialog },
     "-",
-    { label: "Print…", kbd: "Ctrl+P", action: () => window.print() },
+    { label: "Print…", kbd: "Ctrl+P", action: () => (layoutOn() ? layoutPrint() : window.print()) },
     "-",
     { label: "Sign Out", action: () => authLogout(), disabled: () => !auth.cfg?.enabled && !auth.cfg?.local },
     { label: "Exit", disabled: true },
@@ -535,8 +535,8 @@ const MENUS = () => ({
     { label: "Unselect All Elements", action: () => { state.graphics.forEach((g) => (g.selected = false)); renderGraphics(); } },
   ],
   View: [
-    { label: "Data View", icon: "dataView", checked: true },
-    { label: "Layout View", icon: "layout", disabled: true },
+    { label: "Data View", icon: "dataView", checked: () => !layoutOn(), action: () => closeLayout() },
+    { label: "Layout View", icon: "layout", checked: () => layoutOn(), disabled: () => !VERIFY, action: () => openLayout() },
     "-",
     { label: "Zoom Data", sub: [
       { label: "Full Extent", icon: "fullExtent", action: fullExtent },
@@ -852,8 +852,8 @@ document.querySelectorAll("[data-pane-pin]").forEach((b) => { b.innerHTML = icon
 
 // --- map strip (data/layout view, refresh, pause drawing) ---
 $("stripButtons").append(
-  h("span", { class: "tb active", title: "Data View", html: icon("dataView") }),
-  h("span", { class: "tb disabled", title: "Layout View", html: icon("layout") }),
+  h("span", { class: "tb active", id: "dataViewBtn", title: "Data View", html: icon("dataView"), onclick: () => closeLayout() }),
+  h("span", { class: "tb" + (VERIFY ? "" : " disabled"), id: "layoutViewBtn", title: "Layout View", html: icon("layout"), onclick: () => VERIFY && openLayout() }),
   h("span", { class: "tb", title: "Refresh", html: icon("refresh"), onclick: () => refreshAll() }),
   h("span", { class: "tb", id: "pauseBtn", title: "Pause Drawing", html: icon("pause"), onclick: (e) => {
     const b = e.currentTarget; b.classList.toggle("active");
@@ -3405,7 +3405,7 @@ function openVerification() {
   floatWindow("Checking and Data Verification", body, { id: "verifyWin", width: 470 });
   renderVerification();
 }
-function refreshVerification() { if ($("verifyWin")) renderVerification(); }
+function refreshVerification() { if ($("verifyWin")) renderVerification(); else layoutChanged(); }
 function verifyDraw() {
   selectTemplate("parcel");
   if (!edit.active) startEditing("sketch"); else setTool("sketch");
@@ -3413,6 +3413,7 @@ function verifyDraw() {
 }
 function verifyClear() { clearSketch(); verify.report = null; verify.key = ""; verify.source = ""; showCadRef(null); showPicture(null); refreshSketchProps(); updateEditorButtons(); }
 function renderVerification() {
+  layoutChanged();
   const body = $("verifyBody"); if (!body) return;
   body.innerHTML = "";
   const n = edit.geomType === "polygon" ? edit.verts.length : 0;
@@ -3424,7 +3425,8 @@ function renderVerification() {
     h("div", { class: "frow" },
       h("button", { class: "btn btnPrimary", disabled: n < 3, onclick: verifySketch }, "Check boundary"),
       h("button", { class: "btn", disabled: !edit.verts.length && !verify.report, onclick: verifyClear }, "Clear"),
-      h("button", { class: "btn", disabled: n < 3 && !verify.ref && !verify.picture, title: "Save the boundary and the drawing as DXF, DWG, KML, EMF, TIFF or BMP", onclick: openExport }, "Export…")),
+      h("button", { class: "btn", disabled: n < 3 && !verify.ref && !verify.picture, title: "Save the boundary and the drawing as DXF, DWG, KML, EMF, TIFF or BMP", onclick: openExport }, "Export…"),
+      h("button", { class: "btn", title: "The boundary on a sheet of paper, to scale, to print or save as PDF", onclick: () => openLayout() }, "Layout…")),
     h("p", { class: "muted" }, n >= 3 ? `Boundary: ${n} corners, ${area2(sketchAreaM2())} m²${verify.source ? ` (from ${verify.source})` : ""}.` : "No boundary yet: import one or draw it."));
   if (verify.drawing) body.append(h("p", { class: "muted" }, `Drawing on the map (magenta, dashed): ${verify.drawing}. `,
     h("a", { href: "#", class: "linkish", onclick: (ev) => { ev.preventDefault(); showCadRef(null); } }, "Hide")));
@@ -3907,6 +3909,301 @@ function openExport() {
     h("div", { class: "frow" }, h("label", {}, "Imported drawing:"), ref, h("span", { class: "muted" }, verify.ref ? `the lines and labels of ${verify.drawing}` : "none on the map")),
     picRow, h("div", { class: "frow", style: "margin-top:8px" }, go), msg), { id: "exportWin", width: 470 });
 }
+
+// --- Layout View: the boundary on a sheet of paper, north up and to scale, to print or save as PDF ---
+// The sheet is SVG in millimetres. Data View's map stays underneath, untouched.
+const LAYOUT_PAGES = { A4: [210, 297], A3: [297, 420] };
+const LAYOUT_SCALES = [100, 200, 250, 500, 750, 1000, 1250, 1500, 2000, 2500, 5000, 7500, 10000, 25000];
+const LAYOUT_PARTS = [["grid", "Grid"], ["parcels", "Parcels"], ["imagery", "Imagery"], ["drawing", "Drawing"], ["picture", "Scanned plan"], ["corners", "Coordinates"], ["result", "Check result"], ["legend", "Legend"], ["sign", "Signatures"]];
+const lay = { paper: "A4", land: false, scale: 0, centre: null, title: "CHECKING AND DATA VERIFICATION", sub: "", prepared: "",
+  show: { grid: true, parcels: true, imagery: false, drawing: true, picture: true, corners: true, result: true, legend: true, sign: true },
+  img: null, imgKey: "", parcels: null, parcelsKey: "", note: "", timer: null, seq: 0 };
+const layoutOn = () => !!document.getElementById("layoutPane");
+function layoutChanged() { if (layoutOn()) layoutDraw(); }
+const layoutRing = () => (edit.geomType === "polygon" && edit.verts.length >= 3 ? edit.verts : null);
+// The ground the sheet is about: the boundary, else the drawing, else the scanned plan.
+function layoutExtent() {
+  const pts = layoutRing()
+    || (verify.ref && [...(verify.ref.boundaries || []).flatMap((b) => b.ring), ...(verify.ref.points || []).map((p) => p.point)].filter(inPlateau).map((p) => [p.x, p.y]))
+    || (verify.picture?.fit && [[0, 0], [verify.picture.width, 0], [verify.picture.width, -verify.picture.height], [0, -verify.picture.height]].map((p) => applyFit(verify.picture.fit, p)));
+  if (!pts?.length) return null;
+  return pts.reduce((b, [e, n]) => [Math.min(b[0], e), Math.min(b[1], n), Math.max(b[2], e), Math.max(b[3], n)], [Infinity, Infinity, -Infinity, -Infinity]);
+}
+// Page size, map frame and panel (below the frame, or at its right on a landscape sheet), in mm.
+function layoutBoxes() {
+  let [w, hgt] = LAYOUT_PAGES[lay.paper]; if (lay.land) [w, hgt] = [hgt, w];
+  const m = 10, top = 29, big = lay.paper === "A3" ? 1.25 : 1;
+  const any = ["corners", "result", "legend", "sign"].some((k) => lay.show[k]);
+  const side = lay.land ? 78 * big : 0, below = lay.land ? 0 : 92 * big;
+  const f = { x: m + 8, y: top + 5, w: w - 2 * m - 16 - (any ? side : 0), h: hgt - top - m - 12 - (any ? below : 0) };
+  const p = lay.land ? { x: w - m - side + 2, y: top, w: side - 4, h: hgt - top - m - 6 } : { x: m + 3, y: hgt - m - below + 1, w: w - 2 * m - 6, h: below - 7 };
+  return { w, h: hgt, m, f, p: any ? p : null };
+}
+function layoutFit() {
+  const b = layoutExtent(), { f } = layoutBoxes();
+  if (b) {
+    lay.centre = [(b[0] + b[2]) / 2, (b[1] + b[3]) / 2];
+    const need = Math.max((b[2] - b[0]) / f.w, (b[3] - b[1]) / f.h) * 1000 * 1.3;
+    lay.scale = LAYOUT_SCALES.find((s) => s >= need) || Math.ceil(need / 5000) * 5000;
+  } else {
+    const c = map.getCenter(); lay.centre = toUTM(c.lng, c.lat);
+    lay.scale = LAYOUT_SCALES.find((s) => s >= currentScale()) || 25000;
+  }
+}
+// The frame's ground rectangle.
+function layoutGround() {
+  const { f } = layoutBoxes(), k = 1000 / lay.scale; // mm of paper a metre
+  return { k, w: lay.centre[0] - f.w / 2 / k, n: lay.centre[1] + f.h / 2 / k, e: lay.centre[0] + f.w / 2 / k, s: lay.centre[1] - f.h / 2 / k };
+}
+function layoutLegs(ring) {
+  return ring.map(([e, n], i) => {
+    const [e2, n2] = ring[(i + 1) % ring.length], d = Math.hypot(e2 - e, n2 - n);
+    let t = Math.round(((Math.atan2(e2 - e, n2 - n) * 180 / Math.PI + 360) % 360) * 3600) % 1296000;
+    const p2 = (v) => String(v).padStart(2, "0");
+    return { id: String(pointIds.get(ptKey(e, n)) || `P${i + 1}`), e, n, d, brg: `${Math.floor(t / 3600)}°${p2(Math.floor((t % 3600) / 60))}'${p2(t % 60)}"` };
+  });
+}
+function layoutResult() {
+  const r = verify.report, ring = layoutRing();
+  if (!ring) return { head: "No boundary", lines: [], color: "#555" };
+  if (!r) return { head: "NOT CHECKED", lines: [], color: "#b07800" };
+  if (verify.key !== ringKey(ring)) return { head: "NOT CHECKED as drawn (changed since the check)", lines: [], color: "#b07800" };
+  const mark = { pass: "Pass", warn: "Warning", fail: "FAIL", skipped: "Not run" };
+  return { head: !r.ok ? "FAILED" : r.warnings ? "PASSED WITH WARNINGS" : "PASSED", color: !r.ok ? "#c62020" : r.warnings ? "#b07800" : "#138a2a",
+    when: fmtDT(r.checked_at), lines: r.items.map((i) => `${i.label || i.title || i.check}: ${mark[i.result] || i.result}`) };
+}
+const svgText = (x, y, t, o = {}) => `<text x="${x.toFixed(2)}" y="${y.toFixed(2)}" font-size="${o.size || 2.6}"${o.bold ? ' font-weight="bold"' : ""}${o.anchor ? ` text-anchor="${o.anchor}"` : ""}${o.fill ? ` fill="${o.fill}"` : ""}${o.more ? " " + o.more : ""}>${esc(t)}</text>`;
+const svgCut = (t, mm, size) => { const n = Math.max(1, Math.floor(mm / (size * 0.52))); t = String(t ?? ""); return t.length > n ? t.slice(0, n - 1) + "…" : t; };
+// Rows of the coordinate table that go at (x, y, w, h): the header, then as many as fit.
+function layoutTable(legs, from, x, y, w, hgt, rowH = 3.7) {
+  const cols = [["Beacon", 0], ["Easting (m)", 0.43], ["Northing (m)", 0.64], ["Dist (m)", 0.79], ["Bearing", 1]];
+  const fits = Math.max(0, Math.floor(hgt / rowH) - 1), rows = legs.slice(from, from + fits), size = Math.min(2.4, rowH * 0.66);
+  let o = cols.map(([t, at], i) => svgText(x + w * at, y + rowH * 0.75, t, { size, bold: true, anchor: i ? "end" : "" })).join("");
+  o += `<path d="M${x} ${y + rowH}h${w}" stroke="#000" stroke-width=".2"/>`;
+  rows.forEach((r, i) => {
+    const yy = y + rowH * (i + 1.75);
+    [svgCut(r.id, w * 0.21, size), fmt3(r.e), fmt3(r.n), r.d.toFixed(2), r.brg].forEach((t, c) => { o += svgText(x + w * cols[c][1], yy, t, { size, anchor: c ? "end" : "" }); });
+  });
+  return { svg: o, next: from + rows.length };
+}
+function layoutSheets() {
+  const { w, h: hgt, m, f, p } = layoutBoxes(), g = layoutGround(), k = g.k, S = lay.show;
+  const X = (e) => f.x + (e - g.w) * k, Y = (n) => f.y + (g.n - n) * k;
+  const path = (pts, close) => pts.map(([e, n], i) => `${i ? "L" : "M"}${X(e).toFixed(3)} ${Y(n).toFixed(3)}`).join("") + (close ? "Z" : "");
+  const inF = (e, n) => e >= g.w && e <= g.e && n >= g.s && n <= g.n;
+  const ring = layoutRing(), legs = ring ? layoutLegs(ring) : [], pic = verify.picture;
+  const affine = (a, b, c, d, e, ff) => `matrix(${[k * a, -k * d, k * b, -k * e, f.x + k * (c - g.w), f.y + k * (g.n - ff)].join(" ")})`;
+  const image = (url, iw, ih, mat, op = 1) => `<image href="${esc(url)}" width="${iw}" height="${ih}" preserveAspectRatio="none" opacity="${op}" transform="${mat}"/>`;
+  let o = `<rect width="${w}" height="${hgt}" fill="#fff"/><rect x="${m}" y="${m}" width="${w - 2 * m}" height="${hgt - 2 * m}" fill="none" stroke="#000" stroke-width=".5"/>`;
+  o += svgText(w / 2, 17.5, svgCut(lay.title, w - 2 * m - 10, 5.2), { size: 5.2, bold: true, anchor: "middle" });
+  if (lay.sub) o += svgText(w / 2, 23, svgCut(lay.sub, w - 2 * m - 10, 3.4), { size: 3.4, anchor: "middle" });
+  o += `<path d="M${m} 26H${w - m}" stroke="#000" stroke-width=".3"/>`;
+  // the map
+  let q = `<rect x="${f.x}" y="${f.y}" width="${f.w}" height="${f.h}" fill="#fff"/>`;
+  if (S.imagery && lay.img && lay.imgKey === layoutKey()) q += image(lay.img.url, lay.img.w, lay.img.h, affine(...lay.img.fit));
+  if (S.picture && pic?.fit && pic.url) q += image(pic.url, pic.width, pic.height, affine(pic.fit[0], -pic.fit[1], pic.fit[2], pic.fit[3], -pic.fit[4], pic.fit[5]), pic.opacity);
+  const dark = S.imagery && lay.img && lay.imgKey === layoutKey();
+  const halo = 'stroke="#fff" stroke-width=".6" paint-order="stroke"';
+  let seen = { parcels: false, drawing: false };
+  if (S.parcels && lay.parcels) for (const pc of lay.parcels) {
+    const bb = pc.bb; if (bb[2] < g.w || bb[0] > g.e || bb[3] < g.s || bb[1] > g.n) continue;
+    seen.parcels = true;
+    q += `<path d="${pc.rings.map((r) => path(r, true)).join("")}" fill="none" stroke="${dark ? "#ffd23f" : "#8b1a1a"}" stroke-width=".25"/>`;
+    const c = [(bb[0] + bb[2]) / 2, (bb[1] + bb[3]) / 2];
+    if (pc.no && inF(...c) && (bb[2] - bb[0]) * k > pc.no.length * 1.1) q += svgText(X(c[0]), Y(c[1]), pc.no, { size: 2, anchor: "middle", fill: "#8b1a1a", more: halo });
+  }
+  if (S.drawing && verify.ref) {
+    for (const b of verify.ref.boundaries || []) if (b.ring.length > 1 && b.ring.every(inPlateau) && !/\(from lines\)$/.test(b.id)) { seen.drawing = true; q += `<path d="${path(b.ring.map((v) => [v.x, v.y]), b.closed)}" fill="none" stroke="#d000d0" stroke-width=".25" stroke-dasharray="1.2 .7"/>`; }
+    for (const t of verify.ref.points || []) if (inF(t.point.x, t.point.y) && (t.code || "").startsWith("TEXT:")) q += svgText(X(t.point.x) + 0.6, Y(t.point.y) - 0.6, t.id, { size: 1.9, fill: "#900090", more: halo });
+  }
+  // Grid: a round ground step of 25 mm of paper or more.
+  const most = 25 / k, pw = 10 ** Math.floor(Math.log10(most)), step = [1, 2, 5, 10].map((v) => v * pw).find((v) => v >= most - 1e-9);
+  let labels = "";
+  for (let e = Math.ceil(g.w / step) * step; e <= g.e; e += step) {
+    if (S.grid) q += `<path d="M${X(e).toFixed(2)} ${f.y}v${f.h}" stroke="${dark ? "#fff" : "#7aa"}" stroke-width=".12"/>`;
+    if (S.grid) for (const yy of [f.y - 1, f.y + f.h + 3]) labels += svgText(X(e), yy, `${e.toFixed(0)}E`, { size: 2, anchor: "middle" });
+  }
+  for (let n = Math.ceil(g.s / step) * step; n <= g.n; n += step) {
+    if (S.grid) q += `<path d="M${f.x} ${Y(n).toFixed(2)}h${f.w}" stroke="${dark ? "#fff" : "#7aa"}" stroke-width=".12"/>`;
+    if (S.grid) for (const xx of [f.x - 1, f.x + f.w + 3]) labels += svgText(xx, Y(n), `${n.toFixed(0)}N`, { size: 2, anchor: "middle", more: `transform="rotate(-90 ${xx.toFixed(2)} ${Y(n).toFixed(2)})"` });
+  }
+  if (ring) {
+    q += `<path d="${path(ring, true)}" fill="none" stroke="#e00000" stroke-width=".6" stroke-linejoin="round"/>`;
+    const c = [legs.reduce((t, l) => t + l.e, 0) / legs.length, legs.reduce((t, l) => t + l.n, 0) / legs.length];
+    for (const l of legs) {
+      const dx = X(l.e) - X(c[0]), dy = Y(l.n) - Y(c[1]), len = Math.hypot(dx, dy) || 1;
+      q += `<circle cx="${X(l.e).toFixed(3)}" cy="${Y(l.n).toFixed(3)}" r=".8" fill="#fff" stroke="#e00000" stroke-width=".35"/>`;
+      q += svgText(X(l.e) + dx / len * 2, Y(l.n) + dy / len * 2.6 + 0.9, l.id, { size: 2.5, bold: true, anchor: dx < -len * 0.3 ? "end" : dx > len * 0.3 ? "start" : "middle", more: halo });
+    }
+    q += svgText(X(c[0]), Y(c[1]), `${area2(sketchAreaM2())} m²`, { size: 2.8, anchor: "middle", more: halo });
+  }
+  if (dark) q += svgText(f.x + f.w - 1, f.y + f.h - 1, "Imagery © Esri", { size: 1.8, anchor: "end", more: halo });
+  // north arrow (grid north is up)
+  const nx = f.x + f.w - 9, ny = f.y + 5;
+  q += `<g><rect x="${nx - 5}" y="${ny - 3}" width="10" height="19" fill="#fff" opacity=".8"/><path d="M${nx} ${ny + 2}l3 11l-3 -2.5z" fill="#000"/><path d="M${nx} ${ny + 2}l-3 11l3 -2.5z" fill="#fff" stroke="#000" stroke-width=".2"/>${svgText(nx, ny + 1, "N", { size: 3.4, bold: true, anchor: "middle" })}</g>`;
+  // scale bar
+  const bm = f.w * 0.3 / k, bp = 10 ** Math.floor(Math.log10(bm)), len = [5, 2, 1].map((v) => v * bp).find((v) => v <= bm), bw = len * k, bx = f.x + 4, by = f.y + f.h - 6;
+  q += `<rect x="${bx - 2}" y="${by - 5.5}" width="${bw + 14}" height="9.5" fill="#fff" opacity=".85"/>`;
+  for (let i = 0; i < 4; i++) q += `<rect x="${(bx + bw * i / 4).toFixed(3)}" y="${by}" width="${(bw / 4).toFixed(3)}" height="1.4" fill="${i % 2 ? "#fff" : "#000"}" stroke="#000" stroke-width=".15"/>`;
+  q += svgText(bx, by - 0.8, "0", { size: 2.2, anchor: "middle" }) + svgText(bx + bw / 2, by - 0.8, String(len / 2), { size: 2.2, anchor: "middle" }) + svgText(bx + bw, by - 0.8, `${len} m`, { size: 2.2, anchor: "middle" })
+    + svgText(bx + bw / 2, by + 3.6, `Scale 1:${lay.scale.toLocaleString("en-US")} on ${lay.paper}`, { size: 2.1, anchor: "middle" });
+  o += `<clipPath id="lf"><rect x="${f.x}" y="${f.y}" width="${f.w}" height="${f.h}"/></clipPath><g clip-path="url(#lf)">${q}</g><rect x="${f.x}" y="${f.y}" width="${f.w}" height="${f.h}" fill="none" stroke="#000" stroke-width=".4"/>${labels}`;
+  // the panel: legend, result and signatures in one column, coordinates in the other (or below)
+  let next = 0;
+  if (p) {
+    const wide = !lay.land, cw = wide ? p.w * 0.36 : p.w; let y = p.y + 3.5;
+    const head = (t) => { o += svgText(p.x, y, t, { size: 2.9, bold: true }); y += 4; };
+    if (S.legend) {
+      head("LEGEND");
+      const items = [ring && ["#e00000", ".6", "", "Boundary"], S.parcels && seen.parcels && [dark ? "#e0b000" : "#8b1a1a", ".25", "", "Committed parcels"], S.drawing && seen.drawing && ["#d000d0", ".25", "1.2 .7", "Surveyor's drawing"]].filter(Boolean);
+      for (const [c, sw, da, t] of items) { o += `<path d="M${p.x} ${y - 0.8}h8" stroke="${c}" stroke-width="${sw}" stroke-dasharray="${da}"/>` + svgText(p.x + 10, y, t, { size: 2.4 }); y += 3.6; }
+      y += 2;
+    }
+    if (S.result) {
+      const r = layoutResult(); head("CHECK RESULT");
+      o += svgText(p.x, y, svgCut(r.head, cw - 2, 2.7), { size: 2.7, bold: true, fill: r.color }); y += 3.6;
+      for (const l of r.lines) { o += svgText(p.x, y, svgCut(l, cw - 2, 2.2), { size: 2.2 }); y += 3.2; }
+      if (r.when) { o += svgText(p.x, y, `Checked ${r.when}. Check only: nothing was saved.`, { size: 2, fill: "#444" }); y += 3.4; }
+      y += 2;
+    }
+    if (S.sign) {
+      const sy = Math.max(y + 3, p.y + p.h - 15);
+      [["Prepared by", lay.prepared], ["Checked by", ""], ["Date", ""]].forEach(([t, v], i) => {
+        const yy = sy + i * 6.5; o += svgText(p.x, yy, `${t}:`, { size: 2.4 }) + svgText(p.x + 18, yy - 0.3, svgCut(v, cw - 22, 2.4), { size: 2.4 }) + `<path d="M${p.x + 17} ${yy + 0.6}H${p.x + cw - 3}" stroke="#000" stroke-width=".15"/>`;
+      });
+    }
+    if (S.corners && legs.length) {
+      const left = ["legend", "result", "sign"].some((v) => S[v]);
+      const tx = wide && left ? p.x + cw + 3 : p.x, tw = p.x + p.w - tx, ty = wide ? p.y : y, th = wide ? p.h : p.y + p.h - y - (S.sign ? 20 : 0);
+      o += svgText(tx, ty + 3.5, `COORDINATES (${legs.length} corners, ${area2(sketchAreaM2())} m²)`, { size: 2.9, bold: true });
+      const t = layoutTable(legs, 0, tx, ty + 5, tw, th - 9); o += t.svg; next = t.next;
+      if (next < legs.length) o += svgText(tx, ty + th - 1, `${legs.length - next} more on the next sheet`, { size: 2.2, fill: "#444" });
+    }
+  }
+  const foot = (n, total) => svgText(m + 2, hgt - m - 1.6, svgCut(`WGS 84 / UTM zone 32N (EPSG:32632), grid bearings and distances in metres${verify.source ? ` · ${verify.source}` : ""}`, w - 2 * m - 55, 2), { size: 2, fill: "#333" })
+    + svgText(w - m - 2, hgt - m - 1.6, `Printed ${fmtDT(new Date().toISOString())}${total > 1 ? ` · sheet ${n} of ${total}` : ""}`, { size: 2, anchor: "end", fill: "#333" });
+  const pages = [o];
+  while (S.corners && p && next < legs.length) {
+    let s2 = `<rect width="${w}" height="${hgt}" fill="#fff"/><rect x="${m}" y="${m}" width="${w - 2 * m}" height="${hgt - 2 * m}" fill="none" stroke="#000" stroke-width=".5"/>` + svgText(w / 2, 18, `${svgCut(lay.title, w - 80, 4)}: coordinates, continued`, { size: 4, bold: true, anchor: "middle" });
+    for (const c of [0, 1]) { if (next >= legs.length) break; const cw = (w - 2 * m - 18) / 2, t = layoutTable(legs, next, m + 6 + c * (cw + 6), 23, cw, hgt - m - 31, 4); s2 += t.svg; next = t.next; }
+    pages.push(s2);
+  }
+  return pages.map((s, i) => `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 ${w} ${hgt}" width="${w}mm" height="${hgt}mm" font-family="Arial, Helvetica, sans-serif">${s}${foot(i + 1, pages.length)}</svg>`);
+}
+const layoutKey = () => { const { f } = layoutBoxes(); return [f.w, f.h, lay.scale, ...lay.centre.map((v) => v.toFixed(2))].join(); };
+// The parcels the map holds; each is projected to UTM once, when it first comes into view.
+function layoutParcels() {
+  if (lay.parcelsFrom === state.parcels && lay.parcels) return;
+  lay.parcelsFrom = state.parcels;
+  lay.parcels = (state.parcels.features || []).filter((f) => /Polygon$/.test(f.geometry?.type || "")).map((f) => ({ f, ll: fcBounds({ type: "FeatureCollection", features: [f] }) }));
+}
+// The satellite imagery for the frame, from a map off the screen; kept until the frame moves.
+async function layoutImagery() {
+  if (!lay.show.imagery) return;
+  const key = layoutKey(); if (lay.imgKey === key) return;
+  const seq = ++lay.seq, { f } = layoutBoxes(), g = layoutGround();
+  const px = Math.min(6, 2000 / Math.max(f.w, f.h)), cw = Math.round(f.w * px * 1.06), ch = Math.round(f.h * px * 1.06);
+  const [lng, lat] = toLL(...lay.centre), mpp = lay.scale / 1000 / px;
+  const box = h("div", { style: `position:fixed;left:-10000px;top:0;width:${cw}px;height:${ch}px` }); document.body.append(box);
+  lay.note = "Loading imagery…"; layoutNote();
+  let m2 = null;
+  try {
+    m2 = new maplibregl.Map({ container: box, interactive: false, attributionControl: false, pixelRatio: 1, fadeDuration: 0, maxZoom: 24, center: [lng, lat],
+      zoom: Math.log2(156543.03392 * Math.cos(lat * Math.PI / 180) / (2 * mpp)),
+      style: { version: 8, sources: { i: { type: "raster", tiles: [IMAGERY], tileSize: 256, maxzoom: 18 } }, layers: [{ id: "i", type: "raster", source: "i" }] } });
+    let failed = false; m2.on("error", () => { failed = true; });
+    await new Promise((ok, bad) => { m2.once("idle", ok); setTimeout(() => bad(new Error("the imagery did not arrive")), 20000); });
+    if (failed) throw new Error("some imagery could not be loaded");
+    const url = await new Promise((ok, bad) => { m2.once("render", () => { try { ok(m2.getCanvas().toDataURL("image/jpeg", 0.9)); } catch (e) { bad(e); } }); m2.triggerRepaint(); });
+    const at = (x, y) => { const c = m2.unproject([x, y]); return toUTM(c.lng, c.lat); };
+    const a = at(0, 0), b = at(cw, 0), c = at(0, ch);
+    if (seq === lay.seq) {
+      lay.img = { url, w: cw, h: ch, fit: [(b[0] - a[0]) / cw, (c[0] - a[0]) / ch, a[0], (b[1] - a[1]) / cw, (c[1] - a[1]) / ch, a[1]] };
+      lay.imgKey = key; lay.note = "";
+    }
+  } catch (e) { if (seq === lay.seq) { lay.img = null; lay.imgKey = ""; lay.note = `No imagery: ${e.message}.`; } }
+  finally { try { m2?.remove(); } catch { /* already gone */ } box.remove(); }
+  if (layoutOn() && seq === lay.seq) { layoutNote(); layoutDraw(false); }
+}
+function layoutNote() { const el = $("layNote"); if (el) el.textContent = lay.note || ((state.parcels.features || []).length >= 20000 ? "The map holds only the first 20,000 parcels: some neighbours may be missing from the sheet." : "") || (!layoutExtent() ? "No boundary, drawing or plan yet: the sheet shows where the map was." : ""); }
+function layoutDraw(fetchImagery = true) {
+  const box = $("layPages"); if (!box) return;
+  layoutParcels();
+  const g = layoutGround(), [w, s] = toLL(g.w, g.s), [e, n] = toLL(g.e, g.n);
+  // Only the parcels in view are projected.
+  const all = lay.parcels;
+  lay.parcels = all.filter(({ ll }) => ll && ll.getEast() >= w - 0.001 && ll.getWest() <= e + 0.001 && ll.getNorth() >= s - 0.001 && ll.getSouth() <= n + 0.001).map((pc) => {
+    if (!pc.rings) {
+      const c = pc.f.geometry.coordinates;
+      pc.rings = (pc.f.geometry.type === "Polygon" ? c : c.flat()).map((r) => r.map(([x, y]) => toUTM(x, y)));
+      pc.bb = pc.rings.flat().reduce((b, [x, y]) => [Math.min(b[0], x), Math.min(b[1], y), Math.max(b[2], x), Math.max(b[3], y)], [Infinity, Infinity, -Infinity, -Infinity]);
+      const pr = pc.f.properties || {}; pc.no = String(pr.parcel_number || pr.upin || pr.number || "");
+    }
+    return pc;
+  });
+  try { box.innerHTML = layoutSheets().map((x) => `<div class="layPage">${x}</div>`).join(""); } finally { lay.parcels = all; }
+  const { w: pw } = layoutBoxes(), wide = box.clientWidth - 40;
+  box.querySelectorAll(".layPage > svg").forEach((x) => { const z = Math.max(0.5, Math.min(1.6, wide / (pw * 96 / 25.4))); x.style.width = `${pw * z}mm`; x.style.height = "auto"; });
+  const sel = $("layScale"); if (sel && document.activeElement !== sel) sel.value = `1:${lay.scale}`;
+  layoutNote();
+  if (fetchImagery) { clearTimeout(lay.timer); lay.timer = setTimeout(layoutImagery, 600); }
+}
+function openLayout() {
+  if (layoutOn()) return;
+  layoutFit();
+  if (!lay.prepared) lay.prepared = state.me?.username || "";
+  const sel = (opts, val, on) => h("select", { onchange: (e) => on(e.target.value) }, ...opts.map(([v, t]) => h("option", { value: v, selected: v === val }, t)));
+  const txt = (key, width, label) => h("label", {}, label + " ", h("input", { type: "text", value: lay[key], style: `width:${width}px`, oninput: (e) => { lay[key] = e.target.value; layoutDraw(false); } }));
+  const setScale = (v) => { const s = Math.round(parseFloat(String(v).replace(/^\s*1\s*:\s*/, "").replace(/,/g, ""))); if (s >= 10 && s <= 1e6) lay.scale = s; layoutDraw(); };
+  const scale = h("input", { type: "text", id: "layScale", list: "layScales", style: "width:80px", onchange: (e) => { setScale(e.target.value); e.target.value = `1:${lay.scale}`; } });
+  const pages = h("div", { id: "layPages" });
+  $("mapFrame").append(h("div", { id: "layoutPane" },
+    h("div", { id: "layBar" },
+      sel([["A4", "A4"], ["A3", "A3"]], lay.paper, (v) => { lay.paper = v; layoutDraw(); }),
+      sel([["p", "Portrait"], ["l", "Landscape"]], lay.land ? "l" : "p", (v) => { lay.land = v === "l"; layoutDraw(); }),
+      h("label", {}, "Scale ", scale, h("datalist", { id: "layScales" }, ...LAYOUT_SCALES.map((s) => h("option", { value: `1:${s}` })))),
+      h("button", { class: "btn", title: "Centre the boundary and choose a scale that fits it", onclick: () => { layoutFit(); layoutDraw(); } }, "Fit"),
+      txt("title", 230, "Title"), txt("sub", 200, "Subtitle"), txt("prepared", 120, "Prepared by"),
+      ...LAYOUT_PARTS.map(([k, t]) => h("label", {}, h("input", { type: "checkbox", checked: lay.show[k], onchange: (e) => { lay.show[k] = e.target.checked; layoutDraw(); } }), t)),
+      h("button", { class: "btn btnPrimary", onclick: layoutPrint }, "Print / Save as PDF"),
+      h("button", { class: "btn", onclick: closeLayout }, "Back to Data View"),
+      h("span", { id: "layNote", class: "muted" })),
+    pages));
+  // Drag the map inside its frame; the wheel (with Ctrl) steps the scale.
+  let drag = null;
+  const mmPx = () => { const s = pages.querySelector("svg"); return s.getBoundingClientRect().width / layoutBoxes().w; };
+  pages.addEventListener("pointerdown", (ev) => { const pg = ev.target.closest(".layPage"); if (pg && pg === pages.firstChild) { drag = { x: ev.clientX, y: ev.clientY, c: lay.centre.slice() }; pages.setPointerCapture(ev.pointerId); ev.preventDefault(); } });
+  pages.addEventListener("pointermove", (ev) => { if (!drag) return; const k = mmPx() * 1000 / lay.scale; lay.centre = [drag.c[0] - (ev.clientX - drag.x) / k, drag.c[1] + (ev.clientY - drag.y) / k]; cancelAnimationFrame(lay.raf); lay.raf = requestAnimationFrame(() => layoutDraw()); });
+  for (const t of ["pointerup", "pointercancel"]) pages.addEventListener(t, () => { drag = null; });
+  pages.addEventListener("wheel", (ev) => {
+    if (!ev.ctrlKey) return; ev.preventDefault();
+    const s = ev.deltaY > 0 ? LAYOUT_SCALES.find((v) => v > lay.scale) : [...LAYOUT_SCALES].reverse().find((v) => v < lay.scale);
+    if (s) { lay.scale = s; layoutDraw(); }
+  }, { passive: false });
+  $("layoutViewBtn").classList.add("active"); $("dataViewBtn").classList.remove("active");
+  layoutDraw();
+  status("Layout View: drag the map inside its frame, Ctrl + wheel steps the scale.");
+}
+function closeLayout() {
+  if (!layoutOn()) return;
+  clearTimeout(lay.timer); lay.seq++;
+  $("layoutPane").remove();
+  $("dataViewBtn").classList.add("active"); $("layoutViewBtn").classList.remove("active");
+  status("Data View");
+}
+async function layoutPrint() {
+  const win = window.open("", "_blank"); // at once: after a wait the browser would block it
+  if (!win) { uiAlert("The browser blocked the print window: allow pop-ups for this site."); return; }
+  if (lay.show.imagery && lay.imgKey !== layoutKey()) { status("Waiting for the imagery…"); clearTimeout(lay.timer); await layoutImagery(); }
+  layoutDraw(false);
+  const { w, h: hgt } = layoutBoxes();
+  win.document.write(`<!doctype html><html><head><meta charset="utf-8"><title>${esc(lay.title)}</title><style>@page{size:${w}mm ${hgt}mm;margin:0}body{margin:0;background:#888}
+    .page{width:${w}mm;height:${hgt}mm;margin:8px auto;box-shadow:0 2px 8px #0006;overflow:hidden}.page svg{display:block;width:100%;height:100%}.bar{position:sticky;top:0;background:#eee;padding:6px;text-align:center;font:13px sans-serif}
+    @media print{body{background:#fff}.page{margin:0;box-shadow:none;break-after:page}.page:last-child{break-after:auto}.bar{display:none}}</style></head><body>
+    <div class="bar"><button onclick="window.print()">Print / Save as PDF</button> Choose ${lay.paper}, scale 100 % and no margins, so the sheet is to scale.</div>${layoutSheets().map((s) => `<div class="page">${s}</div>`).join("")}</body></html>`);
+  win.document.close();
+}
+document.addEventListener("keydown", (ev) => { if ((ev.ctrlKey || ev.metaKey) && ev.key.toLowerCase() === "p" && layoutOn()) { ev.preventDefault(); layoutPrint(); } });
 
 // --- System check (before the next stage, and again at commit on the server) ---
 // Overlaps here and in Aumentum, the drop point (is the plot free?), a title on the land, and the

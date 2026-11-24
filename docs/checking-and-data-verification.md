@@ -25,6 +25,7 @@ own VER number; anyone who may open Digitising may open this unit.
 | V1 | The unit's view (`/verification`) and check-only mode | **built** |
 | V2 | CAD import: binary DXF, DWG through the ODA File Converter, choosing the parcel's layer / polyline | **built** |
 | V2b | File formats: import KML, TIFF, BMP and EMF as well; export DXF, DWG, KML, EMF, TIFF and BMP | **built** |
+| V2c | Layout View: the boundary on an A4/A3 sheet, to scale, printed or saved as PDF | **built** |
 | V3 | Adjoining-coordinates report: neighbours sharing a boundary, their corners, as print, CSV and DXF | open |
 | V4 | Save the verified boundary (VER number, file number, check report) and hand it to Digitising | open |
 
@@ -169,3 +170,20 @@ Tests: `kml`, `emf`, `export` and `picture` unit tests, `drawings_export_and_imp
 (integration) and `the_real_converter_reads_a_dwg` (DXF to DWG and back). Checked by hand in a
 browser (24 Nov 2026): every format exported and read back, a scan and an EMF placed by points. Not
 yet tried: surveyors' own files, and the exported files in AutoCAD, Google Earth and Word.
+
+## V2c: Layout View
+
+*View → Layout View*, the sheet icon at the map's bottom left, or *Layout…* in the panel (this unit
+only; in the other units it stays greyed out). *Data View* goes back; the map is as it was left.
+
+- **Sheet:** A4 or A3, portrait or landscape, grid north up. Any scale; *Fit* picks a standard one
+  for the boundary (else the drawing, else the scanned plan). Drag the map inside its frame;
+  Ctrl + wheel steps the scale.
+- **On it:** title, subtitle, map with grid, north arrow and scale bar, legend, check result,
+  signature lines, coordinates with grid distances and bearings. Corners that do not fit go to
+  further sheets. Parts can be switched off; imagery and the scanned plan can be put under the lines.
+- **Check result:** only for the boundary exactly as drawn. Unchecked, or moved since the check, it
+  says NOT CHECKED.
+- **Print / Save as PDF** opens the sheets in a new window (pop-ups must be allowed). Print at
+  **100 %, no margins**, or the scale is wrong. Nothing is saved on the server.
+- Parcels are those the map holds (at most 20 000; the bar says so when that is reached).
