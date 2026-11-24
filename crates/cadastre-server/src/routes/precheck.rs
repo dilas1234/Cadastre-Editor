@@ -105,6 +105,26 @@ fn list(u: &[String]) -> String {
     if u.len() > 6 { format!("{} and {} more", u[..6].join(", "), u.len() - 6) } else { u.join(", ") }
 }
 
+/// Aumentum's live parcels in an envelope (UTM 32N): UPIN (may be empty) and the shape as GeoJSON.
+/// `None`: the link is not configured; an error is a sentence for the officer.
+pub(crate) async fn aumentum_parcels(env: (f64, f64, f64, f64)) -> Option<Result<Vec<(String, String)>, String>> {
+    let geometry = format!("{},{},{},{}", env.0, env.1, env.2, env.3);
+    let q = format!(
+        "/GISViewer/gis.gate/0/0/query?geometry={}&geometryType=esriGeometryEnvelope&inSR=32632&spatialRel=esriSpatialRelIntersects&outFields=UPIN,propertyNo&returnGeometry=true&outSR=32632&f=json",
+        pct_encode(&geometry));
+    Some(match aumentum_get(&q).await? {
+        Err(e) => Err(format!("Aumentum's parcels could not be checked: {e}.")),
+        Ok(body) => match serde_json::from_slice::<Value>(&body) {
+            Err(_) => Err("Aumentum's answer could not be read.".into()),
+            Ok(v) if v.get("error").is_some() => Err(format!("Aumentum refused the search: {}", v["error"])),
+            Ok(v) => Ok(v["features"].as_array().into_iter().flatten().filter(|f| f["geometry"]["rings"].is_array()).map(|f| (
+                f["attributes"]["UPIN"].as_str().unwrap_or("").trim().to_string(),
+                json!({ "type": "Polygon", "coordinates": f["geometry"]["rings"] }).to_string(),
+            )).collect()),
+        },
+    })
+}
+
 /// Run every check for job instance `id`, on `vertices` (a sketch) or on the job's draft parcels.
 /// With no job (the Checking and Data Verification unit's check-only mode) only the land is
 /// checked: overlaps, drop point, title on the overlapped land and gaps; there is no Registry
@@ -201,23 +221,13 @@ pub async fn run(state: &AppState, id: Option<i32>, vertices: &[[f64; 2]], editi
             let r = sqlx::query(&format!("SELECT ST_XMin(b) x0, ST_YMin(b) y0, ST_XMax(b) x1, ST_YMax(b) y1 FROM (SELECT Box2D({g}) b) s")).bind(&shape).fetch_one(&mut *conn).await?;
             (r.get("x0"), r.get("y0"), r.get("x1"), r.get("y1"))
         };
-        let geometry = format!("{},{},{},{}", env.0, env.1, env.2, env.3);
-        let q = format!(
-            "/GISViewer/gis.gate/0/0/query?geometry={}&geometryType=esriGeometryEnvelope&inSR=32632&spatialRel=esriSpatialRelIntersects&outFields=UPIN,propertyNo&returnGeometry=true&outSR=32632&f=json",
-            pct_encode(&geometry));
-        match aumentum_get(&q).await {
+        match aumentum_parcels(env).await {
             None => item("aumentum", "Overlap with Aumentum", "warn", "Aumentum's parcels could not be checked: the Aumentum link is not configured on this server.", vec![]),
-            Some(Err(e)) => item("aumentum", "Overlap with Aumentum", "warn", format!("Aumentum's parcels could not be checked: {e}."), vec![]),
-            Some(Ok(body)) => match serde_json::from_slice::<Value>(&body) {
-                Err(_) => item("aumentum", "Overlap with Aumentum", "warn", "Aumentum's answer could not be read.", vec![]),
-                Ok(v) if v.get("error").is_some() => item("aumentum", "Overlap with Aumentum", "warn", format!("Aumentum refused the search: {}", v["error"]), vec![]),
-                Ok(v) => {
+            Some(Err(e)) => item("aumentum", "Overlap with Aumentum", "warn", e, vec![]),
+            Some(Ok(found)) => {
                     let mut hits: Vec<(String, f64)> = Vec::new();
-                    for f in v["features"].as_array().cloned().unwrap_or_default() {
-                        let upin = f["attributes"]["UPIN"].as_str().unwrap_or("").trim().to_string();
-                        let rings = &f["geometry"]["rings"];
-                        if !rings.is_array() || (!upin.is_empty() && mutated.contains(&upin)) { continue; }
-                        let other = json!({ "type": "Polygon", "coordinates": rings }).to_string();
+                    for (upin, other) in found {
+                        if !upin.is_empty() && mutated.contains(&upin) { continue; }
                         let r = sqlx::query(&format!(
                             "SELECT ST_Area(ST_Intersection(o, {g})) AS a, ST_Contains(o, ST_SetSRID(ST_MakePoint($3, $4), 32632)) AS at_point, {} AS counts \
                              FROM (SELECT ST_MakeValid(ST_SetSRID(ST_GeomFromGeoJSON($2), 32632)) AS o) s", counts_sql("o", g, "$5")))
@@ -238,8 +248,7 @@ pub async fn run(state: &AppState, id: Option<i32>, vertices: &[[f64; 2]], editi
                         let d = hits.iter().take(6).map(|(u, a)| format!("{u} ({a:.2} m²)")).collect::<Vec<_>>().join(", ");
                         item("aumentum", "Overlap with Aumentum", "fail", format!("The parcel overlaps Aumentum's {d}."), aum_upins.clone())
                     }
-                }
-            },
+            }
         }
     };
     let aumentum_checked = aum_item.result != "warn";

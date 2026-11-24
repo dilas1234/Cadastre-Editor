@@ -3405,7 +3405,7 @@ function openVerification() {
   floatWindow("Checking and Data Verification", body, { id: "verifyWin", width: 470 });
   renderVerification();
 }
-function refreshVerification() { if ($("verifyWin")) renderVerification(); else layoutChanged(); }
+function refreshVerification() { if ($("verifyWin")) renderVerification(); else { layoutChanged(); adjStale(); } }
 function verifyDraw() {
   selectTemplate("parcel");
   if (!edit.active) startEditing("sketch"); else setTool("sketch");
@@ -3413,7 +3413,7 @@ function verifyDraw() {
 }
 function verifyClear() { clearSketch(); verify.report = null; verify.key = ""; verify.source = ""; showCadRef(null); showPicture(null); refreshSketchProps(); updateEditorButtons(); }
 function renderVerification() {
-  layoutChanged();
+  layoutChanged(); adjStale();
   const body = $("verifyBody"); if (!body) return;
   body.innerHTML = "";
   const n = edit.geomType === "polygon" ? edit.verts.length : 0;
@@ -3426,6 +3426,7 @@ function renderVerification() {
       h("button", { class: "btn btnPrimary", disabled: n < 3, onclick: verifySketch }, "Check boundary"),
       h("button", { class: "btn", disabled: !edit.verts.length && !verify.report, onclick: verifyClear }, "Clear"),
       h("button", { class: "btn", disabled: n < 3 && !verify.ref && !verify.picture, title: "Save the boundary and the drawing as DXF, DWG, KML, EMF, TIFF or BMP", onclick: openExport }, "Export…"),
+      h("button", { class: "btn", disabled: n < 3, title: "The neighbours' corners as the database has them, for the surveyor: print, CSV, DXF", onclick: openAdjoining }, "Adjoining…"),
       h("button", { class: "btn", title: "The boundary on a sheet of paper, to scale, to print or save as PDF", onclick: () => openLayout() }, "Layout…")),
     h("p", { class: "muted" }, n >= 3 ? `Boundary: ${n} corners, ${area2(sketchAreaM2())} m²${verify.source ? ` (from ${verify.source})` : ""}.` : "No boundary yet: import one or draw it."));
   if (verify.drawing) body.append(h("p", { class: "muted" }, `Drawing on the map (magenta, dashed): ${verify.drawing}. `,
@@ -4204,6 +4205,140 @@ async function layoutPrint() {
   win.document.close();
 }
 document.addEventListener("keydown", (ev) => { if ((ev.ctrlKey || ev.metaKey) && ev.key.toLowerCase() === "p" && layoutOn()) { ev.preventDefault(); layoutPrint(); } });
+
+// --- Adjoining coordinates (V3): the neighbours' corners as the database has them, compared with
+// the boundary's, for the surveyor to conform to. Printed, CSV and DXF; nothing is saved. ---
+const adj = { report: null, key: "", ring: null, within: 2, source: "" };
+const ADJ_RELATION = { overlaps: "Overlaps", side: "Shares a side", point: "Meets at a corner / close" };
+const adjName = (p) => p.upin || "Parcel without UPIN";
+const adjSigned = (v) => (v == null ? "" : `${v >= 0 ? "+" : "−"}${Math.abs(v).toFixed(3)}`);
+// The database's own coordinates for one of the surveyor's corners may disagree between neighbours:
+// then no single one can be conformed to, and the unit must say which holds.
+function adjConflict(c) {
+  if (c.kind !== "corner") return false;
+  return adj.report.parcels.some((p) => p.corners.some((o) => o.your_corner === c.your_corner && Math.hypot(o.easting - c.easting, o.northing - c.northing) > adj.report.tolerance_m));
+}
+// What the surveyor is told about a corner.
+function adjRemark(c) {
+  if (adjConflict(c)) return `${c.agrees ? "Agrees with this one" : `Differs by ${c.off.toFixed(3)} m`}; the database has different coordinates near this corner: ask the unit which to use`;
+  if (c.kind === "corner") return c.agrees ? "Agrees" : `Differs by ${c.off.toFixed(3)} m: use the database coordinate`;
+  if (c.kind === "line") return c.agrees ? "On your line; you have no corner here" : `${c.off.toFixed(3)} m off your line; you have no corner here`;
+  return `End of the adjoining side, ${c.off.toFixed(2)} m from your boundary`;
+}
+const adjCornerName = (k, ring) => String(pointIds.get(ptKey(...ring[k - 1])) || `P${k}`);
+const adjDiffers = (r) => r.parcels.reduce((t, p) => t + p.corners.filter((c) => c.agrees === false).length + p.off_line.filter((o) => o.off > r.tolerance_m).length, 0);
+async function openAdjoining() {
+  if (!layoutRing()) { uiAlert("Import or draw a boundary of at least 3 corners first."); return; }
+  if (!$("adjWin")) floatWindow("Adjoining coordinates", h("div", { id: "adjBody" }), { id: "adjWin", width: 760 });
+  await adjQuery();
+}
+async function adjQuery() {
+  const body = $("adjBody"), ring = layoutRing()?.map((v) => [v[0], v[1]]); if (!body || !ring) return;
+  body.textContent = "Looking up the adjoining parcels, here and in Aumentum…";
+  const seq = (adj.seq = (adj.seq || 0) + 1);
+  let r;
+  try { r = await api("/api/v1/verification/adjoining", { method: "POST", body: { vertices: ring, within_m: adj.within } }); }
+  catch (e) { if (seq === adj.seq) { adj.report = null; body.textContent = "The adjoining parcels could not be looked up: " + e.message; } return; }
+  if (seq !== adj.seq) return;
+  Object.assign(adj, { report: r, key: ringKey(ring), ring, source: verify.source });
+  adjRender();
+}
+// The report is of the boundary as it was looked up: once that moves, it must not be given out.
+function adjStale() {
+  if (!$("adjWin") || !adj.report) return;
+  const ring = layoutRing(), stale = !ring || ringKey(ring) !== adj.key;
+  $("adjStale")?.classList.toggle("hidden", !stale);
+  document.querySelectorAll("#adjWin .adjOut").forEach((b) => { b.disabled = stale; });
+}
+function adjRender() {
+  const body = $("adjBody"), r = adj.report; if (!body || !r) return;
+  const within = h("select", { onchange: (e) => { adj.within = Number(e.target.value); adjQuery(); } }, ...[0.5, 1, 2, 5, 10, 20].map((v) => h("option", { value: v, selected: v === r.within_m }, `${v} m`)));
+  const out = (label, title, fn) => h("button", { class: "btn adjOut", title, onclick: fn }, label);
+  body.innerHTML = "";
+  body.append(h("div", { class: "frow" }, h("label", {}, "Within:"), within,
+    out("Print / Save as PDF", "The list for the surveyor", adjPrint), out("CSV", "For a spreadsheet", adjCsv), out("DXF", "For AutoCAD", adjDxf),
+    h("button", { class: "btn", onclick: adjQuery }, "Look up again")));
+  body.append(h("p", { id: "adjStale", class: "verifyStale hidden" }, "The boundary has changed since this was looked up: look it up again."));
+  for (const w of r.warnings) body.append(h("p", { class: "verifyStale" }, `The list may be incomplete. ${w}`));
+  const bad = adjDiffers(r);
+  body.append(h("p", {}, h("b", {}, r.parcels.length ? `${r.parcels.length} adjoining parcel(s)` : "No parcel adjoins this boundary"),
+    r.parcels.length ? (bad ? ` — ${bad} point(s) do not agree (over ${r.tolerance_m} m).` : ` — every compared point agrees within ${r.tolerance_m} m.`) : ` within ${r.within_m} m.`));
+  for (const p of r.parcels) {
+    body.append(h("div", { style: "margin-top:8px" }, h("b", {}, adjName(p)), ` — ${ADJ_RELATION[p.relation]}`,
+      p.relation === "overlaps" ? ` (${p.overlap_m2.toFixed(2)} m²)` : p.gap > 0 ? ` (gap ${p.gap.toFixed(3)} m)` : "", p.source === "aumentum" ? " — in Aumentum only" : ""));
+    if (p.corners.length) body.append(h("table", { class: "legs" },
+      h("tr", {}, ...["Beacon", "Easting", "Northing", "Your corner", "dE", "dN", "Remark"].map((t) => h("th", {}, t))),
+      ...p.corners.map((c) => {
+        const tr = h("tr", { style: "cursor:pointer" + (c.agrees === false ? ";background:#fdecea" : ""), title: "Show on the map", onclick: () => map.easeTo({ center: toLL(c.easting, c.northing), zoom: Math.max(map.getZoom(), 19) }) },
+          h("td", {}, c.beacon || "—"), h("td", {}, fmt3(c.easting)), h("td", {}, fmt3(c.northing)), h("td", {}, c.your_corner ? adjCornerName(c.your_corner, adj.ring) : "—"),
+          h("td", {}, adjSigned(c.d_east)), h("td", {}, adjSigned(c.d_north)), h("td", { style: "white-space:normal" }, adjRemark(c)));
+        return tr;
+      })));
+    for (const o of p.off_line) body.append(h("div", { class: "muted" }, `Your corner ${adjCornerName(o.your_corner, adj.ring)} is ${o.off.toFixed(3)} m from this parcel's line (it has no corner there).`));
+    if (!p.corners.length && !p.off_line.length) body.append(h("div", { class: "muted" }, "None of its corners lies near the boundary."));
+  }
+  adjStale();
+}
+const adjFileName = (ext) => `adjoining-${(adj.source || "boundary").replace(/^.* in /, "").replace(/\.[^.]+$/, "").replace(/[^\w-]+/g, "_").slice(0, 60)}.${ext}`;
+function adjCsv() {
+  const r = adj.report;
+  // Text that a spreadsheet would run as a formula is kept as text.
+  const q = (v, text) => { let s = String(v ?? ""); if (text && /^[=+\-@\t\r]/.test(s)) s = "'" + s; return /[",\n\r]/.test(s) ? `"${s.replace(/"/g, '""')}"` : s; };
+  const rows = [["Parcel", "Source", "Relation", "Beacon", "Easting", "Northing", "Your corner", "Your easting", "Your northing", "dE (database - yours)", "dN (database - yours)", "Distance (m)", "Remark"].map((v) => q(v))];
+  for (const p of r.parcels) {
+    const head = [q(adjName(p), true), p.source === "aumentum" ? "Aumentum" : "Cadastre", q(ADJ_RELATION[p.relation])];
+    for (const c of p.corners) {
+      const own = c.your_corner ? adj.ring[c.your_corner - 1] : null;
+      rows.push([...head, q(c.beacon, true), fmt3(c.easting), fmt3(c.northing), q(own ? adjCornerName(c.your_corner, adj.ring) : "", true), own ? fmt3(own[0]) : "", own ? fmt3(own[1]) : "",
+        c.d_east == null ? "" : fmt3(c.d_east), c.d_north == null ? "" : fmt3(c.d_north), fmt3(c.off), q(adjRemark(c))]);
+    }
+    for (const o of p.off_line) { const own = adj.ring[o.your_corner - 1]; rows.push([...head, "", "", "", q(adjCornerName(o.your_corner, adj.ring), true), fmt3(own[0]), fmt3(own[1]), "", "", fmt3(o.off), q("Your corner, from this parcel's line")]); }
+    if (!p.corners.length && !p.off_line.length) rows.push([...head, "", "", "", "", "", "", "", "", fmt3(p.gap), q("No corner near the boundary")]);
+  }
+  for (const w of r.warnings) rows.push([q("NOTE"), "", "", "", "", "", "", "", "", "", "", "", q(`The list may be incomplete. ${w}`)]);
+  saveFile(new Blob(["﻿" + rows.map((x) => x.join(",")).join("\r\n") + "\r\n"], { type: "text/csv" }), adjFileName("csv"));
+}
+async function adjDxf() {
+  const r = adj.report, ring = adj.ring;
+  const d = { title: "Adjoining coordinates", shapes: [{ layer: "BOUNDARY", name: "Boundary", closed: true, points: ring }],
+    labels: ring.map((v, i) => ({ layer: "CORNERS", text: adjCornerName(i + 1, ring), point: v })) };
+  for (const p of r.parcels) {
+    const layer = `ADJ_${p.upin || "NO_UPIN"}`;
+    // Only the sides along the boundary: runs of corners that follow one another.
+    let run = [];
+    const flush = () => { if (run.length > 1) d.shapes.push({ layer, name: adjName(p), closed: false, points: run }); run = []; };
+    for (const c of p.corners) { run.push([c.easting, c.northing]); if (!c.joined_to_next) flush(); }
+    // A whole parcel inside the search closes on its first corner.
+    if (run.length > 2) run.push(run[0]);
+    flush();
+    for (const c of p.corners) d.labels.push({ layer: "ADJ_CORNERS", text: c.beacon || "", point: [c.easting, c.northing] });
+  }
+  try { saveFile(await api("/api/v1/export/drawing", { method: "POST", body: { format: "dxf", drawing: d }, blob: true }), adjFileName("dxf")); }
+  catch (e) { uiAlert("The DXF could not be written: " + e.message); }
+}
+function adjPrintHtml() {
+  const r = adj.report, ring = adj.ring, bad = adjDiffers(r);
+  const tr = (cells, tag = "td", cls = "") => `<tr${cls ? ` class="${cls}"` : ""}>${cells.map(([v, num]) => `<${tag}${num ? ' class="n"' : ""}>${esc(v)}</${tag}>`).join("")}</tr>`;
+  const parcels = r.parcels.map((p) => `<section><h2>${esc(adjName(p))} <small>${esc(ADJ_RELATION[p.relation])}${p.relation === "overlaps" ? `, ${p.overlap_m2.toFixed(2)} m²` : p.gap > 0 ? `, gap ${p.gap.toFixed(3)} m` : ""}${p.source === "aumentum" ? ", in Aumentum only" : ""}</small></h2>`
+    + (p.corners.length ? `<table><thead>${tr([["Beacon"], ["Easting (m)", 1], ["Northing (m)", 1], ["Your corner"], ["dE", 1], ["dN", 1], ["Remark"]], "th")}</thead><tbody>${p.corners.map((c) => tr([[c.beacon || "—"], [fmt3(c.easting), 1], [fmt3(c.northing), 1], [c.your_corner ? adjCornerName(c.your_corner, ring) : "—"], [adjSigned(c.d_east), 1], [adjSigned(c.d_north), 1], [adjRemark(c)]], "td", c.agrees === false ? "bad" : "")).join("")}</tbody></table>` : "")
+    + p.off_line.map((o) => `<p>Your corner ${esc(adjCornerName(o.your_corner, ring))} is ${o.off.toFixed(3)} m from this parcel's line (it has no corner there).</p>`).join("")
+    + (!p.corners.length && !p.off_line.length ? "<p>None of its corners lies near the boundary.</p>" : "") + "</section>").join("");
+  return `<!doctype html><html><head><meta charset="utf-8"><title>Adjoining coordinates</title><style>@page{size:A4;margin:14mm}body{font:11px Arial,Helvetica,sans-serif;margin:0 auto;max-width:182mm;color:#000}
+    h1{font-size:17px;text-align:center;margin:6px 0 2px}h2{font-size:13px;margin:14px 0 3px}h2 small{font-weight:normal;font-size:11px}table{border-collapse:collapse;width:100%}th,td{border:1px solid #777;padding:2px 4px;text-align:left}th{background:#eee}.n{text-align:right;white-space:nowrap}
+    tr{break-inside:avoid}h2{break-after:avoid}.bad td{font-weight:bold}.warn{border:1px solid #b07800;padding:4px}.sign{margin-top:26px;display:flex;gap:20px;break-inside:avoid}.sign div{flex:1;border-top:1px solid #000;padding-top:3px}.bar{padding:6px;text-align:center}@media print{.bar{display:none}}</style></head><body>
+    <div class="bar"><button onclick="window.print()">Print / Save as PDF</button></div>
+    <h1>ADJOINING COORDINATES</h1><p style="text-align:center;margin:0">Checking and Data Verification${adj.source ? ` · ${esc(adj.source)}` : ""} · ${esc(fmtDT(r.queried_at))}${state.me ? ` · ${esc(state.me.username)}` : ""}</p>
+    <p>WGS 84 / UTM zone 32N (EPSG:32632), metres. Corners of the parcels within ${r.within_m} m of the boundary, as the database has them; dE and dN are database minus yours. Points agree when they are within ${r.tolerance_m} m. Make your adjoining corners conform to the database coordinates.</p>
+    ${r.warnings.map((w) => `<p class="warn">The list may be incomplete. ${esc(w)}</p>`).join("")}
+    <p><b>${r.parcels.length ? `${r.parcels.length} adjoining parcel(s); ${bad ? `${bad} point(s) do not agree` : "every compared point agrees"}.` : "No parcel adjoins this boundary."}</b></p>
+    ${parcels}<h2>Your boundary</h2><table><thead>${tr([["Corner"], ["Easting (m)", 1], ["Northing (m)", 1]], "th")}</thead><tbody>${ring.map((v, i) => tr([[adjCornerName(i + 1, ring)], [fmt3(v[0]), 1], [fmt3(v[1]), 1]])).join("")}</tbody></table>
+    <div class="sign"><div>Issued by</div><div>Received by (surveyor)</div><div>Date</div></div></body></html>`;
+}
+function adjPrint() {
+  const win = window.open("", "_blank");
+  if (!win) { uiAlert("The browser blocked the print window: allow pop-ups for this site."); return; }
+  win.document.write(adjPrintHtml()); win.document.close();
+}
 
 // --- System check (before the next stage, and again at commit on the server) ---
 // Overlaps here and in Aumentum, the drop point (is the plot free?), a title on the land, and the
