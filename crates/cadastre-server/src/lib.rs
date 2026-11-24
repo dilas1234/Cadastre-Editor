@@ -15,6 +15,7 @@ pub mod numbering;
 pub mod oda;
 pub mod openapi;
 pub mod pdf;
+pub mod picture;
 pub mod raster;
 pub mod report;
 pub mod routes;

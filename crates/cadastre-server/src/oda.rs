@@ -1,4 +1,4 @@
-//! DWG → DXF through the ODA File Converter (Open Design Alliance, free), for the Checking and
+//! DWG → DXF (and DXF → DWG, for export) through the ODA File Converter (Open Design Alliance, free), for the Checking and
 //! Data Verification unit's CAD import. DWG is a closed format; the converter is the dependable way
 //! to read every AutoCAD version without linking a DWG library into the server.
 //!
@@ -81,17 +81,43 @@ fn choose_screen(windows: bool, xvfb_run: Option<PathBuf>, has_display: bool) ->
     }
 }
 
+/// Which way a drawing is converted.
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum Way {
+    DwgToDxf,
+    DxfToDwg,
+}
+
+impl Way {
+    /// Input file, output type, filter.
+    fn names(self) -> (&'static str, &'static str, &'static str) {
+        match self {
+            Way::DwgToDxf => ("DRAWING.DWG", "DXF", "*.DWG"),
+            Way::DxfToDwg => ("DRAWING.DXF", "DWG", "*.DXF"),
+        }
+    }
+}
+
 /// Convert one DWG to ASCII DXF (AutoCAD 2018 format) and return the DXF's bytes.
 pub async fn dwg_to_dxf(dwg: &[u8]) -> Result<Vec<u8>, OdaError> {
+    convert(dwg, Way::DwgToDxf).await
+}
+
+/// Convert one DXF to DWG (AutoCAD 2018 format) and return the DWG's bytes.
+pub async fn dxf_to_dwg(dxf: &[u8]) -> Result<Vec<u8>, OdaError> {
+    convert(dxf, Way::DxfToDwg).await
+}
+
+async fn convert(drawing: &[u8], way: Way) -> Result<Vec<u8>, OdaError> {
     let program = converter().ok_or(OdaError::NotInstalled)?;
     let has_display = std::env::var_os("DISPLAY").is_some_and(|d| !d.is_empty());
     let screen = choose_screen(cfg!(windows), on_path("xvfb-run"), has_display)?;
-    let dwg = dwg.to_vec();
+    let drawing = drawing.to_vec();
     // Its own task: a browser that goes away must not leave the converter or its files behind.
     tokio::spawn(async move {
         let _one = ONE_AT_A_TIME.lock().await;
         let work = std::env::temp_dir().join(format!("cadastre-dwg-{}", uuid::Uuid::new_v4()));
-        let result = convert_in(&program, &screen, &work, &dwg, TIMEOUT).await;
+        let result = convert_in(&program, &screen, &work, &drawing, way, TIMEOUT).await;
         let _ = tokio::fs::remove_dir_all(&work).await;
         result
     })
@@ -119,12 +145,13 @@ async fn stop_group(pid: u32) {
     }
 }
 
-async fn convert_in(program: &Path, screen: &Screen, work: &Path, dwg: &[u8], limit: Duration) -> Result<Vec<u8>, OdaError> {
+async fn convert_in(program: &Path, screen: &Screen, work: &Path, drawing: &[u8], way: Way, limit: Duration) -> Result<Vec<u8>, OdaError> {
     let (input, output) = (work.join("in"), work.join("out"));
     let io = |e: std::io::Error| OdaError::Failed(format!("temporary files: {e}"));
     tokio::fs::create_dir_all(&input).await.map_err(io)?;
     tokio::fs::create_dir_all(&output).await.map_err(io)?;
-    tokio::fs::write(input.join("DRAWING.DWG"), dwg).await.map_err(io)?;
+    let (name, to, filter) = way.names();
+    tokio::fs::write(input.join(name), drawing).await.map_err(io)?;
     let mut cmd = match screen {
         Screen::Own => Command::new(program),
         Screen::Virtual(xvfb_run) => {
@@ -133,7 +160,7 @@ async fn convert_in(program: &Path, screen: &Screen, work: &Path, dwg: &[u8], li
             c
         }
     };
-    cmd.arg(&input).arg(&output).args(["ACAD2018", "DXF", "0", "1", "*.DWG"])
+    cmd.arg(&input).arg(&output).args(["ACAD2018", to, "0", "1", filter])
         // Whatever the server's own session uses (wayland, offscreen), the converter has only xcb.
         .env_remove("QT_QPA_PLATFORM").env_remove("WAYLAND_DISPLAY")
         .stdin(std::process::Stdio::null())
@@ -160,27 +187,27 @@ async fn convert_in(program: &Path, screen: &Screen, work: &Path, dwg: &[u8], li
     };
     // The output keeps the input's name; its extension's case is the converter's. A drawing it
     // cannot read is reported in a `.err` file beside it, not by the exit code.
-    let (mut dxf, mut why) = (Vec::new(), String::new());
+    let (mut made, mut why) = (Vec::new(), String::new());
     if let Ok(mut dir) = tokio::fs::read_dir(&output).await {
         while let Ok(Some(e)) = dir.next_entry().await {
             let path = e.path();
             match path.extension().map(|x| x.to_ascii_lowercase()) {
-                Some(x) if x == "dxf" => dxf = tokio::fs::read(&path).await.unwrap_or_default(),
+                Some(x) if x.eq_ignore_ascii_case(to) => made = tokio::fs::read(&path).await.unwrap_or_default(),
                 Some(x) if x == "err" => why = String::from_utf8_lossy(&tokio::fs::read(&path).await.unwrap_or_default()).into_owned(),
                 _ => {}
             }
         }
     }
-    if !dxf.is_empty() {
-        return Ok(dxf);
+    if !made.is_empty() {
+        return Ok(made);
     }
     if why.trim().is_empty() {
         // xvfb-run may pass the converter's errors on as output.
         why = format!("{} {}", String::from_utf8_lossy(&run.stderr), String::from_utf8_lossy(&run.stdout));
     }
     let why = reason(&why, &input, &output, work);
-    tracing::warn!("ODA File Converter {} ({screen:?}) gave no DXF, {}: {why}", program.display(), run.status);
-    Err(OdaError::Failed(if why.is_empty() { format!("no DXF came out ({})", run.status) } else { why }))
+    tracing::warn!("ODA File Converter {} ({screen:?}) gave no {to}, {}: {why}", program.display(), run.status);
+    Err(OdaError::Failed(if why.is_empty() { format!("no {to} came out ({})", run.status) } else { why }))
 }
 
 #[cfg(test)]
@@ -216,22 +243,22 @@ mod tests {
         let fake = script("ODAFileConverter", "[ -z \"$QT_QPA_PLATFORM\" ] || exit 4\n[ \"$DISPLAY\" = :virtual ] || { echo no display; exit 5; }\n\
             [ \"$3 $4 $5 $6 $7\" = \"ACAD2018 DXF 0 1 *.DWG\" ] || exit 3\ncp \"$1/DRAWING.DWG\" \"$2/DRAWING.dxf\"");
         let xvfb = Screen::Virtual(script("xvfb-run", "[ \"$1\" = -a ] || exit 6\nshift\nDISPLAY=:virtual exec \"$@\""));
-        let out = convert_in(&fake, &xvfb, &dir.join("w1"), b"0\nSECTION\n", TIMEOUT).await.unwrap();
+        let out = convert_in(&fake, &xvfb, &dir.join("w1"), b"0\nSECTION\n", Way::DwgToDxf, TIMEOUT).await.unwrap();
         assert_eq!(out, b"0\nSECTION\n");
 
         // A failure reported on output, as through xvfb-run.
         let dies = script("dies", "echo 'no Qt platform plugin'; exit 134");
-        let err = convert_in(&dies, &Screen::Own, &dir.join("w2"), b"x", TIMEOUT).await.unwrap_err().to_string();
+        let err = convert_in(&dies, &Screen::Own, &dir.join("w2"), b"x", Way::DwgToDxf, TIMEOUT).await.unwrap_err().to_string();
         assert!(err.contains("no Qt platform plugin"), "{err}");
 
         // An .err file gives the reason, without the server's folders.
         let bad = script("bad", "echo \"Error in drawing \\\"$1/DRAWING.DWG\\\" : Unexpected end of file\" > \"$2/DRAWING.dxf.err\"");
-        let err = convert_in(&bad, &Screen::Own, &dir.join("w3"), b"x", TIMEOUT).await.unwrap_err().to_string();
+        let err = convert_in(&bad, &Screen::Own, &dir.join("w3"), b"x", Way::DwgToDxf, TIMEOUT).await.unwrap_err().to_string();
         assert!(err.contains("\"DRAWING.DWG\" : Unexpected end of file") && !err.contains(&*dir.to_string_lossy()), "{err}");
 
         // Too slow: what it started is stopped too, not only the script.
         let slow = script("slow", &format!("sleep 600 & echo $! > '{}'\nwait", dir.join("pid").display()));
-        let err = convert_in(&slow, &Screen::Own, &dir.join("w4"), b"x", Duration::from_secs(1)).await.unwrap_err().to_string();
+        let err = convert_in(&slow, &Screen::Own, &dir.join("w4"), b"x", Way::DwgToDxf, Duration::from_secs(1)).await.unwrap_err().to_string();
         assert!(err.contains("longer than 1 s"), "{err}");
         let pid = std::fs::read_to_string(dir.join("pid")).unwrap();
         // Ended, or a zombie waiting for its new parent.
@@ -256,23 +283,21 @@ mod tests {
         }
         let screen = choose_screen(false, on_path("xvfb-run"), display).unwrap();
         let dir = std::env::temp_dir().join(format!("oda-real-{}", uuid::Uuid::new_v4()));
-        let (src, dst) = (dir.join("src"), dir.join("dst"));
-        std::fs::create_dir_all(&src).unwrap();
-        std::fs::create_dir_all(&dst).unwrap();
-        std::fs::write(src.join("plan.dxf"), "0\nSECTION\n2\nENTITIES\n0\nLINE\n8\nBOUNDARY\n10\n493000.125\n20\n1083100.5\n30\n0.0\n11\n493030.0\n21\n1083100.5\n31\n0.0\n0\nENDSEC\n0\nEOF\n").unwrap();
-        let mut cmd = match &screen {
-            Screen::Own => Command::new(&program),
-            Screen::Virtual(x) => { let mut c = Command::new(x); c.arg("-a").arg(&program); c }
-        };
-        cmd.arg(&src).arg(&dst).args(["ACAD2018", "DWG", "0", "1", "*.DXF"]).env_remove("QT_QPA_PLATFORM").env_remove("WAYLAND_DISPLAY");
-        cmd.output().await.unwrap();
-        let dwg = std::fs::read(dst.join("plan.dwg")).expect("the converter made a DWG");
+        // The DXF an export writes, as a DWG and back.
+        let made = cadastre_import::export::dxf(&cadastre_import::export::Drawing {
+            title: String::new(),
+            shapes: vec![cadastre_import::export::Shape { layer: "BOUNDARY".into(), name: String::new(), closed: true,
+                points: vec![[493000.125, 1083100.5], [493030.0, 1083100.5], [493030.0, 1083131.0]] }],
+            labels: vec![cadastre_import::export::Label { layer: "CORNERS".into(), text: "PB 1234".into(), point: [493000.125, 1083100.5] }],
+        });
+        let dwg = convert_in(&program, &screen, &dir.join("make"), made.as_bytes(), Way::DxfToDwg, TIMEOUT).await.expect("the converter made a DWG");
         assert!(dwg.starts_with(b"AC1032"));
-        let dxf = convert_in(&program, &screen, &dir.join("work"), &dwg, TIMEOUT).await.unwrap();
+        let dxf = convert_in(&program, &screen, &dir.join("work"), &dwg, Way::DwgToDxf, TIMEOUT).await.unwrap();
         let d = cadastre_import::dxf::parse_bytes(&dxf).unwrap();
-        assert_eq!((d.lines.len(), d.lines[0].layer.as_str()), (1, "BOUNDARY"));
-        assert!((d.lines[0].from.x - 493000.125).abs() < 1e-6 && (d.lines[0].from.y - 1083100.5).abs() < 1e-6);
-        let err = convert_in(&program, &screen, &dir.join("bad"), b"AC1032 not a real drawing", TIMEOUT).await.unwrap_err().to_string();
+        assert_eq!((d.polylines.len(), d.polylines[0].layer.as_str(), d.polylines[0].closed, d.polylines[0].vertices.len()), (1, "BOUNDARY", true, 3));
+        assert!((d.polylines[0].vertices[0].x - 493000.125).abs() < 1e-6 && (d.polylines[0].vertices[0].y - 1083100.5).abs() < 1e-6);
+        assert_eq!((d.texts.len(), d.texts[0].text.as_str()), (1, "PB 1234"));
+        let err = convert_in(&program, &screen, &dir.join("bad"), b"AC1032 not a real drawing", Way::DwgToDxf, TIMEOUT).await.unwrap_err().to_string();
         assert!(err.contains("Unexpected end of file") && !err.contains(&*dir.to_string_lossy()), "{err}");
         std::fs::remove_dir_all(&dir).unwrap();
     }

@@ -129,6 +129,7 @@ async function api(path, opts = {}) {
     try { await authRefresh(); } catch { return authLogin(); }
     r = await fetch(path, { ...init, headers: { ...init.headers, ...authHeaders() } });
   }
+  if (opts.blob && r.ok) return r.blob(); // a file to download
   const text = await r.text();
   let data = null; try { data = text ? JSON.parse(text) : null; } catch { data = text; }
   if (!r.ok) { const err = new Error((data && data.message) || `${r.status} ${r.statusText}`); err.status = r.status; throw err; }
@@ -2120,6 +2121,11 @@ function importSummary(result, filename) {
       h("ul", { style: "margin:2px 0 0 16px;padding:0" }, ...result.boundaries.slice(0, 25).map((b) =>
         h("li", {}, `${b.id} (${b.kind}) — ${b.ring.length} vertices, ${b.closed ? "closed" : "open"}`))));
   }
+  box.append(importWarnings(result));
+  return box;
+}
+function importWarnings(result) {
+  const box = h("div");
   for (const [label, list] of [["Warning", result.warnings || []], ["Row issue", result.issues || []]]) {
     if (list.length) box.append(h("div", { style: "margin-top:6px" }, h("b", {}, `${label}s`),
       h("ul", { style: "margin:2px 0 0 16px;padding:0" }, ...list.slice(0, 30).map((w) =>
@@ -2132,14 +2138,14 @@ function openImportDialog() {
   const body = h("div");
   floatWindow("Import Survey / CAD / Attributes", body, { id: "importWin", width: 580 });
 
-  const file = h("input", { type: "file", accept: (VERIFY ? ".dwg," : "") + ".csv,.tsv,.txt,.psv,.dxf,.xml,.landxml,.tfw,.tifw,.jgw,.jpgw,.jpegw,.pgw,.gfw,.bpw,.j2w,.wld" });
+  const file = h("input", { type: "file", multiple: VERIFY, accept: (VERIFY ? ".dwg,.kml,.emf,.tif,.tiff,.bmp,.prj," : "") + ".csv,.tsv,.txt,.psv,.dxf,.xml,.landxml,.tfw,.tifw,.jgw,.jpgw,.jpegw,.pgw,.gfw,.bpw,.j2w,.wld" });
   const crs = h("input", { type: "text", value: "EPSG:32632", style: "width:120px" });
   const prj = h("input", { type: "file", accept: ".prj" });
   const join = h("input", { type: "checkbox" });
   const attrFile = h("input", { type: "file", accept: ".csv,.tsv,.txt,.psv", disabled: true });
   const keyColumn = h("input", { type: "text", placeholder: "auto (e.g. Point)", style: "width:130px", disabled: true });
   const out = h("div", { class: "muted" }, VERIFY
-    ? "Choose the surveyor's drawing (DWG or DXF) or coordinate list to preview. Coordinates are not reprojected."
+    ? "Choose the surveyor's drawing (DWG, DXF, KML, EMF), scanned plan (TIFF, BMP) or coordinate list, then Preview."
     : "Choose a file to preview. DXF must be saved as ASCII; drawing units and CRS are not reprojected.");
   const apply = h("button", { class: VERIFY ? "btn hidden" : "btn", disabled: true }, "Import into job");
   let current = null;
@@ -2152,20 +2158,39 @@ function openImportDialog() {
     class: "btn",
     onclick: async () => {
       out.className = ""; out.textContent = "Reading…"; apply.disabled = true; current = null;
-      const picked = file.files?.[0];
-      if (VERIFY && picked && /\.(dwg|dxf)$/i.test(picked.name)) {
+      // In the verification unit a picture's world file and .prj may be picked together with it.
+      const files = [...(file.files || [])];
+      const picked = VERIFY ? files.find((f) => !SIDECAR.test(f.name)) || files[0] : files[0];
+      if (VERIFY && picked && /\.(tiff?|bmp)$/i.test(picked.name)) {
+        out.textContent = "Reading the scanned plan…";
+        try {
+          const pic = await readPicture(picked, files.filter((f) => f !== picked));
+          out.innerHTML = ""; out.append(pictureChoices(pic));
+          if (pic.fit) showPicture(pic); else openPlacing(pic);
+        } catch (e) { out.textContent = "The picture could not be read: " + e.message; }
+        return;
+      }
+      if (VERIFY && picked && /\.(dwg|dxf|kml|kmz|emf)$/i.test(picked.name)) {
         // The drawing itself goes to the server: binary DXF, and DWG through the ODA converter.
         out.textContent = /\.dwg$/i.test(picked.name) ? "Converting the DWG and reading it…" : "Reading the drawing…";
         try {
           const q = `filename=${encodeURIComponent(picked.name)}` + (crs.value.trim() ? `&crs=${encodeURIComponent(crs.value.trim())}` : "");
           const result = await api(`/api/v1/import/cad?${q}`, { method: "POST", body: picked });
+          if (result.unplaced) {
+            // An EMF has page units: the boundaries are offered once it has been placed.
+            out.innerHTML = ""; out.append(h("p", {}, "An EMF has no ground coordinates: place it by two or more known points in the Place window."), importWarnings(result));
+            openPlacing({ name: picked.name, result, done: (placed) => {
+              out.innerHTML = ""; out.append(verifyImportChoices(placed, picked.name), importSummary(placed, picked.name)); showCadRef(placed, picked.name);
+            } });
+            return;
+          }
           out.innerHTML = ""; out.append(verifyImportChoices(result, picked.name), importSummary(result, picked.name));
           showCadRef(result, picked.name);
         } catch (e) { out.textContent = "The drawing could not be read: " + e.message; }
         return;
       }
       try {
-        const f = await readTextFile(file);
+        const f = await readTextFile({ files: picked ? [picked] : [] });
         if (!f) { out.className = "muted"; out.textContent = "Choose a file first."; return; }
         const prjFile = await readTextFile(prj);
         if (join.checked) {
@@ -2223,10 +2248,12 @@ function openImportDialog() {
   };
 
   body.append(
-    h("p", { class: "muted", style: "margin-top:0" }, "Coordinate lists (CSV/TSV), ASCII DXF, LandXML and raster world files are detected from the file name and contents."),
+    h("p", { class: "muted", style: "margin-top:0" }, VERIFY
+      ? "Drawings: DWG, DXF, KML, EMF. Scanned plans: TIFF, BMP (pick the world file and .prj together with the picture, if there are any). Coordinate lists: CSV, TXT; LandXML."
+      : "Coordinate lists (CSV/TSV), ASCII DXF, LandXML and raster world files are detected from the file name and contents."),
     h("div", { class: "frow" }, h("label", {}, "File:"), file),
     h("div", { class: "frow" }, h("label", {}, "CRS:"), crs, h("span", { class: "muted" }, "assumed only if the file does not state one")),
-    h("div", { class: "frow" }, h("label", {}, "World .prj:"), prj, h("span", { class: "muted" }, "optional, for rasters")),
+    h("div", { class: VERIFY ? "frow hidden" : "frow" }, h("label", {}, "World .prj:"), prj, h("span", { class: "muted" }, "optional, for rasters")),
     h("div", { class: "frow" }, h("label", {}, "Join table:"), join, attrFile),
     h("div", { class: "frow" }, h("label", {}, "Key column:"), keyColumn),
     h("div", { class: "frow", style: "margin-top:8px" }, preview, apply),
@@ -3371,7 +3398,7 @@ async function verifyPoints(utm) {
 // The unit checks a surveyor's boundary (from the CAD file or coordinate list, or sketched) before
 // any Digitising job exists: overlaps here and in Aumentum, the drop point, a title on the land and
 // gaps to neighbours. Check-only: nothing is saved, the boundary stays to be adjusted and checked again.
-const verify = { report: null, key: "", corners: 0, area: null, source: "", drawing: "" };
+const verify = { report: null, key: "", corners: 0, area: null, source: "", drawing: "", ref: null, picture: null };
 const ringKey = (v) => v.map(([e, n]) => `${e.toFixed(3)},${n.toFixed(3)}`).join(";");
 function openVerification() {
   const body = h("div", { id: "verifyBody" });
@@ -3384,7 +3411,7 @@ function verifyDraw() {
   if (!edit.active) startEditing("sketch"); else setTool("sketch");
   status("Click the boundary's corners on the map, or type / paste them in Edit Sketch Properties; then Check Boundary.");
 }
-function verifyClear() { clearSketch(); verify.report = null; verify.key = ""; verify.source = ""; showCadRef(null); refreshSketchProps(); updateEditorButtons(); }
+function verifyClear() { clearSketch(); verify.report = null; verify.key = ""; verify.source = ""; showCadRef(null); showPicture(null); refreshSketchProps(); updateEditorButtons(); }
 function renderVerification() {
   const body = $("verifyBody"); if (!body) return;
   body.innerHTML = "";
@@ -3392,14 +3419,23 @@ function renderVerification() {
   body.append(
     h("p", { class: "muted", style: "margin-top:0" }, "Check a surveyor's boundary before it goes to Digitising. Nothing is saved here."),
     h("div", { class: "frow" },
-      h("button", { class: "btn", title: "Read the surveyor's CAD file (DXF) or coordinate list", onclick: openImportDialog }, "Import CAD / coordinates…"),
+      h("button", { class: "btn", title: "Read the surveyor's drawing (DWG, DXF, KML, EMF), scanned plan (TIFF, BMP) or coordinate list", onclick: openImportDialog }, "Import drawing / plan / coordinates…"),
       h("button", { class: "btn", title: "Sketch the boundary on the map, or type its corners", onclick: verifyDraw }, "Draw boundary")),
     h("div", { class: "frow" },
       h("button", { class: "btn btnPrimary", disabled: n < 3, onclick: verifySketch }, "Check boundary"),
-      h("button", { class: "btn", disabled: !edit.verts.length && !verify.report, onclick: verifyClear }, "Clear")),
+      h("button", { class: "btn", disabled: !edit.verts.length && !verify.report, onclick: verifyClear }, "Clear"),
+      h("button", { class: "btn", disabled: n < 3 && !verify.ref && !verify.picture, title: "Save the boundary and the drawing as DXF, DWG, KML, EMF, TIFF or BMP", onclick: openExport }, "Export…")),
     h("p", { class: "muted" }, n >= 3 ? `Boundary: ${n} corners, ${area2(sketchAreaM2())} m²${verify.source ? ` (from ${verify.source})` : ""}.` : "No boundary yet: import one or draw it."));
   if (verify.drawing) body.append(h("p", { class: "muted" }, `Drawing on the map (magenta, dashed): ${verify.drawing}. `,
     h("a", { href: "#", class: "linkish", onclick: (ev) => { ev.preventDefault(); showCadRef(null); } }, "Hide")));
+  if (verify.picture) {
+    const pic = verify.picture;
+    const slider = h("input", { type: "range", min: 0, max: 100, value: Math.round(pic.opacity * 100), title: "Transparency", style: "width:90px;vertical-align:middle",
+      oninput: () => { pic.opacity = slider.value / 100; if (map.getLayer("cadpic")) map.setPaintProperty("cadpic", "raster-opacity", pic.opacity); } });
+    body.append(h("p", { class: "muted" }, `Scanned plan on the map: ${pic.name} `, slider, " ",
+      h("a", { href: "#", class: "linkish", onclick: (ev) => { ev.preventDefault(); openPlacing(pic); } }, "Place again"), " ",
+      h("a", { href: "#", class: "linkish", onclick: (ev) => { ev.preventDefault(); showPicture(null); } }, "Hide")));
+  }
   const r = verify.report;
   if (!r) return;
   const fails = r.items.filter((i) => i.result === "fail").length;
@@ -3449,7 +3485,7 @@ function ringArea(ring) {
 // The drawing on the map (magenta, dashed), for reference while the boundary is chosen or redrawn.
 function showCadRef(result, name) {
   const src = map.getSource("cadref"); if (!src) return;
-  if (!result) { src.setData(empty()); verify.drawing = ""; refreshVerification(); return; }
+  if (!result) { src.setData(empty()); verify.drawing = ""; verify.ref = null; refreshVerification(); return; }
   const ll = (p) => toLL(p.x, p.y);
   const feats = [];
   for (const b of result.boundaries || []) {
@@ -3465,6 +3501,7 @@ function showCadRef(result, name) {
   const fc = { type: "FeatureCollection", features: feats };
   src.setData(fc);
   verify.drawing = feats.length ? name : "";
+  verify.ref = feats.length ? result : null;
   if (feats.length) zoomToFC(fc);
   refreshVerification();
 }
@@ -3477,7 +3514,9 @@ function verifyImportChoices(result, name) {
   const rings = (result.boundaries || []).filter((b) => (b.ring || []).length >= 3)
     .map((b) => ({ ...b, area: ringArea(b.ring) }))
     .sort((a, b) => (b.closed - a.closed) || (b.area - a.area));
-  const pts = result.points || [];
+  // Labels are not corners when the file has points of its own (an export has both at each corner).
+  const marks = (result.points || []).filter((p) => !(p.code || "").startsWith("TEXT:"));
+  const pts = marks.length >= 3 ? marks : result.points || [];
   const coords = [...rings.flatMap((b) => b.ring), ...pts.map((p) => p.point)];
   const outside = coords.filter((p) => !inPlateau(p)).length;
   if (outside) box.append(h("p", { class: "verifyStale" },
@@ -3508,6 +3547,365 @@ function verifyImportChoices(result, name) {
   const blocks = (result.warnings || []).filter((w) => /block reference/.test(w)).length;
   if (blocks) box.append(h("p", { class: "muted", style: "margin:4px 0 0" }, `${blocks} block(s) in the drawing were not exploded (see the warnings below); explode them in AutoCAD if the parcel is drawn inside one.`));
   return box;
+}
+
+// --- Pictures (TIFF, BMP, EMF): reading, placing on the ground, showing ---
+// Picture coordinates (u, v) are in pixels of the scan (or EMF units) with v UPWARDS, so a fit to
+// the ground never mirrors: the top-left corner of a scan is (0, 0), the bottom-right (width, -height).
+// A fit is [a, b, c, d, e, f]: E = a·u + b·v + c, N = d·u + e·v + f.
+const SIDECAR = /\.(prj|tfw|tifw|bpw|bmpw|wld)$/i;
+const PICTURE_SIDE = 4096;
+const applyFit = (m, [u, v]) => [m[0] * u + m[1] * v + m[2], m[3] * u + m[4] * v + m[5]];
+function invertFit(m) {
+  const det = m[0] * m[4] - m[1] * m[3];
+  return [m[4] / det, -m[1] / det, (m[1] * m[5] - m[4] * m[2]) / det, -m[3] / det, m[0] / det, (m[3] * m[2] - m[0] * m[5]) / det];
+}
+// The similarity (one scale, a rotation, a shift) that best takes the picture points to the ground.
+function similarityFit(pairs) {
+  const n = pairs.length; if (n < 2) return null;
+  const mean = (f) => pairs.reduce((t, p) => t + f(p), 0) / n;
+  const [mu, mv, me, mn] = [mean((p) => p.u), mean((p) => p.v), mean((p) => p.e), mean((p) => p.n)];
+  let s = 0, a = 0, b = 0;
+  for (const p of pairs) {
+    const [u, v, e, nn] = [p.u - mu, p.v - mv, p.e - me, p.n - mn];
+    s += u * u + v * v; a += u * e + v * nn; b += u * nn - v * e;
+  }
+  if (s < 1e-9 || Math.hypot(a, b) < 1e-9) return null;
+  a /= s; b /= s;
+  const fit = [a, -b, me - a * mu + b * mv, b, a, mn - b * mu - a * mv];
+  const off = pairs.map((p) => { const [e, nn] = applyFit(fit, [p.u, p.v]); return Math.hypot(e - p.e, nn - p.n); });
+  return { fit, off, scale: Math.hypot(a, b) };
+}
+// A file's own placement (pixel corner, row downwards, in `epsg`) as a fit in UTM 32N.
+function fileFit([a, b, c, d, e, f], epsg, w, hgt) {
+  const crs = resolveCrs(epsg);
+  const utm = (col, row) => { const p = [a * col + b * row + c, d * col + e * row + f]; return crs.code === "EPSG:32632" ? p : proj4(crs.code, "EPSG:32632", p); };
+  const o = utm(0, 0), x = utm(w, 0), y = utm(0, hgt);
+  const fit = [(x[0] - o[0]) / w, -(y[0] - o[0]) / hgt, o[0], (x[1] - o[1]) / w, -(y[1] - o[1]) / hgt, o[1]];
+  return fit.every(Number.isFinite) ? fit : null;
+}
+async function readPicture(file, sidecars) {
+  const pic = { name: file.name, warnings: [], fit: null, opacity: 1 };
+  let transform = null, epsg = null;
+  if (/\.bmp$/i.test(file.name)) {
+    let bmp;
+    try { bmp = await createImageBitmap(file); } catch { throw new Error("not a BMP picture this browser can read"); }
+    [pic.width, pic.height] = [bmp.width, bmp.height];
+    const k = Math.min(1, PICTURE_SIDE / Math.max(bmp.width, bmp.height));
+    const c = document.createElement("canvas");
+    c.width = Math.max(1, Math.round(bmp.width * k)); c.height = Math.max(1, Math.round(bmp.height * k));
+    const g = c.getContext("2d"); g.imageSmoothingQuality = "high"; g.drawImage(bmp, 0, 0, c.width, c.height); bmp.close();
+    pic.blob = await new Promise((ok, bad) => c.toBlob((b) => (b ? ok(b) : bad(new Error("the BMP is too large"))), "image/png"));
+    if (k < 1) pic.warnings.push(`shown at 1/${(1 / k).toFixed(1)} of the scan's resolution`);
+  } else {
+    const r = await api("/api/v1/import/picture", { method: "POST", body: file });
+    Object.assign(pic, { width: r.width, height: r.height });
+    pic.warnings.push(...r.warnings);
+    pic.blob = new Blob([Uint8Array.from(atob(r.png), (ch) => ch.charCodeAt(0))], { type: "image/png" });
+    ({ transform, epsg } = r);
+  }
+  // A world file picked with the picture: its own name when several are picked.
+  const base = (n) => n.replace(/\.[^.]+$/, "").toLowerCase();
+  const beside = (re) => { const l = sidecars.filter((f) => re.test(f.name)); return l.find((f) => base(f.name) === base(file.name)) || l[0]; };
+  const world = beside(/\.(tfw|tifw|bpw|bmpw|wld)$/i), prj = beside(/\.prj$/i);
+  if (world) {
+    const v = (await world.text()).trim().split(/\s+/).map(Number);
+    if (v.length < 6 || !v.slice(0, 6).every(Number.isFinite) || Math.abs(v[0] * v[3] - v[1] * v[2]) === 0) throw new Error(`${world.name} is not a world file`);
+    const [a, d, b, e, c, f] = v; // the file gives the centre of the top-left pixel
+    transform = [a, b, c - (a + b) / 2, d, e, f - (d + e) / 2];
+  }
+  if (prj) {
+    const t = await prj.text();
+    epsg = Number((/EPSG["',:\s]+(\d{4,5})["'\]\s]*\]?\s*$/i.exec(t.trim()) || [])[1]) || (/UTM[ _]zone[ _]32N/i.test(t) && /WGS/i.test(t) ? 32632 : /Minna/i.test(t) && /UTM[ _]zone[ _]32N/i.test(t) ? 26332 : null);
+    if (!epsg) pic.warnings.push(`${prj.name} names a coordinate system that is not known here; UTM 32N is assumed`);
+  }
+  if (transform) {
+    if (!resolveCrs(epsg).known) pic.warnings.push("the file does not say its coordinate system (or it is not known here); UTM 32N (WGS 84) is assumed");
+    const fit = fileFit(transform, epsg, pic.width, pic.height);
+    const centre = fit && applyFit(fit, [pic.width / 2, -pic.height / 2]);
+    if (centre && inPlateau({ x: centre[0], y: centre[1] })) { pic.fit = fit; pic.how = "its own coordinates"; }
+    else pic.warnings.push("the file's own coordinates are outside Plateau State, so it was not placed by them");
+  }
+  return pic;
+}
+function pictureChoices(pic) {
+  const box = h("div", {},
+    h("p", {}, h("b", {}, `${pic.name}: scanned plan`), ` — ${pic.width} × ${pic.height} pixels`),
+    h("p", {}, pic.fit ? `Placed on the map by ${pic.how}. Trace the boundary over it with Draw boundary, or type the corners from the plan.`
+      : "The picture does not say where it lies: place it by two or more known points in the Place window."));
+  if (pic.warnings.length) box.append(importWarnings(pic));
+  box.append(h("div", { class: "frow" }, h("button", { class: "btn", onclick: () => openPlacing(pic) }, pic.fit ? "Place by points…" : "Place…")));
+  return box;
+}
+function showPicture(pic) {
+  if (map.getLayer("cadpic")) map.removeLayer("cadpic");
+  if (map.getSource("cadpic")) map.removeSource("cadpic");
+  if (!pic && verify.picture?.url) { URL.revokeObjectURL(verify.picture.url); verify.picture.url = null; }
+  verify.picture = pic || null;
+  if (pic) {
+    pic.url = pic.url || URL.createObjectURL(pic.blob);
+    const corners = [[0, 0], [pic.width, 0], [pic.width, -pic.height], [0, -pic.height]].map((p) => toLL(...applyFit(pic.fit, p)));
+    map.addSource("cadpic", { type: "image", url: pic.url, coordinates: corners });
+    map.addLayer({ id: "cadpic", type: "raster", source: "cadpic", paint: { "raster-opacity": pic.opacity, "raster-fade-duration": 0 } }, firstVectorLayer());
+    zoomToFC({ type: "FeatureCollection", features: [{ type: "Feature", properties: {}, geometry: { type: "Polygon", coordinates: [[...corners, corners[0]]] } }] }, { maxZoom: 20 });
+  }
+  refreshVerification();
+}
+// Place a scan or an EMF: click a point whose coordinates are printed on the plan (a beacon), type
+// its easting and northing; two points place it, more show how well they agree.
+// `item`: a picture (readPicture), or { name, result, done } for an EMF's lines.
+async function openPlacing(item) {
+  const vector = !!item.result;
+  const cv = h("canvas", { width: 640, height: 310, style: "border:1px solid #bbb;background:#fff;cursor:crosshair;display:block" });
+  const tbl = h("div"), msg = h("p", { class: "muted", style: "margin:4px 0" });
+  const go = h("button", { class: "btn btnPrimary", disabled: true }, "Place on the map");
+  const pairs = item.pairs ? item.pairs.map((p) => ({ ...p })) : [];
+  let img = null, snaps = [], ext;
+  if (vector) {
+    const pts = [...item.result.boundaries.flatMap((b) => b.ring), ...item.result.points.map((p) => p.point)];
+    const rings = item.result.boundaries.filter((b) => b.ring.length > 2); // corners, not the arms of beacon symbols
+    snaps = (rings.length ? rings : item.result.boundaries).flatMap((b) => b.ring.map((p) => [p.x, p.y]));
+    ext = pts.reduce((b, p) => [Math.min(b[0], p.x), Math.min(b[1], p.y), Math.max(b[2], p.x), Math.max(b[3], p.y)], [Infinity, Infinity, -Infinity, -Infinity]);
+  } else {
+    img = await createImageBitmap(item.blob);
+    ext = [0, -item.height, item.width, 0];
+  }
+  floatWindow(`Place ${item.name}`, h("div", {},
+    h("p", { class: "muted", style: "margin-top:0" }, "Click a beacon or corner whose UTM 32N coordinates are printed on the plan and type them. Two points place it; three or more also check it. Wheel: zoom; drag: move."),
+    cv, tbl, msg, h("div", { class: "frow" }, go)), { id: "placeWin", width: 668 });
+  const g = cv.getContext("2d");
+  let k = Math.min(cv.width / Math.max(1e-9, ext[2] - ext[0]), cv.height / Math.max(1e-9, ext[3] - ext[1])) * 0.94;
+  let ox = cv.width / 2 - k * (ext[0] + ext[2]) / 2, oy = cv.height / 2 + k * (ext[1] + ext[3]) / 2;
+  const scr = ([u, v]) => [ox + k * u, oy - k * v], un = ([x, y]) => [(x - ox) / k, (oy - y) / k];
+  const draw = () => {
+    g.clearRect(0, 0, cv.width, cv.height);
+    if (img) { g.imageSmoothingEnabled = true; g.drawImage(img, ox, oy, item.width * k, item.height * k); }
+    else {
+      g.strokeStyle = "#335"; g.lineWidth = 1;
+      for (const b of item.result.boundaries) { g.beginPath(); b.ring.forEach((p, i) => g[i ? "lineTo" : "moveTo"](...scr([p.x, p.y]))); if (b.closed) g.closePath(); g.stroke(); }
+      g.fillStyle = "#909"; g.font = "11px sans-serif";
+      for (const p of item.result.points.slice(0, 2000)) g.fillText(p.id, ...scr([p.point.x, p.point.y]));
+    }
+    pairs.forEach((p, i) => { const [x, y] = scr([p.u, p.v]); g.strokeStyle = "#e00"; g.lineWidth = 2; g.beginPath(); g.moveTo(x - 8, y); g.lineTo(x + 8, y); g.moveTo(x, y - 8); g.lineTo(x, y + 8); g.stroke(); g.fillStyle = "#e00"; g.font = "bold 13px sans-serif"; g.fillText(String(i + 1), x + 8, y - 8); });
+  };
+  // Typed as "E N" together or one by one; a pasted pair fills both.
+  const num = (t) => { const v = Number(String(t).replace(/[,\s]/g, "").replace(/m?[EN]$/i, "")); return String(t).trim() && Number.isFinite(v) ? v : NaN; };
+  let solved = null;
+  const solve = () => {
+    const good = pairs.filter((p) => Number.isFinite(p.e) && Number.isFinite(p.n));
+    const out = good.filter((p) => !inPlateau({ x: p.e, y: p.n })).length;
+    solved = good.length === pairs.length && !out ? similarityFit(good) : null;
+    pairs.forEach((p) => { if (p.cell) p.cell.textContent = solved && pairs.length > 2 ? `${solved.off[good.indexOf(p)].toFixed(2)} m` : ""; });
+    go.disabled = !solved;
+    msg.className = "muted"; msg.textContent = out ? "Those coordinates are not UTM 32N metres in Plateau State." : "";
+    if (solved) {
+      const worst = Math.max(...solved.off);
+      const m = 1 / solved.scale;
+      msg.textContent = pairs.length > 2 ? `Worst disagreement ${worst.toFixed(2)} m. 1 m on the ground is ${m < 10 ? m.toFixed(2) : Math.round(m)} ${vector ? "drawing units" : "pixels"}.`
+        : `Two points cannot check each other: add a third if the plan gives one. 1 m on the ground is ${m < 10 ? m.toFixed(2) : Math.round(m)} ${vector ? "drawing units" : "pixels"}.`;
+      if (pairs.length > 2 && worst > 0.5) { msg.className = "verifyStale"; msg.textContent += " Check the coordinates and the points clicked."; }
+    }
+  };
+  const list = () => {
+    tbl.innerHTML = "";
+    if (!pairs.length) return;
+    const t = h("table", { class: "legs" }, h("tr", {}, ...["", "Easting", "Northing", "Off by", ""].map((x) => h("th", {}, x))));
+    pairs.forEach((p, i) => {
+      const box = (key) => {
+        const inp = h("input", { type: "text", value: Number.isFinite(p[key]) ? p[key] : "", style: "width:120px" });
+        inp.oninput = () => {
+          const two = inp.value.trim().split(/[\s;]+|,\s+/).filter(Boolean);
+          if (key === "e" && two.length === 2 && Number.isFinite(num(two[0])) && num(two[1]) > 100000) { p.e = num(two[0]); p.n = num(two[1]); list(); }
+          else p[key] = num(inp.value);
+          solve();
+        };
+        return inp;
+      };
+      p.cell = h("td");
+      t.append(h("tr", {}, h("td", {}, String(i + 1)), h("td", {}, box("e")), h("td", {}, box("n")), p.cell,
+        h("td", {}, h("button", { class: "btn", title: "Remove this point", onclick: () => { pairs.splice(i, 1); list(); solve(); draw(); } }, "✕"))));
+    });
+    tbl.append(t);
+  };
+  const pos = (ev) => { const r = cv.getBoundingClientRect(); return [ev.clientX - r.left, ev.clientY - r.top]; };
+  cv.addEventListener("wheel", (ev) => {
+    ev.preventDefault();
+    const [x, y] = pos(ev), [u, v] = un([x, y]);
+    k *= ev.deltaY < 0 ? 1.25 : 0.8; ox = x - k * u; oy = y + k * v; draw();
+  }, { passive: false });
+  let drag = null;
+  cv.addEventListener("pointerdown", (ev) => { const p = pos(ev); drag = { p, ox, oy, moved: false }; cv.setPointerCapture(ev.pointerId); });
+  cv.addEventListener("pointermove", (ev) => {
+    if (!drag) return;
+    const p = pos(ev), dx = p[0] - drag.p[0], dy = p[1] - drag.p[1];
+    if (Math.hypot(dx, dy) > 4) drag.moved = true;
+    if (drag.moved) { ox = drag.ox + dx; oy = drag.oy + dy; draw(); }
+  });
+  cv.addEventListener("pointerup", (ev) => {
+    const d = drag; drag = null; if (!d || d.moved) return;
+    const p = pos(ev);
+    let [u, v] = un(p), best = 10; // an EMF's own corner within 10 screen pixels
+    for (const s of snaps) { const q = scr(s), far = Math.hypot(q[0] - p[0], q[1] - p[1]); if (far < best) { best = far; [u, v] = s; } }
+    pairs.push({ u, v, e: NaN, n: NaN });
+    list(); solve(); draw();
+    tbl.querySelectorAll("tr:last-child input")[0]?.focus({ preventScroll: true });
+  });
+  go.onclick = () => {
+    if (!solved) return;
+    const fit = solved.fit, worst = pairs.length > 2 ? Math.max(...solved.off) : null;
+    item.pairs = pairs.map(({ u, v, e, n }) => ({ u, v, e, n }));
+    const how = `${pairs.length} known points${worst == null ? "" : `, worst ${worst.toFixed(2)} m`}`;
+    $("placeWin")?.remove();
+    if (!vector) { item.fit = fit; item.how = how; showPicture(item); status(`${item.name} placed by ${how}. Trace the boundary over it with Draw boundary.`); return; }
+    const put = (p) => { const [x, y] = applyFit(fit, [p.x, p.y]); return { x, y }; };
+    item.done({ ...item.result, unplaced: false, epsg: 32632, crs: "EPSG:32632",
+      warnings: [...(item.result.warnings || []), `placed by ${how}: corners are only as good as the picture, so confirm them with the plan's printed coordinates`],
+      boundaries: item.result.boundaries.map((b) => ({ ...b, ring: b.ring.map(put), stated_area: null })),
+      points: item.result.points.map((p) => ({ ...p, point: put(p.point) })) });
+    status(`${item.name} placed by ${how}.`);
+  };
+  list(); solve(); draw();
+}
+
+// --- Export: the boundary, and the imported drawing or plan, as DXF, DWG, KML, EMF, TIFF or BMP ---
+function exportDrawing(withRef) {
+  const shapes = [], labels = [];
+  if (edit.geomType === "polygon" && edit.verts.length >= 3) {
+    shapes.push({ layer: "BOUNDARY", name: `Boundary, ${area2(sketchAreaM2())} m²`, closed: true, points: edit.verts.map((v) => [v[0], v[1]]) });
+    edit.verts.forEach(([e, n], i) => labels.push({ layer: "CORNERS", text: String(pointIds.get(ptKey(e, n)) || `P${i + 1}`), point: [e, n] }));
+  }
+  if (withRef && verify.ref) {
+    // The rings formed from the drawing's lines would repeat those lines.
+    for (const b of verify.ref.boundaries || []) if (b.ring.length >= 2 && !/\(from lines\)$/.test(b.id)) shapes.push({ layer: `DRAWING_${b.kind}`, name: b.id, closed: !!b.closed, points: b.ring.map((p) => [p.x, p.y]) });
+    for (const p of verify.ref.points || []) labels.push({ layer: `DRAWING_${(p.code || "POINTS").replace(/^TEXT:/, "")}`, text: p.id, point: [p.point.x, p.point.y] });
+  }
+  return { title: `Checking and Data Verification ${new Date().toLocaleDateString("en-GB")}`, shapes, labels };
+}
+// The plan drawn on a canvas, north up: the scanned plan (if asked), lines, corners, a scale bar.
+async function exportCanvas(drawing, pic) {
+  const pts = [...drawing.shapes.flatMap((s) => s.points), ...drawing.labels.map((l) => l.point),
+    ...(pic ? [[0, 0], [pic.width, 0], [pic.width, -pic.height], [0, -pic.height]].map((p) => applyFit(pic.fit, p)) : [])];
+  let b = pts.reduce((x, p) => [Math.min(x[0], p[0]), Math.min(x[1], p[1]), Math.max(x[2], p[0]), Math.max(x[3], p[1])], [Infinity, Infinity, -Infinity, -Infinity]);
+  const pad = Math.max((b[2] - b[0]) * 0.1, (b[3] - b[1]) * 0.1, 2);
+  b = [b[0] - pad, b[1] - pad, b[2] + pad, b[3] + pad];
+  const px = Math.max(b[2] - b[0], b[3] - b[1]) / 2400; // metres a pixel
+  const c = document.createElement("canvas");
+  c.width = Math.max(1, Math.round((b[2] - b[0]) / px)); c.height = Math.max(1, Math.round((b[3] - b[1]) / px));
+  const g = c.getContext("2d", { willReadFrequently: true });
+  g.fillStyle = "#fff"; g.fillRect(0, 0, c.width, c.height);
+  const at = ([e, n]) => [(e - b[0]) / px, (b[3] - n) / px];
+  if (pic) {
+    const img = await createImageBitmap(pic.blob), m = pic.fit, kx = pic.width / img.width, ky = pic.height / img.height;
+    const [x, y] = at([m[2], m[5]]);
+    g.save(); g.imageSmoothingQuality = "high";
+    g.setTransform(m[0] * kx / px, -m[3] * kx / px, -m[1] * ky / px, m[4] * ky / px, x, y);
+    g.drawImage(img, 0, 0); g.restore();
+  }
+  const main = (l) => l === "BOUNDARY" || l === "CORNERS";
+  for (const s of [...drawing.shapes].sort((p, q) => main(p.layer) - main(q.layer))) {
+    g.strokeStyle = main(s.layer) ? "#e00000" : "#555"; g.lineWidth = main(s.layer) ? 4 : 2; g.lineJoin = "round";
+    g.beginPath(); s.points.forEach((p, i) => g[i ? "lineTo" : "moveTo"](...at(p))); if (s.closed) g.closePath(); g.stroke();
+  }
+  for (const l of drawing.labels) {
+    const [x, y] = at(l.point), m = main(l.layer);
+    g.fillStyle = m ? "#e00000" : "#555"; g.beginPath(); g.arc(x, y, m ? 7 : 4, 0, 7); g.fill();
+    g.font = `${m ? "bold 30px" : "22px"} sans-serif`; g.lineWidth = 6; g.strokeStyle = "#fff"; g.strokeText(l.text, x + 10, y - 10);
+    g.fillStyle = "#000"; g.fillText(l.text, x + 10, y - 10);
+  }
+  // Scale bar: the longest 1, 2 or 5 × 10ⁿ metres within a quarter of the width.
+  const most = (c.width * px) / 4, pow = 10 ** Math.floor(Math.log10(most)), len = [5, 2, 1].map((q) => q * pow).find((q) => q <= most);
+  const y = c.height - 30, w = len / px;
+  g.fillStyle = "#fff"; g.fillRect(20, y - 50, w + 40, 70); g.fillStyle = "#000"; g.fillRect(40, y, w, 8);
+  g.font = "26px sans-serif"; g.fillText(`${len} m   N ↑`, 40, y - 12);
+  return { canvas: c, px, west: b[0], north: b[3] };
+}
+async function deflated(bytes) {
+  if (typeof CompressionStream === "undefined") return null;
+  return new Uint8Array(await new Response(new Blob([bytes]).stream().pipeThrough(new CompressionStream("deflate"))).arrayBuffer());
+}
+// An RGB GeoTIFF in UTM 32N.
+async function geoTiff({ canvas, px, west, north }) {
+  const [w, hgt] = [canvas.width, canvas.height], rgba = canvas.getContext("2d").getImageData(0, 0, w, hgt).data;
+  const rgb = new Uint8Array(w * hgt * 3);
+  for (let i = 0, j = 0; i < rgba.length; i += 4) { rgb[j++] = rgba[i]; rgb[j++] = rgba[i + 1]; rgb[j++] = rgba[i + 2]; }
+  const z = await deflated(rgb), data = z || rgb;
+  const SIZE = { 3: 2, 4: 4, 5: 8, 12: 8 };
+  const tags = [[256, 4, [w]], [257, 4, [hgt]], [258, 3, [8, 8, 8]], [259, 3, [z ? 8 : 1]], [262, 3, [2]], [273, 4, [0]], [277, 3, [3]], [278, 4, [hgt]], [279, 4, [data.length]],
+    [282, 5, [300, 1]], [283, 5, [300, 1]], [284, 3, [1]], [296, 3, [2]],
+    [33550, 12, [px, px, 0]], [33922, 12, [0, 0, 0, west, north, 0]],
+    [34735, 3, [1, 1, 0, 3, 1024, 0, 1, 1, 1025, 0, 1, 1, 3072, 0, 1, 32632]]];
+  const count = ([, t, v]) => (t === 5 ? v.length / 2 : v.length), bytes = (t) => count(t) * SIZE[t[1]];
+  let extra = 8 + 2 + tags.length * 12 + 4;
+  const place = tags.map((t) => { if (bytes(t) <= 4) return 0; const at = extra; extra += bytes(t) + (bytes(t) % 2); return at; });
+  tags.find((t) => t[0] === 273)[2][0] = extra;
+  const head = new DataView(new ArrayBuffer(extra));
+  head.setUint16(0, 0x4949); head.setUint16(2, 42, true); head.setUint32(4, 8, true); head.setUint16(8, tags.length, true);
+  tags.forEach((t, i) => {
+    const [tag, type, v] = t, e = 10 + i * 12;
+    head.setUint16(e, tag, true); head.setUint16(e + 2, type, true); head.setUint32(e + 4, count(t), true);
+    let at = place[i] ? (head.setUint32(e + 8, place[i], true), place[i]) : e + 8;
+    for (const x of v) { if (type === 3) { head.setUint16(at, x, true); at += 2; } else if (type === 12) { head.setFloat64(at, x, true); at += 8; } else { head.setUint32(at, x, true); at += 4; } }
+  });
+  return new Blob([head.buffer, data], { type: "image/tiff" });
+}
+function bmpFile({ canvas }) {
+  const [w, hgt] = [canvas.width, canvas.height], rgba = canvas.getContext("2d").getImageData(0, 0, w, hgt).data;
+  const stride = Math.ceil((w * 3) / 4) * 4, out = new Uint8Array(54 + stride * hgt), v = new DataView(out.buffer);
+  v.setUint16(0, 0x424d); v.setUint32(2, out.length, true); v.setUint32(10, 54, true); v.setUint32(14, 40, true);
+  v.setInt32(18, w, true); v.setInt32(22, hgt, true); v.setUint16(26, 1, true); v.setUint16(28, 24, true); v.setUint32(34, stride * hgt, true);
+  v.setInt32(38, 11811, true); v.setInt32(42, 11811, true);
+  for (let y = 0; y < hgt; y++) {
+    let o = 54 + (hgt - 1 - y) * stride, i = y * w * 4;
+    for (let x = 0; x < w; x++, i += 4) { out[o++] = rgba[i + 2]; out[o++] = rgba[i + 1]; out[o++] = rgba[i]; }
+  }
+  return new Blob([out], { type: "image/bmp" });
+}
+// The world file of an exported picture: pixel size, then the centre of the top-left pixel.
+const worldText = ({ px, west, north }) => [px, 0, 0, -px, west + px / 2, north - px / 2].join("\n") + "\n";
+const UTM32N_PRJ = 'PROJCS["WGS_1984_UTM_Zone_32N",GEOGCS["GCS_WGS_1984",DATUM["D_WGS_1984",SPHEROID["WGS_1984",6378137.0,298.257223563]],PRIMEM["Greenwich",0.0],UNIT["Degree",0.0174532925199433]],PROJECTION["Transverse_Mercator"],PARAMETER["False_Easting",500000.0],PARAMETER["False_Northing",0.0],PARAMETER["Central_Meridian",9.0],PARAMETER["Scale_Factor",0.9996],PARAMETER["Latitude_Of_Origin",0.0],UNIT["Meter",1.0]]';
+function saveFile(blob, name) {
+  const url = URL.createObjectURL(blob);
+  const a = h("a", { href: url, download: name }); document.body.append(a); a.click(); a.remove();
+  setTimeout(() => URL.revokeObjectURL(url), 60000);
+}
+const EXPORT_FORMATS = [
+  ["dxf", "DXF", "AutoCAD drawing exchange, UTM 32N"], ["dwg", "DWG", "AutoCAD 2018 drawing, made by the server's converter"], ["kml", "KML", "Google Earth, longitude / latitude"],
+  ["emf", "EMF", "Windows picture of the lines, for Word and similar"], ["tif", "TIFF", "Picture with its coordinates (GeoTIFF)"], ["bmp", "BMP", "Picture, with its .bpw and .prj beside it"]];
+function openExport() {
+  const ring = edit.geomType === "polygon" && edit.verts.length >= 3;
+  const fmt = h("select", {}, ...EXPORT_FORMATS.map(([v, n, what]) => h("option", { value: v }, `${n}: ${what}`)));
+  const base = h("input", { type: "text", style: "width:220px", value: `verification-${(verify.source || verify.drawing || verify.picture?.name || "boundary").replace(/^.* in /, "").replace(/\.[^.]+$/, "").replace(/[^\w-]+/g, "_").slice(0, 60)}` });
+  const ref = h("input", { type: "checkbox", checked: !ring, disabled: !verify.ref }), pic = h("input", { type: "checkbox", checked: !!verify.picture });
+  const picRow = h("div", { class: "frow" }, h("label", {}, "Scanned plan:"), pic, h("span", { class: "muted" }, "under the lines (TIFF and BMP only)"));
+  const msg = h("p", { class: "muted" }, ring ? "" : "There is no boundary: only the imported drawing or plan is exported.");
+  const go = h("button", { class: "btn btnPrimary" }, "Export");
+  const sync = () => picRow.classList.toggle("hidden", !verify.picture || !/tif|bmp/.test(fmt.value));
+  fmt.onchange = sync; sync();
+  go.onclick = async () => {
+    go.disabled = true; msg.className = "muted"; msg.textContent = "Writing…";
+    try {
+      const f = fmt.value, name = base.value.trim().replace(/[^\w .()-]+/g, "_") || "verification";
+      const d = exportDrawing(ref.checked && !!verify.ref), raster = f === "tif" || f === "bmp", plan = raster && pic.checked ? verify.picture : null;
+      if (!d.shapes.length && !d.labels.length && !plan) throw new Error("there is nothing to export");
+      if (!raster) saveFile(await api("/api/v1/export/drawing", { method: "POST", body: { format: f, drawing: d }, blob: true }), `${name}.${f}`);
+      else {
+        const c = await exportCanvas(d, plan);
+        saveFile(f === "tif" ? await geoTiff(c) : bmpFile(c), `${name}.${f}`);
+        if (f === "bmp") {
+          saveFile(new Blob([worldText(c)], { type: "text/plain" }), `${name}.bpw`);
+          saveFile(new Blob([UTM32N_PRJ], { type: "text/plain" }), `${name}.prj`);
+        }
+      }
+      msg.textContent = f === "bmp" ? `${name}.bmp, .bpw and .prj saved; keep them together.` : `${name}.${f} saved.`;
+      status(msg.textContent);
+    } catch (e) { msg.className = "verifyStale"; msg.textContent = "The export failed: " + e.message; }
+    finally { go.disabled = false; }
+  };
+  floatWindow("Export", h("div", {},
+    h("div", { class: "frow" }, h("label", {}, "Format:"), fmt),
+    h("div", { class: "frow" }, h("label", {}, "File name:"), base),
+    h("div", { class: "frow" }, h("label", {}, "Imported drawing:"), ref, h("span", { class: "muted" }, verify.ref ? `the lines and labels of ${verify.drawing}` : "none on the map")),
+    picRow, h("div", { class: "frow", style: "margin-top:8px" }, go), msg), { id: "exportWin", width: 470 });
 }
 
 // --- System check (before the next stage, and again at commit on the server) ---

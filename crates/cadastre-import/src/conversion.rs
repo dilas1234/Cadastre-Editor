@@ -11,6 +11,8 @@ use cadastre_core::types::Point;
 use serde::{Deserialize, Serialize};
 
 use crate::dxf;
+use crate::emf;
+use crate::kml;
 use crate::landxml;
 use crate::tabular::{self, RowIssue};
 use crate::worldfile::{self, RasterReference};
@@ -27,6 +29,10 @@ pub enum ImportFormat {
     LandXml,
     /// Raster world file plus optional projection sidecar.
     WorldFile,
+    /// KML (Google Earth).
+    Kml,
+    /// Enhanced Metafile picture.
+    Emf,
 }
 
 impl ImportFormat {
@@ -37,6 +43,8 @@ impl ImportFormat {
             ImportFormat::Dxf => "DXF drawing",
             ImportFormat::LandXml => "LandXML",
             ImportFormat::WorldFile => "Raster world file",
+            ImportFormat::Kml => "KML",
+            ImportFormat::Emf => "EMF picture",
         }
     }
 }
@@ -145,7 +153,7 @@ impl fmt::Display for ImportError {
         match self {
             ImportError::UnknownFormat => write!(
                 f,
-                "unrecognised import format: expected CSV/TSV coordinates, ASCII DXF, LandXML or a world file"
+                "unrecognised import format: expected CSV/TSV coordinates, ASCII DXF, KML, LandXML or a world file"
             ),
             ImportError::TooLarge { size, limit } => {
                 write!(f, "file is {size} bytes; the limit is {limit} bytes")
@@ -188,6 +196,7 @@ pub fn detect_format(filename: &str, contents: &str) -> Option<ImportFormat> {
     let ext = lower.rsplit('.').next().unwrap_or("");
     match ext {
         "dxf" => return Some(ImportFormat::Dxf),
+        "kml" => return Some(ImportFormat::Kml),
         "xml" | "landxml" => return Some(ImportFormat::LandXml),
         "csv" | "tsv" | "txt" | "psv" => return Some(ImportFormat::Coordinates),
         "tfw" | "tifw" | "jgw" | "jpgw" | "jpegw" | "pgw" | "gfw" | "bpw" | "j2w" | "wld" => {
@@ -197,6 +206,9 @@ pub fn detect_format(filename: &str, contents: &str) -> Option<ImportFormat> {
     }
 
     let head = contents.trim_start();
+    if head.contains("<kml") {
+        return Some(ImportFormat::Kml);
+    }
     if head.starts_with("<?xml") || head.starts_with("<LandXML") || head.contains("<LandXML") {
         return Some(ImportFormat::LandXml);
     }
@@ -379,6 +391,8 @@ pub fn import_text(
         ImportFormat::Coordinates => survey_from_coordinates(contents, crs),
         ImportFormat::Dxf => survey_from_dxf(contents)?,
         ImportFormat::LandXml => survey_from_landxml(contents)?,
+        ImportFormat::Kml => kml::parse(contents)?,
+        ImportFormat::Emf => return Err(ImportError::UnknownFormat), // binary: import_bytes
         ImportFormat::WorldFile => {
             return Ok(ImportResult::Raster(worldfile::reference_from(
                 contents, None,
@@ -400,6 +414,9 @@ pub fn import_bytes(filename: &str, bytes: &[u8], crs: Option<&str>) -> Result<I
         let mut survey = survey_from_drawing(dxf::parse_bytes(bytes)?);
         survey.crs = crs.map(str::to_string);
         return Ok(ImportResult::Survey(survey));
+    }
+    if emf::is_emf(bytes) {
+        return Ok(ImportResult::Survey(emf::parse(bytes)?.survey));
     }
     import_text(filename, &String::from_utf8_lossy(bytes), crs)
 }

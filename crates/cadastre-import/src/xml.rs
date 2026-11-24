@@ -276,6 +276,9 @@ pub fn parse(contents: &str) -> Result<Node, XmlError> {
         }
 
         // Start tag.
+        if stack.len() > 256 {
+            return error("elements are nested too deeply");
+        }
         let start = i + 1;
         let mut j = start;
         let mut quote: Option<u8> = None;
