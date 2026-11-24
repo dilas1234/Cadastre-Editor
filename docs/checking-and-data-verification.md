@@ -24,6 +24,7 @@ own VER number; anyone who may open Digitising may open this unit.
 |---|---|---|
 | V1 | The unit's view (`/verification`) and check-only mode | **built** |
 | V2 | CAD import: binary DXF, DWG through the ODA File Converter, choosing the parcel's layer / polyline | **built** |
+| V2b | File formats: import KML, TIFF, BMP and EMF as well; export DXF, DWG, KML, EMF, TIFF and BMP | **built** |
 | V3 | Adjoining-coordinates report: neighbours sharing a boundary, their corners, as print, CSV and DXF | open |
 | V4 | Save the verified boundary (VER number, file number, check report) and hand it to Digitising | open |
 
@@ -98,32 +99,73 @@ DXF (HTTP 409), and everything else works.
 
 1. Download the Linux package (`.deb`, "Ubuntu 64-bit") from the Open Design Alliance's ODA File
    Converter page (free; accept the licence there).
-2. Install it: `sudo apt install ./ODAFileConverter_*.deb`. It installs `ODAFileConverter` in
-   `/usr/bin`, where the server finds it with no setting.
-3. Try it without a screen, as the server runs it:
+2. Install it with a virtual display: `sudo apt install ./ODAFileConverter_*.deb xvfb xauth`. It
+   installs `ODAFileConverter` in `/usr/bin`, where the server finds it with no setting. The
+   converter has only Qt's `xcb` plugin, so it needs an X display even though it shows nothing
+   useful (`QT_QPA_PLATFORM=offscreen` does **not** work); the server runs it under `xvfb-run`.
+3. Try it as the server runs it:
 
    ```bash
-   mkdir -p /tmp/oda/in /tmp/oda/out && cp some-plan.dwg /tmp/oda/in/
-   QT_QPA_PLATFORM=offscreen ODAFileConverter /tmp/oda/in /tmp/oda/out ACAD2018 DXF 0 1 "*.DWG"
-   ls /tmp/oda/out   # some-plan.dxf
+   mkdir -p /tmp/oda/in /tmp/oda/out && cp some-plan.dwg /tmp/oda/in/PLAN.DWG
+   xvfb-run -a ODAFileConverter /tmp/oda/in /tmp/oda/out ACAD2018 DXF 0 1 "*.DWG"
+   ls /tmp/oda/out   # PLAN.dxf
    ```
 
-4. If that fails for want of a display, run it under a virtual one: `sudo apt install xvfb`, make
-   `/usr/local/bin/oda-headless` (`chmod +x`):
-
-   ```sh
-   #!/bin/sh
-   exec xvfb-run -a /usr/bin/ODAFileConverter "$@"
-   ```
-
-   and start the server with `CADASTRE_ODA_CONVERTER=/usr/local/bin/oda-headless` in its settings.
-   `scripts/restart-server.sh` carries the running server's settings forward, so set it once in
-   `.env` and start the server from it (stop it first; the script then reads `.env`).
+No server setting or restart is needed for either package. Without `xvfb` the server's own
+`DISPLAY` is used if it has one (a window may flash on that desktop); with neither, a DWG is
+refused with a message naming the package (HTTP 409).
 
 `CADASTRE_ODA_CONVERTER` may also name the program when it is not on the `PATH` (on Windows,
 `C:\Program Files\ODA\ODAFileConverter <version>\ODAFileConverter.exe`). One conversion may take
 two minutes at most; the converter's own error (`.err` file) is shown when a drawing will not convert.
 
 Tests: `cad_import_reads_dxf_binary_dxf_and_dwg` (integration: lines chained into a ring, binary
-DXF read as ASCII, DWG through a stand-in converter), `oda::tests` (command line, `.err` reason) and
-the DXF reader's binary tests. The real ODA File Converter is not part of the tests.
+DXF read as ASCII, DWG through a stand-in converter), `oda::tests` and the DXF reader's binary
+tests. `the_real_converter_reads_a_dwg` uses the real converter where it and a display are
+installed, and is skipped elsewhere. Checked by hand with ODA 27.10 (24 Nov 2026): DWGs of AutoCAD
+2000, 2004, 2010, 2013 and 2018 made by the converter from a simple drawing; not yet with surveyors'
+own drawings.
+
+## V2b: file formats, in and out
+
+Nothing is saved on the server by an import or an export.
+
+### Import
+
+| File | How it is read | Where it lies |
+|---|---|---|
+| DXF, DWG | as V2 | UTM 32N, as drawn |
+| KML | `cadastre-import/src/kml.rs`; folders are layers. KMZ is refused (save as KML) | longitude / latitude, projected to UTM 32N |
+| EMF | `cadastre-import/src/emf.rs`: lines, curves and text; the pen's colour is the layer. Arcs and images inside it are left out, with a warning; EMF+ only files are refused | page units: placed by points (below). An EMF exported here carries its placement |
+| TIFF | the server makes a PNG of it (`src/picture.rs`, `POST /api/v1/import/picture`, 64 MiB): 1-bit (Group 4), grey, palette, RGB, CMYK; first page. Group 3 is refused | GeoTIFF tags, a `.tfw`, or placed by points |
+| BMP | the browser itself | a `.bpw`, or placed by points |
+
+- A picture's world file and `.prj` are chosen **together with it** in the file box. Without a
+  `.prj`, UTM 32N is assumed, with a warning. Minna and the Nigerian belts are reprojected.
+- **Placing** (*Place* window): click a beacon whose UTM 32N coordinates are printed on the plan and
+  type them. Two points place the picture (one scale, a rotation, a shift; never stretched); from
+  three on, each point's disagreement in metres is shown, and over 0.5 m is flagged. An EMF's own
+  corners are snapped to.
+- A TIFF or BMP is shown under the map's parcels (transparency slider, *Place again*, *Hide*) to
+  trace with *Draw boundary*. It has no boundary of its own; nothing is read off it automatically.
+- Corners traced from a picture, or of an EMF placed by points, are only as good as the picture.
+  Type the plan's printed coordinates over them before relying on the check.
+
+### Export (*Export…* in the panel)
+
+The boundary and its corners, and if wanted the imported drawing. Corners have the beacon numbers
+that came with typed points, else P1, P2, ….
+
+| File | Content |
+|---|---|
+| DXF | R12 ASCII, UTM 32N (`POST /api/v1/export/drawing`, `cadastre-import/src/export.rs`) |
+| DWG | that DXF through the ODA File Converter, AutoCAD 2018 (needs the converter, as import does) |
+| KML | WGS 84 longitude / latitude |
+| EMF | lines and labels on a 250 × 180 mm page |
+| TIFF | a north-up picture as a GeoTIFF (EPSG:32632), with the scanned plan under the lines if wanted |
+| BMP | the same picture, with its `.bpw` and `.prj` (the browser may ask to allow several downloads) |
+
+Tests: `kml`, `emf`, `export` and `picture` unit tests, `drawings_export_and_import_back`
+(integration) and `the_real_converter_reads_a_dwg` (DXF to DWG and back). Checked by hand in a
+browser (24 Nov 2026): every format exported and read back, a scan and an EMF placed by points. Not
+yet tried: surveyors' own files, and the exported files in AutoCAD, Google Earth and Word.

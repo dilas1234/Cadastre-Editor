@@ -2713,6 +2713,8 @@ async fn cad_import_reads_dxf_binary_dxf_and_dwg() {
         std::fs::write(&fake, format!("#!/bin/sh\ncp '{}' \"$2/DRAWING.dxf\"\n", dir.join("plan.dxf").display())).unwrap();
         std::fs::set_permissions(&fake, std::fs::Permissions::from_mode(0o755)).unwrap();
         std::env::set_var("CADASTRE_ODA_CONVERTER", &fake);
+        // The stand-in needs no display; a machine without xvfb-run must still get as far as running it.
+        if std::env::var_os("DISPLAY").is_none() { std::env::set_var("DISPLAY", ":stand-in"); }
         let (st, d) = post_file(&app, "/api/v1/import/cad?filename=PLAN.DWG", b"AC1032 not a real drawing".to_vec()).await;
         let (st_bad, _) = post_file(&app, "/api/v1/import/cad?filename=plan.dwg", b"hello".to_vec()).await;
         std::env::remove_var("CADASTRE_ODA_CONVERTER");
@@ -2724,4 +2726,45 @@ async fn cad_import_reads_dxf_binary_dxf_and_dwg() {
 
     let (st, _) = post_file(&app, "/api/v1/import/cad?filename=plan.pdf", b"%PDF".to_vec()).await;
     assert_eq!(st, StatusCode::BAD_REQUEST);
+}
+
+/// Checking and Data Verification, file formats: a drawing exported as KML, EMF and DXF comes back
+/// through the import where it was, and a scan or an unreadable file gets a plain answer.
+#[tokio::test]
+async fn drawings_export_and_import_back() {
+    let Some(db_url) = test_db_url() else {
+        eprintln!("skipping: CADASTRE_TEST_DATABASE_URL not set");
+        return;
+    };
+    let app = routes::router(state_with(AuthMode::Disabled, None, &db_url).await);
+    let (x, y) = (493_000.0, 1_083_100.0);
+    let drawing = json!({ "title": "t", "shapes": [{ "layer": "BOUNDARY", "name": "Plot 7", "closed": true,
+        "points": [[x, y], [x + 30.0, y], [x + 30.0, y + 30.0], [x, y + 30.0]] }], "labels": [{ "layer": "CORNERS", "text": "PB 1234", "point": [x, y] }] });
+    let export = |format: &str, drawing: Value| {
+        let req = Request::builder().method("POST").uri("/api/v1/export/drawing").header(header::CONTENT_TYPE, "application/json")
+            .body(Body::from(json!({ "format": format, "drawing": drawing }).to_string())).unwrap();
+        let app = app.clone();
+        async move {
+            let resp = app.oneshot(req).await.unwrap();
+            let st = resp.status();
+            (st, to_bytes(resp.into_body(), usize::MAX).await.unwrap().to_vec())
+        }
+    };
+    for format in ["kml", "emf", "dxf"] {
+        let (st, bytes) = export(format, drawing.clone()).await;
+        assert_eq!(st, StatusCode::OK, "{format}: {}", String::from_utf8_lossy(&bytes));
+        let (st, v) = post_file(&app, &format!("/api/v1/import/cad?filename=plan.{format}"), bytes).await;
+        assert_eq!(st, StatusCode::OK, "{format}: {v}");
+        assert_eq!(v["unplaced"], json!(false), "{format}");
+        let b = v["boundaries"].as_array().unwrap().iter().find(|b| b["closed"] == true).unwrap_or_else(|| panic!("{format}: {v}"));
+        assert_eq!(b["ring"].as_array().unwrap().len(), 4, "{format}: {b}");
+        assert!((b["ring"][1]["x"].as_f64().unwrap() - x - 30.0).abs() < 0.002 && (b["ring"][2]["y"].as_f64().unwrap() - y - 30.0).abs() < 0.002, "{format}: {b}");
+        assert!(v["points"].as_array().unwrap().iter().any(|p| p["id"] == "PB 1234"), "{format}: {v}");
+    }
+    let (st, _) = export("dxf", json!({})).await;
+    assert_eq!(st, StatusCode::BAD_REQUEST, "nothing to export");
+    for (uri, body) in [("/api/v1/import/picture", &b"hello"[..]), ("/api/v1/import/cad?filename=a.emf", b"hello"), ("/api/v1/import/cad?filename=a.kml", b"hello"), ("/api/v1/import/cad?filename=a.kmz", b"PK")] {
+        let (st, v) = post_file(&app, uri, body.to_vec()).await;
+        assert_eq!(st, StatusCode::BAD_REQUEST, "{uri}: {v}");
+    }
 }

@@ -71,6 +71,8 @@ use crate::routes::{
         import::preview,
         import::attributes,
         import::cad,
+        import::picture,
+        import::export_drawing,
         import::import_into_job,
         fci::import_feature_class,
         fabric::validate,
@@ -141,6 +143,7 @@ use crate::routes::{
         crate::routes::registry::CompletePlanJobDto, crate::routes::registry::ParcelWorkDto, crate::routes::mutations::LineageDto, crate::routes::mutations::LineageEdgeDto, PostResult, AuditEntryDto, AuditVerifyDto, PromoteResult,
         crate::routes::import::PreviewRequest, crate::routes::import::AttributeImportRequest,
         crate::routes::import::JobImportRequest,
+        crate::routes::import::ExportRequest, crate::routes::import::ExportFormat,
         crate::routes::fci::FciRequest,
     )),
     tags(

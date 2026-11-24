@@ -354,10 +354,10 @@ pub async fn import_into_job(
 // A surveyor's CAD drawing (Checking and Data Verification unit; docs/checking-and-data-verification.md)
 // ---------------------------------------------------------------------------------------------
 
-/// The drawing's file name (selects DWG or DXF) and the CRS to assume.
+/// The drawing's file name (selects DWG, DXF, KML or EMF) and the CRS to assume.
 #[derive(Debug, Deserialize, utoipa::IntoParams)]
 pub struct CadQuery {
-    /// Original file name: `.dwg` or `.dxf`.
+    /// Original file name: `.dwg`, `.dxf`, `.kml` or `.emf`.
     pub filename: String,
     /// CRS to assume when the drawing does not state one.
     #[serde(default)]
@@ -400,15 +400,16 @@ async fn rings_from_lines(state: &AppState, boundaries: &[ImportedBoundary], war
     Ok(out)
 }
 
-/// Preview a surveyor's CAD drawing: ASCII or binary DXF, or DWG converted to DXF by the ODA File
-/// Converter on the server. The body is the file itself. Besides the drawing's own polylines, the
+/// Preview a surveyor's drawing: ASCII or binary DXF, DWG converted to DXF by the ODA File
+/// Converter on the server, KML (projected to UTM 32N), or EMF (`unplaced` unless this editor wrote
+/// it: page units, to be placed by known points). The body is the file itself. Besides the drawing's own polylines, the
 /// closed rings its loose lines enclose are returned (`… ring N (from lines)`). Nothing is saved.
 #[utoipa::path(post, path = "/api/v1/import/cad", tag = "import", params(CadQuery),
-    request_body(content = Vec<u8>, content_type = "application/octet-stream", description = "The .dwg or .dxf file"),
+    request_body(content = Vec<u8>, content_type = "application/octet-stream", description = "The .dwg, .dxf, .kml or .emf file"),
     responses(
         (status = 200, description = "Parsed drawing (as /import/preview), with `source_format` and `rings_from_lines`"),
-        (status = 400, description = "Not a DWG/DXF drawing, or unreadable"),
-        (status = 409, description = "A DWG, and the ODA File Converter is not installed on the server"),
+        (status = 400, description = "Not a DWG, DXF, KML or EMF file, or unreadable"),
+        (status = 409, description = "A DWG, and the ODA File Converter (or the virtual display it needs) is not installed on the server"),
         (status = 422, description = "Too large"),
     ))]
 pub async fn cad(
@@ -419,23 +420,17 @@ pub async fn cad(
 ) -> ApiResult<Json<Value>> {
     user.require_role("editor")?;
     let lower = q.filename.to_ascii_lowercase();
-    let (bytes, source) = if lower.ends_with(".dwg") {
-        if !body.starts_with(b"AC10") {
-            return Err(AppError::BadRequest(format!("{} is not an AutoCAD DWG file", q.filename)));
-        }
-        let dxf = crate::oda::dwg_to_dxf(&body).await.map_err(|e| match e {
-            crate::oda::OdaError::NotInstalled => AppError::Conflict(e.to_string()),
-            crate::oda::OdaError::Failed(_) => AppError::BadRequest(e.to_string()),
-        })?;
-        (dxf, "DWG")
-    } else if lower.ends_with(".dxf") {
-        let binary = body.starts_with(cadastre_import::dxf::BINARY_SENTINEL);
-        (body.to_vec(), if binary { "binary DXF" } else { "DXF" })
+    let mut unplaced = false;
+    let (mut survey, source) = if lower.ends_with(".emf") {
+        let d = cadastre_import::emf::parse(&body).map_err(import_error)?;
+        unplaced = !d.placed;
+        (d.survey, "EMF")
+    } else if lower.ends_with(".kml") {
+        (cadastre_import::kml::parse(&String::from_utf8_lossy(&body)).map_err(import_error)?, "KML")
+    } else if lower.ends_with(".kmz") {
+        return Err(AppError::BadRequest("a KMZ is a zipped KML: save it as KML in Google Earth and import that".into()));
     } else {
-        return Err(AppError::BadRequest("choose an AutoCAD drawing: .dwg or .dxf".into()));
-    };
-    let ImportResult::Survey(mut survey) = conversion::import_bytes("drawing.dxf", &bytes, q.crs.as_deref()).map_err(import_error)? else {
-        return Err(AppError::BadRequest("not a drawing".into()));
+        read_cad(&q, &lower, &body).await?
     };
     let mut warnings = Vec::new();
     let rings = rings_from_lines(&state, &survey.boundaries, &mut warnings).await?;
@@ -446,5 +441,104 @@ pub async fn cad(
         .map_err(|e| AppError::BadRequest(format!("could not serialise import: {e}")))?;
     v["source_format"] = json!(source);
     v["rings_from_lines"] = json!(formed);
+    v["unplaced"] = json!(unplaced);
     Ok(Json(v))
+}
+
+fn oda_error(e: crate::oda::OdaError) -> AppError {
+    match e {
+        crate::oda::OdaError::NotInstalled | crate::oda::OdaError::NoDisplay => AppError::Conflict(e.to_string()),
+        crate::oda::OdaError::Failed(_) => AppError::BadRequest(e.to_string()),
+    }
+}
+
+async fn read_cad(q: &CadQuery, lower: &str, body: &[u8]) -> ApiResult<(ImportedSurvey, &'static str)> {
+    let (bytes, source) = if lower.ends_with(".dwg") {
+        if !body.starts_with(b"AC10") {
+            return Err(AppError::BadRequest(format!("{} is not an AutoCAD DWG file", q.filename)));
+        }
+        let dxf = crate::oda::dwg_to_dxf(body).await.map_err(oda_error)?;
+        (dxf, "DWG")
+    } else if lower.ends_with(".dxf") {
+        let binary = body.starts_with(cadastre_import::dxf::BINARY_SENTINEL);
+        (body.to_vec(), if binary { "binary DXF" } else { "DXF" })
+    } else {
+        return Err(AppError::BadRequest("choose a drawing: .dwg, .dxf, .kml or .emf".into()));
+    };
+    let ImportResult::Survey(survey) = conversion::import_bytes("drawing.dxf", &bytes, q.crs.as_deref()).map_err(import_error)? else {
+        return Err(AppError::BadRequest("not a drawing".into()));
+    };
+    Ok((survey, source))
+}
+
+/// The most a scanned plan may weigh.
+pub const MAX_PICTURE_BYTES: usize = 64 * 1024 * 1024;
+/// One scan is decoded at a time: a large one takes a few hundred megabytes while it is read.
+static ONE_PICTURE: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+/// A scanned plan (TIFF) as a PNG for the browser, with where it lies if the file says so
+/// (GeoTIFF). BMP is read by the browser itself. Nothing is saved.
+#[utoipa::path(post, path = "/api/v1/import/picture", tag = "import",
+    request_body(content = Vec<u8>, content_type = "application/octet-stream", description = "The .tif file"),
+    responses(
+        (status = 200, description = "width, height (of the scan), png (base64), transform (pixel to map, from the top-left corner; null when the file does not say), epsg, warnings"),
+        (status = 400, description = "Not a TIFF, or one that cannot be read"),
+    ))]
+pub async fn picture(user: AuthUser, body: axum::body::Bytes) -> ApiResult<Json<Value>> {
+    use base64::Engine as _;
+    user.require_role("editor")?;
+    let one = ONE_PICTURE.lock().await;
+    // The lock goes with the work: a browser that goes away does not let a second scan start beside it.
+    let p = tokio::task::spawn_blocking(move || { let _one = one; crate::picture::read_tiff(body.to_vec()) }).await
+        .map_err(|e| AppError::BadRequest(format!("the TIFF could not be read: {e}")))?
+        .map_err(AppError::BadRequest)?;
+    Ok(Json(json!({
+        "width": p.width, "height": p.height, "transform": p.transform, "epsg": p.epsg, "warnings": p.warnings,
+        "png": base64::engine::general_purpose::STANDARD.encode(&p.png),
+    })))
+}
+
+/// The formats a boundary and its drawing are written in on the server (TIFF and BMP pictures are
+/// made in the browser).
+#[derive(Debug, Clone, Copy, Deserialize, ToSchema)]
+#[serde(rename_all = "lowercase")]
+pub enum ExportFormat { Dxf, Dwg, Kml, Emf }
+
+#[derive(Debug, Deserialize, ToSchema)]
+pub struct ExportRequest {
+    pub format: ExportFormat,
+    /// `title`, `shapes` (`layer`, `name`, `points` [[e, n], …], `closed`) and `labels` (`layer`,
+    /// `text`, `point` [e, n]), in UTM 32N metres.
+    #[schema(value_type = Object)]
+    pub drawing: cadastre_import::export::Drawing,
+}
+
+/// Write a drawing as DXF, DWG (through the ODA File Converter), KML or EMF. Nothing is saved.
+#[utoipa::path(post, path = "/api/v1/export/drawing", tag = "import", request_body = ExportRequest,
+    responses(
+        (status = 200, description = "The file", content_type = "application/octet-stream"),
+        (status = 400, description = "Nothing to export, or it could not be converted"),
+        (status = 409, description = "DWG, and the ODA File Converter (or its display) is not installed on the server"),
+    ))]
+pub async fn export_drawing(user: AuthUser, Json(req): Json<ExportRequest>) -> ApiResult<([(axum::http::HeaderName, &'static str); 1], Vec<u8>)> {
+    use cadastre_import::export;
+    user.require_role("editor")?;
+    if let Some(why) = req.drawing.problem() {
+        return Err(AppError::BadRequest(why.into()));
+    }
+    let (mime, bytes) = match req.format {
+        ExportFormat::Dxf => ("image/vnd.dxf", export::dxf(&req.drawing).into_bytes()),
+        ExportFormat::Dwg => {
+            let dwg = crate::oda::dxf_to_dwg(export::dxf(&req.drawing).as_bytes()).await.map_err(|e| match e {
+                // The converter's own advice is about importing.
+                crate::oda::OdaError::Failed(_) => AppError::BadRequest("the DWG could not be made. Export DXF instead and save it as DWG in AutoCAD.".into()),
+                _ => AppError::Conflict("DWG export needs the ODA File Converter and the xvfb package on the server, and one is not installed \
+                    (see docs/checking-and-data-verification.md). Export DXF instead.".into()),
+            })?;
+            ("image/vnd.dwg", dwg)
+        }
+        ExportFormat::Kml => ("application/vnd.google-earth.kml+xml", export::kml(&req.drawing).into_bytes()),
+        ExportFormat::Emf => ("image/emf", export::emf(&req.drawing)),
+    };
+    Ok(([(axum::http::header::CONTENT_TYPE, mime)], bytes))
 }
