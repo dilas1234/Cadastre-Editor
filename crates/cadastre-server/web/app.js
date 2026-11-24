@@ -120,8 +120,9 @@ const authReady = initAuth().catch((e) => {
 const authHeaders = () => (auth.token ? { authorization: `Bearer ${auth.token}` } : {});
 async function api(path, opts = {}) {
   await authReady;
-  const init = { ...opts, headers: { ...(opts.body ? { "content-type": "application/json" } : {}), ...authHeaders(), ...(opts.headers || {}) } };
-  if (opts.body && typeof opts.body !== "string") init.body = JSON.stringify(opts.body);
+  const raw = opts.body instanceof Blob || opts.body instanceof ArrayBuffer; // a file, sent as it is
+  const init = { ...opts, headers: { ...(opts.body ? { "content-type": raw ? "application/octet-stream" : "application/json" } : {}), ...authHeaders(), ...(opts.headers || {}) } };
+  if (opts.body && typeof opts.body !== "string" && !raw) init.body = JSON.stringify(opts.body);
   let r = await fetch(path, init);
   if (r.status === 401 && auth.cfg?.local) { location.assign("/login"); return new Promise(() => {}); }
   if (r.status === 401 && auth.cfg?.enabled) {
@@ -396,6 +397,16 @@ map.once("style.load", async () => {
     paint: { "line-color": "#00e5ff", "line-width": 2.5 } });
   map.addLayer({ id: "tdfeat-point", type: "circle", source: "tdfeat", filter: ["==", ["geometry-type"], "Point"],
     paint: { "circle-color": "#00e5ff", "circle-radius": 5, "circle-stroke-color": "#000", "circle-stroke-width": 1 } });
+
+  // A surveyor's CAD drawing, shown for reference under the sketch (Checking and Data Verification).
+  map.addSource("cadref", { type: "geojson", data: empty() });
+  map.addLayer({ id: "cadref-line", type: "line", source: "cadref", filter: ["==", "$type", "LineString"],
+    paint: { "line-color": "#d000d0", "line-width": 1.5, "line-dasharray": [3, 2] } });
+  map.addLayer({ id: "cadref-pt", type: "circle", source: "cadref", filter: ["==", "$type", "Point"],
+    paint: { "circle-color": "#d000d0", "circle-radius": 2.5 } });
+  map.addLayer({ id: "cadref-label", type: "symbol", source: "cadref", filter: ["all", ["==", "$type", "Point"], ["has", "label"]],
+    layout: { "text-field": ["get", "label"], "text-font": ["OpenSans-Regular"], "text-size": 11, "text-offset": [0.6, -0.6], "text-anchor": "bottom-left" },
+    paint: { "text-color": "#900090", "text-halo-color": "#fff", "text-halo-width": 1.2 } });
 
   // Digitizing sketch (fill + segments + vertices). Last/selected vertex is drawn red.
   map.addSource("sketch", { type: "geojson", data: empty() });
@@ -2121,13 +2132,15 @@ function openImportDialog() {
   const body = h("div");
   floatWindow("Import Survey / CAD / Attributes", body, { id: "importWin", width: 580 });
 
-  const file = h("input", { type: "file", accept: ".csv,.tsv,.txt,.psv,.dxf,.xml,.landxml,.tfw,.tifw,.jgw,.jpgw,.jpegw,.pgw,.gfw,.bpw,.j2w,.wld" });
+  const file = h("input", { type: "file", accept: (VERIFY ? ".dwg," : "") + ".csv,.tsv,.txt,.psv,.dxf,.xml,.landxml,.tfw,.tifw,.jgw,.jpgw,.jpegw,.pgw,.gfw,.bpw,.j2w,.wld" });
   const crs = h("input", { type: "text", value: "EPSG:32632", style: "width:120px" });
   const prj = h("input", { type: "file", accept: ".prj" });
   const join = h("input", { type: "checkbox" });
   const attrFile = h("input", { type: "file", accept: ".csv,.tsv,.txt,.psv", disabled: true });
   const keyColumn = h("input", { type: "text", placeholder: "auto (e.g. Point)", style: "width:130px", disabled: true });
-  const out = h("div", { class: "muted" }, "Choose a file to preview. DXF must be saved as ASCII; drawing units and CRS are not reprojected.");
+  const out = h("div", { class: "muted" }, VERIFY
+    ? "Choose the surveyor's drawing (DWG or DXF) or coordinate list to preview. Coordinates are not reprojected."
+    : "Choose a file to preview. DXF must be saved as ASCII; drawing units and CRS are not reprojected.");
   const apply = h("button", { class: VERIFY ? "btn hidden" : "btn", disabled: true }, "Import into job");
   let current = null;
 
@@ -2139,6 +2152,18 @@ function openImportDialog() {
     class: "btn",
     onclick: async () => {
       out.className = ""; out.textContent = "Reading…"; apply.disabled = true; current = null;
+      const picked = file.files?.[0];
+      if (VERIFY && picked && /\.(dwg|dxf)$/i.test(picked.name)) {
+        // The drawing itself goes to the server: binary DXF, and DWG through the ODA converter.
+        out.textContent = /\.dwg$/i.test(picked.name) ? "Converting the DWG and reading it…" : "Reading the drawing…";
+        try {
+          const q = `filename=${encodeURIComponent(picked.name)}` + (crs.value.trim() ? `&crs=${encodeURIComponent(crs.value.trim())}` : "");
+          const result = await api(`/api/v1/import/cad?${q}`, { method: "POST", body: picked });
+          out.innerHTML = ""; out.append(verifyImportChoices(result, picked.name), importSummary(result, picked.name));
+          showCadRef(result, picked.name);
+        } catch (e) { out.textContent = "The drawing could not be read: " + e.message; }
+        return;
+      }
       try {
         const f = await readTextFile(file);
         if (!f) { out.className = "muted"; out.textContent = "Choose a file first."; return; }
@@ -2159,7 +2184,7 @@ function openImportDialog() {
           current = { name: f.name, contents: f.text, crs: crs.value.trim() || null, attributes: null, key_column: null };
           out.innerHTML = ""; out.append(importSummary(result, f.name));
           if (result.kind === "raster") current = null;
-          if (VERIFY && current) out.prepend(verifyImportChoices(result));
+          if (VERIFY && current) { out.prepend(verifyImportChoices(result, f.name)); showCadRef(result, f.name); }
         }
         apply.disabled = !(current && state.job);
         if (current && !state.job && !VERIFY) out.append(h("p", { class: "muted" }, "Pick a Job Area to import these features as drafts."));
@@ -2519,7 +2544,7 @@ function editorMenu() {
 function startEditing(tool = "sketch") {
   edit.active = true;
   selectTemplate(edit.template);
-  openCreateFeatures();
+  if (!VERIFY) openCreateFeatures(); // the verification unit only checks parcel boundaries
   setTool(tool);
   openSketchProps();
   updateEditorButtons();
@@ -3346,7 +3371,7 @@ async function verifyPoints(utm) {
 // The unit checks a surveyor's boundary (from the CAD file or coordinate list, or sketched) before
 // any Digitising job exists: overlaps here and in Aumentum, the drop point, a title on the land and
 // gaps to neighbours. Check-only: nothing is saved, the boundary stays to be adjusted and checked again.
-const verify = { report: null, key: "", corners: 0, area: null, source: "" };
+const verify = { report: null, key: "", corners: 0, area: null, source: "", drawing: "" };
 const ringKey = (v) => v.map(([e, n]) => `${e.toFixed(3)},${n.toFixed(3)}`).join(";");
 function openVerification() {
   const body = h("div", { id: "verifyBody" });
@@ -3359,7 +3384,7 @@ function verifyDraw() {
   if (!edit.active) startEditing("sketch"); else setTool("sketch");
   status("Click the boundary's corners on the map, or type / paste them in Edit Sketch Properties; then Check Boundary.");
 }
-function verifyClear() { clearSketch(); verify.report = null; verify.key = ""; verify.source = ""; refreshSketchProps(); updateEditorButtons(); }
+function verifyClear() { clearSketch(); verify.report = null; verify.key = ""; verify.source = ""; showCadRef(null); refreshSketchProps(); updateEditorButtons(); }
 function renderVerification() {
   const body = $("verifyBody"); if (!body) return;
   body.innerHTML = "";
@@ -3373,6 +3398,8 @@ function renderVerification() {
       h("button", { class: "btn btnPrimary", disabled: n < 3, onclick: verifySketch }, "Check boundary"),
       h("button", { class: "btn", disabled: !edit.verts.length && !verify.report, onclick: verifyClear }, "Clear")),
     h("p", { class: "muted" }, n >= 3 ? `Boundary: ${n} corners, ${area2(sketchAreaM2())} m²${verify.source ? ` (from ${verify.source})` : ""}.` : "No boundary yet: import one or draw it."));
+  if (verify.drawing) body.append(h("p", { class: "muted" }, `Drawing on the map (magenta, dashed): ${verify.drawing}. `,
+    h("a", { href: "#", class: "linkish", onclick: (ev) => { ev.preventDefault(); showCadRef(null); } }, "Hide")));
   const r = verify.report;
   if (!r) return;
   const fails = r.items.filter((i) => i.result === "fail").length;
@@ -3411,20 +3438,75 @@ function verifyLoadRing(ring, source) {
   if (!$("verifyWin")) openVerification();
   verifySketch();
 }
-function verifyImportChoices(result) {
-  const box = h("div", { style: "margin-bottom:8px;padding:6px;border:1px solid #9cc;background:#f3fbfb" }, h("b", {}, "Check a boundary from this file"));
-  const rings = (result.boundaries || []).filter((b) => (b.ring || []).length >= 3);
-  for (const b of rings.slice(0, 30)) {
-    box.append(h("div", { class: "frow" },
-      h("button", { class: "btn", onclick: () => verifyLoadRing(b.ring, `${b.id} (${b.kind})`) }, "Check"),
-      h("span", {}, `${b.id} (${b.kind}) — ${b.ring.length} vertices${b.closed ? "" : ", open"}`)));
+// Plateau State in UTM 32N, generously: coordinates outside are not UTM 32N metres (a local grid,
+// Minna / Nigeria grid, or a drawing in millimetres), and the check would look in the wrong place.
+const PLATEAU_UTM = { e0: 150000, e1: 850000, n0: 750000, n1: 1350000 };
+const inPlateau = (p) => p.x >= PLATEAU_UTM.e0 && p.x <= PLATEAU_UTM.e1 && p.y >= PLATEAU_UTM.n0 && p.y <= PLATEAU_UTM.n1;
+function ringArea(ring) {
+  let a = 0; for (let i = 0; i < ring.length; i++) { const p = ring[i], q = ring[(i + 1) % ring.length]; a += p.x * q.y - q.x * p.y; }
+  return Math.abs(a) / 2;
+}
+// The drawing on the map (magenta, dashed), for reference while the boundary is chosen or redrawn.
+function showCadRef(result, name) {
+  const src = map.getSource("cadref"); if (!src) return;
+  if (!result) { src.setData(empty()); verify.drawing = ""; refreshVerification(); return; }
+  const ll = (p) => toLL(p.x, p.y);
+  const feats = [];
+  for (const b of result.boundaries || []) {
+    if ((b.ring || []).length < 2 || !b.ring.every(inPlateau)) continue;
+    const c = b.ring.map(ll); if (b.closed) c.push(c[0]);
+    feats.push({ type: "Feature", properties: { layer: b.kind }, geometry: { type: "LineString", coordinates: c } });
   }
+  for (const p of result.points || []) {
+    if (!inPlateau(p.point)) continue;
+    const text = (p.code || "").startsWith("TEXT:");
+    feats.push({ type: "Feature", properties: text ? { label: p.id } : {}, geometry: { type: "Point", coordinates: ll(p.point) } });
+  }
+  const fc = { type: "FeatureCollection", features: feats };
+  src.setData(fc);
+  verify.drawing = feats.length ? name : "";
+  if (feats.length) zoomToFC(fc);
+  refreshVerification();
+}
+function verifyImportChoices(result, name) {
+  const box = h("div", { style: "margin-bottom:8px;padding:6px;border:1px solid #9cc;background:#f3fbfb" }, h("b", {}, "Check a boundary from this file"));
+  const from = result.source_format ? `${result.source_format}${result.source_format === "DWG" ? ", converted to DXF on the server" : ""}` : "";
+  if (from || result.rings_from_lines) box.append(h("p", { class: "muted", style: "margin:2px 0" },
+    [from, result.rings_from_lines ? `${result.rings_from_lines} closed ring(s) formed from the drawing's lines` : ""].filter(Boolean).join("; ") + "."));
+  // Candidates: closed rings first, then by area; open ones (3+ vertices) are closed back to the start.
+  const rings = (result.boundaries || []).filter((b) => (b.ring || []).length >= 3)
+    .map((b) => ({ ...b, area: ringArea(b.ring) }))
+    .sort((a, b) => (b.closed - a.closed) || (b.area - a.area));
   const pts = result.points || [];
+  const coords = [...rings.flatMap((b) => b.ring), ...pts.map((p) => p.point)];
+  const outside = coords.filter((p) => !inPlateau(p)).length;
+  if (outside) box.append(h("p", { class: "verifyStale" },
+    `${outside} of ${coords.length} coordinates are not UTM 32N metres in Plateau State (a local grid, Minna / Nigeria grid, or millimetres?). ` +
+    "The check looks for the boundary where its coordinates say; ask the surveyor for UTM 32N (WGS 84)."));
+  const layers = [...new Set(rings.map((b) => b.kind))].sort();
+  const list = h("div", { style: "max-height:220px;overflow:auto" });
+  const draw = (layer) => {
+    list.innerHTML = "";
+    const shown = rings.filter((b) => !layer || b.kind === layer);
+    for (const b of shown.slice(0, 60)) {
+      list.append(h("div", { class: "frow" },
+        h("button", { class: "btn", onclick: () => verifyLoadRing(b.ring, `${b.id}, layer ${b.kind}, in ${name}`) }, "Check"),
+        h("span", {}, `${b.id} — layer ${b.kind}, ${b.ring.length} corners, ${area2(b.area)} m²${b.closed ? "" : " (open: closed back to its start)"}`)));
+    }
+    if (shown.length > 60) list.append(h("p", { class: "muted" }, `… ${shown.length - 60} more: choose a layer.`));
+  };
+  if (layers.length > 1) {
+    const sel = h("select", { onchange: () => draw(sel.value) }, h("option", { value: "" }, `All layers (${rings.length})`),
+      ...layers.map((l) => h("option", { value: l }, `${l} (${rings.filter((b) => b.kind === l).length})`)));
+    box.append(h("div", { class: "frow" }, h("label", {}, "Layer:"), sel));
+  }
+  box.append(list); draw("");
   if (pts.length >= 3) box.append(h("div", { class: "frow" },
-    h("button", { class: "btn", onclick: () => verifyLoadRing(pts.map((p) => p.point), `${pts.length} points in file order`) }, "Check"),
+    h("button", { class: "btn", onclick: () => verifyLoadRing(pts.map((p) => p.point), `${pts.length} points in file order, in ${name}`) }, "Check"),
     h("span", {}, `The ${pts.length} points as one boundary, in file order`)));
-  if (!rings.length && pts.length < 3) box.append(h("p", { class: "muted" }, "No closed boundary or coordinate list of 3 or more points in this file."));
-  else box.append(h("p", { class: "muted", style: "margin:4px 0 0" }, "Coordinates are taken as UTM 32N metres (EPSG:32632), as drawn."));
+  if (!rings.length && pts.length < 3) box.append(h("p", { class: "muted" }, "No boundary or coordinate list of 3 or more points in this file. Use Draw boundary over the drawing."));
+  const blocks = (result.warnings || []).filter((w) => /block reference/.test(w)).length;
+  if (blocks) box.append(h("p", { class: "muted", style: "margin:4px 0 0" }, `${blocks} block(s) in the drawing were not exploded (see the warnings below); explode them in AutoCAD if the parcel is drawn inside one.`));
   return box;
 }
 

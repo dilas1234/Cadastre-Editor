@@ -349,3 +349,102 @@ pub async fn import_into_job(
         })),
     ))
 }
+
+// ---------------------------------------------------------------------------------------------
+// A surveyor's CAD drawing (Checking and Data Verification unit; docs/checking-and-data-verification.md)
+// ---------------------------------------------------------------------------------------------
+
+/// The drawing's file name (selects DWG or DXF) and the CRS to assume.
+#[derive(Debug, Deserialize, utoipa::IntoParams)]
+pub struct CadQuery {
+    /// Original file name: `.dwg` or `.dxf`.
+    pub filename: String,
+    /// CRS to assume when the drawing does not state one.
+    #[serde(default)]
+    pub crs: Option<String>,
+}
+
+/// Lines in one layer, at most this many, are chained into closed rings.
+const MAX_RING_SEGMENTS: usize = 20_000;
+
+/// Survey drawings often draw a parcel as loose LINEs (or open polylines) rather than one closed
+/// polyline: chain each layer's lines into the closed rings they enclose (PostGIS polygonize,
+/// with ends snapped to the millimetre). Faces smaller than 0.5 m² are drawing noise.
+async fn rings_from_lines(state: &AppState, boundaries: &[ImportedBoundary], warnings: &mut Vec<String>) -> ApiResult<Vec<ImportedBoundary>> {
+    let mut by_layer: std::collections::BTreeMap<&str, Vec<String>> = std::collections::BTreeMap::new();
+    for b in boundaries.iter().filter(|b| !b.closed && b.ring.len() >= 2) {
+        let coords: Vec<[f64; 2]> = b.ring.iter().map(|p| [p.x, p.y]).collect();
+        by_layer.entry(b.kind.as_str()).or_default().push(json!({ "type": "LineString", "coordinates": coords }).to_string());
+    }
+    let mut out = Vec::new();
+    for (layer, lines) in by_layer {
+        if lines.len() > MAX_RING_SEGMENTS {
+            warnings.push(format!("layer `{layer}` has {} lines; too many to chain into rings", lines.len()));
+            continue;
+        }
+        let rows: Vec<(String, f64)> = sqlx::query_as(
+            "WITH n AS (SELECT ST_Node(ST_Collect(ST_SnapToGrid(ST_GeomFromGeoJSON(x), 0.001))) AS g FROM unnest($1::text[]) AS x), \
+                  f AS (SELECT (ST_Dump(p)).geom AS poly FROM (SELECT ST_Polygonize(d.geom) AS p FROM n, ST_Dump(n.g) AS d) s) \
+             SELECT ST_AsGeoJSON(ST_ExteriorRing(poly), 3), ST_Area(poly) FROM f WHERE ST_Area(poly) > 0.5 ORDER BY 2 DESC LIMIT 200")
+            .bind(&lines).fetch_all(&state.pool).await
+            .map_err(|e| AppError::BadRequest(format!("the lines of layer `{layer}` could not be chained: {e}")))?;
+        for (k, (ring, area)) in rows.into_iter().enumerate() {
+            let v: Value = serde_json::from_str(&ring).unwrap_or(Value::Null);
+            let mut pts: Vec<Point> = v["coordinates"].as_array().into_iter().flatten()
+                .filter_map(|c| Some(Point::new(c[0].as_f64()?, c[1].as_f64()?))).collect();
+            if pts.len() > 1 && pts.first() == pts.last() { pts.pop(); }
+            if pts.len() < 3 { continue; }
+            out.push(ImportedBoundary { id: format!("{layer} ring {} (from lines)", k + 1), kind: layer.to_string(), ring: pts, closed: true, stated_area: Some(area) });
+        }
+    }
+    Ok(out)
+}
+
+/// Preview a surveyor's CAD drawing: ASCII or binary DXF, or DWG converted to DXF by the ODA File
+/// Converter on the server. The body is the file itself. Besides the drawing's own polylines, the
+/// closed rings its loose lines enclose are returned (`… ring N (from lines)`). Nothing is saved.
+#[utoipa::path(post, path = "/api/v1/import/cad", tag = "import", params(CadQuery),
+    request_body(content = Vec<u8>, content_type = "application/octet-stream", description = "The .dwg or .dxf file"),
+    responses(
+        (status = 200, description = "Parsed drawing (as /import/preview), with `source_format` and `rings_from_lines`"),
+        (status = 400, description = "Not a DWG/DXF drawing, or unreadable"),
+        (status = 409, description = "A DWG, and the ODA File Converter is not installed on the server"),
+        (status = 422, description = "Too large"),
+    ))]
+pub async fn cad(
+    State(state): State<AppState>,
+    user: AuthUser,
+    axum::extract::Query(q): axum::extract::Query<CadQuery>,
+    body: axum::body::Bytes,
+) -> ApiResult<Json<Value>> {
+    user.require_role("editor")?;
+    let lower = q.filename.to_ascii_lowercase();
+    let (bytes, source) = if lower.ends_with(".dwg") {
+        if !body.starts_with(b"AC10") {
+            return Err(AppError::BadRequest(format!("{} is not an AutoCAD DWG file", q.filename)));
+        }
+        let dxf = crate::oda::dwg_to_dxf(&body).await.map_err(|e| match e {
+            crate::oda::OdaError::NotInstalled => AppError::Conflict(e.to_string()),
+            crate::oda::OdaError::Failed(_) => AppError::BadRequest(e.to_string()),
+        })?;
+        (dxf, "DWG")
+    } else if lower.ends_with(".dxf") {
+        let binary = body.starts_with(cadastre_import::dxf::BINARY_SENTINEL);
+        (body.to_vec(), if binary { "binary DXF" } else { "DXF" })
+    } else {
+        return Err(AppError::BadRequest("choose an AutoCAD drawing: .dwg or .dxf".into()));
+    };
+    let ImportResult::Survey(mut survey) = conversion::import_bytes("drawing.dxf", &bytes, q.crs.as_deref()).map_err(import_error)? else {
+        return Err(AppError::BadRequest("not a drawing".into()));
+    };
+    let mut warnings = Vec::new();
+    let rings = rings_from_lines(&state, &survey.boundaries, &mut warnings).await?;
+    let formed = rings.len();
+    survey.boundaries.extend(rings);
+    survey.warnings.extend(warnings);
+    let mut v = serde_json::to_value(ImportResult::Survey(survey))
+        .map_err(|e| AppError::BadRequest(format!("could not serialise import: {e}")))?;
+    v["source_format"] = json!(source);
+    v["rings_from_lines"] = json!(formed);
+    Ok(Json(v))
+}
