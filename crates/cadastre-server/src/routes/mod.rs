@@ -88,6 +88,7 @@ pub fn router(state: AppState) -> Router {
         .route("/api/v1/wf/jobs/{id}/editing/corners", get(wfbeacons::corners))
         .route("/api/v1/wf/jobs/{id}/precheck", post(precheck::precheck))
         .route("/api/v1/verification/check", post(verification::check))
+        .route("/api/v1/verification/adjoining", post(verification::adjoining))
         .route("/api/v1/wf/completed", get(completed::list))
         .route("/api/v1/wf/jobs/{id}/correct", post(completed::correct))
         .route("/api/v1/wf/jobs/{id}/registry/withdraw-plan", post(registry::withdraw_plan))

@@ -26,7 +26,7 @@ own VER number; anyone who may open Digitising may open this unit.
 | V2 | CAD import: binary DXF, DWG through the ODA File Converter, choosing the parcel's layer / polyline | **built** |
 | V2b | File formats: import KML, TIFF, BMP and EMF as well; export DXF, DWG, KML, EMF, TIFF and BMP | **built** |
 | V2c | Layout View: the boundary on an A4/A3 sheet, to scale, printed or saved as PDF | **built** |
-| V3 | Adjoining-coordinates report: neighbours sharing a boundary, their corners, as print, CSV and DXF | open |
+| V3 | Adjoining-coordinates report: neighbours sharing a boundary, their corners, as print, CSV and DXF | **built** |
 | V4 | Save the verified boundary (VER number, file number, check report) and hand it to Digitising | open |
 
 ## V1: the view and check-only mode
@@ -187,3 +187,30 @@ only; in the other units it stays greyed out). *Data View* goes back; the map is
 - **Print / Save as PDF** opens the sheets in a new window (pop-ups must be allowed). Print at
   **100 %, no margins**, or the scale is wrong. Nothing is saved on the server.
 - Parcels are those the map holds (at most 20 000; the bar says so when that is reached).
+
+## V3: adjoining coordinates
+
+*Adjoining…* in the panel looks up the parcels within a distance of the boundary (0.5 to 20 m,
+default 2 m) and lists their corners **as the database has them**, compared with the boundary's
+(`POST /api/v1/verification/adjoining`, editor role; nothing is saved).
+
+- **Parcels:** committed here, and Aumentum's live parcels not known here (marked *in Aumentum
+  only*). If Aumentum cannot be asked, the window, the print and the CSV say the list may be
+  incomplete. At most 100.
+- **Relation:** *Overlaps* (as the check counts it), *Shares a side*, or *Meets at a corner / close*.
+- **Corners listed:** near one of the boundary's corners (dE, dN = database minus the surveyor's);
+  near one of its sides only; and the ends of a neighbour's side running along the boundary. The
+  boundary's own corners near a neighbour's side where it has no corner are given with their
+  distance from that line.
+- **Agrees** means within `commit.beacon_tolerance_m` (5 cm). Beacon numbers are found by position
+  with the same tolerance.
+- **Neighbours that disagree:** when the database has coordinates further apart than that near the
+  same corner of the surveyor's, the remark says to ask the unit which to use, not to conform.
+- **Out:** *Print / Save as PDF* (A4, with the surveyor's own corners and signature lines), *CSV*,
+  and *DXF* (layers `BOUNDARY`, `CORNERS`, `ADJ_<UPIN>` for the adjoining sides, `ADJ_CORNERS`).
+  Only the adjoining part of a neighbour is given out, not its whole boundary, nor its holder.
+- Once the boundary moves the outputs are switched off until it is looked up again.
+
+Tests: `verification::tests`, and the adjoining part of
+`verification_checks_a_boundary_without_a_job_and_saves_nothing`. Aumentum's parcels were not
+tested against the live system.

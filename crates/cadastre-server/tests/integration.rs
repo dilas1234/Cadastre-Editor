@@ -2621,6 +2621,22 @@ async fn verification_checks_a_boundary_without_a_job_and_saves_nothing() {
     let (_, r) = check(east(0.0)).await;
     assert_eq!(find(&r, "fabric_overlap").unwrap()["result"], "pass", "{r}");
 
+    // The adjoining coordinates: the neighbour's two corners on our west side, one 10 cm off ours.
+    let mut off = east(0.0);
+    off[3][0] -= 0.1;
+    let (st, r) = send(&app, "POST", "/api/v1/verification/adjoining", None, Some(json!({"vertices": off}))).await;
+    assert_eq!(st, StatusCode::OK, "{r}");
+    let n = r["parcels"].as_array().unwrap().iter().find(|p| p["upin"] == json!(neighbour)).unwrap_or_else(|| panic!("{r}"));
+    assert_eq!((n["source"].clone(), n["corners"].as_array().unwrap().len()), (json!("cadastre"), 2), "{n}");
+    let at = |k: u64| n["corners"].as_array().unwrap().iter().find(|c| c["your_corner"] == json!(k)).cloned().unwrap();
+    assert_eq!((at(1)["agrees"].clone(), at(1)["easting"].clone()), (json!(true), json!(x0 + 20.0)), "{n}");
+    assert_eq!((at(4)["agrees"].clone(), at(4)["d_east"].clone()), (json!(false), json!(0.1)), "{n}");
+    assert_eq!(r["warnings"].as_array().unwrap().len(), 1, "Aumentum is not configured: {r}");
+    let (_, r) = send(&app, "POST", "/api/v1/verification/adjoining", None, Some(json!({"vertices": east(-30.0)}))).await;
+    assert_eq!(r["parcels"], json!([]), "30 m away does not adjoin");
+    let (st, _) = send(&app, "POST", "/api/v1/verification/adjoining", None, Some(json!({"vertices": off, "within_m": 500}))).await;
+    assert_eq!(st, StatusCode::BAD_REQUEST);
+
     // Fewer than 3 corners is refused; nothing was saved by any check.
     let (st, _) = check(vec![[x0, y0], [x0 + 1.0, y0]]).await;
     assert_eq!(st, StatusCode::BAD_REQUEST);
