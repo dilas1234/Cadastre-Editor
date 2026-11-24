@@ -2713,6 +2713,8 @@ async fn cad_import_reads_dxf_binary_dxf_and_dwg() {
         std::fs::write(&fake, format!("#!/bin/sh\ncp '{}' \"$2/DRAWING.dxf\"\n", dir.join("plan.dxf").display())).unwrap();
         std::fs::set_permissions(&fake, std::fs::Permissions::from_mode(0o755)).unwrap();
         std::env::set_var("CADASTRE_ODA_CONVERTER", &fake);
+        // The stand-in needs no display; a machine without xvfb-run must still get as far as running it.
+        if std::env::var_os("DISPLAY").is_none() { std::env::set_var("DISPLAY", ":stand-in"); }
         let (st, d) = post_file(&app, "/api/v1/import/cad?filename=PLAN.DWG", b"AC1032 not a real drawing".to_vec()).await;
         let (st_bad, _) = post_file(&app, "/api/v1/import/cad?filename=plan.dwg", b"hello".to_vec()).await;
         std::env::remove_var("CADASTRE_ODA_CONVERTER");

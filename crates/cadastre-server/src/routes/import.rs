@@ -408,7 +408,7 @@ async fn rings_from_lines(state: &AppState, boundaries: &[ImportedBoundary], war
     responses(
         (status = 200, description = "Parsed drawing (as /import/preview), with `source_format` and `rings_from_lines`"),
         (status = 400, description = "Not a DWG/DXF drawing, or unreadable"),
-        (status = 409, description = "A DWG, and the ODA File Converter is not installed on the server"),
+        (status = 409, description = "A DWG, and the ODA File Converter (or the virtual display it needs) is not installed on the server"),
         (status = 422, description = "Too large"),
     ))]
 pub async fn cad(
@@ -424,7 +424,7 @@ pub async fn cad(
             return Err(AppError::BadRequest(format!("{} is not an AutoCAD DWG file", q.filename)));
         }
         let dxf = crate::oda::dwg_to_dxf(&body).await.map_err(|e| match e {
-            crate::oda::OdaError::NotInstalled => AppError::Conflict(e.to_string()),
+            crate::oda::OdaError::NotInstalled | crate::oda::OdaError::NoDisplay => AppError::Conflict(e.to_string()),
             crate::oda::OdaError::Failed(_) => AppError::BadRequest(e.to_string()),
         })?;
         (dxf, "DWG")
