@@ -37,7 +37,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     };
     let pool = sqlx::PgPool::connect(&std::env::var("CADASTRE_DATABASE_URL")?).await?;
     let cfg = LrsConfig::from_env().ok_or("the Registry connection is not configured (CADASTRE_REGISTRY_URL / _USER / _PASSWORD)")?;
-    let session = Session::start(&cfg).await?;
+    let session = Session::sign_in(&cfg).await?;
     let result = match cmd.as_str() {
         "links" => links(&pool, &session, &rest[1..], apply).await,
         "plan" => plan(&pool, &session, rest.get(1).ok_or("give the job instance id")?.parse()?, apply).await,
