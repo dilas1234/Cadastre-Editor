@@ -76,9 +76,13 @@ start_line=1; [[ -f "$log" ]] && start_line=$(( $(wc -l < "$log") + 1 ))
 bind=0.0.0.0:8080
 for kv in "${settings[@]}"; do [[ $kv == CADASTRE_BIND=* ]] && bind=${kv#CADASTRE_BIND=}; done
 port=${bind##*:}
-say "check http://127.0.0.1:$port/health"
+# Ask the address it listens on: bound to one address (10.10.10.11), it does not answer on 127.0.0.1.
+host=${bind%:*}
+case "$host" in ''|0.0.0.0|'[::]') host=127.0.0.1 ;; esac
+health="http://$host:$port/health"
+say "check $health"
 for _ in $(seq 1 60); do
-  if curl -fs -m 2 "http://127.0.0.1:$port/health" >/dev/null; then
+  if curl -fs --noproxy '*' -m 2 "$health" >/dev/null; then
     echo "up: pid $(pgrep -x cadastre-server | head -1), log $log"
     tail -n +"$start_line" "$log" | grep -E 'registry-admin|ERROR|WARN' || true
     exit 0
