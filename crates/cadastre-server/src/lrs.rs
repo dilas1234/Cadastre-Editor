@@ -75,12 +75,65 @@ pub enum LrsError {
     Parse(String),
 }
 
-/// One signed-in session. Dropping it does not sign out: call [`Session::end`].
+/// A signed-in session. Registry tickets never expire and each holds one of its licensed places
+/// until `endSession`, so a session always signs out: [`Session::end`] does it and waits briefly;
+/// dropping the session (an early return, a request whose browser went away) does it in the
+/// background. A shared session ([`Session::start`]) stays signed in for the next caller.
 pub struct Session {
     cfg: LrsConfig,
     ticket: String,
     /// Registry clock minus this machine's clock.
     offset: Duration,
+    /// Borrowed from [`SHARED`]: not signed out when this user of it is done.
+    shared: bool,
+}
+
+/// The server's own account's session, reused so that each read does not take a licensed place.
+struct Shared {
+    cfg: LrsConfig,
+    ticket: String,
+    offset: Duration,
+    /// When the Registry last confirmed the ticket; `None` after a refusal (check before reuse).
+    checked: Option<std::time::Instant>,
+}
+
+static SHARED: tokio::sync::Mutex<Option<Shared>> = tokio::sync::Mutex::const_new(None);
+/// How long a confirmed ticket is reused before the Registry is asked again (it can be deleted in
+/// the Registry's User Sessions, and a restart of LRSAS ends it).
+const RECHECK: std::time::Duration = std::time::Duration::from_secs(30);
+/// Waits before each try at signing out.
+const SIGN_OUT_WAITS: [u64; 4] = [0, 1, 5, 15];
+
+/// Sign a ticket out in its own task, which no dropped request cancels; retried.
+fn sign_out(cfg: LrsConfig, ticket: String) -> Option<tokio::task::JoinHandle<()>> {
+    let rt = tokio::runtime::Handle::try_current().ok()?;
+    Some(rt.spawn(async move {
+        let body = format!("<auth:endSession xmlns:auth=\"{AUTH}\"><auth:ticket>{}</auth:ticket></auth:endSession>", escape(&ticket));
+        for wait in SIGN_OUT_WAITS {
+            tokio::time::sleep(std::time::Duration::from_secs(wait)).await;
+            match soap(&cfg, "AuthenticationService", &format!("{AUTH}/endSession"), "", &body).await {
+                Ok(_) => return,
+                Err(e) => tracing::warn!("Registry sign-out failed: {e}"),
+            }
+        }
+        tracing::error!("Registry sign-out given up: a session of {} may still hold a licensed place", cfg.user);
+    }))
+}
+
+/// Sign the shared session out (the server is stopping).
+pub async fn shutdown() {
+    let Some(s) = SHARED.lock().await.take() else { return };
+    if let Some(task) = sign_out(s.cfg, s.ticket) {
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(5), task).await;
+    }
+}
+
+impl Drop for Session {
+    fn drop(&mut self) {
+        if !self.shared && !self.ticket.is_empty() {
+            sign_out(self.cfg.clone(), std::mem::take(&mut self.ticket));
+        }
+    }
 }
 
 pub fn escape(s: &str) -> String {
@@ -162,7 +215,10 @@ async fn soap(cfg: &LrsConfig, service: &str, action: &str, header: &str, body: 
     let url = format!("{}{service}", base(cfg));
     let r = http(&url, "POST", &[("Content-Type", "text/xml; charset=utf-8".into()), ("SOAPAction", format!("\"{action}\""))], &envelope).await?;
     if r.status != 200 {
-        let fault = between(&r.body, "<faultstring>", "</faultstring>").unwrap_or_else(|| r.body.chars().take(300).collect());
+        // The Registry often leaves <faultstring> empty and gives the reason in <detail><message>.
+        let fault = between(&r.body, "<faultstring>", "</faultstring>").filter(|f| !f.trim().is_empty())
+            .or_else(|| find_text(&r.body, "message"))
+            .unwrap_or_else(|| r.body.chars().take(300).collect());
         return Err(LrsError::Fault(format!("{service} HTTP {}: {}", r.status, fault.trim())));
     }
     Ok(r.body)
@@ -186,15 +242,64 @@ async fn clock_offset(cfg: &LrsConfig) -> Result<Duration, LrsError> {
 }
 
 impl Session {
+    /// The server's own session: shared, confirmed with the Registry when not used lately, signed
+    /// in when there is none. For a password check use [`Session::sign_in`].
     pub async fn start(cfg: &LrsConfig) -> Result<Self, LrsError> {
-        let offset = clock_offset(cfg).await?;
-        let body = format!(
-            "<auth:startSession xmlns:auth=\"{AUTH}\"><auth:username>{}</auth:username><auth:password>{}</auth:password></auth:startSession>",
-            escape(&cfg.user), escape(&cfg.password)
-        );
-        let xml = soap(cfg, "AuthenticationService", &format!("{AUTH}/startSession"), "", &body).await?;
-        let ticket = find_text(&xml, "ticket").ok_or(LrsError::NoTicket)?;
-        Ok(Self { cfg: cfg.clone(), ticket, offset })
+        let mut slot = SHARED.lock().await;
+        if let Some(s) = slot.as_mut() {
+            let same = s.cfg.base_url == cfg.base_url && s.cfg.user == cfg.user && s.cfg.password == cfg.password;
+            let mut usable = same && s.checked.is_some_and(|t| t.elapsed() < RECHECK);
+            if same && !usable {
+                match ticket_check(cfg, &cfg.user, &s.ticket).await {
+                    Ok((true, offset)) => {
+                        s.offset = offset;
+                        s.checked = Some(std::time::Instant::now());
+                        usable = true;
+                    }
+                    Ok((false, _)) | Err(LrsError::Fault(_)) => {}
+                    Err(e) => return Err(e),
+                }
+            }
+            if usable {
+                return Ok(Self { cfg: cfg.clone(), ticket: s.ticket.clone(), offset: s.offset, shared: true });
+            }
+        }
+        // Signed out even if the Registry called it invalid: it must not hold a place.
+        if let Some(old) = slot.take() {
+            sign_out(old.cfg, old.ticket);
+        }
+        let mut own = Self::sign_in(cfg).await?;
+        *slot = Some(Shared { cfg: cfg.clone(), ticket: own.ticket.clone(), offset: own.offset, checked: Some(std::time::Instant::now()) });
+        own.shared = true;
+        Ok(own)
+    }
+
+    /// A session of its own: the Registry checks the password now. Runs in its own task, so a caller
+    /// that goes away before the ticket arrives still gets it signed out (dropped when it arrives).
+    pub async fn sign_in(cfg: &LrsConfig) -> Result<Self, LrsError> {
+        let cfg = cfg.clone();
+        tokio::spawn(async move {
+            let offset = clock_offset(&cfg).await?;
+            let body = format!(
+                "<auth:startSession xmlns:auth=\"{AUTH}\"><auth:username>{}</auth:username><auth:password>{}</auth:password></auth:startSession>",
+                escape(&cfg.user), escape(&cfg.password)
+            );
+            let xml = soap(&cfg, "AuthenticationService", &format!("{AUTH}/startSession"), "", &body).await?;
+            let ticket = find_text(&xml, "ticket").ok_or(LrsError::NoTicket)?;
+            Ok(Self { cfg, ticket, offset, shared: false })
+        }).await.map_err(|e| LrsError::Http(format!("sign-in task: {e}")))?
+    }
+
+    /// Call the Registry with this session. After a refusal a shared ticket is confirmed before its
+    /// next use (it is not signed out here: others may be using it).
+    async fn call(&self, service: &str, action: &str, body: &str) -> Result<String, LrsError> {
+        let r = soap(&self.cfg, service, action, &self.security_header(), body).await;
+        if self.shared && r.is_err() {
+            if let Some(s) = SHARED.lock().await.as_mut().filter(|s| s.ticket == self.ticket) {
+                s.checked = None;
+            }
+        }
+        r
     }
 
     /// The Registry groups a user belongs to, directly or through other groups (Alfresco's
@@ -204,7 +309,7 @@ impl Session {
             "<acs:getParentAuthorities xmlns:acs=\"{ACS}\"><acs:authority>{}</acs:authority><acs:filter><acs:authorityType>GROUP</acs:authorityType><acs:immediate>false</acs:immediate></acs:filter></acs:getParentAuthorities>",
             escape(username)
         );
-        let xml = soap(&self.cfg, "AccessControlService", &format!("{ACS}/getParentAuthorities"), &self.security_header(), &body).await?;
+        let xml = self.call("AccessControlService", &format!("{ACS}/getParentAuthorities"), &body).await?;
         Ok(xml.split("GROUP_").skip(1).filter_map(|t| t.split('<').next()).map(|n| format!("GROUP_{}", n.replace("&amp;", "&"))).collect())
     }
 
@@ -215,7 +320,7 @@ impl Session {
             "<adm:changePassword xmlns:adm=\"{ADM}\"><adm:userName>{}</adm:userName><adm:oldPassword>{}</adm:oldPassword><adm:newPassword>{}</adm:newPassword></adm:changePassword>",
             escape(username), escape(old), escape(new)
         );
-        soap(&self.cfg, "AdministrationService", &format!("{ADM}/changePassword"), &self.security_header(), &body).await?;
+        self.call("AdministrationService", &format!("{ADM}/changePassword"), &body).await?;
         Ok(())
     }
 
@@ -227,7 +332,7 @@ impl Session {
             "<adm:createUsers xmlns:adm=\"{ADM}\"><adm:newUsers><adm:userName>{}</adm:userName><adm:password>{}</adm:password>{}{}{}</adm:newUsers></adm:createUsers>",
             escape(username), escape(password), prop("userName", username), prop("firstName", first_name), prop("lastName", last_name)
         );
-        soap(&self.cfg, "AdministrationService", &format!("{ADM}/createUsers"), &self.security_header(), &body).await?;
+        self.call("AdministrationService", &format!("{ADM}/createUsers"), &body).await?;
         Ok(())
     }
 
@@ -237,15 +342,7 @@ impl Session {
     }
 
     fn security_header(&self) -> String {
-        let now = Utc::now() + self.offset;
-        let created = now.format("%Y-%m-%dT%H:%M:%SZ");
-        let expires = (now + Duration::seconds(600)).format("%Y-%m-%dT%H:%M:%SZ");
-        let id = uuid::Uuid::new_v4();
-        format!(
-            "<wsse:Security xmlns:wsse=\"{WSSE}\" xmlns:wsu=\"{WSU}\"><wsu:Timestamp wsu:Id=\"Timestamp-{id}\"><wsu:Created>{created}</wsu:Created><wsu:Expires>{expires}</wsu:Expires></wsu:Timestamp>\
-             <wsse:UsernameToken wsu:Id=\"SecurityToken-{id}\"><wsse:Username>{}</wsse:Username><wsse:Password Type=\"{PWTEXT}\">{}</wsse:Password><wsu:Created>{created}</wsu:Created></wsse:UsernameToken></wsse:Security>",
-            escape(&self.cfg.user), escape(&self.ticket)
-        )
+        security_header(&self.cfg.user, &self.ticket, self.offset)
     }
 
     /// Run an HQL query (Aumentum's `LRSIntegrationQueryDefinition` style); each row is the
@@ -255,7 +352,7 @@ impl Session {
             "<dom:loadObjects xmlns:dom=\"{DOM}\" xmlns:lrs=\"{LRS}\"><dom:Query><lrs:SimpleQuery><lrs:queryString>{}</lrs:queryString><lrs:maxResults>{max_results}</lrs:maxResults></lrs:SimpleQuery></dom:Query></dom:loadObjects>",
             escape(hql)
         );
-        let xml = soap(&self.cfg, "DomainModelService", &format!("{DOM}/loadObjects"), &self.security_header(), &body).await?;
+        let xml = self.call("DomainModelService", &format!("{DOM}/loadObjects"), &body).await?;
         parse_scalar_rows(&xml)
     }
 
@@ -271,7 +368,7 @@ impl Session {
         let body = format!(
             "<int:SaveEntity xmlns:int=\"{INT}\" xmlns:lrs=\"{LRS}\" xmlns:cms=\"{CMS}\" xmlns:xsi=\"{XSI}\"><int:transactionId>{transaction_id}</int:transactionId>{entities_xml}</int:SaveEntity>"
         );
-        let xml = soap(&self.cfg, "IntegrationService", &format!("{INT}/SaveEntity"), &self.security_header(), &body).await?;
+        let xml = self.call("IntegrationService", &format!("{INT}/SaveEntity"), &body).await?;
         if xml.contains("className") || xml.contains(":value>") || xml.contains("<value") {
             Ok(())
         } else {
@@ -292,23 +389,41 @@ impl Session {
         Ok(r.body.trim().to_string())
     }
 
-    pub async fn end(self) {
-        let body = format!("<auth:endSession xmlns:auth=\"{AUTH}\"><auth:ticket>{}</auth:ticket></auth:endSession>", escape(&self.ticket));
-        if let Err(e) = soap(&self.cfg, "AuthenticationService", &format!("{AUTH}/endSession"), "", &body).await {
-            tracing::warn!("Registry sign-out failed: {e}");
+    /// Done with the session: sign out (a shared one stays for the next caller).
+    pub async fn end(mut self) {
+        if self.shared {
+            return;
+        }
+        if let Some(task) = sign_out(self.cfg.clone(), std::mem::take(&mut self.ticket)) {
+            let _ = tokio::time::timeout(std::time::Duration::from_secs(5), task).await;
         }
     }
+}
+
+fn security_header(user: &str, ticket: &str, offset: Duration) -> String {
+    let now = Utc::now() + offset;
+    let created = now.format("%Y-%m-%dT%H:%M:%SZ");
+    let expires = (now + Duration::seconds(600)).format("%Y-%m-%dT%H:%M:%SZ");
+    let id = uuid::Uuid::new_v4();
+    format!(
+        "<wsse:Security xmlns:wsse=\"{WSSE}\" xmlns:wsu=\"{WSU}\"><wsu:Timestamp wsu:Id=\"Timestamp-{id}\"><wsu:Created>{created}</wsu:Created><wsu:Expires>{expires}</wsu:Expires></wsu:Timestamp>\
+         <wsse:UsernameToken wsu:Id=\"SecurityToken-{id}\"><wsse:Username>{}</wsse:Username><wsse:Password Type=\"{PWTEXT}\">{}</wsse:Password><wsu:Created>{created}</wsu:Created></wsse:UsernameToken></wsse:Security>",
+        escape(user), escape(ticket)
+    )
 }
 
 /// Whether a Registry user's session ticket is valid (`AuthenticationService.isTicketValid`), as
 /// Aumentum's GISViewer checked the Registry user its map window was opened for.
 pub async fn ticket_valid(cfg: &LrsConfig, user: &str, ticket: &str) -> Result<bool, LrsError> {
+    ticket_check(cfg, user, ticket).await.map(|(valid, _)| valid)
+}
+
+/// [`ticket_valid`], with the Registry's clock offset read for it.
+async fn ticket_check(cfg: &LrsConfig, user: &str, ticket: &str) -> Result<(bool, Duration), LrsError> {
     let offset = clock_offset(cfg).await?;
-    let s = Session { cfg: cfg.clone(), ticket: ticket.to_string(), offset };
-    let header = s.security_header().replace(&format!("<wsse:Username>{}</wsse:Username>", escape(&cfg.user)), &format!("<wsse:Username>{}</wsse:Username>", escape(user)));
     let body = format!("<auth:isTicketValid xmlns:auth=\"{AUTH}\"><auth:ticket>{}</auth:ticket></auth:isTicketValid>", escape(ticket));
-    let xml = soap(cfg, "AuthenticationService", &format!("{AUTH}/isTicketValid"), &header, &body).await?;
-    Ok(find_text(&xml, "result").is_some_and(|v| v.eq_ignore_ascii_case("true")))
+    let xml = soap(cfg, "AuthenticationService", &format!("{AUTH}/isTicketValid"), &security_header(user, ticket, offset), &body).await?;
+    Ok((find_text(&xml, "result").is_some_and(|v| v.eq_ignore_ascii_case("true")), offset))
 }
 
 fn find_text(xml: &str, local_name: &str) -> Option<String> {

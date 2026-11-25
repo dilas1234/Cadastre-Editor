@@ -125,7 +125,7 @@ async fn registry_sign_in(login: &str, password: &str) -> Option<Vec<String>> {
     }
     let service = LrsConfig::from_env()?;
     let own = LrsConfig { user: login.to_string(), password: password.to_string(), ..service.clone() };
-    match Session::start(&own).await {
+    match Session::sign_in(&own).await {
         Ok(s) => s.end().await,
         // A refusal, or the Registry cannot be reached: local accounts can still sign in.
         Err(e) => {
@@ -307,7 +307,7 @@ pub async fn change_password(State(state): State<AppState>, session: Option<Exte
 async fn change_registry_password(state: &AppState, code: &str, current: String, new: String) -> ApiResult<Json<Value>> {
     let service = LrsConfig::from_env().ok_or_else(|| AppError::Conflict("the Registry connection is not configured on this server".into()))?;
     let own = LrsConfig { user: code.to_string(), password: current.clone(), ..service };
-    let session = Session::start(&own).await.map_err(|e| match e {
+    let session = Session::sign_in(&own).await.map_err(|e| match e {
         LrsError::Fault(_) => AppError::Unauthorized("The current password is not correct.".into()),
         other => AppError::UnprocessableEntity(format!("the Registry could not be reached: {other}")),
     })?;

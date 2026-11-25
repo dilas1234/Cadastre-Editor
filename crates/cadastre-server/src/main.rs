@@ -66,9 +66,21 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         tracing::warn!("Users & Units (registry-admin): NOT built in, /user-management will answer 501; rebuild with the default features");
     }
 
-    axum::serve(listener, app)
-        .with_graceful_shutdown(shutdown_signal())
-        .await?;
+    let (stop, mut stopping) = tokio::sync::watch::channel(false);
+    let serve = axum::serve(listener, app).with_graceful_shutdown(async move {
+        shutdown_signal().await;
+        let _ = stop.send(true);
+    });
+    // Requests still running get a few seconds; then the Registry session is signed out, so a
+    // restart does not leave one holding a licensed place.
+    tokio::select! {
+        r = async { serve.await } => r?,
+        _ = async {
+            if stopping.wait_for(|s| *s).await.is_err() { std::future::pending::<()>().await; }
+            tokio::time::sleep(std::time::Duration::from_secs(3)).await;
+        } => {}
+    }
+    cadastre_server::lrs::shutdown().await;
 
     Ok(())
 }
@@ -82,10 +94,26 @@ fn init_tracing() {
         .init();
 }
 
-/// Resolve when the process receives Ctrl-C (SIGINT).
+/// Resolve when the process receives Ctrl-C (SIGINT) or, on Unix, SIGTERM (`kill`, a restart).
 async fn shutdown_signal() {
-    if let Err(e) = tokio::signal::ctrl_c().await {
-        tracing::error!("failed to install Ctrl-C handler: {e}");
-    }
+    let ctrl_c = async {
+        if let Err(e) = tokio::signal::ctrl_c().await {
+            tracing::error!("failed to install Ctrl-C handler: {e}");
+            std::future::pending::<()>().await;
+        }
+    };
+    #[cfg(unix)]
+    let term = async {
+        match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()) {
+            Ok(mut s) => { s.recv().await; }
+            Err(e) => {
+                tracing::error!("failed to install SIGTERM handler: {e}");
+                std::future::pending::<()>().await;
+            }
+        }
+    };
+    #[cfg(not(unix))]
+    let term = std::future::pending::<()>();
+    tokio::select! { _ = ctrl_c => {}, _ = term => {} }
     tracing::info!("shutdown signal received");
 }
