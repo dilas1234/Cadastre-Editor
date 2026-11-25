@@ -20,6 +20,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         e
     })?;
 
+    // Take the port before anything else. A second copy of the server must stop here: started by a
+    // service that retries every few seconds, it would otherwise migrate the database and sign in to
+    // the Registry each time, and leave a session holding a licensed place there when it exits.
+    let bind_addr = config.bind_addr.clone();
+    let listener = tokio::net::TcpListener::bind(&bind_addr).await.map_err(|e| {
+        tracing::error!("cannot listen on {bind_addr}: {e} (is another cadastre-server running?)");
+        e
+    })?;
+
     let jwks = if config.auth_mode == AuthMode::Enabled {
         let keys = idp::load_jwks(&config).await.map_err(|e| {
             tracing::error!("failed to load Keycloak JWKS: {e}");
@@ -37,7 +46,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let pool = db::connect_and_migrate(&config.database_url).await?;
     tracing::info!("database connected and migrations applied");
 
-    let bind_addr = config.bind_addr.clone();
     // Task notifications: sent while an SMTP server is configured (mail.* settings).
     tokio::spawn(cadastre_server::mail::run_outbox(pool.clone()));
     // Registry links: read from the Aumentum Registry every minute while it is configured
@@ -57,7 +65,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         state,
     );
 
-    let listener = tokio::net::TcpListener::bind(&bind_addr).await?;
     tracing::info!("cadastre-server listening on http://{bind_addr} (docs at /swagger-ui)");
     // Which build this is, in the log, so a build without Users & Units is seen at start.
     if cfg!(feature = "registry-admin") {
