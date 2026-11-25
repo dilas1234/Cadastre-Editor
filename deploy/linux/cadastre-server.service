@@ -1,0 +1,25 @@
+# The one Cadastre server of this host. Installed by scripts/install-service.sh, which fills in
+# @USER@ and @WORKDIR@. Settings: /etc/cadastre/cadastre-server.env (root only).
+[Unit]
+Description=PLAGIS Cadastre Editor server
+Wants=network-online.target
+After=network-online.target postgresql.service postgresql@16-main.service
+# At most 10 starts in 15 minutes, then it stays stopped: a server that keeps failing must not sign
+# in to the Registry without end (its sessions never expire and hold licensed places).
+StartLimitIntervalSec=900
+StartLimitBurst=10
+
+[Service]
+Type=exec
+User=@USER@
+WorkingDirectory=@WORKDIR@
+EnvironmentFile=/etc/cadastre/cadastre-server.env
+ExecStart=/usr/local/lib/cadastre/cadastre-server
+Restart=on-failure
+RestartSec=30
+# SIGTERM signs the Registry session out; give it time.
+KillSignal=SIGTERM
+TimeoutStopSec=25
+
+[Install]
+WantedBy=multi-user.target
