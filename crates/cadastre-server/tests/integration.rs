@@ -2643,6 +2643,73 @@ async fn verification_checks_a_boundary_without_a_job_and_saves_nothing() {
     assert_eq!(parcels_here().await.unwrap(), before, "a check saves nothing");
 }
 
+/// A sketch corner typed 10 cm off a neighbour's beacon (N .265 for .365) overlaps it by a thin
+/// triangle: the system check names the corner and the beacon, with the fix; on the beacon it
+/// passes. A neighbour stored twice (two UPINs, one shape) is named as one plot, and listed in
+/// Duplicate Parcels.
+#[tokio::test]
+async fn a_corner_typed_off_the_neighbours_beacon_is_named_with_the_fix() {
+    let Some(db_url) = test_db_url() else {
+        eprintln!("skipping: CADASTRE_TEST_DATABASE_URL not set");
+        return;
+    };
+    let app = routes::router(state_with(AuthMode::Disabled, None, &db_url).await);
+    let pool = sqlx::PgPool::connect(&db_url).await.unwrap();
+    let b = 200_000 + (rand_12() % 700_000) as i32 * 10 + 3;
+    sqlx::query("INSERT INTO cadastre.wf_task (id, name) VALUES ($1, 'Construct Parcel')").bind(b).execute(&pool).await.unwrap();
+    sqlx::query("INSERT INTO cadastre.wf_job_type (id, name, start_task_id, end_task_id) VALUES ($1, 'Near corner (test)', $1, $1)")
+        .bind(b).execute(&pool).await.unwrap();
+    let (_, d) = send(&app, "POST", "/api/v1/wf/jobs", None, Some(json!({"job_type_id": b, "name": "Job-NC"}))).await;
+    let id = d["job"]["id"].as_i64().unwrap();
+
+    // The neighbour south of the plot (the shape of PL000000019101, moved somewhere no other test
+    // draws), stored twice under two UPINs as Aumentum's import did.
+    let (dx, dy) = (-300_000.0 + ((b / 10) % 60_000) as f64 * 40.0, 8_100_000.0);
+    let nb: Vec<[f64; 2]> = vec![[486688.3838, 1088960.0397], [486677.4213, 1088988.9316], [486650.8636, 1088981.3651], [486659.9223, 1088951.5567]]
+        .into_iter().map(|[e, n]| [e + dx, n + dy]).collect();
+    let wkt = format!("POLYGON(({}))", nb.iter().chain(std::iter::once(&nb[0])).map(|p| format!("{} {}", p[0], p[1])).collect::<Vec<_>>().join(","));
+    let (u1, u2) = (format!("PLNC{b}A"), format!("PLNC{b}B"));
+    for u in [&u1, &u2] {
+        sqlx::query("INSERT INTO cadastre.parcel (parcel_number, geom, status) VALUES ($1, ST_GeomFromText($2, 32632), 'posted')")
+            .bind(u).bind(&wkt).execute(&pool).await.unwrap();
+    }
+
+    // The plot north of it: corners 1 and 2 are the neighbour's corners 2 and 3, corner 2 typed 10 cm south.
+    let plot = |n2: f64| vec![nb[1], [nb[2][0], n2], [nb[2][0] - 4.0, nb[2][1] + 25.0], [nb[1][0] + 4.0, nb[1][1] + 25.0]];
+    let check_url = format!("/api/v1/wf/jobs/{id}/precheck");
+    let item = |r: &Value, c: &str| r["items"].as_array().unwrap().iter().find(|i| i["check"] == c).cloned().unwrap();
+
+    let (st, r) = send(&app, "POST", &check_url, None, Some(json!({"vertices": plot(nb[2][1] - 0.10)}))).await;
+    assert_eq!(st, StatusCode::OK, "{r}");
+    let fabric = item(&r, "fabric_overlap");
+    assert_eq!(fabric["result"], "fail", "{r}");
+    let fd = fabric["detail"].as_str().unwrap();
+    assert!(fd.contains(&u1) && fd.contains(&u2) && fd.contains("the same plot stored twice"), "{fabric}");
+    let nc = item(&r, "near_corner");
+    assert_eq!(nc["result"], "warn", "{r}");
+    assert_eq!(nc["fixes"].as_array().unwrap().len(), 1, "{nc}");
+    let f = &nc["fixes"][0];
+    assert_eq!(f["index"], 1, "{nc}");
+    assert!((f["to"][1].as_f64().unwrap() - nb[2][1]).abs() < 1e-6 && (f["distance_m"].as_f64().unwrap() - 0.10).abs() < 1e-3, "{nc}");
+    assert!(nc["detail"].as_str().unwrap().starts_with("Corner 2 is 10.0 cm from"), "{nc}");
+
+    // On the beacon: no overlap, no corner to fix.
+    let (_, r) = send(&app, "POST", &check_url, None, Some(json!({"vertices": plot(nb[2][1])}))).await;
+    assert_eq!(item(&r, "fabric_overlap")["result"], "pass", "{r}");
+    assert_eq!(item(&r, "near_corner")["result"], "pass", "{r}");
+    assert!(item(&r, "near_corner").get("fixes").is_none(), "{r}");
+
+    // Duplicate Parcels lists the pair as one shape.
+    let (st, dups) = send(&app, "GET", "/api/v1/parcels/duplicates", None, None).await;
+    assert_eq!(st, StatusCode::OK, "{dups}");
+    let g = dups["groups"].as_array().unwrap().iter()
+        .find(|g| g["parcels"].as_array().unwrap().iter().any(|p| p["upin"] == json!(u1))).cloned().expect("the pair is listed");
+    let upins: Vec<&str> = g["parcels"].as_array().unwrap().iter().map(|p| p["upin"].as_str().unwrap()).collect();
+    assert_eq!(upins, vec![u1.as_str(), u2.as_str()], "{g}");
+
+    sqlx::query("DELETE FROM cadastre.parcel WHERE parcel_number = ANY($1)").bind(vec![u1, u2]).execute(&pool).await.unwrap();
+}
+
 /// A parcel's exterior ring as vertices (UTM), without the closing repeat.
 async fn pts_of(pool: &sqlx::PgPool, id: &str) -> Vec<[f64; 2]> {
     let pts: Vec<(f64, f64)> = sqlx::query_as("SELECT ST_X(d.geom), ST_Y(d.geom) FROM cadastre.parcel p, ST_DumpPoints(ST_ExteriorRing(ST_GeometryN(ST_Multi(p.geom), 1))) d WHERE p.id = $1::uuid ORDER BY d.path")

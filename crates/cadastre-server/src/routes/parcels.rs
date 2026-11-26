@@ -689,6 +689,46 @@ pub async fn sketch_overlaps(State(state): State<AppState>, Json(req): Json<Sket
     Ok(Json(serde_json::json!({ "free": overlaps.is_empty() && at_point.is_empty(), "overlaps": overlaps, "at_point": at_point, "titled": titled })))
 }
 
+/// Committed parcels stored twice or more: the same shape under different UPINs (from Aumentum's
+/// import, where the duplicate exists too). Each group with its UPINs, whether each is linked to a
+/// Registry property, its property number, and where it is (WGS 84 bounds, to zoom to). One of each
+/// group is the plot; the others should be retired in Aumentum.
+#[utoipa::path(get, path = "/api/v1/parcels/duplicates", tag = "parcels", responses((status = 200)))]
+pub async fn duplicate_parcels(State(state): State<AppState>) -> ApiResult<Json<serde_json::Value>> {
+    let rows = sqlx::query(
+        "WITH k AS (SELECT p.parcel_number, p.geom, p.job_id, md5(ST_AsBinary(ST_Normalize(p.geom))) AS shape \
+                    FROM cadastre.parcel p WHERE p.status = 'posted' AND p.parcel_number IS NOT NULL), \
+              g AS (SELECT shape FROM k GROUP BY shape HAVING count(*) > 1) \
+         SELECT k.shape, k.parcel_number, k.job_id IS NULL AS imported, ST_Area(k.geom) AS area, \
+                ST_AsGeoJSON(ST_Transform(ST_Envelope(k.geom), 4326), 7)::json AS bounds, \
+                x.lrs_id, x.property_number, COALESCE(x.linkage_status, 0) = 1 AS linked \
+         FROM k JOIN g USING (shape) \
+         LEFT JOIN LATERAL (SELECT lrs_id, property_number, linkage_status FROM cadastre.parcel_attribute y \
+                            WHERE y.upin = k.parcel_number AND (y.status = '0' OR y.status IS NULL) \
+                            ORDER BY y.linkage_status DESC NULLS LAST LIMIT 1) x ON true \
+         ORDER BY k.shape, linked DESC, k.parcel_number")
+        .fetch_all(&state.pool).await?;
+    let mut groups: Vec<serde_json::Value> = Vec::new();
+    let mut last: Option<String> = None;
+    for r in &rows {
+        let shape: String = r.get("shape");
+        if last.as_deref() != Some(&shape) {
+            groups.push(serde_json::json!({ "area_m2": (r.get::<f64, _>("area") * 100.0).round() / 100.0, "bounds": r.get::<serde_json::Value, _>("bounds"), "parcels": [] }));
+            last = Some(shape);
+        }
+        let g = groups.last_mut().expect("a group was pushed");
+        g["parcels"].as_array_mut().expect("parcels is an array").push(serde_json::json!({
+            "upin": r.get::<String, _>("parcel_number"),
+            "linked": r.get::<Option<bool>, _>("linked").unwrap_or(false),
+            "lrs_id": r.get::<Option<String>, _>("lrs_id"),
+            "property_number": r.get::<Option<String>, _>("property_number"),
+            "imported": r.get::<bool, _>("imported"),
+        }));
+    }
+    let parcels: usize = groups.iter().map(|g| g["parcels"].as_array().map_or(0, Vec::len)).sum();
+    Ok(Json(serde_json::json!({ "groups": groups, "parcels": parcels })))
+}
+
 #[derive(Debug, Deserialize, utoipa::IntoParams)]
 pub struct ParcelPointsQuery {
     /// The committed parcel's UPIN.

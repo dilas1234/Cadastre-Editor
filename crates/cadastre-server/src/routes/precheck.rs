@@ -9,10 +9,14 @@
 //! | `title`          | a title on the land: a parcel there linked to a Registry property, or the job's Registry property already holding a UPIN | fail |
 //! | `transaction`    | the job's Registry transaction is still Active                             | fail   |
 //! | `near_miss`      | gaps under 10 cm against committed neighbours                              | warn   |
+//! | `near_corner`    | sketch corners 5 mm to 15 cm from a committed neighbour's corner (the same beacon typed differently?), with the fix | warn |
 //!
 //! An overlap counts only when it is wider than `editor.overlap_min_width_m` (5 cm): a thinner one
 //! is a shared boundary drawn a little differently (the same beacons, typed from the survey plan,
 //! against a neighbour's stored line), not land taken twice. It is named in the check's detail.
+//!
+//! A neighbour stored twice (two UPINs, the same shape: an Aumentum duplicate) is named as such
+//! in the overlap checks, so one plot does not read as two neighbours.
 //!
 //! Parcels this job's mutations replace (split, merge, re-survey …) are not counted against it.
 //! A source that cannot be reached is a warning, not a pass: the officer must say why to go on.
@@ -52,6 +56,26 @@ pub fn counts_sql(a: &str, b: &str, width: &str) -> String {
 }
 /// Gaps narrower than this (m) to a committed neighbour are reported as near misses.
 const NEAR_MISS_M: f64 = 0.10;
+/// A sketch corner this close (m) to a committed neighbour's corner, but not on it, is probably
+/// the same beacon typed a little differently.
+const NEAR_CORNER_M: f64 = 0.15;
+/// Closer than this (m) the corner is on the beacon (plan coordinates to mm against stored ones).
+const ON_CORNER_M: f64 = 0.005;
+
+/// A sketch corner near a neighbour's beacon, and where that beacon is.
+#[derive(Debug, Clone, Serialize, ToSchema)]
+pub struct CornerFix {
+    /// The corner's position in the sketch (0-based).
+    pub index: usize,
+    /// The corner as sketched (UTM 32N metres).
+    pub from: [f64; 2],
+    /// The neighbour's corner (UTM 32N metres).
+    pub to: [f64; 2],
+    /// How far apart they are (m).
+    pub distance_m: f64,
+    /// The neighbour.
+    pub upin: String,
+}
 
 #[derive(Debug, Clone, Serialize, ToSchema)]
 pub struct PrecheckItem {
@@ -63,6 +87,9 @@ pub struct PrecheckItem {
     pub detail: String,
     /// The parcels concerned.
     pub upins: Vec<String>,
+    /// `near_corner`: the corners to move onto the neighbours' beacons.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub fixes: Vec<CornerFix>,
 }
 
 #[derive(Debug, Clone, Serialize, ToSchema)]
@@ -89,7 +116,7 @@ pub struct PrecheckRequest {
 }
 
 fn item(check: &str, label: &str, result: &str, detail: impl Into<String>, upins: Vec<String>) -> PrecheckItem {
-    PrecheckItem { check: check.into(), label: label.into(), result: result.into(), detail: detail.into(), upins }
+    PrecheckItem { check: check.into(), label: label.into(), result: result.into(), detail: detail.into(), upins, fixes: Vec::new() }
 }
 
 /// For a passing overlap check: the shared-boundary differences it let through, if any.
@@ -123,6 +150,57 @@ pub(crate) async fn aumentum_parcels(env: (f64, f64, f64, f64)) -> Option<Result
             )).collect()),
         },
     })
+}
+
+/// The sketch's corners that lie 5 mm to 15 cm from a committed neighbour's corner, each with the
+/// nearest such corner. A corner on a beacon (within 5 mm) is not reported.
+async fn near_corners(conn: &mut sqlx::PgConnection, vertices: &[[f64; 2]], skip: &[String]) -> ApiResult<PrecheckItem> {
+    let es: Vec<f64> = vertices.iter().map(|v| v[0]).collect();
+    let ns: Vec<f64> = vertices.iter().map(|v| v[1]).collect();
+    let rows: Vec<(i64, String, f64, f64, f64)> = sqlx::query_as(
+        "SELECT s.i, b.upin, b.e, b.n, b.d FROM unnest($1::float8[], $2::float8[]) WITH ORDINALITY AS s(e, n, i) \
+         CROSS JOIN LATERAL ( \
+           SELECT p.parcel_number AS upin, ST_X(q.geom) AS e, ST_Y(q.geom) AS n, \
+                  ST_Distance(q.geom, ST_SetSRID(ST_MakePoint(s.e, s.n), 32632)) AS d \
+           FROM cadastre.parcel p, ST_DumpPoints(p.geom) q \
+           WHERE p.status = 'posted' AND p.parcel_number IS NOT NULL AND NOT (p.parcel_number = ANY($3)) \
+             AND ST_DWithin(p.geom, ST_SetSRID(ST_MakePoint(s.e, s.n), 32632), $4) \
+           ORDER BY d, p.parcel_number LIMIT 1) b \
+         WHERE b.d > $5 AND b.d <= $4 ORDER BY s.i")
+        .bind(&es).bind(&ns).bind(skip).bind(NEAR_CORNER_M).bind(ON_CORNER_M)
+        .fetch_all(&mut *conn).await?;
+    if rows.is_empty() {
+        return Ok(item("near_corner", "Corners near a neighbour's beacon", "pass",
+            format!("No corner is within {:.0} cm of a neighbour's corner without being on it.", NEAR_CORNER_M * 100.0), vec![]));
+    }
+    let fixes: Vec<CornerFix> = rows.iter().map(|(i, u, e, n, d)| {
+        let index = (*i - 1) as usize;
+        CornerFix { index, from: vertices[index], to: [*e, *n], distance_m: *d, upin: u.clone() }
+    }).collect();
+    let d = fixes.iter().map(|f| format!("corner {} is {:.1} cm from {}'s corner (E {:.3}, N {:.3})",
+        f.index + 1, f.distance_m * 100.0, f.upin, f.to[0], f.to[1])).collect::<Vec<_>>().join("; ");
+    let mut upins: Vec<String> = Vec::new();
+    for f in &fixes { if !upins.contains(&f.upin) { upins.push(f.upin.clone()); } }
+    let mut it = item("near_corner", "Corners near a neighbour's beacon", "warn",
+        format!("{}. If the survey plan has the same beacon, use the neighbour's position.", capitalise(&d)), upins);
+    it.fixes = fixes;
+    Ok(it)
+}
+
+fn capitalise(s: &str) -> String {
+    let mut c = s.chars();
+    c.next().map(|f| f.to_uppercase().collect::<String>() + c.as_str()).unwrap_or_default()
+}
+
+/// Pairs (kept, copy) among `upins` with the same shape: a parcel stored twice.
+async fn duplicates_among(conn: &mut sqlx::PgConnection, upins: &[String]) -> ApiResult<Vec<(String, String)>> {
+    if upins.len() < 2 { return Ok(Vec::new()); }
+    Ok(sqlx::query_as(
+        "SELECT a.parcel_number, b.parcel_number FROM cadastre.parcel a JOIN cadastre.parcel b \
+           ON b.status = 'posted' AND b.parcel_number = ANY($1) AND a.parcel_number < b.parcel_number \
+          AND a.geom && b.geom AND ST_Equals(a.geom, b.geom) \
+         WHERE a.status = 'posted' AND a.parcel_number = ANY($1) ORDER BY 1, 2")
+        .bind(upins).fetch_all(&mut *conn).await?)
 }
 
 /// Run every check for job instance `id`, on `vertices` (a sketch) or on the job's draft parcels.
@@ -345,6 +423,23 @@ pub async fn run(state: &AppState, id: Option<i32>, vertices: &[[f64; 2]], editi
         let d = near.iter().map(|(u, d)| format!("{u} ({:.1} cm)", d * 100.0)).collect::<Vec<_>>().join(", ");
         item("near_miss", "Gaps to neighbours", "warn", format!("Small gaps to {d}: snap the shared corners if they are the same beacons."), near.iter().map(|n| n.0.clone()).collect())
     });
+
+    // 6. Corners near a neighbour's beacon but not on it: the same beacon typed differently?
+    if vertices.len() >= 3 {
+        items.push(near_corners(&mut conn, vertices, &mutated).await?);
+    }
+
+    // A neighbour stored twice (the same shape under two UPINs) is one plot, not two neighbours.
+    let mut overlapped: Vec<String> = our_upins.clone();
+    for u in &aum_upins { if !overlapped.contains(u) { overlapped.push(u.clone()); } }
+    let twins = duplicates_among(&mut conn, &overlapped).await?;
+    if !twins.is_empty() {
+        let note = format!(" {} {} the same plot stored twice (Geoprocessing → Duplicate Parcels).",
+            twins.iter().map(|(a, b)| format!("{a} and {b}")).collect::<Vec<_>>().join("; "), if twins.len() > 1 { "are each" } else { "are" });
+        for i in items.iter_mut().filter(|i| (i.check == "fabric_overlap" || i.check == "aumentum") && i.result == "fail") {
+            i.detail.push_str(&note);
+        }
+    }
 
     let ok = !items.iter().any(|i| i.result == "fail");
     let warnings = items.iter().any(|i| i.result == "warn");

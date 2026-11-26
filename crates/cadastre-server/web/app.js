@@ -572,6 +572,7 @@ const MENUS = () => ({
   ],
   Geoprocessing: [
     { label: "Validate Fabric (selected / job)…", icon: "validate", action: validateFabric },
+    { label: "Duplicate Parcels…", action: duplicateParcels },
     { label: "Survey Closure Check…", icon: "survey", action: () => openTask("survey") },
     { label: "Computation Tools (35)…", icon: "arcToolbox", action: openComputeTools },
     "-",
@@ -2359,6 +2360,39 @@ async function validateFabric() {
   } catch (e) { uiAlert("Validation failed: " + e.message); }
 }
 
+// Committed parcels stored twice (the same shape under two UPINs, from Aumentum's import): one plot
+// that reads as two neighbours in the system check. Listed to be retired in Aumentum.
+async function duplicateParcels() {
+  let r;
+  try { r = await api("/api/v1/parcels/duplicates"); } catch (e) { uiAlert("The duplicate parcels could not be listed: " + e.message); return; }
+  if (!r.groups.length) { uiAlert("No parcel is stored twice: every committed shape has one UPIN."); return; }
+  const zoom = (g) => {
+    const c = g.bounds.coordinates[0], xs = c.map((p) => p[0]), ys = c.map((p) => p[1]);
+    map.fitBounds([[Math.min(...xs), Math.min(...ys)], [Math.max(...xs), Math.max(...ys)]], { padding: 120, maxZoom: 19 });
+  };
+  const who = (p) => `${p.upin}${p.linked ? ` (linked ${p.lrs_id || ""})` : " (not linked)"}`;
+  const tbl = h("table", { class: "verifyTbl" },
+    h("tr", {}, h("th", {}, "#"), h("th", {}, "UPINs (same shape)"), h("th", {}, "File"), h("th", {}, "Area (m²)")));
+  r.groups.forEach((g, i) => {
+    const files = [...new Set(g.parcels.map((p) => p.property_number).filter(Boolean))].join(", ");
+    const tr = h("tr", { title: "Show it on the map" }, h("td", { class: "n" }, String(i + 1)),
+      h("td", { style: "white-space:normal" }, g.parcels.map(who).join(", ")), h("td", {}, files || "–"), h("td", { class: "n" }, g.area_m2.toFixed(2)));
+    tr.addEventListener("click", () => { zoom(g); tbl.querySelectorAll("tr.selrow").forEach((x) => x.classList.remove("selrow")); tr.classList.add("selrow"); });
+    tbl.append(tr);
+  });
+  const csv = () => {
+    const lines = ["group,upin,linked,lrs_id,property_number,area_m2"];
+    r.groups.forEach((g, i) => g.parcels.forEach((p) => lines.push([i + 1, p.upin, p.linked ? "yes" : "no", p.lrs_id || "", p.property_number || "", g.area_m2].join(","))));
+    const a = h("a", { href: URL.createObjectURL(new Blob([lines.join("\r\n")], { type: "text/csv" })), download: "duplicate-parcels.csv" });
+    document.body.append(a); a.click(); a.remove();
+  };
+  floatWindow("Duplicate Parcels", h("div", {},
+    h("p", {}, h("b", {}, `${r.groups.length} shapes stored more than once (${r.parcels} UPINs).`),
+      " Each is one plot. Keep the UPIN linked to the Registry and retire the others in Aumentum."),
+    h("p", {}, h("button", { class: "btn", onclick: csv }, "Save as CSV")),
+    h("div", { class: "verifyWrap", style: "max-height:360px;overflow:auto" }, tbl)), { id: "dupParcelsWin", width: 620 });
+}
+
 // ---- Tasks wizard ----
 const TASKS = {
   survey: { name: "New parcel from survey (COGO)", steps: ["Job", "Start point", "Traverse", "Review & save"] },
@@ -2889,11 +2923,12 @@ async function saveSketchParcel() {
     uiAlert(`This sketch edits a draft parcel of ${edit.editingJob.reference}, but ${state.job.reference} is selected.\nSelect ${edit.editingJob.reference} again (Job box, or Work On This Job) and Save Changes, or Cancel Edit to draw for ${state.job.reference}.`);
     return;
   }
-  const utm = edit.verts.slice();
+  let utm = edit.verts.slice();
   // Verify Points: the digitiser checks every corner (beacon, coordinates) before anything is saved.
   if (!(await verifyPoints(utm))) { status("Back to the sketch: adjust the corners, then Finish Sketch again."); return; }
   // System check before the next stage: nothing goes on to attributes and commit on taken land.
   if (!(await runPrecheck(utm))) { status("Back to the sketch: the system check did not pass."); return; }
+  utm = edit.verts.slice(); // the check may have put corners on the neighbours' beacons
   if (!(await ensureJobArea(utm))) return; // keep the sketch so nothing is lost
   // Finish Sketch saves the shape at once (nothing to confirm, nothing lost if the attribute form
   // is closed); the Update Parcel Attribute form then opens on the saved draft.
@@ -4364,10 +4399,23 @@ async function runPrecheck(utm) {
   const body = h("div", {},
     h("p", {}, report.ok ? "The system check found warnings. Look at them before going on." : h("b", {}, `The system check failed (${fails} problem${fails > 1 ? "s" : ""}). Nothing can be committed on this land.`)),
     h("div", { class: "verifyWrap" }, precheckTable(report)));
+  // Corners a few cm off a neighbour's beacon: offer to put them on it, then check again.
+  const fixes = report.items.flatMap((i) => i.fixes || []);
+  const fixBtn = fixes.length ? [{ label: `Use the neighbour's beacon${fixes.length > 1 ? "s" : ""} (${fixes.length} corner${fixes.length > 1 ? "s" : ""})`, value: "fix" }] : [];
   const buttons = report.ok
-    ? [{ label: "Back to sketch", value: false, cancel: true }, { label: "Continue…", value: true, primary: true }]
-    : [{ label: "Back to sketch", value: false, cancel: true, primary: true }];
+    ? [{ label: "Back to sketch", value: false, cancel: true }, ...fixBtn, { label: "Continue…", value: true, primary: true }]
+    : [{ label: "Back to sketch", value: false, cancel: true, primary: !fixes.length }, ...fixBtn.map((b) => ({ ...b, primary: true }))];
   const go = await uiDialog({ title: "System Check", message: body, kind: report.ok ? "warn" : "error", width: 720, buttons });
+  if (go === "fix") {
+    let moved = 0;
+    for (const f of fixes) {
+      const v = edit.verts[f.index];
+      if (v && Math.hypot(v[0] - f.from[0], v[1] - f.from[1]) < 0.001) { edit.verts[f.index] = [f.to[0], f.to[1]]; moved++; }
+    }
+    drawSketch(); refreshSketchProps(); updateEditorButtons();
+    notify(`${moved} corner${moved === 1 ? "" : "s"} moved onto the neighbour's beacon. Checking again…`);
+    return runPrecheck(edit.verts.slice());
+  }
   if (!go || !report.ok) return false;
   const reason = await uiPrompt("Why go on despite the warnings? (recorded with the job)", "", { title: "System Check" });
   if (!reason || !reason.trim()) return false;
